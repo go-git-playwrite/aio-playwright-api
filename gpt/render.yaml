@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: playwright-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: 0
