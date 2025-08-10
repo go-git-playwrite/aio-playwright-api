@@ -4,11 +4,8 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => {
-  res.send("Playwright API is running!");
-});
-
 app.get("/scrape", async (req, res) => {
+  console.log("=== /scrape accessed ===");
   console.log("Incoming /scrape request, query:", req.query);
 
   const url = req.query.url;
@@ -18,16 +15,13 @@ app.get("/scrape", async (req, res) => {
 
   try {
     const browser = await chromium.launch({
-      headless: true, // GUIなし
+      headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // ページタイトルを取得
     const title = await page.title();
-
-    // 例：h1タグのテキストをすべて取得
     const h1Texts = await page.$$eval("h1", els => els.map(e => e.innerText.trim()));
 
     await browser.close();
@@ -38,6 +32,7 @@ app.get("/scrape", async (req, res) => {
       h1: h1Texts
     });
   } catch (error) {
+    console.error("Error during scraping:", error);
     res.status(500).json({ error: error.message });
   }
 });
