@@ -9,6 +9,8 @@ app.get("/", (req, res) => {
 });
 
 app.get("/scrape", async (req, res) => {
+  console.log("Incoming /scrape request, query:", req.query);
+
   const url = req.query.url;
   if (!url) {
     return res.status(400).json({ error: "URL parameter is required" });
