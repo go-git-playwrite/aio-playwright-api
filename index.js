@@ -1,42 +1,45 @@
-const express = require('express');
-const { chromium } = require('playwright-chromium');
+import express from "express";
+import { chromium } from "playwright";
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
-app.get('/', async (req, res) => {
-  const { url } = req.query;
+app.get("/", (req, res) => {
+  res.send("Playwright API is running!");
+});
+
+app.get("/scrape", async (req, res) => {
+  const url = req.query.url;
   if (!url) {
-    return res.status(400).send({ error: 'URL parameter is required.' });
+    return res.status(400).json({ error: "URL parameter is required" });
   }
 
-  let browser = null;
   try {
-    console.log(`Fetching URL: ${url}`);
-    browser = await chromium.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    const browser = await chromium.launch({
+      headless: true, // GUIなし
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
-    
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded" });
 
-    // ★★★ タイムアウトを90秒に延長し、読み込み完了の判断を、より速い基準に変更 ★★★
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-    
-    const html = await page.content();
-    console.log(`Successfully fetched content from ${url}`);
-    res.status(200).send(html);
+    // ページタイトルを取得
+    const title = await page.title();
 
+    // 例：h1タグのテキストをすべて取得
+    const h1Texts = await page.$$eval("h1", els => els.map(e => e.innerText.trim()));
+
+    await browser.close();
+
+    res.json({
+      url,
+      title,
+      h1: h1Texts
+    });
   } catch (error) {
-    console.error(`Error fetching ${url}:`, error);
-    // ★★★ エラー時に、より詳細な情報を返すように修正 ★★★
-    res.status(500).send({ error: 'An error occurred while fetching the page.', details: error.message });
-  } finally {
-    if (browser) {
-      await browser.close();
-      console.log('Browser closed.');
-    }
+    res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
