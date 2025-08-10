@@ -1,16 +1,17 @@
 {
-  "name": "playwright-api-server",
+  "name": "playwright-api",
   "version": "1.0.0",
-  "description": "A simple API server to scrape web pages using Playwright.",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "playwright-chromium": "^1.40.1"
+    "playwright": "^1.46.0"
   },
-  "engines": {
-    "node": "18.x"
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps"
   }
 }
