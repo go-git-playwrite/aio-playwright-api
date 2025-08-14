@@ -63,3 +63,4 @@ app.get('/scrape', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Playwright API server is running on port ${PORT}`);
 });
+
