@@ -1,17 +1,18 @@
-FROM mcr.microsoft.com/playwright:latest
+# Playwrightが必要とする全ての部品が最初から入っている公式イメージをベースにする
+FROM mcr.microsoft.com/playwright:v1.45.0-jammy
 
-WORKDIR /usr/src/app
+# 作業ディレクトリを設定
+WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --only=production
+# まず依存パッケージだけをインストール（ビルドを高速化するため）
+COPY package*.json ./
+RUN npm install
 
-# ここでPlaywrightブラウザをインストール
-RUN npx playwright install
-
+# アプリケーションのコードをコピー
 COPY . .
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+# サーバーが使うポートを指定
+EXPOSE 8080
 
-EXPOSE 3000
-
-CMD ["node", "index.js"]
+# サーバーを起動する
+CMD [ "npm", "start" ]
