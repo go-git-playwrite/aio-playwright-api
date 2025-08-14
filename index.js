@@ -1,72 +1,65 @@
-import express from "express";
-import { chromium } from "playwright";
+const express = require('express');
+const { chromium } = require('playwright-chromium');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Renderが提供するポートを使用
 
-// 5. グローバル例外捕捉 (uncaughtException, unhandledRejection)
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
-});
+// JSON形式のリクエストボディを解析するためのミドルウェア
+app.use(express.json());
 
-app.get("/scrape", async (req, res) => {
-  console.log("=== /scrape accessed ===");
-  console.log("Incoming /scrape request, query:", req.query);
+app.get('/scrape', async (req, res) => {
+  const urlToFetch = req.query.url;
 
-  const url = req.query.url;
-  if (!url) {
-    console.error("URL parameter missing");
-    return res.status(400).json({ error: "URL parameter is required" });
+  if (!urlToFetch) {
+    return res.status(400).json({ error: 'URL parameter "url" is required.' });
   }
 
+  console.log(`Scraping request received for: ${urlToFetch}`);
+  let browser = null;
   try {
-    // 4. 主要処理の前後にログを入れて状況を把握
-    console.log("Launching browser for URL:", url);
-    const browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    browser = await chromium.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
-    console.log("Browser launched");
+    
+    const context = await browser.newContext({
+      // 一般的なブラウザのユーザーエージェントを設定
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    });
+    const page = await context.newPage();
 
-    const page = await browser.newPage();
-    console.log("New page created");
+    // ページ遷移のタイムアウトを90秒に延長
+    await page.goto(urlToFetch, { waitUntil: 'networkidle', timeout: 90000 });
 
-    console.log("Navigating to URL:", url);
-    await page.goto(url, { waitUntil: "domcontentloaded" });
-    console.log("Page navigation completed");
-
+    // 1. ページのタイトルを取得
     const title = await page.title();
-    console.log("Page title retrieved:", title);
 
-    const h1Texts = await page.$$eval("h1", els => els.map(e => e.innerText.trim()));
-    console.log("H1 tags extracted:", h1Texts);
+    // 2. JavaScript描画後のHTML全文を取得
+    const fullHtml = await page.content();
+    
+    // 3. JavaScript描画後の表示テキスト全文を取得
+    const bodyText = await page.evaluate(() => document.body.innerText);
 
-    await browser.close();
-    console.log("Browser closed");
+    // 4. 取得した情報をまとめてJSONとして返却
+    const responseData = {
+      url: urlToFetch,
+      title: title,
+      fullHtml: fullHtml,
+      bodyText: bodyText
+    };
 
-    res.json({
-      url,
-      title,
-      h1: h1Texts
-    });
+    console.log(`Successfully scraped: ${urlToFetch}`);
+    res.status(200).json(responseData);
+
   } catch (error) {
-    console.error("Error during scraping:", error.message);
-    console.error(error.stack);
-    res.status(500).json({ error: error.message });
+    console.error(`Error scraping ${urlToFetch}:`, error);
+    res.status(500).json({ error: 'An error occurred during scraping.', details: error.message });
+  } finally {
+    if (browser) {
+      await browser.close();
+    }
   }
 });
 
-// 3. サーバ起動処理を即時実行関数に包み、起動時例外も拾う
-(async () => {
-  try {
-    app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
-    });
-  } catch (err) {
-    console.error("Fatal error on startup:", err);
-    process.exit(1);
-  }
-})();
+app.listen(PORT, () => {
+  console.log(`Playwright API server is running on port ${PORT}`);
+});
