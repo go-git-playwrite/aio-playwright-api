@@ -6,6 +6,11 @@ WORKDIR /app
 
 # まず依存パッケージだけをインストール（ビルドを高速化するため）
 COPY package*.json ./
+
+# ブラウザのダウンロードをスキップするよう環境変数を設定
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# 依存パッケージをインストール
 RUN npm install
 
 # アプリケーションのコードをコピー
