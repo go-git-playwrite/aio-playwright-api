@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: playwright-api
+    name: playwright-api-2
     env: node
     plan: free
     buildCommand: npm install
