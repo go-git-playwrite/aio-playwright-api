@@ -3,10 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "npx playwright install --with-deps chromium"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "1.54.2"
+    "playwright-chromium": "1.54.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
