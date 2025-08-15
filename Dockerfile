@@ -1,5 +1,5 @@
 # Playwrightが必要とする全ての部品が最初から入っている公式イメージをベースにする
-FROM mcr.microsoft.com/playwright:v1.45.0-jammy
+FROM mcr.microsoft.com/playwright:v1.54.2-jammy
 
 # 作業ディレクトリを設定
 WORKDIR /app
