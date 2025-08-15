@@ -92,6 +92,41 @@ app.get('/scrape', async (req, res) => {
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.waitForTimeout(1500); // ちょい追い
 
+// === ADD: noscript が消える / 非表示になるまで待機 → SPAコンテナが見えるまで待機 ===
+const noscriptSelector = 'noscript, p.warning'; // フォールバック文言が <p class="warning"> の場合も拾う
+const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot]';
+
+let noscriptHidden = false;
+let appVisible = false;
+
+try {
+  // noscript/p.warning が DOM から消える or hidden になるまで待つ（5秒）
+  await page.waitForSelector(noscriptSelector, { state: 'hidden', timeout: 5000 });
+  noscriptHidden = true;
+} catch (_) {
+  // なくてもOK。DOMに残っていても“非表示なら良し”にする
+  try {
+    noscriptHidden = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return true; // そもそも存在しないなら OK
+      const style = window.getComputedStyle(el);
+      return (style && (style.display === 'none' || style.visibility === 'hidden'));
+    }, noscriptSelector);
+  } catch (_) {}
+}
+
+try {
+  // SPAのメインコンテンツが見えるまで待つ（8秒）
+  await page.waitForSelector(appSelector, { state: 'visible', timeout: 8000 });
+  appVisible = true;
+} catch (_) {
+  // 最終保険：可視テキストが十分あるかで判定
+  appVisible = await page.evaluate(() => {
+    const t = (document.body?.innerText || '').replace(/\s+/g, '');
+    return t.length > 200;
+  });
+}
+
     // === 待機の統合版（ここだけでOK） ===
     // 1) body が非表示でない
     await page.waitForFunction(() => {
@@ -193,6 +228,21 @@ app.get('/scrape', async (req, res) => {
     const combinedAll     = [bodyAll, docAll, shadowText].filter(Boolean).join('\n').trim();
     const combinedText    = combinedVisible.replace(/\s+/g, '').length >= 40 ? combinedVisible : combinedAll;
 
+// ★ADD: 空対策（HTMLをテキスト化してフォールバック）
+const bodyAll = await page.evaluate(() => document.body ? document.body.innerHTML : '');
+function stripTags(html) {
+  if (!html) return '';
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+const finalText = (combinedText && combinedText.trim().length > 0)
+  ? combinedText
+  : stripTags(bodyAll);
+
 // ★ADD: body.innerHTML を拾って、必要ならテキスト化フォールバック
 const bodyAll = await page.evaluate(() => document.body ? document.body.innerHTML : '');
 function stripTags(html) {
@@ -229,34 +279,35 @@ const finalText = (combinedText && combinedText.trim().length > 0)
 
     const elapsedMs = Date.now() - t0;
 
-    // 返却（res.json は Express の JSON レスポンスです）
-    return res.status(200).json({
-      url: urlToFetch,
-      title,
-      fullHtml,
-// 変更
-bodyText: finalText,
+// ▼ここから res.status(200).json(...) を丸ごと置き換え
+res.status(200).json({
+  url: urlToFetch,
+  title,
+  fullHtml,
+  bodyText: finalText,           // ← combinedText ではなく finalText を返す
+  jsonld,
+  debug: {
+    hydrated,
+    // ★追加
+    noscriptHidden,              // noscript/p.warning が消えた・非表示になったか
+    appVisible,                  // SPA のコンテナが可視になったか
+    bodyAllLen: bodyAll.length,  // body.innerHTML の長さ（フォールバック観測）
 
-// 追加（debugオブジェクトの中に足す）
-bodyAllLen: bodyAll.length,
-      jsonld,
-      debug: {
-        hydrated,
-        innerTextLen: innerText.length,
-        docTextLen: docText.length,
-        shadowTextLen: shadowText.length,
-        bodyAllLen: bodyAll.length,   // 追加
-        docAllLen: docAll.length,     // 追加
-        fullHtmlLen: fullHtml.length,
-        frames: framesInfo,
-        telLinks,
-        extractedPhones,
-        extractedAddrs,
-        jsonldCount: Array.isArray(jsonld) ? jsonld.length : 0,
-        elapsedMs,
-        netLog
-      }
-    });
+    // 既存のデバッグ値（そのまま維持）
+    innerTextLen: innerText.length,
+    docTextLen: docText.length,
+    shadowTextLen: shadowText.length,
+    fullHtmlLen: fullHtml.length,
+    frames: framesInfo,
+    telLinks,
+    extractedPhones: extractedPhones || [],
+    extractedAddrs,
+    jsonldCount: Array.isArray(jsonld) ? jsonld.length : 0,
+    elapsedMs,
+    netLog
+  }
+});
+// ▲ここまで
 
   } catch (err) {
     const elapsedMs = Date.now() - t0;
