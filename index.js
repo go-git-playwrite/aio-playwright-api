@@ -193,6 +193,23 @@ app.get('/scrape', async (req, res) => {
     const combinedAll     = [bodyAll, docAll, shadowText].filter(Boolean).join('\n').trim();
     const combinedText    = combinedVisible.replace(/\s+/g, '').length >= 40 ? combinedVisible : combinedAll;
 
+// ★ADD: body.innerHTML を拾って、必要ならテキスト化フォールバック
+const bodyAll = await page.evaluate(() => document.body ? document.body.innerHTML : '');
+function stripTags(html) {
+  if (!html) return '';
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// 「描画後テキスト」が空っぽなら、HTML→テキスト化で補う
+const finalText = (combinedText && combinedText.trim().length > 0)
+  ? combinedText
+  : stripTags(bodyAll);
+
     // hydrated の判定（可視テキストが一定量あれば true）
     const hydrated = combinedVisible.replace(/\s+/g, '').length > 200;
 
@@ -217,7 +234,11 @@ app.get('/scrape', async (req, res) => {
       url: urlToFetch,
       title,
       fullHtml,
-      bodyText: combinedText,
+// 変更
+bodyText: finalText,
+
+// 追加（debugオブジェクトの中に足す）
+bodyAllLen: bodyAll.length,
       jsonld,
       debug: {
         hydrated,
