@@ -1,16 +1,12 @@
 {
-  "name": "playwright-api-server",
+  "name": "aio-playwright-api",
   "version": "1.0.0",
-  "description": "A simple API server to scrape web pages using Playwright.",
-  "main": "index.js",
+  "private": true,
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "express": "^4.19.2",
     "playwright": "1.54.2"
-  },
-    },
-  "engines": {
-    "node": "18.x"
   }
 }
