@@ -5,7 +5,7 @@ const { chromium } = require('playwright'); // Docker: mcr.microsoft.com/playwri
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// CORS（GAS などから叩く想定なら付けておくとラク）
+// CORS（GAS 等から叩く場合に便利）
 app.use((_, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   next();
@@ -22,6 +22,7 @@ app.get('/scrape', async (req, res) => {
 
   let browser = null;
   const t0 = Date.now();
+
   try {
     // Playwright 起動
     browser = await chromium.launch({
@@ -30,28 +31,21 @@ app.get('/scrape', async (req, res) => {
     });
 
     const context = await browser.newContext({
-      // レンダリング差分が出にくい UA を固定
       userAgent:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      // SW によるオフライン/キャッシュの影響を回避
+      // SW をブロック → 必要に応じて 'allow' へ
       serviceWorkers: 'block',
-      // 画面幅固定（レスポンシブ分岐を抑える）
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
     });
 
-    // 画像/フォント/メディア/スタイルはスキップして高速化（必要に応じて外してOK）
-    await context.route('**/*', (route) => {
-      const type = route.request().resourceType();
-      if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
-        return route.abort();
-      }
-      route.continue();
-    });
+    // ★以前の「画像/フォント/スタイルを abort」は外しています（CSS未読込で innerText が 0 になるのを防ぐ）
 
     const page = await context.newPage();
 
-    // --- 診断ログ収集 ---
+    // ネットワーク/コンソール/ページエラーを収集
     const netLog = { requestsFailed: [], responses: [], console: [], pageErrors: [] };
 
     page.on('requestfailed', req => {
@@ -67,50 +61,55 @@ app.get('/scrape', async (req, res) => {
     });
 
     page.on('pageerror', err => {
-      netLog.pageErrors.push({ message: err.message, name: err.name, stack: (err.stack||'').slice(0,5000) });
+      netLog.pageErrors.push({
+        message: err.message,
+        name: err.name,
+        stack: (err.stack || '').slice(0, 5000)
+      });
     });
 
     page.on('response', async (r) => {
       try {
         const url = r.url();
         const status = r.status();
-        const ct = (r.headers()['content-type']||'').toLowerCase();
+        const ct = (r.headers()['content-type'] || '').toLowerCase();
         let jsonSnippet = null;
         if (ct.includes('application/json')) {
           const txt = await r.text();
-          if (txt && txt.length < 200_000) {
-            jsonSnippet = txt.slice(0, 5000);
-          }
+          if (txt && txt.length < 200_000) jsonSnippet = txt.slice(0, 5000);
         }
         netLog.responses.push({
           url, status, contentType: ct,
           jsonSnippetLen: jsonSnippet ? jsonSnippet.length : 0,
           jsonSnippet: jsonSnippet || null
         });
-      } catch(_) {}
+      } catch (_) {}
     });
 
-    // --- ナビゲーション（SPA 対策でしっかり待つ） ---
-    await page.goto(urlToFetch, { waitUntil: 'networkidle', timeout: 90000 });
+    // ページ遷移（しっかり待つ）
+    await page.goto(urlToFetch, { waitUntil: 'networkidle', timeout: 90_000 });
     await page.waitForLoadState('domcontentloaded');
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.waitForTimeout(1500); // ちょい追い
 
-    // “本文が 200 文字以上 or 代表要素が存在”を最大 8 秒待つ
+    // === 待機の統合版（ここだけでOK） ===
+    // 1) body が非表示でない
     await page.waitForFunction(() => {
-      const t = (document.body && document.body.innerText || '').trim();
-      const key = document.querySelector('main, #app, [id*="root"], [data-reactroot], [data-v-app]');
+      const b = document.body;
+      if (!b) return false;
+      const s = window.getComputedStyle(b);
+      const hidden = (s.visibility === 'hidden') || (s.display === 'none') || (parseFloat(s.opacity || '1') === 0);
+      return !hidden;
+    }, { timeout: 5000 }).catch(() => {});
+
+    // 2) 可視テキストが一定量 or 代表要素が出る
+    await page.waitForFunction(() => {
+      const t = (document.body && document.body.innerText || '').replace(/\s+/g, '');
+      const key = document.querySelector('main, #app, [id*="root"], [data-reactroot], [data-v-app], footer, address, a[href^="tel:"]');
       return (t.length > 200) || !!key;
     }, { timeout: 8000 }).catch(() => {});
 
-    // “可視テキスト量” or “代表要素”の出現を待機（最大 8 秒）
-    await page.waitForFunction(() => {
-      const txtLen = (document.body?.innerText || '').replace(/\s+/g, '').length;
-      const hasKey = !!document.querySelector('main, #app, [id*="root"], footer, address, a[href^="tel:"]');
-      return txtLen > 80 || hasKey;
-    }, { timeout: 8000 }).catch(() => {});
-
-    // --- JSON-LD（Organization/Corporation を抽出） ---
+    // JSON-LD（Organization/Corporation）抽出
     const jsonld = await page.evaluate(() => {
       const out = [];
       const nodes = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
@@ -141,7 +140,7 @@ app.get('/scrape', async (req, res) => {
       return out;
     });
 
-    // --- Shadow DOM のテキスト再帰抽出 ---
+    // Shadow DOM テキストの再帰抽出
     const shadowText = await page.evaluate(() => {
       function collectShadow(root, acc) {
         const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
@@ -159,7 +158,7 @@ app.get('/scrape', async (req, res) => {
       return out.join('\n');
     });
 
-    // --- iframe（同一オリジンのみ）情報 ---
+    // iframe（同一オリジンのみアクセス）
     const framesInfo = await page.evaluate(() => {
       const arr = [];
       for (const f of Array.from(document.querySelectorAll('iframe'))) {
@@ -174,22 +173,30 @@ app.get('/scrape', async (req, res) => {
             telLinksCount: doc.querySelectorAll('a[href^="tel:"]').length || 0
           });
         } catch (_) {
-          // クロスオリジンでアクセス不可のものはスキップ
+          // クロスオリジンはアクセス不可
         }
       }
       return arr;
     });
 
-    // --- 本文テキスト（複数パス）※ここは重複禁止 ---
+    // 本文テキスト（可視/非可視の両系統）
     const [title, fullHtml] = await Promise.all([page.title(), page.content()]);
+
+    // 可視テキスト
     const innerText = await page.evaluate(() => document.body?.innerText || '');
     const docText   = await page.evaluate(() => document.documentElement?.innerText || '');
-    const combinedText = [innerText, docText, shadowText].filter(Boolean).join('\n').trim();
+    // 非可視も含むテキスト
+    const bodyAll   = await page.evaluate(() => document.body?.textContent || '');
+    const docAll    = await page.evaluate(() => document.documentElement?.textContent || '');
 
-    // hydrated の指標（可視テキストが一定量あれば true）
-    const hydrated = combinedText.replace(/\s+/g,'').length > 200;
+    const combinedVisible = [innerText, docText, shadowText].filter(Boolean).join('\n').trim();
+    const combinedAll     = [bodyAll, docAll, shadowText].filter(Boolean).join('\n').trim();
+    const combinedText    = combinedVisible.replace(/\s+/g, '').length >= 40 ? combinedVisible : combinedAll;
 
-    // --- 電話・住所・telリンク抽出 ---
+    // hydrated の判定（可視テキストが一定量あれば true）
+    const hydrated = combinedVisible.replace(/\s+/g, '').length > 200;
+
+    // 電話・住所・telリンク抽出
     const telLinks = await page.$$eval('a[href^="tel:"]', as => as.map(a => a.getAttribute('href')));
     const extractedPhones = await page.evaluate(() => {
       const text = (document.body?.innerText || '');
@@ -205,8 +212,8 @@ app.get('/scrape', async (req, res) => {
 
     const elapsedMs = Date.now() - t0;
 
-    // --- レスポンス ---
-    res.status(200).json({
+    // 返却（res.json は Express の JSON レスポンスです）
+    return res.status(200).json({
       url: urlToFetch,
       title,
       fullHtml,
@@ -217,11 +224,12 @@ app.get('/scrape', async (req, res) => {
         innerTextLen: innerText.length,
         docTextLen: docText.length,
         shadowTextLen: shadowText.length,
+        bodyAllLen: bodyAll.length,   // 追加
+        docAllLen: docAll.length,     // 追加
         fullHtmlLen: fullHtml.length,
         frames: framesInfo,
         telLinks,
-        rawPhones: [], // 未使用なら削除可
-        extractedPhones: extractedPhones || [],
+        extractedPhones,
         extractedAddrs,
         jsonldCount: Array.isArray(jsonld) ? jsonld.length : 0,
         elapsedMs,
@@ -231,7 +239,7 @@ app.get('/scrape', async (req, res) => {
 
   } catch (err) {
     const elapsedMs = Date.now() - t0;
-    res.status(500).json({
+    return res.status(500).json({
       error: 'An error occurred during scraping.',
       details: err?.message || String(err),
       elapsedMs
