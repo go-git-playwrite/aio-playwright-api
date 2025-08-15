@@ -1,5 +1,6 @@
 // index.js
 const express = require('express');
+const BUILD_TAG = 'scrape-v3-debug-01';
 const { chromium } = require('playwright'); // Docker公式イメージに同梱
 
 const app = express();
@@ -13,6 +14,15 @@ app.use((_, res, next) => {
 
 // ヘルスチェック
 app.get('/', (_, res) => res.status(200).json({ ok: true }));
+
+// 既存のヘルスチェックの下あたりに追加
+app.get('/__version', (_, res) => {
+  res.status(200).json({
+    ok: true,
+    build: BUILD_TAG,
+    now: new Date().toISOString()
+  });
+});
 
 app.get('/scrape', async (req, res) => {
   const urlToFetch = req.query.url;
