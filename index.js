@@ -145,7 +145,7 @@ app.get('/scrape', async (req, res) => {
       const l = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).map(el => el.getAttribute('href')).filter(Boolean);
       return { scriptSrcs: s, preloadHrefs: l };
     });
-    const abs = (u) => { try { return new URL(u, location.href).toString(); } catch { return null; } };
+    const abs = (u) => { try { return new URL(u, urlToFetch).toString(); } catch { return null; } };
     const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
 
     // ---- JS/JSON 本文を取得して抽出 ----
