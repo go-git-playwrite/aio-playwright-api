@@ -88,13 +88,6 @@ function scorePhoneBasic(n){
   if (isDummyPhone(n)) s -= 10;
   return s;
 }
-function pickBestPhone(list){
-  const cand = (list || []).filter(x => x && !isDummyPhone(x));
-  if (!cand.length) return null;
-  cand.sort((a,b) => scorePhoneBasic(b) - scorePhoneBasic(a));
-  return cand[0] || null;
-}
-
 const PREF_RE = /(北海道|東京都|(?:京都|大阪)府|..県)/;
 function stripTags(s){ return String(s||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
 function parseBestAddressFromLines(lines){
@@ -462,7 +455,7 @@ const responsePayload = {
     innerTextLen: innerText.length,
     docTextLen: docText.length,
     jsUrls: jsUrls.slice(0, 10),
-    tappedUrls: jsUrls.slice(0, 20),
+    tappedUrls: tappedUrls.slice(0, 20),
     tappedBodiesMeta: fetchedMeta.slice(0, 10),
     bundlePhones: phones.slice(0, 10),
     bundleZips: zips.slice(0, 10),
