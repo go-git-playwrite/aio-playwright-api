@@ -1,6 +1,54 @@
 // index.js  — scrape-v5-bundle
 // 目的: DOMが空でも、JSバンドル/JSONから電話・郵便番号・住所を直接抽出
 const express = require('express');
+
+// ---- Simple in-memory cache for /scrape ----
+const CACHE_TTL_MS = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 既定6h
+const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX || 300); // 既定300件
+const scrapeCache = new Map(); // key=url, val={ ts, json }
+
+// LRU 風に古いものを落とす
+function cacheSet(url, json) {
+  if (!url) return;
+  if (scrapeCache.size >= CACHE_MAX_ENTRIES) {
+    // 最古（Mapは挿入順）を1件削除
+    const firstKey = scrapeCache.keys().next().value;
+    if (firstKey) scrapeCache.delete(firstKey);
+  }
+  scrapeCache.set(url, { ts: Date.now(), json });
+}
+function cacheGet(url) {
+  const entry = url ? scrapeCache.get(url) : null;
+  if (!entry) return null;
+  const age = Date.now() - entry.ts;
+  if (age > CACHE_TTL_MS) { scrapeCache.delete(url); return null; }
+  // LRU リフレッシュ（末尾に移す）
+  scrapeCache.delete(url);
+  scrapeCache.set(url, entry);
+  return { age, json: entry.json };
+}
+
+// ヘルス/運用用サブエンドポイント
+app.get('/__cache/status', (_, res) => {
+  res.json({
+    ok: true,
+    entries: scrapeCache.size,
+    ttlMs: CACHE_TTL_MS,
+    maxEntries: CACHE_MAX_ENTRIES
+  });
+});
+app.get('/__cache/purge', (req, res) => {
+  const u = req.query.url;
+  if (u) {
+    const existed = scrapeCache.delete(u);
+    return res.json({ ok:true, purged: existed ? 1 : 0, url: u });
+  }
+  const n = scrapeCache.size;
+  scrapeCache.clear();
+  res.json({ ok:true, purgedAll: n });
+});
+// ---- /cache end ----
+
 const { chromium } = require('playwright');
 
 const BUILD_TAG = 'scrape-v5-bundle';
