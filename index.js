@@ -1,12 +1,11 @@
-// index.js — scrape-v5-bundle+cache+nettap
-// 目的: DOMが空でも、ネットワーク経由の .js / Firestore / .json 本文から
-//       電話・郵便番号・住所を直接抽出し、結果をキャッシュ
-//       （script[src] が取れないケースでも動くよう network tap を追加）
+// index.js — scrape-v5-bundle+cache (phones/addresses, cache, jsonldSynth, robust debug)
+// 目的: DOMが空でも、JSバンドル/JSONから電話・郵便番号・住所を直接抽出し、
+//       最終的な採用値（pickedPhone / pickedAddress）を返す。結果はメモリキャッシュ。
 
 const express = require('express');
 const { chromium } = require('playwright');
 
-const BUILD_TAG = 'scrape-v5-bundle-cache-03';
+const BUILD_TAG = 'scrape-v5-bundle-cache-03-fixed';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -22,6 +21,7 @@ const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 
 const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
 const scrapeCache = new Map(); // key=url, val={ ts, json }
 
+// LRU風に古いものを落とす
 function cacheSet(url, json) {
   if (!url) return;
   if (scrapeCache.size >= CACHE_MAX_ENTRIES) {
@@ -55,6 +55,7 @@ app.get('/__cache/purge', (req, res) => {
   scrapeCache.clear();
   res.json({ ok:true, purgedAll: n });
 });
+// -------------------- /cache end --------------------
 
 // -------------------- ユーティリティ --------------------
 function uniq(a){ return Array.from(new Set((a||[]).filter(Boolean))); }
@@ -71,84 +72,135 @@ function normalizeJpPhone(raw){
   return d.replace(/^(\d{2,4})(\d{2,4})(\d{4})$/, '$1-$2-$3');
 }
 function looksLikeZip7(s){ return /^〒?\d{3}-?\d{4}$/.test(String(s).trim()); }
-// ---- phone/address helpers ----
-const JP_PREFS = ['北海道','青森県','岩手県','宮城県','秋田県','山形県','福島県',
-  '茨城県','栃木県','群馬県','埼玉県','千葉県','東京都','神奈川県',
-  '新潟県','富山県','石川県','福井県','山梨県','長野県','岐阜県',
-  '静岡県','愛知県','三重県','滋賀県','京都府','大阪府','兵庫県',
-  '奈良県','和歌山県','鳥取県','島根県','岡山県','広島県','山口県',
-  '徳島県','香川県','愛媛県','高知県','福岡県','佐賀県','長崎県',
-  '熊本県','大分県','宮崎県','鹿児島県','沖縄県'];
+function digitsOnly(s){ return String(s||'').replace(/\D+/g,''); }
 
-function isDummyPhone(p){
-  const d = String(p||'').replace(/\D+/g,'');
-  return /^(007|017|089|000)/.test(d) || d === '0123456789' || /^0000+/.test(d);
-}
-function scorePhone(p){
-  let s = 0;
-  if (/^03-/.test(p)) s += 30;          // 首都圏
-  if (/^06-/.test(p)) s += 20;          // 関西圏
-  if (/^\d{2}-\d{4}-\d{4}$/.test(p)) s += 10; // 2-4-4 など綺麗な区切り
-  return s;
-}
-function pickBestPhone(telFromLinks, phones){
-  // tel:リンク最優先（ダミー除外）
-  const pri = (telFromLinks||[]).filter(x=>!isDummyPhone(x));
-  if (pri.length){
-    return pri.sort((a,b)=>scorePhone(b)-scorePhone(a))[0];
-  }
-  const cand = (phones||[]).filter(x=>!isDummyPhone(x));
-  if (cand.length){
-    return cand.sort((a,b)=>scorePhone(b)-scorePhone(a))[0];
-  }
-  return null;
+// 電話の重み付け（近接ラベルは今回はテキストのみで簡易スコア）
+function scorePhoneByContext(num, corpusText){
+  const c = String(corpusText || '');
+  const n = String(num || '');
+  let sc = 0;
+
+  // ラベル近接（簡易）：電話/代表/お問い合わせ/TEL が本文にあれば+（テキストベース）
+  if (/(代表|電話|お問い合わせ|TEL|Tel|Phone)/i.test(c)) sc += 20;
+
+  // 03/06 を少し優先（大手本社で出やすいための汎用バイアス）
+  if (/^03-/.test(n)) sc += 15;
+  if (/^06-/.test(n)) sc += 10;
+
+  // ページに出現していれば加点（digitsで）
+  const nd = digitsOnly(n);
+  const cd = digitsOnly(c);
+  if (nd && cd.includes(nd)) sc += 25;
+
+  return sc;
 }
 
-function stripTags(s){ return String(s||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
-function looksStationNoise(s){
-  return /駅|出口|徒歩|分|地図を開く|アクセス|フロア|階/.test(String(s||''));
-}
-function pickBestAddress(addrs, zips){
-  // 1) タグ除去 & ノイズ行除去
-  const cleaned = (addrs||[])
-    .map(stripTags)
-    .filter(Boolean)
-    .filter(a => !looksStationNoise(a))
-    .filter(a => a.length >= 8);
+// 住所を構造化（PostalAddress）へ
+function normalizePickedAddressJp(raw) {
+  const t = String(raw || '').replace(/\s+/g,' ').trim();
+  if (!t) return null;
 
-  if (!cleaned.length) return null;
+  // 郵便番号
+  const mZip = t.match(/(〒?\d{3}-?\d{4})/);
+  const postalCode = mZip ? mZip[1].replace(/^〒/,'') : '';
 
-  // 2) 都道府県を含む候補を優先
-  const withPref = cleaned.filter(a => JP_PREFS.some(p=>a.indexOf(p)>=0));
-  const pool = withPref.length ? withPref : cleaned;
-
-  // 3) 最も長い（情報量が多い）候補を採用
-  const bestLine = pool.sort((a,b)=>b.length-a.length)[0];
-
-  // 4) 分解（ざっくり）
-  const zip = (zips||[]).find(looksLikeZip7) || '';
-  const mZip = bestLine.match(/〒?\s?(\d{3}-?\d{4})/);
-  const postal = (mZip ? mZip[1] : zip).replace(/^〒/,'');
-  let region = JP_PREFS.find(p=>bestLine.indexOf(p)>=0) || '';
-  let after = region ? bestLine.split(region)[1] : bestLine;
-  after = after.replace(/^[\s,，・・-]+/, '');
-
-  // locality 推定（市区）
-  let locality = '';
-  const mLoc = after.match(/^(.*?[市区郡町村])/);
-  if (mLoc) {
-    locality = mLoc[1];
-    after = after.slice(locality.length).trim();
+  // 都道府県
+  const mPref = t.match(/(東京都|道|府|..県)/);
+  let addressRegion = '';
+  if (mPref) {
+    // “道/府” 単独マッチをもう少し丁寧に
+    const pref = mPref[1];
+    if (pref === '道' || pref === '府') {
+      const m2 = t.match(/(北海道|京都府|大阪府|..県|東京都)/);
+      addressRegion = m2 ? m2[1] : '';
+    } else {
+      addressRegion = pref === '道' ? '北海道' : pref;
+    }
+  } else {
+    // 代表的な都道府県名をざっくり拾う
+    const m2 = t.match(/(北海道|東京都|京都府|大阪府|..県)/);
+    addressRegion = m2 ? m2[1] : '';
   }
 
-  const street = after.trim();
-  return {
-    postalCode: postal || undefined,
-    addressRegion: region || undefined,
-    addressLocality: locality || undefined,
-    streetAddress: street || undefined,
+  // 市区町村（都/道/府/県 の直後から「市|区|町|村」まで）
+  let addressLocality = '';
+  if (addressRegion) {
+    const idx = t.indexOf(addressRegion);
+    if (idx >= 0) {
+      const tail = t.slice(idx + addressRegion.length);
+      const mLoc = tail.match(/([^0-9]*?(市|区|町|村))/);
+      if (mLoc) addressLocality = mLoc[1].trim();
+    }
+  }
+
+  // 残りを番地/建物に
+  let streetAddress = t;
+  if (postalCode) streetAddress = streetAddress.replace(postalCode, '');
+  if (addressRegion) streetAddress = streetAddress.replace(addressRegion, '');
+  if (addressLocality) streetAddress = streetAddress.replace(addressLocality, '');
+  streetAddress = streetAddress.replace(/[\/\|].*$/, ''); // “/ 駅 …” のような説明を切る
+  streetAddress = streetAddress.replace(/\s+/g,' ').trim();
+  streetAddress = streetAddress.replace(/^[-—–~・・]+/, '').trim();
+
+  // 住所でない説明（駅・徒歩など）を除去
+  streetAddress = streetAddress.replace(/(駅|徒歩|分|出口|フロア|階|地図|アクセス).*/,'').trim();
+
+  const obj = {
+    postalCode: postalCode || undefined,
+    addressRegion: addressRegion || undefined,
+    addressLocality: addressLocality || undefined,
+    streetAddress: streetAddress || undefined,
     addressCountry: 'JP'
   };
+  // 空を消す
+  Object.keys(obj).forEach(k => { if (!obj[k]) delete obj[k]; });
+  return Object.keys(obj).length ? obj : null;
+}
+
+// 電話を最終決定：telリンク > バンドル抽出（ダミー番号除外 + スコア降順）
+function pickBestPhone(telLinks, phones, corpusText=''){
+  const DUMMY_PREFIX = /^(007|017|089|000)/;
+
+  // 1) tel:リンク優先
+  for (const raw of telLinks || []) {
+    const n = normalizeJpPhone(raw);
+    if (!n) continue;
+    const digits = n.replace(/-/g,'');
+    if (DUMMY_PREFIX.test(digits)) continue;
+    return n;
+  }
+
+  // 2) バンドル抽出（スコア付け）
+  const cand = [];
+  for (const raw of phones || []) {
+    const n = normalizeJpPhone(raw);
+    if (!n) continue;
+    const digits = n.replace(/-/g,'');
+    if (DUMMY_PREFIX.test(digits)) continue;
+    cand.push({ n, s: scorePhoneByContext(n, corpusText) });
+  }
+  cand.sort((a,b) => b.s - a.s);
+  return cand.length ? cand[0].n : null;
+}
+
+// 住所を最終決定：バンドル抽出 + 郵便番号の補助
+function pickBestAddress(addrLines, zips) {
+  // 候補行から駅/徒歩などを除去し、都道府県語を含むものを優先
+  const cleaned = [];
+  for (const line of addrLines || []) {
+    const t = String(line || '').replace(/\s+/g,' ').trim();
+    if (!t) continue;
+    if (!/(東京都|北海道|..県|京都府|大阪府)/.test(t)) continue; // 県名がない行はスキップ
+    const cut = t.replace(/[\/\|].*$/, ''); // “/ …” 以降を切る
+    cleaned.push(cut);
+  }
+  if (!cleaned.length) return null;
+
+  // 郵便番号が近くで拾えているなら先頭候補に付与
+  const zip = (zips||[]).find(looksLikeZip7) || '';
+  const raw = zip ? (zip.replace(/^〒/,'') + ' ' + cleaned[0]) : cleaned[0];
+
+  return normalizePickedAddressJp(raw);
 }
 
 // -------------------- /scrape --------------------
@@ -192,41 +244,12 @@ app.get('/scrape', async (req, res) => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
-    // ---- network tap: .js / .json / Firestore を直接収集 ----
-    const tappedBodies = [];   // { url, ct, textLen, text (trimmed) }
-    const tappedUrls   = [];   // URL一覧（重複なし）
-    let tappedBytes = 0;       // メモリ安全のため累計に上限
-    const TAPPED_MAX_BYTES = 1_200_000; // ~1.2MB
-
-    page.on('response', async (r) => {
-      try {
-        const url = r.url();
-        const ct  = (r.headers()['content-type'] || '').toLowerCase();
-        const isJs = /\.js(\?|$)/i.test(url) || ct.includes('javascript');
-        const isFs = url.includes('firestore.googleapis.com');
-        const isJson = ct.includes('application/json') || /\.json(\?|$)/i.test(url);
-        if (!(isJs || isFs || isJson)) return;
-
-        const txt = await r.text();
-        if (!txt) return;
-
-        tappedUrls.push(url);
-        if (tappedBytes < TAPPED_MAX_BYTES) {
-          const room = TAPPED_MAX_BYTES - tappedBytes;
-          const slice = txt.slice(0, Math.max(0, Math.min(room, 400_000))); // 1レスポンスにつき最大40万文字
-          tappedBodies.push({ url, ct, textLen: txt.length, text: slice });
-          tappedBytes += slice.length;
-        }
-      } catch(_) {}
-    });
-
-    // ---- 主要待機 ----
+    // ---- 主要待機（軽め） ----
     await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await Promise.race([
       page.waitForResponse(r => {
         const u = r.url();
-        const h = (r.headers()['content-type'] || '').toLowerCase();
-        return /\.js(\?|$)/i.test(u) || u.includes('firestore.googleapis.com') || h.includes('application/json');
+        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
       }, { timeout: 20_000 }).catch(()=>null),
       page.waitForTimeout(20_000)
     ]);
@@ -241,9 +264,14 @@ app.get('/scrape', async (req, res) => {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
-    // ---- tel: リンク（最優先候補）----
-    const telLinks = await page.$$eval('a[href^="tel:"]', as => as.map(a => a.getAttribute('href'))).catch(()=>[]);
-    const telFromLinks = uniq((telLinks||[]).map(h => h.replace(/^tel:/i,'').trim()).map(normalizeJpPhone)).filter(Boolean);
+    // tel:リンク（ここで必ず取得しておく）
+    const telLinks = await page.$$eval('a[href^="tel:"]',
+      as => as.map(a => (a.getAttribute('href') || '')
+        .replace(/^tel:/i,'')
+        .replace(/^\+81[-\s()]?/,'0')
+        .trim()
+      )
+    ).catch(()=>[]);
 
     // ---- JSON-LD（参考）----
     const jsonld = await page.evaluate(() => {
@@ -254,38 +282,60 @@ app.get('/scrape', async (req, res) => {
       return arr;
     }).catch(()=>[]);
 
-    // ---- script/src と modulepreload から JS 候補URLを収集（DOM経由）----
+    // ---- script/src と modulepreload から JS 候補URLを収集 ----
     const { scriptSrcs, preloadHrefs } = await page.evaluate(() => {
       const s = Array.from(document.querySelectorAll('script[src]')).map(el => el.getAttribute('src')).filter(Boolean);
       const l = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).map(el => el.getAttribute('href')).filter(Boolean);
       return { scriptSrcs: s, preloadHrefs: l };
     });
     const abs = (u) => { try { return new URL(u, location.href).toString(); } catch { return null; } };
-    const jsUrlsDom = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
+    const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
 
-    // ---- ネットワーク経由で掴んだ本文から抽出（本筋）----
+    // ---- JS/JSON 本文を取得して抽出 ----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
     const ZIP_RE   = /〒?\d{3}-?\d{4}/g;
 
     const bundlePhones = [];
     const bundleZips   = [];
     const bundleAddrs  = [];
+    const fetchedMeta  = [];
+    const tappedUrls   = [];
+    const tappedBodies = [];
 
-    for (const t of tappedBodies) {
+    // ページが教えてくれたJS候補 & 典型的なchunk命名を少し増やす
+    const jsToTap = uniq([
+      ...jsUrls,
+      // SPAでよくある追加エンドポイント（念のため）
+      `${new URL(urlToFetch).origin}/app-index.js`
+    ]);
+
+    for (const u of jsToTap) {
       try {
+        const resp = await page.request.get(u, { timeout: 20_000 });
+        if (!resp.ok()) continue;
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
+
+        const text = await resp.text();
+        if (!text) continue;
+
+        tappedUrls.push(u);
+        tappedBodies.push({ url: u, ct, textLen: text.length });
+        fetchedMeta.push({ url: u, ct, textLen: text.length });
+
         // 電話
-        (t.text.match(PHONE_RE) || [])
+        (text.match(PHONE_RE) || [])
           .map(normalizeJpPhone)
           .filter(Boolean)
           .forEach(v => bundlePhones.push(v));
 
         // 郵便番号
-        (t.text.match(ZIP_RE) || [])
+        (text.match(ZIP_RE) || [])
           .filter(looksLikeZip7)
           .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
 
         // 住所っぽい行（軽め）
-        for (const line of t.text.split(/\n+/)) {
+        for (const line of text.split(/\n+/)) {
           if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
             bundleAddrs.push(line.replace(/\s+/g,' ').trim());
           }
@@ -293,120 +343,79 @@ app.get('/scrape', async (req, res) => {
       } catch(_) {}
     }
 
-    // ---- 追加で DOM 由来の URL を個別フェッチ（tap で拾えなかったときの保険）----
-    const fetchedMeta = [];
-    if (tappedBodies.length === 0 && jsUrlsDom.length > 0) {
-      // 代表的なJSだけ先頭数件を試す
-      const tryUrls = jsUrlsDom.slice(0, 6);
-      for (const u of tryUrls) {
-        try {
-          const resp = await page.request.get(u, { timeout: 20_000 });
-          if (!resp.ok()) continue;
-          const ct = (resp.headers()['content-type'] || '').toLowerCase();
-          if (!(ct.includes('javascript') || ct.includes('json') || /\.js(\?|$)/i.test(u) || /\.json(\?|$)/i.test(u))) continue;
-          const text = await resp.text();
-          if (!text) continue;
-          fetchedMeta.push({ url: u, len: text.length });
+    // ---- 整理 & 採用値の決定 ----
+    const phones = uniq(bundlePhones);
+    const zips   = uniq(bundleZips);
+    const addrs  = uniq(bundleAddrs);
 
-          (text.match(PHONE_RE) || [])
-            .map(normalizeJpPhone)
-            .filter(Boolean)
-            .forEach(v => bundlePhones.push(v));
-
-          (text.match(ZIP_RE) || [])
-            .filter(looksLikeZip7)
-            .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
-
-          for (const line of text.split(/\n+/)) {
-            if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
-              bundleAddrs.push(line.replace(/\s+/g,' ').trim());
-            }
-          }
-        } catch(_) {}
-      }
-    }
-
-    // ---- 整理 & bodyText フォールバック ----
-    // ---- pick final telephone & address ----
-    const pickedPhone = pickBestPhone(telFromLinks, phones);
+    const corpusTextForScoring = innerText || ''; // 簡易：本文の文字列ベースでスコア
+    const pickedPhone = pickBestPhone(telLinks, phones, corpusTextForScoring);
     const pickedAddr  = pickBestAddress(addrs, zips);
 
-    // bodyText が空のときのフォールバックを“採用値”で再構成
-    if (!innerText || !innerText.trim()){
+    // ---- bodyText フォールバック ----
+    let bodyText = innerText && innerText.trim() ? innerText : '';
+    if (!bodyText) {
       const lines = [];
       if (pickedPhone) lines.push('TEL: ' + pickedPhone);
       if (pickedAddr) {
         const prev = [pickedAddr.postalCode, pickedAddr.addressRegion, pickedAddr.addressLocality, pickedAddr.streetAddress]
                       .filter(Boolean).join(' ');
         lines.push('ADDR: ' + prev);
-      } else if (zips.length || addrs.length) {
-        if (zips.length) lines.push('ZIP: ' + zips.slice(0,3).join(', '));
+      } else {
+        if (zips.length)  lines.push('ZIP: ' + zips.slice(0,3).join(', '));
         if (addrs.length) lines.push('ADDR: ' + addrs.slice(0,2).join(' / '));
       }
       bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
     }
 
-    // ---- synthesize minimal JSON-LD ----
+    // ---- JSON-LD（最小）を合成 ----
     let jsonldSynth = [];
     try {
-      const org = {
-        '@context': 'https://schema.org',
-        '@type': 'Organization',
-        url: urlToFetch
-      };
+      const org = { '@context':'https://schema.org', '@type':'Organization', url: urlToFetch, name: '企業情報' };
+      // 画像などは既知のOGPパスがあればここに足す（安全のため固定入れはしない）
       if (pickedPhone) org.telephone = pickedPhone;
-      if (pickedAddr)  org.address = Object.assign({ '@type': 'PostalAddress' }, pickedAddr);
+      if (pickedAddr)  org.address   = Object.assign({ '@type':'PostalAddress' }, pickedAddr);
       jsonldSynth = [org];
     } catch(_){}
 
-    const phones = uniq([...(telFromLinks||[]), ...(bundlePhones||[])]);
-    const zips   = uniq(bundleZips);
-    const addrs  = uniq(bundleAddrs);
-
-    let bodyText = innerText && innerText.trim() ? innerText : '';
-    if (!bodyText) {
-      const lines = [];
-      if (phones.length) lines.push('TEL: ' + phones.slice(0,3).join(', '));
-      if (zips.length)   lines.push('ZIP: ' + zips.slice(0,3).join(', '));
-      if (addrs.length)  lines.push('ADDR: ' + addrs.slice(0,2).join(' / '));
-      bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
-    }
-
     const elapsedMs = Date.now() - t0;
 
-    // ---- 返却ペイロード ----
-const responsePayload = {
-  url: urlToFetch,
-  bodyText,
-  jsonld,
-  jsonldSynth,                              // ← 追加
-  structured: {                             // ← 追加（機械可読の抜粋）
-    telephone: pickedPhone || null,
-    address: pickedAddr || null
-  },
-  debug: {
-    build: BUILD_TAG,
-    hydrated,
-    innerTextLen: innerText.length,
-    docTextLen: docText.length,
-    telLinks: telLinks || [],
-    jsUrls: jsUrlsDom.slice(0, 10),
-    tappedUrls: uniq(tappedUrls).slice(0, 20),
-    tappedBodiesMeta: tappedBodies.slice(0, 10).map(x => ({ url: x.url, ct: x.ct, textLen: x.textLen })),
-    fetchedMeta: fetchedMeta.slice(0, 10),
-    bundlePhones: phones.slice(0, 10),
-    bundleZips: zips.slice(0, 10),
-    bundleAddrs: addrs.slice(0, 10),
-    pickedPhone,                            // ← 追加（採用した電話）
-    pickedAddressPreview: pickedAddr ?      // ← 追加（採用住所のプレビュー）
-      [pickedAddr.postalCode,pickedAddr.addressRegion,pickedAddr.addressLocality,pickedAddr.streetAddress].filter(Boolean).join(' ') : null,
-    elapsedMs
-  }
-};
+    // ---- 返却ペイロードを一度だけ組み立てる ----
+    const responsePayload = {
+      url: urlToFetch,
+      bodyText,
+      jsonld,
+      jsonldSynth,
+      structured: {
+        telephone: pickedPhone || null,
+        address: pickedAddr || null
+      },
+      debug: {
+        build: BUILD_TAG,
+        hydrated,
+        innerTextLen: innerText.length,
+        docTextLen: docText.length,
+        telLinks: telLinks || [],
+        jsUrls: jsUrls.slice(0, 10),
+        tappedUrls: uniq(tappedUrls).slice(0, 20),
+        tappedBodiesMeta: tappedBodies.slice(0, 10).map(x => ({ url: x.url, ct: x.ct, textLen: x.textLen })),
+        fetchedMeta: fetchedMeta.slice(0, 10),
+        bundlePhones: phones.slice(0, 10),
+        bundleZips: zips.slice(0, 10),
+        bundleAddrs: addrs.slice(0, 10),
+        pickedPhone,
+        pickedAddressPreview: pickedAddr
+          ? [pickedAddr.postalCode, pickedAddr.addressRegion, pickedAddr.addressLocality, pickedAddr.streetAddress]
+              .filter(Boolean).join(' ')
+          : null,
+        elapsedMs
+      }
+    };
 
     // --- CACHE SET（成功時のみ保存）
-    try { cacheSet(urlToFetch, responsePayload); } catch(_) {}
+    try { cacheSet(urlToFetch, responsePayload); } catch(_){}
 
+    // 返却
     return res.status(200).json(responsePayload);
 
   } catch (err) {
