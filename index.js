@@ -71,14 +71,13 @@ function normalizeJpPhone(raw){
   if (/^\d{10}$/.test(d))     return d.replace(/^(\d{3})(\d{3})(\d{4})$/, '$1-$2-$3'); // 3-3-4
   return d.replace(/^(\d{2,4})(\d{2,4})(\d{4})$/, '$1-$2-$3');
 }
-function looksLikeZip7(s){ return /^〒?\d{3}-?\d{4}$/.test(String(s).trim()); }
-// ---- scoring & picking helpers (phones/addresses) ----
+// ====== PHONE scoring & picking (代表電話ラベル優先) ======
 function isDummyPhone(n){
   if (!n) return true;
   const d = String(n).replace(/[^\d]/g, '');
   if (/^(012|000|007|017|089)/.test(d)) return true;         // 典型ダミー/π断片
   if (/(\d)\1{3,}/.test(d)) return true;                     // 3333, 0000 など
-  if (n === '03-3333-3333') return true;                     // よくある例
+  if (n === '03-3333-3333') return true;                     // よくあるダミー
   return false;
 }
 function scorePhoneBasic(n){
@@ -88,6 +87,43 @@ function scorePhoneBasic(n){
   if (isDummyPhone(n)) s -= 10;
   return s;
 }
+
+/**
+ * 代表電話などの“ラベル近接”で拾えた番号を最優先。
+ * 次に tel: リンク、最後に通常スコアリング。
+ */
+function pickBestPhone({ telLinks=[], phones=[], labelHits=[], corpusText='' } = {}){
+  // 1) 代表電話などのラベル近接（最優先）
+  const labeled = Array.from(new Set(labelHits
+    .map(normalizeJpPhone)
+    .filter(n => n && !isDummyPhone(n))));
+  if (labeled.length) return labeled[0];
+
+  // 2) tel:リンク優先
+  const DUMMY_PREFIX = /^(007|017|089|000)/;
+  for (const raw of telLinks) {
+    const n = normalizeJpPhone(raw);
+    if (!n) continue;
+    const digits = n.replace(/-/g,'');
+    if (DUMMY_PREFIX.test(digits)) continue;
+    if (!isDummyPhone(n)) return n;
+  }
+
+  // 3) バンドル抽出（スコア付け）
+  const cand = [];
+  for (const raw of phones) {
+    const n = normalizeJpPhone(raw);
+    if (!n || isDummyPhone(n)) continue;
+    // 超簡易：本文に出ていれば +25
+    const nd = (n||'').replace(/\D+/g,'');
+    const cd = String(corpusText||'').replace(/\D+/g,'');
+    const ctx = (nd && cd.includes(nd)) ? 25 : 0;
+    cand.push({ n, s: scorePhoneBasic(n) + ctx });
+  }
+  cand.sort((a,b) => b.s - a.s);
+  return cand.length ? cand[0].n : null;
+}
+function looksLikeZip7(s){ return /^〒?\d{3}-?\d{4}$/.test(String(s).trim()); }
 const PREF_RE = /(北海道|東京都|(?:京都|大阪)府|..県)/;
 function stripTags(s){ return String(s||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
 function parseBestAddressFromLines(lines){
@@ -203,32 +239,6 @@ function normalizePickedAddressJp(raw) {
   // 空を消す
   Object.keys(obj).forEach(k => { if (!obj[k]) delete obj[k]; });
   return Object.keys(obj).length ? obj : null;
-}
-
-// 電話を最終決定：telリンク > バンドル抽出（ダミー番号除外 + スコア降順）
-function pickBestPhone(telLinks, phones, corpusText=''){
-  const DUMMY_PREFIX = /^(007|017|089|000)/;
-
-  // 1) tel:リンク優先
-  for (const raw of telLinks || []) {
-    const n = normalizeJpPhone(raw);
-    if (!n) continue;
-    const digits = n.replace(/-/g,'');
-    if (DUMMY_PREFIX.test(digits)) continue;
-    return n;
-  }
-
-  // 2) バンドル抽出（スコア付け）
-  const cand = [];
-  for (const raw of phones || []) {
-    const n = normalizeJpPhone(raw);
-    if (!n) continue;
-    const digits = n.replace(/-/g,'');
-    if (DUMMY_PREFIX.test(digits)) continue;
-    cand.push({ n, s: scorePhoneByContext(n, corpusText) });
-  }
-  cand.sort((a,b) => b.s - a.s);
-  return cand.length ? cand[0].n : null;
 }
 
 // 住所を最終決定：バンドル抽出 + 郵便番号の補助
@@ -350,6 +360,10 @@ app.get('/scrape', async (req, res) => {
     const tappedUrls   = [];
     const tappedBodies = [];
 
+// ラベル近接検出用（「代表電話」「電話」「お問い合わせ」「TEL」など）
+const LABEL_RE = /(代表電話番号|代表電話|代表TEL|代表|電話番号|電話|お問合せ|お問い合わせ|TEL|Tel|Phone)/i;
+const labelHitPhones = []; // ← ここに“ラベル近接で見つけた”番号を貯める
+
     // ページが教えてくれたJS候補 & 典型的なchunk命名を少し増やす
     const jsToTap = uniq([
       ...jsUrls,
@@ -365,6 +379,26 @@ app.get('/scrape', async (req, res) => {
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
 
         const text = await resp.text();
+
+// --- ラベル近接での抽出（周辺±60文字を見てスコア優先採用用に覚える） ---
+try {
+  for (const m of text.matchAll(PHONE_RE)) {
+    const raw = m[0];
+    const idx = m.index ?? -1;
+    let near = '';
+    if (idx >= 0) {
+// 置換: ラベル近接のブロック内
+const start = Math.max(0, idx - 160);
+const end   = Math.min(text.length, idx + raw.length + 160);
+      near = text.slice(start, end);
+    }
+    if (near && LABEL_RE.test(near)) {
+      const n = normalizeJpPhone(raw);
+      if (n) labelHitPhones.push(n);
+    }
+  }
+} catch {}
+
         if (!text) continue;
 
         tappedUrls.push(u);
@@ -396,8 +430,14 @@ app.get('/scrape', async (req, res) => {
     const zips   = uniq(bundleZips);
     const addrs  = uniq(bundleAddrs);
 
-// ★ここから追加：良質な1件を決める（ZIPは addrs の行から優先抽出）
-const pickedPhone   = pickBestPhone(telLinks, phones, innerText || docText);
+// ★ 代表電話ラベル > telリンク > 通常スコア の順で最終決定
+const pickedPhone = pickBestPhone({
+  telLinks,
+  phones,
+  labelHits: labelHitPhones,
+  corpusText: innerText || docText || ''
+});
+
 const pickedAddress = parseBestAddressFromLines(addrs);
 
 // ★bodyText フォールバックも “選ばれた値” を優先的に使う
@@ -466,6 +506,7 @@ const responsePayload = {
       ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
           .filter(Boolean).join(' ')
       : null,
+labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
     elapsedMs
   }
 };
