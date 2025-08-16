@@ -1,16 +1,16 @@
 // index.js
 const express = require('express');
 const { chromium } = require('playwright');
-const app = express();
 
-const BUILD_TAG = 'scrape-v5-antiBot-poll';
+const app = express();
+const BUILD_TAG = 'scrape-v7-wait-js-or-firestore';
 const PORT = process.env.PORT || 8080;
 
 app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
-app.get('/', (_, res) => res.status(200).json({ ok: true }));
+app.get('/',  (_, res) => res.status(200).json({ ok: true }));
 app.get('/__version', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
 
-// 文字列ユーティリティ
+// 小ユーティリティ
 const stripTags = (html) => (html || '')
   .replace(/<script[\s\S]*?<\/script>/gi, '')
   .replace(/<style[\s\S]*?<\/style>/gi, '')
@@ -22,30 +22,34 @@ app.get('/scrape', async (req, res) => {
   const urlToFetch = req.query.url;
   if (!urlToFetch) return res.status(400).json({ ok:false, error:'URL parameter "url" is required.' });
 
-  const t0 = Date.now();
   let browser = null;
+  const t0 = Date.now();
   const debug = {
     build: BUILD_TAG,
     url: urlToFetch,
-    nav: {},
     ua: null,
-    webdriver: null,
-    lang: null,
-    swState: 'unknown',
-    readyState: null,
-    noscriptGone: null,
-    appVisible: null,
+    headers: null,
+    jsUrls: [],
+    cssUrls: [],
+    jsonUrls: [],
+    scriptsCount: 0,
     textPoll: [],
     innerTextLen: 0,
     docTextLen: 0,
     shadowTextLen: 0,
     bodyHTMLLen: 0,
     fullHtmlLen: 0,
-    scriptsCount: 0,
+    noscriptGone: null,
+    appVisible: null,
+    retriedLoadMainJs: false,
     console: [],
     pageErrors: [],
     requestsFailed: [],
-    jsonResponsesSeen: 0
+    jsonResponsesSeen: 0,
+    screenshotLen: 0,
+    // 追加: JS/Firestore 待機の実施状況
+    jsOrFirestoreSeen: { js:false, firestore:false },
+    waitJsOrFirestoreResolved: false
   };
 
   try {
@@ -53,11 +57,13 @@ app.get('/scrape', async (req, res) => {
       args: ['--no-sandbox','--disable-setuid-sandbox','--disable-blink-features=AutomationControlled'],
       headless: true
     });
+
     const context = await browser.newContext({
-      // “本物っぽい”環境
       userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      // ← 重要：PWA系で SW が必要なケースがあるので allow に
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+        'Chrome/125.0.0.0 Safari/537.36',
+      // SW は allow（PWA で必要な場合があるため）
       serviceWorkers: 'allow',
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
@@ -65,75 +71,124 @@ app.get('/scrape', async (req, res) => {
       timezoneId: 'Asia/Tokyo'
     });
 
-    // いくつかの fingerprint を “それっぽく”
+    // 実ブラウザ寄りのヘッダ
+    await context.setExtraHTTPHeaders({
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'accept-language': 'ja,en-US;q=0.9,en;q=0.8',
+      'upgrade-insecure-requests': '1',
+      'sec-ch-ua': '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+    });
+
+    // 指紋ステルス
     await context.addInitScript(() => {
       try {
-        // webdriver 無効化
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // chrome オブジェクト
         window.chrome = window.chrome || { runtime: {} };
-        // 言語
         Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP','ja','en-US','en'] });
-        // プラグイン
         Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
       } catch(_) {}
     });
 
     const page = await context.newPage();
 
-    // ログ収集
+    // ネットワーク観測
     page.on('console', (msg) => debug.console.push({ type: msg.type(), text: msg.text() }));
-    page.on('pageerror', (err) => debug.pageErrors.push({ message: err.message, stack: String(err.stack||'').slice(0,3000) }));
+    page.on('pageerror', (err) => debug.pageErrors.push({ message: err.message, stack: String(err.stack||'').slice(0,2000) }));
     page.on('requestfailed', (req) => debug.requestsFailed.push({ url: req.url(), error: req.failure()?.errorText || 'unknown' }));
     page.on('response', async (r) => {
-      const ct = (r.headers()['content-type'] || '').toLowerCase();
-      if (ct.includes('application/json')) debug.jsonResponsesSeen++;
+      const url = r.url();
+      const ct  = (r.headers()['content-type'] || '').toLowerCase();
+      if (ct.includes('application/javascript') || url.endsWith('.js')) {
+        debug.jsUrls.push(url);
+        debug.jsOrFirestoreSeen.js = true;
+      }
+      if (ct.includes('text/css') || url.endsWith('.css')) debug.cssUrls.push(url);
+      if (ct.includes('application/json') || url.endsWith('.json')) {
+        debug.jsonUrls.push(url);
+        debug.jsonResponsesSeen++;
+        if (url.includes('firestore.googleapis.com')) debug.jsOrFirestoreSeen.firestore = true;
+      }
     });
 
-    // ナビゲーション
+    // Sec-Fetch* などを補う
+    await context.route('**/*', (route) => {
+      const req = route.request();
+      const headers = {
+        ...req.headers(),
+        'referer': urlToFetch,
+        'sec-fetch-site': 'same-origin',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-user': '?1',
+        'sec-fetch-dest': 'document'
+      };
+      route.continue({ headers });
+    });
+
     page.setDefaultNavigationTimeout(45_000);
     page.setDefaultTimeout(12_000);
 
-    const navStart = Date.now();
-    await page.goto(urlToFetch, { waitUntil: 'networkidle', timeout: 45_000 });
-    debug.nav.gotoMs = Date.now() - navStart;
+    // 1) DOMContentLoaded まで
+    await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
-    // クライアント側の環境値を取得
-    const env = await page.evaluate(() => ({
-      ua: navigator.userAgent,
-      webdriver: navigator.webdriver === undefined ? null : navigator.webdriver,
-      lang: navigator.language,
-      sw: (('serviceWorker' in navigator) ? 'available' : 'unavailable'),
-      ready: document.readyState
-    }));
-    debug.ua = env.ua; debug.webdriver = env.webdriver; debug.lang = env.lang;
-    debug.swState = env.sw; debug.readyState = env.ready;
-
-    // noscript（or .warning）消失待ち（最大10秒）
+    // 2) 「.js か Firestore レスポンス」が来るまで待機（最大 30s）
     try {
-      await page.waitForSelector('noscript, p.warning', { state: 'hidden', timeout: 10_000 });
-      debug.noscriptGone = true;
+      await page.waitForResponse((response) => {
+        const u = response.url();
+        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
+      }, { timeout: 30_000 });
+      debug.waitJsOrFirestoreResolved = true;
     } catch {
-      debug.noscriptGone = false;
+      debug.waitJsOrFirestoreResolved = false;
     }
 
-    // SPAコンテナが“見える”か（最大12秒）
-    try {
-      await page.waitForSelector('main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot]', { state: 'visible', timeout: 12_000 });
-      debug.appVisible = true;
-    } catch {
-      debug.appVisible = false;
-    }
+    // 3) その後に networkidle も待つ（落ち着くまで）
+    await page.waitForLoadState('networkidle', { timeout: 12_000 }).catch(()=>{});
+    await page.waitForTimeout(1000).catch(()=>{}); // 追い 1 秒
 
-    // 追加で “毎秒ポーリングでテキスト量” を 20秒 監視
+    // noscript/p.warning が消えるか
+    try { await page.waitForSelector('noscript, p.warning', { state: 'hidden', timeout: 10_000 }); debug.noscriptGone = true; }
+    catch { debug.noscriptGone = false; }
+
+    // SPAコンテナが出るか
+    try { await page.waitForSelector('main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot]', { state: 'visible', timeout: 12_000 }); debug.appVisible = true; }
+    catch { debug.appVisible = false; }
+
+    // 可視テキスト量を 20 秒ポーリング（増えたら打ち切り）
     for (let i=0;i<20;i++){
-      const len = await page.evaluate(() => ((document.body?.innerText || '').replace(/\s+/g,'').length));
+      const len = await page.evaluate(() => ((document.body?.innerText || '').replace(/\s+/g,'').length)).catch(()=>0);
       debug.textPoll.push(len);
-      if (len > 400) break; // 十分テキストが出たら切り上げ
+      if (len > 400) break;
       await page.waitForTimeout(1000);
     }
 
-    // 各種テキスト取得
+    // JS/Firestore が見えていない & テキストが増えない → HTML から script を推定して手動ロード
+    const likelyEmpty = debug.textPoll.every(v => v === 0);
+    if (likelyEmpty && debug.jsUrls.length <= 2) {
+      debug.retriedLoadMainJs = true;
+      const hints = await page.evaluate(() => {
+        const out = [];
+        document.querySelectorAll('script[src]').forEach(s => out.push(s.getAttribute('src')));
+        document.querySelectorAll('link[rel="modulepreload"][href$=".js"]').forEach(l => out.push(l.getAttribute('href')));
+        return out;
+      }).catch(()=>[]);
+      const abs = (u) => { try { return new URL(u, location.href).href; } catch { return null; } };
+      for (const u of (hints || []).map(abs).filter(Boolean)) {
+        try {
+          await page.addScriptTag({ url: u, type: u.endsWith('.mjs') ? 'module' : undefined });
+          await page.waitForTimeout(2000);
+          const len = await page.evaluate(() => ((document.body?.innerText || '').replace(/\s+/g,'').length)).catch(()=>0);
+          debug.textPoll.push(len);
+          if (len > 400) break;
+        } catch {}
+      }
+    }
+
+    // スクリプト個数
+    debug.scriptsCount = await page.evaluate(() => document.querySelectorAll('script').length).catch(()=>0);
+
+    // Shadow DOM テキスト
     const shadowText = await page.evaluate(() => {
       try {
         const out = [];
@@ -149,10 +204,8 @@ app.get('/scrape', async (req, res) => {
       } catch { return ''; }
     });
 
-    const [title, fullHtml] = await Promise.all([
-      page.title().catch(()=> ''),
-      page.content().catch(()=> '')
-    ]);
+    // 本文・HTML
+    const [title, fullHtml] = await Promise.all([page.title().catch(()=>''), page.content().catch(()=> '')]);
     debug.fullHtmlLen = (fullHtml || '').length;
 
     const [innerText, docText, bodyHTML] = await Promise.all([
@@ -165,16 +218,16 @@ app.get('/scrape', async (req, res) => {
     debug.shadowTextLen= shadowText.length;
     debug.bodyHTMLLen  = bodyHTML.length;
 
-    // scriptタグ個数（JSが読めてるかの目安）
-    debug.scriptsCount = await page.evaluate(() => document.querySelectorAll('script').length).catch(()=>0);
+    // スクショ
+    try {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 60, fullPage: true });
+      debug.screenshotLen = Buffer.byteLength(buf);
+    } catch {}
 
-    // 最終テキスト決定
+    // 最終テキスト
     const visible = [innerText, docText, shadowText].filter(Boolean).join('\n').trim();
-    let finalText = (visible.replace(/\s+/g,'').length >= 80)
-      ? visible
-      : stripTags(bodyHTML);
+    let bodyText = (visible.replace(/\s+/g,'').length >= 80) ? visible : stripTags(bodyHTML);
 
-    // hydrated 判定（可視テキスト量 or appVisible）
     const hydrated = (visible.replace(/\s+/g,'').length > 300) || debug.appVisible === true;
 
     const elapsedMs = Date.now() - t0;
@@ -183,7 +236,7 @@ app.get('/scrape', async (req, res) => {
       build: BUILD_TAG,
       url: urlToFetch,
       title,
-      bodyText: finalText,         // ← ここを見る
+      bodyText,
       debug: { ...debug, hydrated, elapsedMs }
     });
 
