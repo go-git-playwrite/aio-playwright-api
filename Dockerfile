@@ -1,23 +1,23 @@
-# Playwrightが必要とする全ての部品が最初から入っている公式イメージをベースにする
+# Playwright 公式イメージ（ブラウザ＆依存込み）
 FROM mcr.microsoft.com/playwright:v1.54.2-jammy
 
-# 作業ディレクトリを設定
+# 環境
+ENV NODE_ENV=production \
+    TZ=Asia/Tokyo \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# 公式イメージは既定で pwuser ユーザーが用意されている
 WORKDIR /app
 
-# まず依存パッケージだけをインストール（ビルドを高速化するため）
-COPY package*.json ./
+# 依存だけ先に入れてキャッシュを効かせる
+COPY --chown=pwuser:pwuser package*.json ./
+RUN npm ci --omit=dev
 
-# ブラウザのダウンロードをスキップするよう環境変数を設定
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# アプリ本体
+COPY --chown=pwuser:pwuser . .
 
-# 依存パッケージをインストール
-RUN npm install
-
-# アプリケーションのコードをコピー
-COPY . .
-
-# サーバーが使うポートを指定
+# ポート
 EXPOSE 8080
 
-# サーバーを起動する
-CMD [ "npm", "start" ]
+# 起動（package.json の "start": "node index.js" を想定）
+CMD ["npm", "start"]
