@@ -285,11 +285,14 @@ try {
     // ---- JS/JSON 本文を取得して抽出 ----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
     const ZIP_RE   = /〒?\d{3}-?\d{4}/g;
-    const FOUNDING_RES = [
-      /設立[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/,
-      /創業[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/,
-      /((19|20)\d{2})[\/\.\-年](\d{1,2})[\/\.\-月](\d{1,2})日?/
-    ];
+const FOUNDING_RES = [
+  // 「設立」「創業」の近辺 ~80文字以内に日付があるパターン（タグや改行を許容）
+  /設立[\s\S]{0,80}?((19|20)\d{2})[^\d]{0,10}(\d{1,2})[^\d]{0,10}(\d{1,2})/i,
+  /創業[\s\S]{0,80}?((19|20)\d{2})[^\d]{0,10}(\d{1,2})[^\d]{0,10}(\d{1,2})/i,
+
+  // そのまま日付だけがバンドル内にあるケース
+  /((19|20)\d{2})[\/.\-年](\d{1,2})[\/.\-月](\d{1,2})日?/,
+];
 
     const bundlePhones = [];
     const bundleZips   = [];
@@ -399,7 +402,7 @@ if (!text) continue;
 try {
   const extraChunkUrls = new Set();
   for (const t of tappedAppIndexBodies) {
-    const m = t.match(/["'`](\/chunk-[A-Z0-9-]+\.js)["'`]/g) || [];
+    const m = t.match(/["'`](\/?(?:chunk|assets|static|_next\/static\/chunks)\/[^"'`]+?\.js)["'`]/g) || [];
     for (const raw of m) {
       const rel = raw.replace(/^["'`]|["'`]$/g, '');
       try {
