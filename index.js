@@ -1,17 +1,3 @@
-助かった、全文くれたので一気に直せました。
-いまのファイルは以下の問題で壊れてます：
-
-foundFoundingDate の多重宣言＆未宣言参照（宣言前に使ってる箇所がある）
-
-途中に実行不能な断片（// …DOM 成功時 などの例示コードをそのまま置いちゃってる）
-
-innerText/docText を返却後にもう一度書いている（構文的にも位置的にもNG）
-
-foundingDateSource を debug に入れていない
-
-
-下に、これらをすべて解消した動く完全版を置きます（構造はそのまま／設立日のソースもdebug.foundingDateSourceで出します）。
-
 // index.js — scrape-v5-bundle+cache (phones/addresses + foundingDate + sameAs, chunk-chase)
 
 const express = require('express');
