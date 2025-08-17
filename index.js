@@ -1,9 +1,11 @@
 // index.js — scrape-v5-bundle+cache (phones/addresses + foundingDate + sameAs, chunk-chase)
+// 目的: DOMが空でも JS/JSON から電話・住所・設立日・sameAs を抽出し、
+//       最終値（pickedPhone / pickedAddress / foundingDate / sameAs）を返す。結果はメモリキャッシュ。
 
 const express = require('express');
 const { chromium } = require('playwright');
 
-const BUILD_TAG = 'scrape-v5-bundle-cache-05';
+const BUILD_TAG = 'scrape-v5-bundle-cache-06';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -19,6 +21,7 @@ const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 
 const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
 const scrapeCache = new Map(); // key=url, val={ ts, json }
 
+// LRU風に古いものを落とす
 function cacheSet(url, json) {
   if (!url) return;
   if (scrapeCache.size >= CACHE_MAX_ENTRIES) {
@@ -32,7 +35,7 @@ function cacheGet(url) {
   if (!entry) return null;
   const age = Date.now() - entry.ts;
   if (age > CACHE_TTL_MS) { scrapeCache.delete(url); return null; }
-  // LRUリフレッシュ
+  // LRU リフレッシュ
   scrapeCache.delete(url);
   scrapeCache.set(url, entry);
   return { age, json: entry.json };
@@ -52,6 +55,7 @@ app.get('/__cache/purge', (req, res) => {
   scrapeCache.clear();
   res.json({ ok:true, purgedAll: n });
 });
+// -------------------- /cache end --------------------
 
 // -------------------- ユーティリティ --------------------
 function uniq(a){ return Array.from(new Set((a||[]).filter(Boolean))); }
@@ -69,24 +73,34 @@ function normalizeJpPhone(raw){
 }
 function looksLikeZip7(s){ return /^〒?\d{3}-?\d{4}$/.test(String(s).trim()); }
 
+// ====== PHONE scoring & picking (代表電話ラベル優先) ======
 function isDummyPhone(n){
   if (!n) return true;
   const d = String(n).replace(/[^\d]/g, '');
-  if (/^(012|000|007|017|089)/.test(d)) return true;
-  if (/(\d)\1{3,}/.test(d)) return true;
-  if (n === '03-3333-3333') return true;
+  if (/^(012|000|007|017|089)/.test(d)) return true;         // 典型ダミー/π断片
+  if (/(\d)\1{3,}/.test(d)) return true;                     // 3333, 0000 など
+  if (n === '03-3333-3333') return true;                     // よくあるダミー
   return false;
 }
 function scorePhoneBasic(n){
   let s = 0;
-  if (/^03-/.test(n)) s += 3;
-  else if (/^06-/.test(n)) s += 2;
+  if (/^03-/.test(n)) s += 3;       // 都内
+  else if (/^06-/.test(n)) s += 2;  // 大阪
   if (isDummyPhone(n)) s -= 10;
   return s;
 }
+/**
+ * 代表電話などの“ラベル近接”で拾えた番号を最優先。
+ * 次に tel: リンク、最後に通常スコアリング。
+ */
 function pickBestPhone({ telLinks=[], phones=[], labelHits=[], corpusText='' } = {}){
-  const labeled = Array.from(new Set(labelHits.map(normalizeJpPhone).filter(n => n && !isDummyPhone(n))));
+  // 1) 代表電話などのラベル近接（最優先）
+  const labeled = Array.from(new Set(labelHits
+    .map(normalizeJpPhone)
+    .filter(n => n && !isDummyPhone(n))));
   if (labeled.length) return labeled[0];
+
+  // 2) tel:リンク優先
   const DUMMY_PREFIX = /^(007|017|089|000)/;
   for (const raw of telLinks) {
     const n = normalizeJpPhone(raw);
@@ -95,10 +109,13 @@ function pickBestPhone({ telLinks=[], phones=[], labelHits=[], corpusText='' } =
     if (DUMMY_PREFIX.test(digits)) continue;
     if (!isDummyPhone(n)) return n;
   }
+
+  // 3) バンドル抽出（スコア付け）
   const cand = [];
   for (const raw of phones) {
     const n = normalizeJpPhone(raw);
     if (!n || isDummyPhone(n)) continue;
+    // 超簡易：本文に出ていれば +25
     const nd = (n||'').replace(/\D+/g,'');
     const cd = String(corpusText||'').replace(/\D+/g,'');
     const ctx = (nd && cd.includes(nd)) ? 25 : 0;
@@ -117,35 +134,43 @@ function parseBestAddressFromLines(lines){
     const mZip  = line.match(/〒?\s?(\d{3})-?(\d{4})/);
     const mPref = line.match(PREF_RE);
     if (!mZip || !mPref) continue;
-    const postal = mZip[1] + '-' + mZip[2];
-    const pref   = mPref[0];
+
+    const postal = mZip[1] + '-' + mZip[2];          // 例: 107-0062
+    const pref   = mPref[0];                         // 例: 東京都
     const afterPref = line.slice(line.indexOf(pref) + pref.length).trim();
-    const locM = afterPref.match(/^([^\s、,，]+?(市|区|郡|町|村))/);
+
+    const locM = afterPref.match(/^([^\s、,，]+?(市|区|郡|町|村))/); // 例: 港区
     const locality = locM ? locM[1] : '';
+
+    // ZIP を先頭に付けているケースや全角記号を掃除
     let rest = afterPref.slice(locality.length).replace(/^、|^,|^，/, '').trim();
-    rest = rest.replace(/^〒?\s?\d{3}-?\d{4}\s*/, '').trim();
-    return {
+    rest = rest.replace(/^〒?\s?\d{3}-?\d{4}\s*/, '').trim(); // 先頭に ZIP が重複してたら除去
+
+    const addr = {
       postalCode: postal,
       addressRegion: pref,
       addressLocality: locality || undefined,
       streetAddress: rest || undefined,
       addressCountry: 'JP'
     };
+    return addr; // 最初に条件を満たした行を採用
   }
   return null;
 }
 function digitsOnly(s){ return String(s||'').replace(/\D+/g,''); }
 function decodeUnicodeEscapes(s){
+  // \uXXXX を実文字に変換（サロゲートペアは連結で自然に復元される）
   return String(s || '').replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
     String.fromCharCode(parseInt(hex, 16))
   );
 }
 
-// ---- foundingDate 抽出（柔らかめ判定 + ラベル近接優先）----
+// ---- foundingDate 抽出（強化版）----
 function tryExtractFounding(text) {
   if (!text) return '';
   const t = String(text).replace(/\s+/g, ' ');
-  // A. ラベル直後に Y-M-D
+
+  // A. 「設立/創業」の直後に Y/M/D（最優先）
   let m = t.match(/(設立|創業)[^\d]{0,20}((?:19|20)\d{2})[^\d]{0,8}(\d{1,2})[^\d]{0,8}(\d{1,2})/);
   if (m) {
     const Y  = String(m[2]).padStart(4,'0');
@@ -155,18 +180,146 @@ function tryExtractFounding(text) {
     const dt = new Date(iso);
     return (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(MM)) ? iso : '';
   }
-  // B. 年月 or 年のみ（1日丸め）
+
+  // B. 年月まで or 年のみ（ISO丸め）
   m = t.match(/(設立|創業)[^\d]{0,20}((?:19|20)\d{2})[^\d]{0,8}(\d{1,2})(?![^\d]{0,8}\d)/)
    || t.match(/(設立|創業)[^\d]{0,20}((?:19|20)\d{2})(?![^\d]{0,8}\d)/);
   if (m) {
     const Y  = String(m[2]).padStart(4,'0');
     const MM = String(m[3] || '1').padStart(2,'0');
-    const iso = `${Y}-${MM}-01`;
+    const DD = '01';
+    const iso = `${Y}-${MM}-${DD}`;
     const dt = new Date(iso);
     return (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(MM)) ? iso : '';
   }
+
+  // C. 素の日付（1999/5/6 等）
+  m = t.match(/((?:19|20)\d{2})[\/.\-年](\d{1,2})(?:[\/.\-月](\d{1,2})日?)?/);
+  if (m) {
+    const Y  = String(m[1]).padStart(4,'0');
+    const MM = String(m[2] || '1').padStart(2,'0');
+    const DD = String(m[3] || '1').padStart(2,'0');
+    const iso = `${Y}-${MM}-${DD}`;
+    const dt = new Date(iso);
+    return (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(MM)) ? iso : '';
+  }
+
   return '';
 }
+
+function tryExtractFoundingFromHtml(html) {
+  if (!html) return '';
+  const h = String(html);
+  // <dt>設立</dt> ... <dd>1999年5月6日</dd>
+  const m1 = h.match(/<dt[^>]*>\s*(設立|創業)\s*<\/dt>[\s\S]{0,200}?<dd[^>]*>\s*([^<]+)\s*<\/dd>/i);
+  if (m1 && m1[2]) {
+    const t = m1[2].replace(/\s+/g, '');
+    const m = t.match(/((?:19|20)\d{2})\D{0,5}(\d{1,2})\D{0,5}(\d{1,2})/);
+    if (m) {
+      const Y = String(m[1]).padStart(4,'0');
+      const M = String(m[2]).padStart(2,'0');
+      const D = String(m[3]).padStart(2,'0');
+      const iso = `${Y}-${M}-${D}`;
+      const dt = new Date(iso);
+      if (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(M)) return iso;
+    }
+  }
+  // タグ剥がし後の「設立 1999 5 6」
+  const m2 = h.replace(/<[^>]*>/g,' ').match(/設立|創業/);
+  if (m2) {
+    const flat = h.replace(/<[^>]*>/g,' ');
+    const iso = tryExtractFounding(flat);
+    if (iso) return iso;
+  }
+  return '';
+}
+
+// JSON/配列を雑に切り出す（構文木いらずの安全側）
+function* extractJsonBlocks(text, minLen = 40) {
+  const s = String(text || '');
+  const stack = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '{' || c === '[') stack.push({c, i});
+    else if (c === '}' || c === ']') {
+      const open = stack.pop();
+      if (!open) continue;
+      const chunk = s.slice(open.i, i + 1);
+      if (chunk.length >= minLen) yield chunk;
+    }
+  }
+}
+function sniffFoundingFromJsonText(text) {
+  for (const chunk of extractJsonBlocks(text)) {
+    try {
+      const obj = JSON.parse(chunk);
+      const flat = JSON.stringify(obj);
+
+      // 直接キー → 文字列
+      let m = flat.match(/"(?:founded|established|設立|創業)\"\s*:\s*\"([^\"]{4,20})\"/i);
+      if (m) {
+        const iso = tryExtractFounding(m[1]);
+        if (iso) return iso;
+      }
+
+      // year/month/day
+      m = flat.match(/"(?:year|年度|西暦)\"\s*:\s*(\d{4}).{0,40}?"(?:month|mon|月)\"\s*:\s*(\d{1,2}).{0,40}?"(?:day|date|日)\"\s*:\s*(\d{1,2})/i);
+      if (m) {
+        const Y = String(m[1]).padStart(4,'0');
+        const M = String(m[2]).padStart(2,'0');
+        const D = String(m[3]).padStart(2,'0');
+        const iso = `${Y}-${M}-${D}`;
+        const dt = new Date(iso);
+        if (!Number.isNaN(+dt) && dt.getMonth()+1 === +M) return iso;
+      }
+
+      // year + month だけ
+      m = flat.match(/"(?:year|西暦)\"\s*:\s*(\d{4}).{0,40}?"(?:month|mon|月)\"\s*:\s*(\d{1,2})/i);
+      if (m) return `${m[1]}-${String(m[2]).padStart(2,'0')}-01`;
+
+    } catch {}
+  }
+  return '';
+}
+
+function tryFoundingFromBase64(text) {
+  const cand = (String(text).match(/\b[A-Za-z0-9+/]{12,}={0,2}\b/g) || []).slice(0, 200);
+  for (const b64 of cand) {
+    try {
+      const decoded = Buffer.from(b64, 'base64').toString('utf8');
+      const iso = tryExtractFounding(decoded);
+      if (iso) return iso;
+    } catch {}
+  }
+  return '';
+}
+function tryFoundingFromDateCtor(text) {
+  const m = String(text).match(/new\s+Date\s*\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)/);
+  if (!m) return '';
+  const Y = m[1], M = String(+m[2] + 1).padStart(2,'0'), D = String(m[3]).padStart(2,'0');
+  const iso = `${Y}-${M}-${D}`;
+  const dt = new Date(iso);
+  return (!Number.isNaN(+dt) && dt.getMonth()+1 === +M) ? iso : '';
+}
+function tryFoundingFromStringJoin(text) {
+  const s = String(text);
+  // "1999" + "年" + "5" + "月" + "6" + "日"
+  const plus = s.match(/(?:"\d{4}"\s*\+\s*".{0,3}"\s*\+\s*"\d{1,2}".{0,20}?\+\s*"\d{1,2}")/);
+  if (plus) {
+    const joined = plus[0].replace(/\s*\+\s*/g,'').replace(/"/g,'');
+    const iso = tryExtractFounding(joined);
+    if (iso) return iso;
+  }
+  // ["1999","年","5","月","6","日"].join("")
+  const arr = s.match(/\[\s*"(?:[^"]|\\")+"\s*(?:,\s*"(?:[^"]|\\")+"\s*){2,}\]\.join\(\s*""\s*\)/);
+  if (arr) {
+    const joined = arr[0].replace(/\[|\]|\.join\(""\)|"/g,'').replace(/\s*,\s*/g,'');
+    const iso = tryExtractFounding(joined);
+    if (iso) return iso;
+  }
+  return '';
+}
+
 function toIsoFromJpDate(s){
   const t = String(s || '').replace(/\s+/g,'');
   const m = t.match(/((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/);
@@ -176,32 +329,16 @@ function toIsoFromJpDate(s){
   const D = String(m[4]).padStart(2,'0');
   return `${Y}-${M}-${D}`;
 }
-function tryExtractFoundingFromHtml(html) {
-  if (!html) return '';
-  const h = String(html);
-  const m1 = h.match(/<dt[^>]*>\s*(設立|創業)\s*<\/dt>[\s\S]{0,200}?<dd[^>]*>\s*([^<]+)\s*<\/dd>/i);
-  if (m1 && m1[2]) {
-    const t = m1[2].replace(/\s+/g, '');
-    const m = t.match(/((19|20)\d{2})\D{0,5}(\d{1,2})\D{0,5}(\d{1,2})/);
-    if (m) {
-      const Y = String(m[1]).padStart(4,'0');
-      const M = String(m[3]).padStart(2,'0');
-      const D = String(m[4]).padStart(2,'0');
-      const iso = `${Y}-${M}-${D}`;
-      const dt = new Date(iso);
-      if (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(M)) return iso;
-    }
-  }
-  const m2 = h.replace(/<[^>]*>/g,' ').match(/設立[^0-9]{0,10}((19|20)\d{2})[^0-9]{0,10}(\d{1,2})[^0-9]{0,10}(\d{1,2})/);
-  if (m2) {
-    const Y = String(m2[1]).padStart(4,'0');
-    const M = String(m2[3]).padStart(2,'0');
-    const D = String(m2[4]).padStart(2,'0');
-    const iso = `${Y}-${M}-${D}`;
-    const dt = new Date(iso);
-    if (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(M)) return iso;
-  }
-  return '';
+
+// 「scan」1本に対しての総合検出（順番に実施）
+function findFoundingInScan(text) {
+  const t = String(text || '');
+  const byJson   = sniffFoundingFromJsonText(t);    if (byJson)   return { iso: byJson,   source: 'json' };
+  const byCtor   = tryFoundingFromDateCtor(t);      if (byCtor)   return { iso: byCtor,   source: 'date_ctor' };
+  const byJoin   = tryFoundingFromStringJoin(t);    if (byJoin)   return { iso: byJoin,   source: 'string_join' };
+  const byB64    = tryFoundingFromBase64(t);        if (byB64)    return { iso: byB64,    source: 'base64' };
+  const byRegex  = tryExtractFounding(t);           if (byRegex)  return { iso: byRegex,  source: 'regex' };
+  return { iso: '', source: '' };
 }
 
 // -------------------- /scrape --------------------
@@ -209,11 +346,11 @@ app.get('/scrape', async (req, res) => {
   const urlToFetch = req.query.url;
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
 
-  // CACHE CHECK
+  // --- CACHE CHECK (early return) ---
   try {
     const cached = cacheGet(urlToFetch);
     if (cached && cached.json) {
-      const payload = JSON.parse(JSON.stringify(cached.json));
+      const payload = JSON.parse(JSON.stringify(cached.json)); // defensive copy
       if (!payload.debug) payload.debug = {};
       payload.debug.cache = { hit: true, ageMs: cached.age, ttlMs: CACHE_TTL_MS };
       return res.status(200).json(payload);
@@ -224,51 +361,68 @@ app.get('/scrape', async (req, res) => {
   const t0 = Date.now();
 
   try {
-    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      serviceWorkers: 'allow',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                 'Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',                // PWA配布を通す
       viewport: { width: 1366, height: 900 },
       javaScriptEnabled: true,
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
-    const page = await context.newPage();
-    await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
 
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    // ---- 主要待機（軽め） ----
     await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await Promise.race([
-      page.waitForResponse(r => { const u = r.url(); return u.endsWith('.js') || u.includes('firestore.googleapis.com'); }, { timeout: 20_000 }).catch(()=>null),
+      page.waitForResponse(r => {
+        const u = r.url();
+        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
+      }, { timeout: 20_000 }).catch(()=>null),
       page.waitForTimeout(20_000)
     ]);
     await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
+
+    // ---- 状態変数（ここで一度だけ宣言）----
+    let foundFoundingDate = '';
+    let foundFoundingDateSource = '';
+
+    // ★ DOM の dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）
     await page.waitForFunction(() => {
       const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
       return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
     }, { timeout: 8000 }).catch(()=>{});
 
-    // ---- DOMテキスト
+    // ---- DOMテキスト（空でもOK）----
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
       page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
-    // ---- 統一スキャン用フラグ（ここで1回だけ宣言）
-    let foundFoundingDate = '';
-    let foundFoundingDateSource = '';
-
-    // ---- DOM の dt/dd からフォールバック取得
+    // === DOM直読みで設立/創業日（dt/dd・表のth/td対応） ===
     const foundingFromDom = await page.evaluate(() => {
       const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      // <dl><dt>設立</dt><dd>...</dd>
       for (const dt of Array.from(document.querySelectorAll('dl dt'))) {
         if (/設立|創業/.test(dt.textContent || '')) {
           const dd = dt.nextElementSibling;
           if (dd) return clean(dd.textContent);
         }
       }
+      // <table><tr><th>設立</th><td>...</td></tr>
       for (const el of Array.from(document.querySelectorAll('table th, table td'))) {
         if (/設立|創業/.test(el.textContent || '')) {
           const td = el.tagName === 'TH' ? el.nextElementSibling : el;
@@ -278,18 +432,27 @@ app.get('/scrape', async (req, res) => {
       return '';
     });
     if (!foundFoundingDate && foundingFromDom) {
-      const iso = toIsoFromJpDate(foundingFromDom);
+      const iso = toIsoFromJpDate(foundingFromDom) || tryExtractFounding(foundingFromDom);
       if (iso) { foundFoundingDate = iso; foundFoundingDateSource = 'dom'; }
     }
 
-    // ---- HTMLソースも見る
+    // --- HTMLソース（タグあり）スキャン
     const htmlSource = await page.content().catch(() => '');
     if (!foundFoundingDate) {
       const hitHtml = tryExtractFoundingFromHtml(htmlSource);
       if (hitHtml) { foundFoundingDate = hitHtml; foundFoundingDateSource = 'html'; }
     }
 
-    // ---- ページ中のリンクから sameAs 候補
+    // tel:リンク
+    const telLinks = await page.$$eval('a[href^="tel:"]',
+      as => as.map(a => (a.getAttribute('href') || '')
+        .replace(/^tel:/i,'')
+        .replace(/^\+81[-\s()]?/,'0')
+        .trim()
+      )
+    ).catch(()=>[]);
+
+    // sameAs 候補（ページ内 a[href]）
     const bundleSameAs = [];
     const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com)/i;
     const anchorHrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href') || '').filter(Boolean)).catch(()=>[]);
@@ -300,12 +463,7 @@ app.get('/scrape', async (req, res) => {
       } catch(_) {}
     }
 
-    // ---- tel:リンク
-    const telLinks = await page.$$eval('a[href^="tel:"]',
-      as => as.map(a => (a.getAttribute('href') || '').replace(/^tel:/i,'').replace(/^\+81[-\s()]?/,'0').trim())
-    ).catch(()=>[]);
-
-    // ---- JSON-LD（参考）
+    // ---- JSON-LD（参考）----
     const jsonld = await page.evaluate(() => {
       const arr = [];
       for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
@@ -314,7 +472,7 @@ app.get('/scrape', async (req, res) => {
       return arr;
     }).catch(()=>[]);
 
-    // ---- JS候補URL収集
+    // ---- script/src と modulepreload から JS 候補URLを収集 ----
     const { scriptSrcs, preloadHrefs } = await page.evaluate(() => {
       const s = Array.from(document.querySelectorAll('script[src]')).map(el => el.getAttribute('src')).filter(Boolean);
       const l = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).map(el => el.getAttribute('href')).filter(Boolean);
@@ -323,15 +481,20 @@ app.get('/scrape', async (req, res) => {
     const abs = (u) => { try { return new URL(u, urlToFetch).toString(); } catch { return null; } };
     const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
 
-    // ---- ページで読み込まれたリソース一覧から JSON 系も拾う
+    // --- ページで読み込まれたリソース一覧から JSON 系も拾う
     const resourceUrls = await page.evaluate(() => {
-      try { return performance.getEntriesByType('resource').map(e => e.name).filter(Boolean); }
-      catch { return []; }
+      try {
+        return performance.getEntriesByType('resource')
+          .map(e => e.name)
+          .filter(Boolean);
+      } catch { return []; }
     });
-    const extraJsonUrls = uniq(resourceUrls.filter(u => /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(u)));
+    const extraJsonUrls = uniq(resourceUrls.filter(u =>
+      /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(u)
+    ));
     const jsonToTap = extraJsonUrls.filter(u => !jsUrls.includes(u));
 
-    // ---- 正規表現
+    // ---- 正規表現系 ----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
     const ZIP_RE   = /〒?\d{3}-?\d{4}/g;
 
@@ -340,51 +503,55 @@ app.get('/scrape', async (req, res) => {
     const bundleAddrs  = [];
     const fetchedMeta  = [];
     const tappedUrls   = [];
-    const tappedBodies = [];
     const tappedAppIndexBodies = [];
     const labelHitPhones = [];
     const LABEL_RE = /(代表電話|代表|電話|お問い合わせ|TEL|Tel|Phone)/i;
 
-    // ---- HTML直リクエストも軽くスキャン（sameAsと設立の保険）
+    // --- HTML 自体も直取り（sameAs追加 & 設立フォロー）
     try {
       const resp0 = await page.request.get(urlToFetch, { timeout: 20000 });
       if (resp0.ok()) {
         const html0 = await resp0.text();
         const urlMatches0 = html0.match(/https?:\/\/[^\s"'<>]+/g) || [];
         for (const rawUrl of urlMatches0) {
-          try { const host = new URL(rawUrl).hostname; if (SOCIAL_HOST_RE.test(host)) bundleSameAs.push(String(rawUrl)); } catch {}
+          try {
+            const host = new URL(rawUrl).hostname;
+            if (SOCIAL_HOST_RE.test(host)) bundleSameAs.push(String(rawUrl));
+          } catch (_) {}
         }
         if (!foundFoundingDate) {
           const flat = stripTags(html0);
           const scan0 = flat + '\n' + decodeUnicodeEscapes(flat);
-          const hit0 = tryExtractFounding(scan0);
-          if (hit0) { foundFoundingDate = hit0; foundFoundingDateSource = 'html2'; }
+          const { iso, source } = findFoundingInScan(scan0);
+          if (iso) { foundFoundingDate = iso; foundFoundingDateSource = source || 'html'; }
         }
       }
     } catch {}
 
-    // ---- JSON APIっぽいURLも叩く（設立の保険）
+    // --- リソース由来の JSON を先に叩く（最短で決まることが多い）
     for (const u of jsonToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 10000 });
         if (!resp.ok()) continue;
         const body = await resp.text();
-        if (!body) continue;
+        if (!body || foundFoundingDate) continue;
+
         const raw = body;
         const decoded = decodeUnicodeEscapes(raw);
         const scan = raw + '\n' + decoded;
-        if (!foundFoundingDate) {
-          const hit = tryExtractFounding(scan);
-          if (hit) { foundFoundingDate = hit; foundFoundingDateSource = 'json'; continue; }
-          const hitHtml = tryExtractFoundingFromHtml(scan);
-          if (hitHtml) { foundFoundingDate = hitHtml; foundFoundingDateSource = 'jsonHtml'; continue; }
-        }
+
+        const { iso, source } = findFoundingInScan(scan);
+        if (iso) { foundFoundingDate = iso; foundFoundingDateSource = source || 'json'; }
       } catch {}
     }
 
-    // ---- JS/JSON 本文を取得して抽出
-    const jsToTap = uniq([...jsUrls, `${new URL(urlToFetch).origin}/app-index.js`]);
+    // ページが教えてくれたJS候補 + 典型的なエントリ
+    const jsToTap = uniq([
+      ...jsUrls,
+      `${new URL(urlToFetch).origin}/app-index.js`
+    ]);
 
+    // ---- JS/JSON 本文を取得して抽出 ----
     for (const u of jsToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 20_000 });
@@ -393,7 +560,9 @@ app.get('/scrape', async (req, res) => {
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
 
         const text = await resp.text();
-        if (/\/app-index\.js(\?|$)/.test(u)) tappedAppIndexBodies.push(text || '');
+        if (/\/app-index\.js(\?|$)/.test(u)) {
+          tappedAppIndexBodies.push(text || '');
+        }
         if (!text) continue;
 
         const raw = text || '';
@@ -401,9 +570,9 @@ app.get('/scrape', async (req, res) => {
         const scan = raw + '\n' + decoded;
 
         tappedUrls.push(u);
-        tappedBodies.push({ url: u, ct, textLen: raw.length });
         fetchedMeta.push({ url: u, ct, textLen: raw.length });
 
+        // ラベル近接での電話抽出
         try {
           for (const m of scan.matchAll(PHONE_RE)) {
             const rawNum = m[0];
@@ -421,27 +590,42 @@ app.get('/scrape', async (req, res) => {
           }
         } catch {}
 
-        (scan.match(PHONE_RE) || []).map(normalizeJpPhone).filter(Boolean).forEach(v => bundlePhones.push(v));
-        (scan.match(ZIP_RE)   || []).filter(looksLikeZip7).forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+        // 電話
+        (scan.match(PHONE_RE) || [])
+          .map(normalizeJpPhone)
+          .filter(Boolean)
+          .forEach(v => bundlePhones.push(v));
+
+        // 郵便番号
+        (scan.match(ZIP_RE) || [])
+          .filter(looksLikeZip7)
+          .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+        // 住所っぽい行（軽め）
         for (const line of scan.split(/\n+/)) {
           if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
             bundleAddrs.push(line.replace(/\s+/g,' ').trim());
           }
         }
 
+        // 設立（順番制・早期確定）
         if (!foundFoundingDate) {
-          const hit = tryExtractFounding(scan);
-          if (hit) { foundFoundingDate = hit; foundFoundingDateSource = 'bundle'; }
+          const { iso, source } = findFoundingInScan(scan);
+          if (iso) { foundFoundingDate = iso; foundFoundingDateSource = source || 'bundle'; }
         }
 
+        // sameAs らしき URL（スクリプト内の直書き）
         const urlMatches = scan.match(/https?:\/\/[^\s"'<>]+/g) || [];
         for (const rawUrl of urlMatches) {
-          try { const p = new URL(rawUrl); if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString()); } catch {}
+          try {
+            const p = new URL(rawUrl);
+            if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+          } catch(_) {}
         }
       } catch(_) {}
     }
 
-    // ---- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃
+    // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃 --------
     try {
       const extraChunkUrls = new Set();
       for (const t of tappedAppIndexBodies) {
@@ -454,9 +638,10 @@ app.get('/scrape', async (req, res) => {
           } catch {}
         }
       }
+
       let count = 0;
       for (const u of Array.from(extraChunkUrls)) {
-        if (count++ >= 8) break;
+        if (count++ >= 8) break; // 取りすぎ防止
         try {
           const resp = await page.request.get(u, { timeout: 15_000 });
           if (!resp.ok()) continue;
@@ -466,36 +651,48 @@ app.get('/scrape', async (req, res) => {
           const text = await resp.text();
           if (!text) continue;
 
-          tappedUrls.push(u);
-          tappedBodies.push({ url: u, ct, textLen: text.length });
-          fetchedMeta.push({ url: u, ct, textLen: text.length });
-
           const raw = text || '';
           const decoded = decodeUnicodeEscapes(raw);
           const scan = raw + '\n' + decoded;
 
-          (scan.match(PHONE_RE) || []).map(normalizeJpPhone).filter(Boolean).forEach(v => bundlePhones.push(v));
-          (scan.match(ZIP_RE)   || []).filter(looksLikeZip7).forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+          // 電話
+          (scan.match(PHONE_RE) || [])
+            .map(normalizeJpPhone)
+            .filter(Boolean)
+            .forEach(v => bundlePhones.push(v));
+
+          // 郵便番号
+          (scan.match(ZIP_RE) || [])
+            .filter(looksLikeZip7)
+            .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+          // 住所っぽい行
           for (const line of scan.split(/\n+/)) {
             if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
               bundleAddrs.push(line.replace(/\s+/g,' ').trim());
             }
           }
 
+          // 設立日（2nd pass）
           if (!foundFoundingDate) {
-            const hit = tryExtractFounding(scan);
-            if (hit) { foundFoundingDate = hit; foundFoundingDateSource = 'chunk'; }
+            const { iso, source } = findFoundingInScan(scan);
+            if (iso) { foundFoundingDate = iso; foundFoundingDateSource = source || 'bundle'; }
           }
 
+          // sameAs
           const urlMatches = scan.match(/https?:\/\/[^\s"'<>]+/g) || [];
           for (const rawUrl of urlMatches) {
-            try { const p = new URL(rawUrl); if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString()); } catch {}
+            try {
+              const p = new URL(rawUrl);
+              if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+            } catch(_) {}
           }
         } catch {}
       }
     } catch {}
+    // -------- 2nd pass end --------
 
-    // ---- 整理 & 採用値の決定
+    // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
     const zips   = uniq(bundleZips);
     const addrs  = uniq(bundleAddrs);
@@ -515,7 +712,8 @@ app.get('/scrape', async (req, res) => {
       if (pickedPhone) lines.push('TEL: ' + pickedPhone);
       if (pickedAddress) {
         const p = pickedAddress;
-        const addrLine = [p.postalCode, p.addressRegion, p.addressLocality, p.streetAddress].filter(Boolean).join(' ');
+        const addrLine = [p.postalCode, p.addressRegion, p.addressLocality, p.streetAddress]
+          .filter(Boolean).join(' ');
         lines.push('ADDR: ' + addrLine);
       } else {
         if (zips.length)  lines.push('ZIP: ' + zips.slice(0,3).join(', '));
@@ -524,7 +722,7 @@ app.get('/scrape', async (req, res) => {
       bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
     }
 
-    // sameAs フィルタ
+    // --- sameAs フィルタ＆重複排除（SNS系のみ残す） ---
     const ALLOW_HOST_SNS = /(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|youtube\.com|linkedin\.com|tiktok\.com)/i;
     const sameAsClean = Array.from(new Set(
       (bundleSameAs || [])
@@ -533,13 +731,14 @@ app.get('/scrape', async (req, res) => {
         .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
     ));
 
-    // 返却ペイロード
+    // ---- 返却ペイロードを組み立て ----
     const structured = {
       telephone: pickedPhone || null,
       address: pickedAddress || null,
       foundingDate: foundFoundingDate || null,
       sameAs: sameAsClean
     };
+
     const jsonldSynth = [{
       "@context": "https://schema.org",
       "@type": "Organization",
@@ -570,16 +769,22 @@ app.get('/scrape', async (req, res) => {
         bundleZips: zips.slice(0, 10),
         bundleAddrs: addrs.slice(0, 10),
         pickedPhone: pickedPhone || null,
-        pickedAddressPreview: pickedAddress ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress].filter(Boolean).join(' ') : null,
+        pickedAddressPreview: pickedAddress
+          ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
+              .filter(Boolean).join(' ')
+          : null,
         labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
         foundingDatePicked: foundFoundingDate || null,
-        foundingDateSource: foundFoundingDateSource || null, // ★ 追加
+        foundingDateSource: foundFoundingDateSource || null,
         sameAsCount: new Set(sameAsClean).size,
         elapsedMs
       }
     };
 
+    // --- CACHE SET（成功時のみ保存）
     try { cacheSet(urlToFetch, responsePayload); } catch(_){}
+
+    // 返却
     return res.status(200).json(responsePayload);
 
   } catch (err) {
