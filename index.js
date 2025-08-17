@@ -328,16 +328,42 @@ const foundingFromDom = await page.evaluate(() => {
       )
     ).catch(()=>[]);
 
-    // sameAs 候補（ページ内 a[href]）
-    const bundleSameAs = [];
-    const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com)/i;
-    const anchorHrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href') || '').filter(Boolean)).catch(()=>[]);
-    for (const href of anchorHrefs) {
+// sameAs 候補（ページ内 a[href]）
+const bundleSameAs = [];
+const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com)/i;
+const anchorHrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href') || '').filter(Boolean)).catch(()=>[]);
+for (const href of anchorHrefs) {
+  try {
+    const u = new URL(href, urlToFetch);
+    if (SOCIAL_HOST_RE.test(u.hostname)) bundleSameAs.push(u.toString());
+  } catch(_) {}
+}
+
+// --- NEW: 生HTMLのソースもスキャン（Unicodeエスケープも両取り）---
+try {
+  const resp0 = await page.request.get(urlToFetch, { timeout: 20000 });
+  if (resp0.ok()) {
+    const html0 = await resp0.text();
+
+    // sameAs を HTML 直書きからも追加（フッター等の a 以外・JS に埋め込まれたURLも拾える）
+    const urlMatches0 = html0.match(/https?:\/\/[^\s"'<>]+/g) || [];
+    for (const rawUrl of urlMatches0) {
       try {
-        const u = new URL(href, urlToFetch);
-        if (SOCIAL_HOST_RE.test(u.hostname)) bundleSameAs.push(u.toString());
-      } catch(_) {}
+        const host = new URL(rawUrl).hostname;
+        if (SOCIAL_HOST_RE.test(host)) bundleSameAs.push(String(rawUrl));
+      } catch (_) {}
     }
+
+    // HTML → テキスト化（タグ剥がし） → Unicode デコード → 設立日の再スキャン
+    const flat = stripTags(html0);
+    const scan0 = flat + '\n' + decodeUnicodeEscapes(flat);
+
+    if (!foundFoundingDate) {
+      const hit0 = tryExtractFounding(scan0);
+      if (hit0) foundFoundingDate = hit0;
+    }
+  }
+} catch (_) {}
 
     // ---- JSON-LD（参考）----
     const jsonld = await page.evaluate(() => {
