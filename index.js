@@ -1,11 +1,11 @@
-// index.js — scrape-v5-bundle+cache (phones/addresses + foundingDate + sameAs)
+// index.js — scrape-v5-bundle+cache (phones/addresses + foundingDate + sameAs, chunk-chase)
 // 目的: DOMが空でも JS/JSON から電話・住所・設立日・sameAs を抽出し、
 //       最終値（pickedPhone / pickedAddress / foundingDate / sameAs）を返す。結果はメモリキャッシュ。
 
 const express = require('express');
 const { chromium } = require('playwright');
 
-const BUILD_TAG = 'scrape-v5-bundle-cache-04';
+const BUILD_TAG = 'scrape-v5-bundle-cache-05';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -159,6 +159,35 @@ function parseBestAddressFromLines(lines){
 }
 function digitsOnly(s){ return String(s||'').replace(/\D+/g,''); }
 
+// ---- foundingDate 抽出（柔らかめ判定）----
+const FOUNDING_RES = [
+  /設立[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/,
+  /創業[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/,
+  /((19|20)\d{2})[\/\.\-年](\d{1,2})[\/\.\-月](\d{1,2})日?/
+];
+const FOUNDING_RES_SOFT = [
+  /設立[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})?日?/,
+  /創業[^0-9]{0,6}((19|20)\d{2})年(\d{1,2})月(\d{1,2})?日?/,
+  /((19|20)\d{2})[\/\.\-年](\d{1,2})(?:[\/\.\-月](\d{1,2})日?)?/
+];
+function tryExtractFounding(text) {
+  if (!text) return '';
+  for (const re of FOUNDING_RES_SOFT) {
+    const m = text.match(re);
+    if (m) {
+      const Y  = String(m[1]).padStart(4, '0');
+      const MM = String(m[3] || '1').padStart(2, '0');
+      const DD = String(m[4] || '1').padStart(2, '0');
+      const iso = `${Y}-${MM}-${DD}`;
+      const dt = new Date(iso);
+      if (!Number.isNaN(+dt) && (dt.getUTCMonth()+1) === Number(MM)) {
+        return iso;
+      }
+    }
+  }
+  return '';
+}
+
 // -------------------- /scrape --------------------
 app.get('/scrape', async (req, res) => {
   const urlToFetch = req.query.url;
@@ -213,30 +242,6 @@ app.get('/scrape', async (req, res) => {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
-// --- raw HTML もスキャンして foundingDate を試す（SPAでDOMが空な場合の保険） ---
-try {
-  const rawResp = await page.request.get(urlToFetch, { timeout: 20000 });
-  if (rawResp.ok()) {
-    const html = await rawResp.text();
-    if (html && !foundFoundingDate) {
-      for (const re of FOUNDING_RES) {
-        const m = html.match(re);
-        if (m) {
-          const Y  = String(m[1]).padStart(4, '0');
-          const MM = String(m[3]).padStart(2, '0');
-          const DD = String(m[4]).padStart(2, '0');
-          const iso = `${Y}-${MM}-${DD}`;
-          const dt  = new Date(iso);
-          if (!Number.isNaN(+dt) && (dt.getMonth() + 1) === Number(MM)) {
-            foundFoundingDate = iso;
-            break;
-          }
-        }
-      }
-    }
-  }
-} catch (_) {}
-
     // ---- DOMテキスト（空でもOK）----
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
@@ -285,14 +290,6 @@ try {
     // ---- JS/JSON 本文を取得して抽出 ----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
     const ZIP_RE   = /〒?\d{3}-?\d{4}/g;
-const FOUNDING_RES = [
-  // 「設立」「創業」の近辺 ~80文字以内に日付があるパターン（タグや改行を許容）
-  /設立[\s\S]{0,80}?((19|20)\d{2})[^\d]{0,10}(\d{1,2})[^\d]{0,10}(\d{1,2})/i,
-  /創業[\s\S]{0,80}?((19|20)\d{2})[^\d]{0,10}(\d{1,2})[^\d]{0,10}(\d{1,2})/i,
-
-  // そのまま日付だけがバンドル内にあるケース
-  /((19|20)\d{2})[\/.\-年](\d{1,2})[\/.\-月](\d{1,2})日?/,
-];
 
     const bundlePhones = [];
     const bundleZips   = [];
@@ -319,14 +316,11 @@ const FOUNDING_RES = [
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
 
-const text = await resp.text();
-
-
-if (/\/app-index\.js(\?|$)/.test(u)) {
-  tappedAppIndexBodies.push(text);
-}
-
-if (!text) continue;
+        const text = await resp.text();
+        if (/\/app-index\.js(\?|$)/.test(u)) {
+          tappedAppIndexBodies.push(text || '');
+        }
+        if (!text) continue;
 
         tappedUrls.push(u);
         tappedBodies.push({ url: u, ct, textLen: text.length });
@@ -351,42 +345,21 @@ if (!text) continue;
         } catch {}
 
         // 電話
-        (text.match(PHONE_RE) || [])
-          .map(normalizeJpPhone)
-          .filter(Boolean)
-          .forEach(v => bundlePhones.push(v));
-
+        (text.match(PHONE_RE) || []).map(normalizeJpPhone).filter(Boolean).forEach(v => bundlePhones.push(v));
         // 郵便番号
-        (text.match(ZIP_RE) || [])
-          .filter(looksLikeZip7)
-          .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
-
+        (text.match(ZIP_RE)   || []).filter(looksLikeZip7).forEach(v => bundleZips.push(v.replace(/^〒/, '')));
         // 住所っぽい行（軽め）
         for (const line of text.split(/\n+/)) {
           if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
             bundleAddrs.push(line.replace(/\s+/g,' ').trim());
           }
         }
-
-        // 設立日（最初にマッチしたもの）
+        // 設立日（1st pass）
         if (!foundFoundingDate) {
-          for (const re of FOUNDING_RES) {
-            const m = text.match(re);
-            if (m) {
-              const Y = String(m[1]).padStart(4, '0');
-              const MM = String(m[3]).padStart(2, '0');
-              const DD = String(m[4]).padStart(2, '0');
-              const iso = `${Y}-${MM}-${DD}`;
-              const dt = new Date(iso);
-              if (!Number.isNaN(+dt) && dt.getMonth()+1 === Number(MM)) {
-                foundFoundingDate = iso;
-                break;
-              }
-            }
-          }
+          const hit = tryExtractFounding(text);
+          if (hit) foundFoundingDate = hit;
         }
-
-        // sameAs らしき URL
+        // sameAs らしき URL（スクリプト内の直書き）
         const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
         for (const raw of urlMatches) {
           try {
@@ -394,77 +367,66 @@ if (!text) continue;
             if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
           } catch(_) {}
         }
-
       } catch(_) {}
     }
 
-// -------- 2nd pass: app-index.js が参照する chunk-*.js を追加で叩く --------
-try {
-  const extraChunkUrls = new Set();
-  for (const t of tappedAppIndexBodies) {
-    const m = t.match(/["'`](\/?(?:chunk|assets|static|_next\/static\/chunks)\/[^"'`]+?\.js)["'`]/g) || [];
-    for (const raw of m) {
-      const rel = raw.replace(/^["'`]|["'`]$/g, '');
-      try {
-        const absUrl = new URL(rel, urlToFetch).toString();
-        if (!tappedUrls.includes(absUrl)) extraChunkUrls.add(absUrl);
-      } catch {}
-    }
-  }
-
-  for (const u of Array.from(extraChunkUrls)) {
+    // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃 --------
     try {
-      const resp = await page.request.get(u, { timeout: 20_000 });
-      if (!resp.ok()) continue;
-      const ct = (resp.headers()['content-type'] || '').toLowerCase();
-      if (!(ct.includes('javascript') || u.endsWith('.js'))) continue;
-
-      const text = await resp.text();
-      if (!text) continue;
-
-      tappedUrls.push(u);
-      tappedBodies.push({ url: u, ct, textLen: text.length });
-      fetchedMeta.push({ url: u, ct, textLen: text.length });
-
-      // 電話
-      (text.match(PHONE_RE) || [])
-        .map(normalizeJpPhone)
-        .filter(Boolean)
-        .forEach(v => bundlePhones.push(v));
-
-      // 郵便番号
-      (text.match(ZIP_RE) || [])
-        .filter(looksLikeZip7)
-        .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
-
-      // 住所っぽい行
-      for (const line of text.split(/\n+/)) {
-        if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
-          bundleAddrs.push(line.replace(/\s+/g,' ').trim());
+      const extraChunkUrls = new Set();
+      for (const t of tappedAppIndexBodies) {
+        const m = (t || '').match(/["'`](\/chunk-[A-Za-z0-9-]+\.js)["'`]/g) || [];
+        for (const raw of m) {
+          const rel = raw.replace(/^["'`]|["'`]$/g, '');
+          try {
+            const absUrl = new URL(rel, urlToFetch).toString();
+            if (!tappedUrls.includes(absUrl)) extraChunkUrls.add(absUrl);
+          } catch {}
         }
       }
 
-      // 設立日（FOUNDING_RES / foundFoundingDate が既に定義済み前提）
-      if (!foundFoundingDate) {
-        for (const re of FOUNDING_RES) {
-          const m = text.match(re);
-          if (m) {
-            const Y  = String(m[1]).padStart(4, '0');
-            const MM = String(m[3]).padStart(2, '0');
-            const DD = String(m[4]).padStart(2, '0');
-            const iso = `${Y}-${MM}-${DD}`;
-            const dt = new Date(iso);
-            if (!Number.isNaN(+dt) && dt.getMonth()+1 === Number(MM)) {
-              foundFoundingDate = iso;
-              break;
+      let count = 0;
+      for (const u of Array.from(extraChunkUrls)) {
+        if (count++ >= 8) break; // 取りすぎ防止
+        try {
+          const resp = await page.request.get(u, { timeout: 15_000 });
+          if (!resp.ok()) continue;
+          const ct = (resp.headers()['content-type'] || '').toLowerCase();
+          if (!(ct.includes('javascript') || u.endsWith('.js'))) continue;
+
+          const text = await resp.text();
+          if (!text) continue;
+
+          tappedUrls.push(u);
+          tappedBodies.push({ url: u, ct, textLen: text.length });
+          fetchedMeta.push({ url: u, ct, textLen: text.length });
+
+          // 電話
+          (text.match(PHONE_RE) || []).map(normalizeJpPhone).filter(Boolean).forEach(v => bundlePhones.push(v));
+          // 郵便番号
+          (text.match(ZIP_RE)   || []).filter(looksLikeZip7).forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+          // 住所っぽい行
+          for (const line of text.split(/\n+/)) {
+            if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
+              bundleAddrs.push(line.replace(/\s+/g,' ').trim());
             }
           }
-        }
+          // 設立日（2nd pass）
+          if (!foundFoundingDate) {
+            const hit = tryExtractFounding(text);
+            if (hit) foundFoundingDate = hit;
+          }
+          // sameAs
+          const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/g) || [];
+          for (const raw of urlMatches) {
+            try {
+              const p = new URL(raw);
+              if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+            } catch(_) {}
+          }
+        } catch {}
       }
     } catch {}
-  }
-} catch {}
-// -------- 2nd pass end --------
+    // -------- 2nd pass end --------
 
     // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
@@ -496,34 +458,34 @@ try {
       bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
     }
 
-// --- sameAs フィルタ＆重複排除（SNS系のみ残す） ---
-const ALLOW_HOST_SNS = /(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|youtube\.com|linkedin\.com|tiktok\.com)/i;
-const sameAsClean = Array.from(new Set(
-  (bundleSameAs || [])
-    .map(u => String(u || '').trim())
-    .filter(u => /^https?:\/\//i.test(u))
-    .filter(u => ALLOW_HOST_SNS.test(u))
-));
+    // --- sameAs フィルタ＆重複排除（SNS系のみ残す） ---
+    const ALLOW_HOST_SNS = /(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|youtube\.com|linkedin\.com|tiktok\.com)/i;
+    const sameAsClean = Array.from(new Set(
+      (bundleSameAs || [])
+        .map(u => String(u || '').trim())
+        .filter(u => /^https?:\/\//i.test(u))
+        .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
+    ));
 
-// ---- 返却ペイロードを組み立て ----
-const structured = {
-  telephone: pickedPhone || null,
-  address: pickedAddress || null,
-  foundingDate: foundFoundingDate || null,
-  sameAs: sameAsClean
-};
+    // ---- 返却ペイロードを組み立て ----
+    const structured = {
+      telephone: pickedPhone || null,
+      address: pickedAddress || null,
+      foundingDate: foundFoundingDate || null,
+      sameAs: sameAsClean
+    };
 
-const jsonldSynth = [{
-  "@context": "https://schema.org",
-  "@type": "Organization",
-  "url": urlToFetch,
-  "name": "企業情報",
-  ...(pickedPhone ? { "telephone": pickedPhone } : {}),
-  ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
-  ...(sameAsClean && sameAsClean.length ? { "sameAs": sameAsClean } : {})
-}];
+    const jsonldSynth = [{
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "url": urlToFetch,
+      "name": "企業情報",
+      ...(pickedPhone ? { "telephone": pickedPhone } : {}),
+      ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
+      ...(sameAsClean && sameAsClean.length ? { "sameAs": sameAsClean } : {})
+    }];
 
-const elapsedMs = Date.now() - t0;
+    const elapsedMs = Date.now() - t0;
 
     const responsePayload = {
       url: urlToFetch,
@@ -537,7 +499,7 @@ const elapsedMs = Date.now() - t0;
         innerTextLen: innerText.length,
         docTextLen: docText.length,
         jsUrls: jsUrls.slice(0, 10),
-        tappedUrls: tappedUrls.slice(0, 20),
+        tappedUrls: tappedUrls.slice(0, 40),
         tappedBodiesMeta: fetchedMeta.slice(0, 10),
         bundlePhones: phones.slice(0, 10),
         bundleZips: zips.slice(0, 10),
@@ -549,7 +511,7 @@ const elapsedMs = Date.now() - t0;
           : null,
         labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
         foundingDatePicked: foundFoundingDate || null,
-        sameAsCount: sameAsClean.length,
+        sameAsCount: new Set(sameAsClean).size,
         elapsedMs
       }
     };
