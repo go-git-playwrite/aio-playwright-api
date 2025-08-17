@@ -283,7 +283,6 @@ const foundingFromDom = await page.evaluate(() => {
 });
 
 // 文字列 → ISO(YYYY-MM-DD) へ軽整形
-let foundFoundingDate = '';
 (function () {
   const t = String(foundingFromDom || '').replace(/[.\u30fb]/g, '/'); // 句点などゆる変換
   // 「1999年5月6日」「1999-5-6」「1999/5/6」などを許容
