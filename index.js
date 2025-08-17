@@ -64,6 +64,70 @@ function decodeUnicodeEscapes(s){
     String.fromCharCode(parseInt(hex, 16))
   );
 }
+// ===== JSON-LD 抽出・正規化まわり =====
+
+// URL 正規化（クエリ・ハッシュ除去）
+function normalizeUrl(u) {
+  try {
+    const x = new URL(u);
+    return x.origin + x.pathname;
+  } catch {
+    return String(u || '');
+  }
+}
+
+// HTML文字列から <script type="application/ld+json"> を全部抜いて JSON.parse
+function extractJsonLdFromHtml(html) {
+  const out = [];
+  if (!html) return out;
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const raw = (m[1] || '').trim();
+    if (!raw) continue;
+    try {
+      // JSON-LD には配列とオブジェクトの両方が来る
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) out.push(...parsed);
+      else out.push(parsed);
+    } catch(_) {}
+  }
+  return out;
+}
+
+// JSON-LD から Organization/Corporation 類や住所/電話/設立が入っていそうなノードだけを抽出
+function pickOrgNodes(jsonldArray) {
+  const arr = Array.isArray(jsonldArray) ? jsonldArray : [];
+  const okType = /^(Organization|Corporation|LocalBusiness|NGO|EducationalOrganization|GovernmentOrganization)$/i;
+  const picked = [];
+
+  const flatten = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(flatten); return; }
+    if (node['@graph']) { flatten(node['@graph']); }
+    if (node['@type']) {
+      const t = Array.isArray(node['@type']) ? node['@type'].join(',') : String(node['@type']||'');
+      if (okType.test(t)) picked.push(node);
+    }
+  };
+
+  arr.forEach(flatten);
+  return picked.length ? picked : arr; // 見つからなければ全体を返す（比較用）
+}
+
+// GTM/外部タグの有無を検知（json-ld 注入のリスク記録用）
+function hasGtmOrExternal(html) {
+  if (!html) return false;
+  return /googletagmanager\.com|googletagservices\.com|gtm\.js|google-analytics\.com/i.test(html);
+}
+
+// トップと /about の JSON-LD を比較して “/about 優先” で返す
+function preferAboutJsonLd(topArr, aboutArr) {
+  const topOrg = pickOrgNodes(topArr);
+  const aboutOrg = pickOrgNodes(aboutArr);
+  if (aboutOrg && aboutOrg.length) return aboutOrg;  // /about を優先
+  return topOrg || [];
+}
 
 // ====== PHONE scoring & picking (代表電話ラベル優先) ======
 function isDummyPhone(n){
@@ -272,6 +336,33 @@ app.get('/scrape', async (req, res) => {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
+// --- トップと /about の JSON-LD を比較 ---
+const targetUrl = normalizeUrl(urlToFetch);
+const u = new URL(targetUrl);
+const topUrl   = u.origin + '/';
+const aboutUrl = u.origin + '/about';
+
+// HTML を取得（ナビゲーションはしない・request 経由）
+let topHtml = '';
+let aboutHtml = '';
+try {
+  const r1 = await page.request.get(topUrl, { timeout: 20000 });
+  if (r1.ok()) topHtml = await r1.text();
+} catch(_) {}
+try {
+  const r2 = await page.request.get(aboutUrl, { timeout: 20000 });
+  if (r2.ok()) aboutHtml = await r2.text();
+} catch(_) {}
+
+const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
+const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
+const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
+
+const gtmTop   = hasGtmOrExternal(topHtml);
+const gtmAbout = hasGtmOrExternal(aboutHtml);
+
+// 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
+
     // ---- HTMLソース（タグあり）----
     const htmlSource = await page.content().catch(() => '');
 
@@ -365,21 +456,6 @@ app.get('/scrape', async (req, res) => {
         .trim()
       )
     ).catch(()=>[]);
-
-    // --- HTML 自体も直取り（sameAs追加）---
-    try {
-      const resp0 = await page.request.get(urlToFetch, { timeout: 20000 });
-      if (resp0.ok()) {
-        const html0 = await resp0.text();
-        const urlMatches0 = html0.match(/https?:\/\/[^\s"'<>]+/g) || [];
-        for (const rawUrl of urlMatches0) {
-          try {
-            const host = new URL(rawUrl).hostname;
-            if (SOCIAL_HOST_RE.test(host)) bundleSameAs.push(String(rawUrl));
-          } catch (_) {}
-        }
-      }
-    } catch {}
 
     // --- リソース由来の JSON（電話/住所/同社SNSのみに使用）---
     for (const u of jsonToTap) {
@@ -607,7 +683,7 @@ app.get('/scrape', async (req, res) => {
     const jsonldSynth = [{
       "@context": "https://schema.org",
       "@type": "Organization",
-      "url": urlToFetch,
+      "url": normalizeUrl(urlToFetch),
       "name": "企業情報",
       ...(pickedPhone ? { "telephone": pickedPhone } : {}),
       ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
@@ -639,11 +715,19 @@ app.get('/scrape', async (req, res) => {
           ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
               .filter(Boolean).join(' ')
           : null,
+jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
+jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
+jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
+jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
+hasGtmTop: !!gtmTop,
+hasGtmAbout: !!gtmAbout,
+normalizedUrl: normalizeUrl(urlToFetch),
         labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
         foundingDatePicked: foundFoundingDate || null,
         foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
         sameAsCount: new Set(sameAsClean).size,
         elapsedMs
+
       }
     };
 
