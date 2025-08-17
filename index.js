@@ -249,6 +249,19 @@ app.get('/scrape', async (req, res) => {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
+// --- DOM の dt/dd から「設立」を拾う（フォールバック用） ---
+function toIsoFromJpDate(s){
+  const t = String(s || '').replace(/\s+/g,'');
+  const m = t.match(/((19|20)\d{2})年(\d{1,2})月(\d{1,2})日?/);
+  if (!m) return null;
+  const Y = m[1].padStart(4,'0');
+  const M = String(m[3]).padStart(2,'0');  // ← ここ重要
+  const D = String(m[4]).padStart(2,'0');  // ← ここ重要
+  return `${Y}-${M}-${D}`;
+}
+
+let foundFoundingDate = ''; // 既存の変数があればそれを使ってOK
+
 // === DOM直読みで設立/創業日を拾う（dt/dd・表のth/td対応） ===
 const foundingFromDom = await page.evaluate(() => {
   const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -342,7 +355,6 @@ let foundFoundingDate = '';
     const tappedBodies = [];
     const tappedAppIndexBodies = [];
     const labelHitPhones = [];
-    let foundFoundingDate = '';
 
     const LABEL_RE = /(代表電話|代表|電話|お問い合わせ|TEL|Tel|Phone)/i;
 
