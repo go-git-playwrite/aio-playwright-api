@@ -242,6 +242,15 @@ app.get('/scrape', async (req, res) => {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
+// ← ここは既存
+await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
+
+// ★ 追加：dt/th に「設立|創業」が現れるまで最大 8 秒待つ
+await page.waitForFunction(() => {
+  const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
+  return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
+}, { timeout: 8000 }).catch(()=>{});
+
     // ---- DOMテキスト（空でもOK）----
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
@@ -371,6 +380,7 @@ const foundingFromDom = await page.evaluate(() => {
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
 
         const text = await resp.text();
+        const textDecoded = text.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
         if (/\/app-index\.js(\?|$)/.test(u)) {
           tappedAppIndexBodies.push(text || '');
         }
@@ -410,7 +420,7 @@ const foundingFromDom = await page.evaluate(() => {
         }
         // 設立日（1st pass）
         if (!foundFoundingDate) {
-          const hit = tryExtractFounding(text);
+          const hit = tryExtractFounding(textDecoded); // ← textDecoded を使う
           if (hit) foundFoundingDate = hit;
         }
         // sameAs らしき URL（スクリプト内の直書き）
@@ -466,7 +476,7 @@ const foundingFromDom = await page.evaluate(() => {
           }
           // 設立日（2nd pass）
           if (!foundFoundingDate) {
-            const hit = tryExtractFounding(text);
+            const hit = tryExtractFounding(textDecoded);
             if (hit) foundFoundingDate = hit;
           }
           // sameAs
