@@ -231,7 +231,7 @@ app.get('/scrape', async (req, res) => {
 
     // sameAs 候補（ページ内 a[href]）
     const bundleSameAs = [];
-    const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com|github\.com)/i;
+    const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com)/i;
     const anchorHrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href') || '').filter(Boolean)).catch(()=>[]);
     for (const href of anchorHrefs) {
       try {
@@ -273,6 +273,7 @@ app.get('/scrape', async (req, res) => {
     const fetchedMeta  = [];
     const tappedUrls   = [];
     const tappedBodies = [];
+    const tappedAppIndexBodies = [];
     const labelHitPhones = [];
     let foundFoundingDate = '';
 
@@ -291,8 +292,14 @@ app.get('/scrape', async (req, res) => {
         const ct = (resp.headers()['content-type'] || '').toLowerCase();
         if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
 
-        const text = await resp.text();
-        if (!text) continue;
+const text = await resp.text();
+
+
+if (/\/app-index\.js(\?|$)/.test(u)) {
+  tappedAppIndexBodies.push(text);
+}
+
+if (!text) continue;
 
         tappedUrls.push(u);
         tappedBodies.push({ url: u, ct, textLen: text.length });
@@ -364,6 +371,74 @@ app.get('/scrape', async (req, res) => {
       } catch(_) {}
     }
 
+// -------- 2nd pass: app-index.js が参照する chunk-*.js を追加で叩く --------
+try {
+  const extraChunkUrls = new Set();
+  for (const t of tappedAppIndexBodies) {
+    const m = t.match(/["'`](\/chunk-[A-Z0-9-]+\.js)["'`]/g) || [];
+    for (const raw of m) {
+      const rel = raw.replace(/^["'`]|["'`]$/g, '');
+      try {
+        const absUrl = new URL(rel, urlToFetch).toString();
+        if (!tappedUrls.includes(absUrl)) extraChunkUrls.add(absUrl);
+      } catch {}
+    }
+  }
+
+  for (const u of Array.from(extraChunkUrls)) {
+    try {
+      const resp = await page.request.get(u, { timeout: 20_000 });
+      if (!resp.ok()) continue;
+      const ct = (resp.headers()['content-type'] || '').toLowerCase();
+      if (!(ct.includes('javascript') || u.endsWith('.js'))) continue;
+
+      const text = await resp.text();
+      if (!text) continue;
+
+      tappedUrls.push(u);
+      tappedBodies.push({ url: u, ct, textLen: text.length });
+      fetchedMeta.push({ url: u, ct, textLen: text.length });
+
+      // 電話
+      (text.match(PHONE_RE) || [])
+        .map(normalizeJpPhone)
+        .filter(Boolean)
+        .forEach(v => bundlePhones.push(v));
+
+      // 郵便番号
+      (text.match(ZIP_RE) || [])
+        .filter(looksLikeZip7)
+        .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+      // 住所っぽい行
+      for (const line of text.split(/\n+/)) {
+        if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
+          bundleAddrs.push(line.replace(/\s+/g,' ').trim());
+        }
+      }
+
+      // 設立日（FOUNDING_RES / foundFoundingDate が既に定義済み前提）
+      if (!foundFoundingDate) {
+        for (const re of FOUNDING_RES) {
+          const m = text.match(re);
+          if (m) {
+            const Y  = String(m[1]).padStart(4, '0');
+            const MM = String(m[3]).padStart(2, '0');
+            const DD = String(m[4]).padStart(2, '0');
+            const iso = `${Y}-${MM}-${DD}`;
+            const dt = new Date(iso);
+            if (!Number.isNaN(+dt) && dt.getMonth()+1 === Number(MM)) {
+              foundFoundingDate = iso;
+              break;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+} catch {}
+// -------- 2nd pass end --------
+
     // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
     const zips   = uniq(bundleZips);
@@ -394,25 +469,34 @@ app.get('/scrape', async (req, res) => {
       bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
     }
 
-    // ---- 返却ペイロードを組み立て ----
-    const structured = {
-      telephone: pickedPhone || null,
-      address: pickedAddress || null,
-      foundingDate: foundFoundingDate || null,
-      sameAs: Array.from(new Set(bundleSameAs.map(s => s.trim()))).slice(0, 20)
-    };
+// --- sameAs フィルタ＆重複排除（SNS系のみ残す） ---
+const ALLOW_HOST_SNS = /(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|youtube\.com|linkedin\.com|tiktok\.com)/i;
+const sameAsClean = Array.from(new Set(
+  (bundleSameAs || [])
+    .map(u => String(u || '').trim())
+    .filter(u => /^https?:\/\//i.test(u))
+    .filter(u => ALLOW_HOST_SNS.test(u))
+));
 
-    const jsonldSynth = [{
-      '@context': 'https://schema.org',
-      '@type': 'Organization',
-      url: urlToFetch,
-      name: '企業情報',
-      ...(pickedPhone ? { telephone: pickedPhone } : {}),
-      ...(pickedAddress ? { address: { '@type': 'PostalAddress', ...pickedAddress } } : {}),
-      ...(structured.sameAs && structured.sameAs.length ? { sameAs: structured.sameAs } : {})
-    }];
+// ---- 返却ペイロードを組み立て ----
+const structured = {
+  telephone: pickedPhone || null,
+  address: pickedAddress || null,
+  foundingDate: foundFoundingDate || null,
+  sameAs: sameAsClean
+};
 
-    const elapsedMs = Date.now() - t0;
+const jsonldSynth = [{
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  "url": urlToFetch,
+  "name": "企業情報",
+  ...(pickedPhone ? { "telephone": pickedPhone } : {}),
+  ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
+  ...(sameAsClean && sameAsClean.length ? { "sameAs": sameAsClean } : {})
+}];
+
+const elapsedMs = Date.now() - t0;
 
     const responsePayload = {
       url: urlToFetch,
@@ -438,7 +522,7 @@ app.get('/scrape', async (req, res) => {
           : null,
         labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
         foundingDatePicked: foundFoundingDate || null,
-        sameAsCount: new Set(bundleSameAs).size,
+        sameAsCount: sameAsClean.length,
         elapsedMs
       }
     };
