@@ -178,20 +178,35 @@ const FOUNDING_RES_SOFT = [
 ];
 function tryExtractFounding(text) {
   if (!text) return '';
-  for (const re of FOUNDING_RES_SOFT) {
-    const m = text.match(re);
+  const t = String(text).replace(/\s+/g, ' ');
+
+  // 1) 「設立/創業」ラベルの直後〜120文字以内に日付
+  const LABEL_NEAR_DATE = /(設立|創業)[^\d]{0,20}((?:19|20)\d{2})[^\d]{0,8}(\d{1,2})[^\d]{0,8}(\d{1,2})/;
+  let m = t.match(LABEL_NEAR_DATE);
+  if (!m) {
+    // 2) ラベル→年のみ or 年月のみ（末尾日がないときは1日に丸め）
+    const LABEL_NEAR_YYYY_MM = /(設立|創業)[^\d]{0,20}((?:19|20)\d{2})[^\d]{0,8}(\d{1,2})(?![^\d]{0,8}\d)/;
+    const LABEL_NEAR_YYYY = /(設立|創業)[^\d]{0,20}((?:19|20)\d{2})(?![^\d]{0,8}\d)/;
+    m = t.match(LABEL_NEAR_YYYY_MM) || t.match(LABEL_NEAR_YYYY);
     if (m) {
-      const Y  = String(m[1]).padStart(4, '0');
+      const Y  = String(m[2]).padStart(4, '0');
       const MM = String(m[3] || '1').padStart(2, '0');
-      const DD = String(m[4] || '1').padStart(2, '0');
+      const DD = '01';
       const iso = `${Y}-${MM}-${DD}`;
       const dt = new Date(iso);
-      if (!Number.isNaN(+dt) && (dt.getUTCMonth()+1) === Number(MM)) {
-        return iso;
-      }
+      if (!Number.isNaN(+dt) && (dt.getMonth() + 1) === Number(MM)) return iso;
+      return '';
     }
+    return '';
   }
-  return '';
+
+  // m: [全体, ラベル, 年, 月, 日]
+  const Y  = String(m[2]).padStart(4, '0');
+  const MM = String(m[3]).padStart(2, '0');
+  const DD = String(m[4]).padStart(2, '0');
+  const iso = `${Y}-${MM}-${DD}`;
+  const dt = new Date(iso);
+  return (!Number.isNaN(+dt) && (dt.getMonth() + 1) === Number(MM)) ? iso : '';
 }
 
 // -------------------- /scrape --------------------
@@ -247,9 +262,6 @@ app.get('/scrape', async (req, res) => {
     await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
-
-// ← ここは既存
-await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
 // ★ 追加：dt/th に「設立|創業」が現れるまで最大 8 秒待つ
 await page.waitForFunction(() => {
