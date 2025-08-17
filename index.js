@@ -249,6 +249,49 @@ app.get('/scrape', async (req, res) => {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
+// === DOM直読みで設立/創業日を拾う（dt/dd・表のth/td対応） ===
+const foundingFromDom = await page.evaluate(() => {
+  const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  // 1) <dl><dt>設立</dt><dd>1999年5月6日</dd>
+  for (const dt of Array.from(document.querySelectorAll('dl dt'))) {
+    if (/設立|創業/.test(dt.textContent || '')) {
+      const dd = dt.nextElementSibling;
+      if (dd) return clean(dd.textContent);
+    }
+  }
+  // 2) <table><tr><th>設立</th><td>...</td></tr> など
+  for (const el of Array.from(document.querySelectorAll('table th, table td'))) {
+    if (/設立|創業/.test(el.textContent || '')) {
+      const td = el.tagName === 'TH' ? el.nextElementSibling : el;
+      if (td) return clean(td.textContent);
+    }
+  }
+  return '';
+});
+
+// 文字列 → ISO(YYYY-MM-DD) へ軽整形
+let foundFoundingDate = '';
+(function () {
+  const t = String(foundingFromDom || '').replace(/[.\u30fb]/g, '/'); // 句点などゆる変換
+  // 「1999年5月6日」「1999-5-6」「1999/5/6」などを許容
+  const m = t.match(/(19|20)\d{2}\D{0,3}(\d{1,2})\D{0,3}(\d{1,2})/);
+  if (!m) return;
+  const Y = String(m[0].match(/(19|20)\d{2}/)[0]).padStart(4, '0');
+  const parts = m[0].replace(/[^\d]/g, ' ').trim().split(/\s+/);
+  // parts から月日を推定（Y 以外の最初の2つ）
+  const nums = parts.map(Number).filter(n => n > 0);
+  // nums 例: [1999, 5, 6] or [1999, 05, 06]
+  const Yidx = nums.findIndex(n => n >= 1900 && n <= 2100);
+  const MM = String(nums[(Yidx === -1 ? 0 : Yidx + 1)] || '').padStart(2, '0');
+  const DD = String(nums[(Yidx === -1 ? 1 : Yidx + 2)] || '').padStart(2, '0');
+  if (!MM || !DD) return;
+  const iso = `${Y}-${MM}-${DD}`;
+  const dt = new Date(iso);
+  if (!Number.isNaN(+dt) && (dt.getMonth() + 1) === Number(MM)) {
+    foundFoundingDate = iso;
+  }
+})();
+
     // tel:リンク
     const telLinks = await page.$$eval('a[href^="tel:"]',
       as => as.map(a => (a.getAttribute('href') || '')
