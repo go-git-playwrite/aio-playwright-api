@@ -264,6 +264,46 @@ await page.waitForFunction(() => {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
+// --- HTMLソース（タグあり）も拾っておく
+const htmlSource = await page.content().catch(() => '');
+
+// タグをまたいでも拾える“超ゆる”マッチ
+function tryExtractFoundingFromHtml(html) {
+  if (!html) return '';
+  const h = String(html);
+  // 例: <dt>設立</dt>\n  <dd>1999年5月6日</dd> のようなパターン
+  const m1 = h.match(/<dt[^>]*>\s*(設立|創業)\s*<\/dt>[\s\S]{0,200}?<dd[^>]*>\s*([^<]+)\s*<\/dd>/i);
+  if (m1 && m1[2]) {
+    const t = m1[2].replace(/\s+/g, '');
+    const m = t.match(/((19|20)\d{2})\D{0,5}(\d{1,2})\D{0,5}(\d{1,2})/);
+    if (m) {
+      const Y = String(m[1]).padStart(4,'0');
+      const M = String(m[3]).padStart(2,'0');
+      const D = String(m[4]).padStart(2,'0');
+      const iso = `${Y}-${M}-${D}`;
+      const dt = new Date(iso);
+      if (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(M)) return iso;
+    }
+  }
+  // “設立1999年5月6日” のように連続したケース（タグ関係なし）
+  const m2 = h.replace(/<[^>]*>/g,' ').match(/設立[^0-9]{0,10}((19|20)\d{2})[^0-9]{0,10}(\d{1,2})[^0-9]{0,10}(\d{1,2})/);
+  if (m2) {
+    const Y = String(m2[1]).padStart(4,'0');
+    const M = String(m2[3]).padStart(2,'0');
+    const D = String(m2[4]).padStart(2,'0');
+    const iso = `${Y}-${M}-${D}`;
+    const dt = new Date(iso);
+    if (!Number.isNaN(+dt) && (dt.getMonth()+1) === Number(M)) return iso;
+  }
+  return '';
+}
+
+let foundFoundingDate = ''; // ここで一度だけ宣言
+if (!foundFoundingDate) {
+   const hitHtml = tryExtractFoundingFromHtml(htmlSource);
+   if (hitHtml) foundFoundingDate = hitHtml;
+ }
+
 // --- DOM の dt/dd から「設立」を拾う（フォールバック用） ---
 function toIsoFromJpDate(s){
   const t = String(s || '').replace(/\s+/g,'');
@@ -274,8 +314,6 @@ function toIsoFromJpDate(s){
   const D = String(m[4]).padStart(2,'0');  // ← ここ重要
   return `${Y}-${M}-${D}`;
 }
-
-let foundFoundingDate = ''; // 既存の変数があればそれを使ってOK
 
 // === DOM直読みで設立/創業日を拾う（dt/dd・表のth/td対応） ===
 const foundingFromDom = await page.evaluate(() => {
@@ -382,6 +420,45 @@ try {
     });
     const abs = (u) => { try { return new URL(u, urlToFetch).toString(); } catch { return null; } };
     const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
+
+// --- ページで読み込まれたリソース一覧から JSON 系も拾う
+const resourceUrls = await page.evaluate(() => {
+  try {
+    return performance.getEntriesByType('resource')
+      .map(e => e.name)
+      .filter(Boolean);
+  } catch { return []; }
+});
+
+// JSON/GoogleAPIっぽいものだけ追加スキャン対象に
+const extraJsonUrls = uniq(resourceUrls.filter(u =>
+  /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(u)
+));
+
+// 既に叩いたURLと重複しないものだけ
+const jsonToTap = extraJsonUrls.filter(u => !jsUrls.includes(u));
+
+for (const u of jsonToTap) {
+  try {
+    const resp = await page.request.get(u, { timeout: 10000 });
+    if (!resp.ok()) continue;
+    const body = await resp.text();
+    if (!body) continue;
+
+    const raw = body;
+    const decoded = decodeUnicodeEscapes(raw);
+    const scan = raw + '\n' + decoded;
+
+    // 設立日候補
+    if (!foundFoundingDate) {
+      const hit = tryExtractFounding(scan);
+      if (hit) { foundFoundingDate = hit; continue; }
+      // HTMLっぽいJSONならタグまたぎで再スキャン
+      const hitHtml = tryExtractFoundingFromHtml(scan);
+      if (hitHtml) { foundFoundingDate = hitHtml; continue; }
+    }
+  } catch {}
+}
 
     // ---- JS/JSON 本文を取得して抽出 ----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
