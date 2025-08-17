@@ -213,6 +213,30 @@ app.get('/scrape', async (req, res) => {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
+// --- raw HTML もスキャンして foundingDate を試す（SPAでDOMが空な場合の保険） ---
+try {
+  const rawResp = await page.request.get(urlToFetch, { timeout: 20000 });
+  if (rawResp.ok()) {
+    const html = await rawResp.text();
+    if (html && !foundFoundingDate) {
+      for (const re of FOUNDING_RES) {
+        const m = html.match(re);
+        if (m) {
+          const Y  = String(m[1]).padStart(4, '0');
+          const MM = String(m[3]).padStart(2, '0');
+          const DD = String(m[4]).padStart(2, '0');
+          const iso = `${Y}-${MM}-${DD}`;
+          const dt  = new Date(iso);
+          if (!Number.isNaN(+dt) && (dt.getMonth() + 1) === Number(MM)) {
+            foundFoundingDate = iso;
+            break;
+          }
+        }
+      }
+    }
+  }
+} catch (_) {}
+
     // ---- DOMテキスト（空でもOK）----
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
