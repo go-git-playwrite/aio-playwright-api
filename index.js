@@ -4,6 +4,7 @@
 
 const express = require('express');
 const { chromium } = require('playwright');
+const PQueue = require('p-queue').default;
 
 const BUILD_TAG = 'scrape-v5-bundle-cache-06-strict';
 const app = express();
@@ -15,6 +16,12 @@ app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); n
 // -------------------- ヘルス --------------------
 app.get('/', (_, res) => res.status(200).json({ ok: true }));
 app.get('/__version', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
+
+// 軽量ヘルスチェック（RSS を見るとメモリ傾向を掴みやすい）
+app.get('/healthz', (_, res) => {
+  const m = process.memoryUsage();
+  res.status(200).json({ ok: true, rss: m.rss, heapUsed: m.heapUsed });
+});
 
 // -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 既定6h
@@ -270,7 +277,18 @@ function getFoundingFromHTML(html) {
 }
 
 // -------------------- /scrape --------------------
+// 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
+const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
+const queue = new PQueue({ concurrency: CONCURRENCY });
+
 app.get('/scrape', async (req, res) => {
+  // キューに積んで 1 ジョブとして実行
+  queue.add(() => scrapeOnce(req, res)).catch(err => {
+    res.status(500).json({ error: 'queue_error', message: String(err) });
+  });
+});
+
+async function scrapeOnce(req, res) {
   const urlToFetch = req.query.url;
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
 
@@ -285,13 +303,24 @@ app.get('/scrape', async (req, res) => {
     }
   } catch(_) {}
 
+  // メモリが既に逼迫している場合はソフトフェイル（Render の再起動ループ回避）
+  const RSS_HARD_LIMIT = Number(process.env.RSS_HARD_LIMIT || 900 * 1024 * 1024); // ~900MB 目安
+  if (process.memoryUsage().rss > RSS_HARD_LIMIT) {
+    return res.status(503).json({ error: 'over_memory_limit', hint: 'reduce concurrency or upgrade instance' });
+  }
+
   let browser = null;
   const t0 = Date.now();
 
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu'
+      ]
     });
 
     const context = await browser.newContext({
@@ -306,6 +335,19 @@ app.get('/scrape', async (req, res) => {
     });
 
     const page = await context.newPage();
+    // デフォルトタイムアウト（ENV で調整可）
+    const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
+    const TOTAL_TIMEOUT_MS = Number(process.env.SCRAPE_TOTAL_TIMEOUT_MS || 25000);
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    page.setDefaultTimeout(NAV_TIMEOUT_MS);
+
+    // 全体タイムアウト番兵：ページがハングしても資源を解放
+    const killer = setTimeout(() => {
+      try { page.close({ runBeforeUnload: false }); } catch (_) {}
+      try { context.close(); } catch (_) {}
+      try { browser.close(); } catch (_) {}
+    }, TOTAL_TIMEOUT_MS + 1000);
+
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -734,7 +776,8 @@ normalizedUrl: normalizeUrl(urlToFetch),
     // --- CACHE SET（成功時のみ保存）
     try { cacheSet(urlToFetch, responsePayload); } catch(_){}
 
-    // 返却
+    // 正常終了
+    clearTimeout(killer);
     return res.status(200).json(responsePayload);
 
   } catch (err) {
@@ -746,8 +789,8 @@ normalizedUrl: normalizeUrl(urlToFetch),
       elapsedMs
     });
   } finally {
-    if (browser) try { await browser.close(); } catch(_) {}
+    try { if (browser) await browser.close(); } catch(_) {}
   }
-});
+}
 
 app.listen(PORT, () => console.log(`[${BUILD_TAG}] running on ${PORT}`));
