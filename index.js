@@ -310,20 +310,18 @@ async function scrapeOnce(req, res) {
   }
 
   let browser = null;
+  let context = null;
+  let page = null;
   const t0 = Date.now();
 
   try {
     browser = await chromium.launch({
       headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      // 共有メモリ不足や権限で落ちるのを回避
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
 
-    const context = await browser.newContext({
+    context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
                  'Chrome/122.0.0.0 Safari/537.36',
@@ -334,7 +332,7 @@ async function scrapeOnce(req, res) {
       timezoneId: 'Asia/Tokyo'
     });
 
-    const page = await context.newPage();
+    page = await context.newPage();
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
     const TOTAL_TIMEOUT_MS = Number(process.env.SCRAPE_TOTAL_TIMEOUT_MS || 25000);
@@ -342,7 +340,7 @@ async function scrapeOnce(req, res) {
     page.setDefaultTimeout(NAV_TIMEOUT_MS);
 
     // 全体タイムアウト番兵：ページがハングしても資源を解放
-    const killer = setTimeout(() => {
+    killer = setTimeout(() => {
       try { page.close({ runBeforeUnload: false }); } catch (_) {}
       try { context.close(); } catch (_) {}
       try { browser.close(); } catch (_) {}
@@ -777,7 +775,7 @@ normalizedUrl: normalizeUrl(urlToFetch),
     try { cacheSet(urlToFetch, responsePayload); } catch(_){}
 
     // 正常終了
-    clearTimeout(killer);
+    if (killer) clearTimeout(killer);
     return res.status(200).json(responsePayload);
 
   } catch (err) {
@@ -789,6 +787,10 @@ normalizedUrl: normalizeUrl(urlToFetch),
       elapsedMs
     });
   } finally {
+    if (killer) clearTimeout(killer);
+    // 終了順：page → context → browser（全て握りつぶし）
+    try { if (page)    await page.close(); } catch(_) {}
+    try { if (context) await context.close(); } catch(_) {}
     try { if (browser) await browser.close(); } catch(_) {}
   }
 }
