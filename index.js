@@ -282,9 +282,10 @@ const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
 const queue = new PQueue({ concurrency: CONCURRENCY });
 
 app.get('/scrape', async (req, res) => {
-  // キューに積んで 1 ジョブとして実行
-  queue.add(() => scrapeOnce(req, res)).catch(err => {
-    res.status(500).json({ error: 'queue_error', message: String(err) });
+  // キューに積んだ Promise を必ず返す（Express が先に切られないように）
+  return queue.add(() => scrapeOnce(req, res)).catch(err => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'queue_error', message: String(err) });
   });
 });
 
@@ -317,8 +318,17 @@ async function scrapeOnce(req, res) {
   try {
     browser = await chromium.launch({
       headless: true,
-      // 共有メモリ不足や権限で落ちるのを回避
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
     });
 
     context = await browser.newContext({
@@ -335,16 +345,8 @@ async function scrapeOnce(req, res) {
     page = await context.newPage();
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
-    const TOTAL_TIMEOUT_MS = Number(process.env.SCRAPE_TOTAL_TIMEOUT_MS || 25000);
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
     page.setDefaultTimeout(NAV_TIMEOUT_MS);
-
-    // 全体タイムアウト番兵：ページがハングしても資源を解放
-    killer = setTimeout(() => {
-      try { page.close({ runBeforeUnload: false }); } catch (_) {}
-      try { context.close(); } catch (_) {}
-      try { browser.close(); } catch (_) {}
-    }, TOTAL_TIMEOUT_MS + 1000);
 
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -775,7 +777,6 @@ normalizedUrl: normalizeUrl(urlToFetch),
     try { cacheSet(urlToFetch, responsePayload); } catch(_){}
 
     // 正常終了
-    if (killer) clearTimeout(killer);
     return res.status(200).json(responsePayload);
 
   } catch (err) {
@@ -787,7 +788,6 @@ normalizedUrl: normalizeUrl(urlToFetch),
       elapsedMs
     });
   } finally {
-    if (killer) clearTimeout(killer);
     // 終了順：page → context → browser（全て握りつぶし）
     try { if (page)    await page.close(); } catch(_) {}
     try { if (context) await context.close(); } catch(_) {}
