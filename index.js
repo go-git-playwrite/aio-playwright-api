@@ -286,6 +286,7 @@ app.get('/scrape', async (req, res) => {
   return queue.add(() => scrapeOnce(req, res)).catch(err => {
     if (!res.headersSent) {
       res.status(500).json({ error: 'queue_error', message: String(err) });
+    }
   });
 });
 
