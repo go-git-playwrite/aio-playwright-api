@@ -739,6 +739,7 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
     const responsePayload = {
       url: urlToFetch,
       bodyText,
+      html: htmlSource,
       jsonld,
       structured,
       jsonldSynth,
