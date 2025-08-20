@@ -276,6 +276,324 @@ function getFoundingFromHTML(html) {
   return '';
 }
 
+// ================== Scoring core (add to index.js) ==================
+const cheerio = require('cheerio');
+
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+function pct(x, min, max){
+  if (max <= min) return 0;
+  return clamp01((x - min) / (max - min));
+}
+function toScore(x){ return Math.round(clamp01(x) * 100); }
+function safe(s){ return (s==null?'':String(s)); }
+
+function parseJsonLdList(jsonldRaw) {
+  // jsonldRaw は配列 or 文字列 or オブジェクトの可能性がある
+  if (!jsonldRaw) return [];
+  if (Array.isArray(jsonldRaw)) return jsonldRaw.filter(Boolean);
+  if (typeof jsonldRaw === 'string') {
+    try { 
+      const v = JSON.parse(jsonldRaw);
+      return Array.isArray(v) ? v : [v];
+    } catch { return []; }
+  }
+  if (typeof jsonldRaw === 'object') return [jsonldRaw];
+  return [];
+}
+function flatTypesFromJsonLd(arr) {
+  const types = new Set();
+  for (const node of arr) {
+    const t = node && node['@type'];
+    if (!t) continue;
+    if (Array.isArray(t)) t.forEach(x => types.add(String(x)));
+    else types.add(String(t));
+    // @graph 内まで掘る
+    if (node['@graph'] && Array.isArray(node['@graph'])) {
+      for (const g of node['@graph']) {
+        const tg = g && g['@type'];
+        if (Array.isArray(tg)) tg.forEach(x => types.add(String(x)));
+        else if (tg) types.add(String(tg));
+      }
+    }
+  }
+  return Array.from(types);
+}
+function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
+
+function analyzeHtmlBasics(html) {
+  const $ = cheerio.load(html || '');
+  const title = $('head > title').text().trim();
+  const metaDesc = $('meta[name="description"]').attr('content') || '';
+  const lang = $('html').attr('lang') || '';
+
+  // セマンティック要素
+  const semanticTags = ['header','nav','main','article','section','aside','footer'];
+  const semanticCount = semanticTags.reduce((a,t)=>a + $(t).length, 0);
+
+  // 見出し
+  const h1s = $('h1');
+  const h2s = $('h2');
+  const h3s = $('h3');
+  const headings = $('h1,h2,h3,h4,h5,h6').get().map(e => Number(e.tagName.slice(1)));
+  // レベル飛び検出（例: h2→h4 など）
+  let levelJumps = 0;
+  for (let i=1; i<headings.length; i++) {
+    const prev = headings[i-1], cur = headings[i];
+    if (cur > prev+1) levelJumps++;
+  }
+
+  // 画像の alt 率
+  const imgs = $('img');
+  const imgCount = imgs.length;
+  const imgAltCount = imgs.filter((_,el)=>!!$(el).attr('alt')).length;
+  const imgAltRatio = imgCount ? (imgAltCount / imgCount) : 1;
+
+  // aタグのラベル性（hrefだけ、"詳しくはこちら"のみ等は弱い）
+  const links = $('a').get();
+  const meaningfulLinks = links.filter(a=>{
+    const txt = ($(a).text() || '').trim();
+    if (!txt) return false;
+    const ng = ['こちら','click','詳しくはこちら','more','詳細','read more'];
+    return !ng.includes(txt.toLowerCase());
+  }).length;
+  const linkRatio = links.length ? meaningfulLinks/links.length : 1;
+
+  // Open Graph / Twitter Card
+  const ogTitle = $('meta[property="og:title"]').attr('content') || '';
+  const ogDesc  = $('meta[property="og:description"]').attr('content') || '';
+  const twCard  = $('meta[name="twitter:card"]').attr('content') || '';
+
+  // パンくず（構造 or 見た目）
+  const hasBreadcrumbDom = $('.breadcrumb, nav[aria-label="breadcrumb"]').length > 0;
+
+  return {
+    title, metaDesc, lang, semanticCount,
+    h1Count: h1s.length, h2Count: h2s.length, h3Count: h3s.length,
+    levelJumps, imgCount, imgAltRatio, linkRatio,
+    hasBreadcrumbDom, hasOg: !!(ogTitle||ogDesc), hasTwitterCard: !!twCard,
+  };
+}
+
+function analyzeTextReadability(bodyText) {
+  const text = safe(bodyText);
+  // 句点で文を割る（日本語想定）
+  const sentences = text.split(/。|\n/).map(s=>s.trim()).filter(Boolean);
+  const charLen = (s)=>s.replace(/\s/g,'').length;
+
+  const lens = sentences.map(charLen);
+  const totalChars = lens.reduce((a,b)=>a+b,0);
+  const avgLen = sentences.length ? totalChars / sentences.length : 0;
+
+  // 長すぎる文の割合（80文字超）
+  const longRatio = sentences.length ? (countIf(lens, L=>L>80) / sentences.length) : 0;
+
+  // 箇条書きの有無（"- "や"・"の頻度）
+  const bullets = (text.match(/(^|\n)\s*[-・＊*●◼︎]/g) || []).length;
+
+  // 漢字だらけ判定を軽く（記号除去後のひらがなカタカナ比率）
+  const onlyChars = text.replace(/[\s0-9!-~、。・…—―「」『』（）【】［］【】\u3000]/g,'');
+  const hiraKata = (onlyChars.match(/[ぁ-んァ-ヶ]/g) || []).length;
+  const ratioHiraKata = onlyChars.length ? (hiraKata / onlyChars.length) : 0;
+
+  return { sentences: sentences.length, avgLen, longRatio, bullets, ratioHiraKata };
+}
+
+function analyzeCoverage(bodyText, html) {
+  const hay = (safe(bodyText) + '\n' + safe(html)).toLowerCase();
+  // 意思決定に効く情報がサイトに揃っているか（キーワード網羅）
+  const keys = [
+    'サービス','製品','特徴','強み','実績','事例','導入','料金','価格','費用',
+    '比較','プラン','サポート','faq','よくある質問','お問い合わせ','連絡先',
+    '会社概要','アクセス','採用','メンバー','チーム','ブログ','ニュース'
+  ];
+  const hits = countIf(keys, k => hay.indexOf(k.toLowerCase()) >= 0);
+  // セクションの多様性（article/section/ul/table）
+  const $ = cheerio.load(html||'');
+  const diversity = ['article','section','ul','ol','table','dl','figure'].reduce((a,t)=>a + ($(t).length>0?1:0), 0);
+  return { keysTotal: keys.length, keysHit: hits, diversity };
+}
+
+function analyzeTrust(bodyText, html, url) {
+  const text = (safe(bodyText) + '\n' + safe(html)).toLowerCase();
+  const trustKeys = [
+    '会社概要','企業情報','特定商取引','プライバシーポリシー','個人情報保護','利用規約',
+    '住所','所在地','電話','tel','お問い合わせ','責任者','監修','著者','発行日','更新日'
+  ];
+  const trustHits = countIf(trustKeys, k => text.indexOf(k.toLowerCase()) >= 0);
+
+  // 住所・電話の露出（実体文字）
+  const hasPhone = /tel[:：]?\s*\+?\d|\d{2,4}-\d{2,4}-\d{3,4}/i.test(text);
+  const hasAddr  = /(東京都|北海道|京都府|大阪府|..県|..市|丁目|番地)/.test(text);
+
+  // 組織系のJSON-LD
+  // 呼び出し側で typesFromJsonLd を渡してもらう
+  return { trustHits, hasPhone, hasAddr, isHttps: /^https:\/\//i.test(url||'') };
+}
+
+// ---- 各スコア（0-100） ----
+function scoreDataStructure(htmlBasics, types) {
+  // 要素: title, meta desc, セマンティック要素数, 画像alt率, 意味のあるリンク率, OG/TwitterCard, パンくず, JSON-LDの量
+  const hasTitle = htmlBasics.title.length > 0;
+  const hasDesc  = htmlBasics.metaDesc.length > 30;
+  const semScore = clamp01(htmlBasics.semanticCount / 4);   // 4種以上で頭打ち
+  const altScore = htmlBasics.imgAltRatio;                  // 0-1
+  const linkScore= htmlBasics.linkRatio;                    // 0-1
+  const ogScore  = htmlBasics.hasOg ? 1 : 0;
+  const twScore  = htmlBasics.hasTwitterCard ? 1 : 0;
+  const bcScore  = htmlBasics.hasBreadcrumbDom ? 1 : 0;
+  const jsonldScore = clamp01(types.length / 4);            // 4タイプ（WebSite/WebPage/Org/Breadcrumb/FAQ等）で満点
+
+  const w = {title:.10, desc:.10, sem:.15, alt:.10, link:.10, og:.05, tw:.05, bc:.05, jsonld:.30};
+  const v = (hasTitle?w.title:0) + (hasDesc?w.desc:0) + semScore*w.sem + altScore*w.alt +
+            linkScore*w.link + ogScore*w.og + twScore*w.tw + bcScore*w.bc + jsonldScore*w.jsonld;
+  return toScore(v);
+}
+
+function scoreDocumentStructure(htmlBasics, html) {
+  const $ = cheerio.load(html||'');
+  const headings = $('h1,h2,h3,h4,h5,h6').get().map(e => Number(e.tagName.slice(1)));
+  const hasH1 = htmlBasics.h1Count === 1;            // h1は1つが理想
+  const hasH2 = htmlBasics.h2Count > 0;
+  const notJump = htmlBasics.levelJumps === 0;
+  const paraCount = $('p').length;
+  const listCount = $('ul,ol').length;
+  const tableCount = $('table').length;
+
+  const w = {h1:.25, h2:.15, notJump:.20, para:.20, list:.10, table:.10};
+  const paraScore = clamp01(paraCount / 10);     // 段落10以上で頭打ち
+  const listScore = clamp01(listCount / 3);      // 3つ以上で頭打ち
+  const tableScore= clamp01(tableCount / 1);     // 1つでOK
+
+  const v = (hasH1?w.h1:0) + (hasH2?w.h2:0) + (notJump?w.notJump:0) +
+            paraScore*w.para + listScore*w.list + tableScore*w.table;
+  return toScore(v);
+}
+
+function scoreClarity(textStats) {
+  // 平均文長が短く、長文比が低く、箇条書きある、ひらカナ比率がそれなりにある → 高得点
+  const sLen = 1 - clamp01((textStats.avgLen - 40) / (120 - 40)); // 40〜120 で線形
+  const sLong= 1 - clamp01(textStats.longRatio);                   // 長文比が低いほど良い
+  const sBul = clamp01(textStats.bullets / 5);                     // 箇条書き（最大5で頭打ち）
+  const sKana= clamp01(textStats.ratioHiraKata / 0.5);             // かな比 0.5 で満点（難語だらけ抑制）
+
+  const w = {len:.35,long:.25,bul:.20,kana:.20};
+  const v = clamp01(sLen)*w.len + clamp01(sLong)*w.long + sBul*w.bul + sKana*w.kana;
+  return toScore(v);
+}
+
+function scoreCoverage(cov) {
+  const k = clamp01(cov.keysHit / Math.max(6, cov.keysTotal)); // 主要6個以上で頭打ち
+  const d = clamp01(cov.diversity / 5);                         // 5要素で満点
+  const v = k*0.7 + d*0.3;
+  return toScore(v);
+}
+
+function scoreTrust(tr, types) {
+  const hasOrg = types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation');
+  const hasContact = types.includes('ContactPoint');
+  const hasBreadcrumb = types.includes('BreadcrumbList');
+  const base = clamp01(tr.trustHits / 6);     // 信頼系の露出 6項目で満点
+  const bonus = (tr.hasPhone?0.1:0) + (tr.hasAddr?0.1:0) + (tr.isHttps?0.1:0) +
+                (hasOrg?0.1:0) + (hasContact?0.05:0) + (hasBreadcrumb?0.05:0);
+  return toScore(clamp01(base + bonus));
+}
+
+function rankFromAvg(avg){
+  const n = Number(avg)||0;
+  if (n >= 85) return 'A';
+  if (n >= 70) return 'B';
+  if (n >= 55) return 'C';
+  if (n >= 40) return 'D';
+  return 'E';
+}
+
+function buildDescriptions({data,doc,clar,cov,tr}) {
+  return {
+    'データ構造': `title/description/セマンティック要素:${data.semanticCount}，画像alt率:${Math.round(data.imgAltRatio*100)}%，リンク可読率:${Math.round(data.linkRatio*100)}%。JSON-LDタイプ:${data.types.join(', ') || 'なし'}`,
+    '文書構造': `h1:${doc.h1Count}，h2:${doc.h2Count}，見出しのレベル飛び:${doc.levelJumps}。段落・箇条書き・表の整備状況を評価。`,
+    '表現の明確さ': `平均文長:${Math.round(clar.avgLen)}字，長文比:${Math.round(clar.longRatio*100)}%，箇条書き:${clar.bullets}，かな比:${Math.round(clar.ratioHiraKata*100)}%。`,
+    '情報網羅性': `意思決定キーワード命中:${cov.keysHit}/${cov.keysTotal}，コンテンツ多様性:${cov.diversity}。`,
+    '信頼性': `信頼キーワード命中:${tr.trustHits}，電話:${tr.hasPhone?'◯':'×'}，住所:${tr.hasAddr?'◯':'×'}，HTTPS:${tr.isHttps?'◯':'×'}. JSON-LD(Org/Contact/Breadcrumb):${data.flags.org? '◯':'×'}/${data.flags.contact? '◯':'×'}/${data.flags.bc? '◯':'×'}`,
+  };
+}
+
+// scraped: { url, html, bodyText, jsonld, structured, jsonldSynth }
+function buildScoresFromScrape(scraped) {
+  const url = scraped.url || '';
+  const html = scraped.html || '';
+  const body = scraped.bodyText || '';
+
+  // JSON-LD（現状=Before）
+  const jsonldArr = parseJsonLdList(scraped.jsonld);
+  const types = flatTypesFromJsonLd(jsonldArr);
+
+  const htmlBasics = analyzeHtmlBasics(html);
+  const textStats  = analyzeTextReadability(body);
+  const cov        = analyzeCoverage(body, html);
+  const tr         = analyzeTrust(body, html, url);
+
+  const sData = scoreDataStructure({...htmlBasics, types, flags:{
+    org: types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation'),
+    contact: types.includes('ContactPoint'),
+    bc: types.includes('BreadcrumbList')
+  }}, types);
+  const sDoc  = scoreDocumentStructure(htmlBasics, html);
+  const sClr  = scoreClarity(textStats);
+  const sCov  = scoreCoverage(cov);
+  const sTr   = scoreTrust(tr, types);
+
+  const beforeScores = [sData, sDoc, sClr, sCov, sTr];
+  const avgBefore = Math.round(beforeScores.reduce((a,b)=>a+b,0)/beforeScores.length);
+
+  // ==== After（JSON-LD強化があれば “その分だけ” 反映）====
+  // scraped.jsonldSynth に FAQPage / BreadcrumbList / Organization 等が含まれていれば、
+  // データ構造＋（該当時のみ）網羅性を実増。文書構造/明確さ/信頼性は基本据え置き。
+  let afterScores = beforeScores.slice(0);
+  const synthArr = parseJsonLdList(scraped.jsonldSynth || scraped.structured);
+  if (synthArr.length) {
+    const t2 = flatTypesFromJsonLd(synthArr);
+
+    // データ構造の再計算（types を置換）
+    const sDataAfter = scoreDataStructure({...htmlBasics, types:t2, flags:{
+      org: t2.includes('Organization') || t2.includes('LocalBusiness') || t2.includes('Corporation'),
+      contact: t2.includes('ContactPoint'),
+      bc: t2.includes('BreadcrumbList')
+    }}, t2);
+
+    // FAQPageやItemListが入った場合のみ “情報網羅性” を小幅に見直す
+    const hasFaq = t2.includes('FAQPage');
+    const hasItemList = t2.includes('ItemList');
+    const sCovAfter = hasFaq || hasItemList ? Math.max(sCov, Math.min(100, sCov + 10)) : sCov;
+
+    afterScores = [sDataAfter, sDoc, sClr, sCovAfter, sTr];
+  }
+
+  const avgAfter = Math.round(afterScores.reduce((a,b)=>a+b,0)/afterScores.length);
+
+  return {
+    url,
+    beforeScores,
+    afterScores,
+    avgBeforeScore: avgBefore,
+    avgAfterScore:  avgAfter,
+    beforeRank: rankFromAvg(avgBefore),
+    afterRank:  rankFromAvg(avgAfter),
+    descriptions: buildDescriptions({
+      data:{...htmlBasics, types, flags:{
+        org: types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation'),
+        contact: types.includes('ContactPoint'),
+        bc: types.includes('BreadcrumbList')
+      }},
+      doc: htmlBasics, clar: textStats, cov, tr
+    }),
+    meta: {
+      scoringVersion: '1.0.0 (/scrape integrated)',
+      generatedAt: new Date().toISOString(),
+    }
+  };
+}
+// ================== end Scoring core ==================
+
 // -------------------- /scrape --------------------
 // 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
 const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
@@ -736,50 +1054,54 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
 
     const elapsedMs = Date.now() - t0;
 
-    const responsePayload = {
-      url: urlToFetch,
-      bodyText,
-      html: htmlSource,
-      jsonld,
-      structured,
-      jsonldSynth,
-      debug: {
-        build: BUILD_TAG,
-        hydrated,
-        innerTextLen: innerText.length,
-        docTextLen: docText.length,
-        jsUrls: jsUrls.slice(0, 10),
-        tappedUrls: tappedUrls.slice(0, 40),
-        tappedBodiesMeta: fetchedMeta.slice(0, 10),
-        bundlePhones: phones.slice(0, 10),
-        bundleZips: zips.slice(0, 10),
-        bundleAddrs: addrs.slice(0, 10),
-        pickedPhone: pickedPhone || null,
-        pickedAddressPreview: pickedAddress
-          ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
-              .filter(Boolean).join(' ')
-          : null,
-jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
-jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
-jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
-jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
-hasGtmTop: !!gtmTop,
-hasGtmAbout: !!gtmAbout,
-normalizedUrl: normalizeUrl(urlToFetch),
-        labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
-        foundingDatePicked: foundFoundingDate || null,
-        foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
-        sameAsCount: new Set(sameAsClean).size,
-        elapsedMs
+const responsePayload = {
+  url: urlToFetch,
+  bodyText,
+  html: htmlSource,
+  jsonld,
+  structured,
+  jsonldSynth,
+  debug: {
+    build: BUILD_TAG,
+    hydrated,
+    innerTextLen: innerText.length,
+    docTextLen: docText.length,
+    jsUrls: jsUrls.slice(0, 10),
+    tappedUrls: tappedUrls.slice(0, 40),
+    tappedBodiesMeta: fetchedMeta.slice(0, 10),
+    bundlePhones: phones.slice(0, 10),
+    bundleZips: zips.slice(0, 10),
+    bundleAddrs: addrs.slice(0, 10),
+    pickedPhone: pickedPhone || null,
+    pickedAddressPreview: pickedAddress
+      ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
+          .filter(Boolean).join(' ')
+      : null,
+    jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
+    jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
+    jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
+    jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
+    hasGtmTop: !!gtmTop,
+    hasGtmAbout: !!gtmAbout,
+    normalizedUrl: normalizeUrl(urlToFetch),
+    labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
+    foundingDatePicked: foundFoundingDate || null,
+    foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
+    sameAsCount: new Set(sameAsClean).size,
+    elapsedMs
+  }
+}; // ← ここで必ず閉じる！
 
-      }
-    };
 
-    // --- CACHE SET（成功時のみ保存）
-    try { cacheSet(urlToFetch, responsePayload); } catch(_){}
+// --- 追加: /scrape で採点も実施して返す ---
+const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
+const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
 
-    // 正常終了
-    return res.status(200).json(responsePayload);
+// --- CACHE SET（成功時のみ保存）
+try { cacheSet(urlToFetch, out); } catch(_) {}
+
+// 正常終了
+return res.status(200).json(out);
 
   } catch (err) {
     const elapsedMs = Date.now() - t0;
