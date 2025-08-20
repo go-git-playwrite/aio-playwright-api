@@ -520,8 +520,8 @@ function buildDescriptions({data,doc,clar,cov,tr}) {
 // scraped: { url, html, bodyText, jsonld, structured, jsonldSynth }
 function buildScoresFromScrape(scraped) {
   const url = scraped.url || '';
-  const html = scraped.html || '';
-  const body = scraped.bodyText || '';
+  const html = (scraped.scoring && scraped.scoring.html)     || scraped.html  || '';
+  const body = (scraped.scoring && scraped.scoring.bodyText) || scraped.bodyText || '';
 
   // JSON-LD（現状=Before）
   const jsonldArr = parseJsonLdList(scraped.jsonld);
@@ -684,6 +684,12 @@ async function scrapeOnce(req, res) {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
+// === ここから追記（本文長しきい値で待機）===
+await page.waitForFunction(() => {
+  const t = (document.documentElement?.innerText || '').replace(/\s+/g,'');
+  return t.length > 200;
+}, { timeout: 8000 }).catch(()=>{});
+
     // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
     await page.waitForFunction(() => {
       const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
@@ -696,6 +702,35 @@ async function scrapeOnce(req, res) {
       page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
+
+// === ここから追記（Shadow DOMも含めて深くテキストを収集）===
+const deepText = await page.evaluate(() => {
+  const seen = new WeakSet();
+  const getText = (root) => {
+    let out = '';
+    const walk = (node) => {
+      if (!node || seen.has(node)) return;
+      seen.add(node);
+      if (node.nodeType === Node.TEXT_NODE) {
+        out += (node.nodeValue || '') + '\n';
+        return;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const sr = node.shadowRoot;
+        if (sr) Array.from(sr.childNodes).forEach(walk);   // Shadow root
+        Array.from(node.childNodes).forEach(walk);         // 通常DOM
+      }
+    };
+    walk(root);
+    return out.replace(/\s+\n/g, '\n').trim();
+  };
+  return getText(document.documentElement);
+}).catch(() => '');
+
+// “描画本文”として優先利用
+const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
+  ? deepText
+  : (innerText || docText || '');
 
 // --- トップと /about の JSON-LD を比較 ---
 const targetUrl = normalizeUrl(urlToFetch);
@@ -1033,6 +1068,12 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
         .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
     ));
 
+// === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
+const scoringHtml  = (aboutHtml || topHtml || htmlSource || '');
+const scoringBodyA = renderedText || '';
+const scoringBodyB = stripTags(scoringHtml);
+const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
+
     // ---- 返却ペイロードを組み立て ----
     const structured = {
       telephone: pickedPhone || null,
@@ -1061,6 +1102,7 @@ const responsePayload = {
   jsonld,
   structured,
   jsonldSynth,
+  scoring: { html: scoringHtml, bodyText: scoringBody },
   debug: {
     build: BUILD_TAG,
     hydrated,
