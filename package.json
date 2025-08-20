@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "playwright": "^1.54.2",
+    "cheerio": "^1.0.0-rc.12",
     "p-queue": "^8.0.1"
   },
   "engines": {
