@@ -98,6 +98,9 @@ async function playScrapeMinimal(url) {
 
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
+  // 追加：ロード完了後にさらに networkidle を待つ（発火しない場合でも catch で続行）
+  try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch (_) {}
+
   // SPA待機
   const waitSelectors = ['main', '#app', '[id*="root"]'];
   for (const sel of waitSelectors) {
@@ -128,19 +131,37 @@ async function playScrapeMinimal(url) {
   };
 }
 
-// === scrape adapter (FIX) ===
+// === scrape adapter (FIX v2) ===
+/**
+ * 役割：
+ * - /scrape が返す bodyText/html を最優先で拾う
+ * - それでも innerText が空なら、cheerio で HTML→本文を復元
+ * - JSON-LD はなければ HTML から抽出
+ */
 async function scrapeForScoring(url) {
-  // 既存のスクレイパ（/scrape の中身と同等）を呼ぶ。
-  // playScrapeMinimal を作ってあるならそれを、なければ yourExistingScrape に差し替え。
+  // 1) 既存スクレイパの呼び出し
+  //   - playScrapeMinimal が定義されていればそれを使う
+  //   - なければ yourExistingScrape(url) にフォールバック（既存名に合わせてOK）
   const r = (typeof playScrapeMinimal === 'function')
     ? await playScrapeMinimal(url)
     : await yourExistingScrape(url);
 
-  // 👉 /scrape が返しているフィールド名に合わせる（bodyText / html）
-  const innerText = r.innerText || r.bodyText || r.text || '';
-  const fullHtml  = r.html || r.fullHtml || '';
+  // 2) フィールド名のゆらぎを吸収（/scrape は bodyText / html を返す）
+  let innerText = r.innerText || r.bodyText || r.text || '';
+  const fullHtml = r.html || r.fullHtml || '';
 
-  // JSON-LD が無ければ HTML から抽出
+  // 3) innerText が空で、HTMLはある → HTMLから本文を復元（cheerio）
+  if ((!innerText || innerText.length === 0) && fullHtml) {
+    try {
+      const $ = cheerio.load(fullHtml);
+      // body テキストを抽出し、空白を整形
+      innerText = $('body').text().replace(/\s+\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+    } catch (e) {
+      console.warn('[adapter] cheerio text fallback failed:', e && e.message ? e.message : e);
+    }
+  }
+
+  // 4) JSON-LD：なければ HTML から抽出
   let jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
   if ((!jsonldArr || jsonldArr.length === 0) && fullHtml) {
     try {
@@ -150,16 +171,20 @@ async function scrapeForScoring(url) {
         .map(n => $(n).text())
         .filter(Boolean)
         .flatMap(t => {
-          try { const j = JSON.parse(t); return Array.isArray(j) ? j : [j]; }
-          catch { return []; }
+          try {
+            const j = JSON.parse(t);
+            return Array.isArray(j) ? j : [j];
+          } catch { return []; }
         });
-    } catch { /* no-op */ }
+    } catch (e) {
+      console.warn('[adapter] cheerio jsonld fallback failed:', e && e.message ? e.message : e);
+    }
   }
 
   return {
     fromScrape: true,
-    hydrated: innerText.length > 200,
-    innerTextLen: innerText.length,
+    hydrated: (innerText && innerText.length > 200) ? true : false,
+    innerTextLen: innerText ? innerText.length : 0,
     fullHtmlLen: fullHtml ? fullHtml.length : 0,
     jsonld: jsonldArr,
     waitStrategy: r.waitStrategy || 'main|#app|[id*=root]',
