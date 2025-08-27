@@ -258,6 +258,10 @@ async function scrapeForScoring(url) {
   let innerText = r.innerText || r.bodyText || r.text || '';
   const fullHtml = r.html || r.fullHtml || '';
 
+  // 既存 /scrape の bodyText が内文より長い場合は優先して採用
+  const altText = r.bodyText || '';
+  if (altText.length > innerText.length) innerText = altText;
+
   // innerText が空なら HTML→本文復元
   if ((!innerText || innerText.length === 0) && fullHtml) {
     try {
@@ -290,22 +294,27 @@ async function scrapeForScoring(url) {
     } catch (_) {}
   }
 
-  // 連絡先の簡易検出（日本語サイト向け・強化版）
+  // 連絡先の簡易検出（日本語サイト向け・HTMLテキストも併用）
   try {
-    // 全角数字・ハイフンを半角に寄せる
-    const z2hMap = { '０':'0','１':'1','２':'2','３':'3','４':'4','５':'5','６':'6','７':'7','８':'8','９':'9','－':'-','ー':'-','―':'-' };
-    const norm = (innerText || '')
+    const $all = fullHtml ? cheerio.load(fullHtml) : null;
+    const htmlText = $all ? $all('body').text() : '';
+    // innerText + HTMLテキストを結合して判定の材料にする
+    const joined = ((innerText || '') + ' ' + (htmlText || '')).trim();
+
+    // 全角→半角、全角ハイフン→半角
+    const z2hMap = { '０': '0', '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9', '－': '-', 'ー': '-', '―': '-' };
+    const norm = joined
       .replace(/[０-９ー―－]/g, ch => z2hMap[ch] || ch)
       .replace(/\s+/g, ' ')
       .trim();
 
-    // 電話番号
+    // 電話番号（国内パターンを緩めに網羅）
     const telRe = /(TEL[:：]?\s*)?(\(0\d{1,4}\)|0\d{1,4})[\s-]?\d{1,4}[\s-]?\d{3,4}/i;
     hasTel = telRe.test(norm);
 
-    // 住所
+    // 住所（郵便番号 or 都道府県名）
     const zipRe = /(〒?\s*\d{3}-\d{4})/;
-    const prefRe = /(東京都|北海道|大阪府|京都府|(?:\S{2,4}県)|(?:\S{2,4}市)|区|町|村)/;
+    const prefRe = /(北海道|青森県|岩手県|宮城県|秋田県|山形県|福島県|茨城県|栃木県|群馬県|埼玉県|千葉県|東京都|神奈川県|新潟県|富山県|石川県|福井県|山梨県|長野県|岐阜県|静岡県|愛知県|三重県|滋賀県|京都府|大阪府|兵庫県|奈良県|和歌山県|鳥取県|島根県|岡山県|広島県|山口県|徳島県|香川県|愛媛県|高知県|福岡県|佐賀県|長崎県|熊本県|大分県|宮崎県|鹿児島県|沖縄県)/;
     hasAddress = zipRe.test(norm) || prefRe.test(norm);
   } catch (e) {
     console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
