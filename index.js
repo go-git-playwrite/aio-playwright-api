@@ -2,13 +2,111 @@
 // 目的: DOMが空でも JS/JSON から電話・住所・sameAs を抽出。
 //       設立日は「誤検出防止のため」DOM/HTML構造からのみ抽出（非必須）。
 
+// === scoring config (ADD) ===
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const WEIGHTS5 = {
+  dataStructure: 35,       // データ構造
+  expressionClarity: 20,   // 表現の明確さ
+  coverage: 20,            // 情報網羅性
+  documentStructure: 15,   // 文書構造
+  trust: 10                // 信頼性
+};
+const USE_REAL_SCORE = process.env.USE_REAL_SCORE !== 'false';
+
+function clamp100(n){ const x = Number(n); return Math.max(0, Math.min(100, isFinite(x)?Math.round(x):0)); }
+function weightedOverall5(ax){
+  const sum = (WEIGHTS5.dataStructure    * clamp100(ax.dataStructure))
+            + (WEIGHTS5.expressionClarity* clamp100(ax.expressionClarity))
+            + (WEIGHTS5.coverage         * clamp100(ax.coverage))
+            + (WEIGHTS5.documentStructure* clamp100(ax.documentStructure))
+            + (WEIGHTS5.trust            * clamp100(ax.trust));
+  return Math.round(sum / 100);
+}
+
+// Gemini scorer (ADD)
+async function scoreWithGemini5axes({ url, scrape }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
+
+  const prompt = `
+You are a strict website AI-friendliness auditor.
+Output strict JSON only (no prose), integers 0-100.
+
+Return exactly:
+{
+ "axes5": {
+   "dataStructure": <0-100>,
+   "expressionClarity": <0-100>,
+   "coverage": <0-100>,
+   "documentStructure": <0-100>,
+   "trust": <0-100>
+ }
+}
+
+Site: ${url}
+Signals: innerTextLen=${scrape.innerTextLen}, jsonldCount=${scrape.jsonld.length}, hydrated=${scrape.hydrated}
+Rules:
+- Use only observable signals; do NOT invent.
+- Only integers 0-100.
+- No additional text besides JSON.
+`.trim();
+
+  const result = await model.generateContent(prompt);
+  const text = result.response.text();
+
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (_) {
+    parsed = { axes5: { dataStructure:60, expressionClarity:60, coverage:60, documentStructure:60, trust:60 } };
+  }
+  const a = parsed && parsed.axes5 ? parsed.axes5 : { dataStructure:60, expressionClarity:60, coverage:60, documentStructure:60, trust:60 };
+  const axes5 = {
+    dataStructure: clamp100(a.dataStructure),
+    expressionClarity: clamp100(a.expressionClarity),
+    coverage: clamp100(a.coverage),
+    documentStructure: clamp100(a.documentStructure),
+    trust: clamp100(a.trust)
+  };
+  const overall = weightedOverall5(axes5);
+
+  return { overall, axes5, weights5: WEIGHTS5, source: 'GEMINI_VIA_SCRAPE' };
+}
+
 const express = require('express');
 const { chromium } = require('playwright');
 const PQueue = require('p-queue').default;
 
-const BUILD_TAG = 'scrape-v5-bundle-cache-06-strict';
+const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// === scrape adapter (ADD) ===
+// 既存のスクレイピングを使って、このフォーマットに整形して返す。
+// 例の中の `yourExistingScrape(url)` を、あなたの関数名に置き換えてください。
+async function scrapeForScoring(url) {
+  // ↓↓↓ ここをあなたの既存呼び出しに合わせて変更 ↓↓↓
+  // 例: const r = await yourExistingScrape(url);
+  const r = await yourExistingScrape(url); // ←関数名だけ置換
+  // ↑↑↑ ここまで ↑↑↑
+
+  // r から innerText/html/jsonld を取り出す。フィールド名はあなたの実装に合わせて変えてOK
+  const innerText = r.innerText || r.text || '';
+  const fullHtml  = r.html || r.fullHtml || '';
+  const jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
+
+  return {
+    fromScrape: true,
+    hydrated: innerText.length > 200,
+    innerTextLen: innerText.length,
+    fullHtmlLen: fullHtml.length,
+    jsonld: jsonldArr,
+    waitStrategy: r.waitStrategy || '(existing)',
+    blockedResources: r.blockedResources || [],
+    facts: r.facts || {},
+    fallbackJsonld: r.fallbackJsonld || {}
+  };
+}
 
 // -------------------- CORS --------------------
 app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
@@ -1160,5 +1258,66 @@ return res.status(200).json(out);
     try { if (browser) await browser.close(); } catch(_) {}
   }
 }
+
+// === /api/score route (ADD) ===
+app.get('/api/score', async (req, res) => {
+  const url = req.query.url;
+  const force = req.query.force; // 'real' | 'dummy'
+  if (!url) return res.status(400).json({ error: 'missing url' });
+
+  const t0 = Date.now();
+  let s = null;
+  try {
+    s = await scrapeForScoring(url); // ← ブロックBの関数
+  } catch (e) {
+    console.error('[scrapeForScoring] failed:', e);
+    s = { fromScrape:false, hydrated:false, innerTextLen:0, fullHtmlLen:0, jsonld:[], waitStrategy:'(failed)', blockedResources:[], facts:{}, fallbackJsonld:{} };
+  }
+
+  // ダミー（5軸）
+  const dummy = {
+    overall: 65,
+    axes5: {
+      dataStructure: 68,
+      expressionClarity: 62,
+      coverage: 64,
+      documentStructure: 60,
+      trust: 66
+    },
+    weights5: WEIGHTS5,
+    source: 'DUMMY_FIXTURE'
+  };
+
+  // 実スコア
+  let real = null;
+  if ((USE_REAL_SCORE || force === 'real') && force !== 'dummy') {
+    try {
+      real = await scoreWithGemini5axes({ url, scrape: s });
+    } catch (e) {
+      console.error('[scoreWithGemini5axes] failed:', e);
+    }
+  }
+
+  const payload = {
+    meta: {
+      targetUrl: url,
+      generatedAt: new Date().toISOString(),
+      'j-from-scrape': !!s?.fromScrape,
+      hydrated: !!s?.hydrated,
+      innerTextLen: s?.innerTextLen || 0,
+      fullHtmlLen: s?.fullHtmlLen || 0,
+      jsonldCount: Array.isArray(s?.jsonld) ? s.jsonld.length : 0,
+      elapsedMs: Date.now() - t0
+    },
+    scores: { real, dummy },
+    before: { source: 'SCRAPE', facts: s?.facts || {} },
+    after: { source: 'FALLBACK_BUILD', jsonld: s?.fallbackJsonld || {} },
+    afterObj: { source: 'FALLBACK_BUILD', jsonld: s?.fallbackJsonld || {} },
+    debug: { wait: s?.waitStrategy, blockedResources: s?.blockedResources, scorerModel: real ? 'gemini-1.5-pro' : 'dummy' }
+  };
+
+  if (force === 'dummy') payload.scores.real = null;
+  res.json(payload);
+});
 
 app.listen(PORT, () => console.log(`[${BUILD_TAG}] running on ${PORT}`));
