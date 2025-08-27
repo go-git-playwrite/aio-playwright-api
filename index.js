@@ -23,54 +23,133 @@ function weightedOverall5(ax){
   return Math.round(sum / 100);
 }
 
-// Gemini scorer (ADD)
+// === scorer (FIX v2: structured prompt + rationales + confidence) ===
 async function scoreWithGemini5axes({ url, scrape }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not set');
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
 
-  const prompt = `
-You are a strict website AI-friendliness auditor.
-Output strict JSON only (no prose), integers 0-100.
+  // 安全ガード
+  const ix = Number(scrape.innerTextLen || 0);
+  const jc = Array.isArray(scrape.jsonld) ? scrape.jsonld.length : 0;
+  const sig = scrape.signals || {};
+  const s = {
+    h1: sig.h1 || 0,
+    h2: sig.h2 || 0,
+    lists: sig.lists || 0,
+    tables: sig.tables || 0,
+    links: sig.links || 0,
+    hasTel: !!sig.hasTel,
+    hasAddress: !!sig.hasAddress,
+    jsonldTypes: Array.isArray(sig.jsonldTypes) ? sig.jsonldTypes : []
+  };
 
-Return exactly:
+  // モデルへの厳密プロンプト
+  const prompt = `
+You are an auditor scoring a website's AI-readiness across 5 axes. 
+Use ONLY the provided numeric/boolean signals; do not invent missing data.
+Return STRICT JSON matching this schema:
+
 {
  "axes5": {
-   "dataStructure": <0-100>,
-   "expressionClarity": <0-100>,
-   "coverage": <0-100>,
-   "documentStructure": <0-100>,
-   "trust": <0-100>
+   "dataStructure": 0-100,
+   "expressionClarity": 0-100,
+   "coverage": 0-100,
+   "documentStructure": 0-100,
+   "trust": 0-100
+ },
+ "rationales": {
+   "dataStructure": [ "<<=50 chars each" ],
+   "expressionClarity": [ "<=50" ],
+   "coverage": [ "<=50" ],
+   "documentStructure": [ "<=50" ],
+   "trust": [ "<=50" ]
  }
 }
 
-Site: ${url}
-Signals: innerTextLen=${scrape.innerTextLen}, jsonldCount=${scrape.jsonld.length}, hydrated=${scrape.hydrated}
+Scoring policy (Japanese site):
+- dataStructure (35): JSON-LD presence/types, machine-identifiable facts (tel/address).
+- expressionClarity (20): clear nouns, concise content (use innerTextLen proxy and lists).
+- coverage (20): breadth/depth proxies (innerTextLen, links).
+- documentStructure (15): h1/h2 counts, lists, tables.
+- trust (10): tel/address presence, policy/contact hints.
+
+Signals:
+- hydrated: ${scrape.hydrated}
+- innerTextLen: ${ix}
+- jsonldCount: ${jc}
+- jsonldTypes: ${JSON.stringify(s.jsonldTypes)}
+- h1: ${s.h1}, h2: ${s.h2}, lists: ${s.lists}, tables: ${s.tables}, links: ${s.links}
+- hasTel: ${s.hasTel}, hasAddress: ${s.hasAddress}
+
 Rules:
-- Use only observable signals; do NOT invent.
-- Only integers 0-100.
-- No additional text besides JSON.
+- Output integers 0–100 only.
+- Provide at most 2 rationale bullets per axis, each <= 50 chars.
+- No prose outside JSON.
 `.trim();
 
-  const result = await model.generateContent(prompt);
-  const text = result.response.text();
-
-  let parsed;
-  try { parsed = JSON.parse(text); } catch (_) {
-    parsed = { axes5: { dataStructure:60, expressionClarity:60, coverage:60, documentStructure:60, trust:60 } };
-  }
-  const a = parsed && parsed.axes5 ? parsed.axes5 : { dataStructure:60, expressionClarity:60, coverage:60, documentStructure:60, trust:60 };
-  const axes5 = {
-    dataStructure: clamp100(a.dataStructure),
-    expressionClarity: clamp100(a.expressionClarity),
-    coverage: clamp100(a.coverage),
-    documentStructure: clamp100(a.documentStructure),
-    trust: clamp100(a.trust)
+  let axes5;
+  let rationales = {
+    dataStructure: [], expressionClarity: [], coverage: [], documentStructure: [], trust: []
   };
+
+  try {
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    const parsed = JSON.parse(text);
+    axes5 = parsed.axes5;
+    rationales = parsed.rationales || rationales;
+  } catch (_) {
+    // フォールバック：信号に基づく簡易ルール
+    const ds = (jc > 0 || s.hasTel || s.hasAddress) ? 70 : 40;
+    const dc = Math.min(90, 30 + s.h1*10 + s.h2*5 + s.lists*5 + s.tables*5);
+    const ec = Math.min(90, 40 + Math.floor(ix/100) + s.lists*3);
+    const cov = Math.min(90, 40 + Math.floor(ix/80) + Math.floor(s.links/10));
+    const tr  = (s.hasTel || s.hasAddress) ? 75 : 50;
+    axes5 = {
+      dataStructure: clamp100(ds),
+      expressionClarity: clamp100(ec),
+      coverage: clamp100(cov),
+      documentStructure: clamp100(dc),
+      trust: clamp100(tr)
+    };
+    rationales = {
+      dataStructure: jc>0 ? ["JSON-LDあり"] : ["JSON-LD無し","本文に電話/住所="+(s.hasTel||s.hasAddress)],
+      expressionClarity: [ "本文長:"+ix, "箇条書き:"+s.lists ],
+      coverage: [ "本文長:"+ix, "リンク数:"+s.links ],
+      documentStructure: [ "h1:"+s.h1+" h2:"+s.h2, "リスト/表:"+s.lists+"/"+s.tables ],
+      trust: [ "電話:"+s.hasTel, "住所:"+s.hasAddress ]
+    };
+  }
+
+  // overall（重み 35/20/20/15/10）
   const overall = weightedOverall5(axes5);
 
-  return { overall, axes5, weights5: WEIGHTS5, source: 'GEMINI_VIA_SCRAPE' };
+  // 簡易 confidence（0-1）：材料が多い & JSON-LD あり & hydrated で上がる
+  const confBase = Math.max(0, Math.min(1, (ix/1500)));
+  const confBoost = (scrape.hydrated ? 0.1 : 0) + (jc>0 ? 0.15 : 0);
+  const confidence = Math.max(0.3, Math.min(0.98, confBase + confBoost));
+
+  return {
+    overall,
+    axes5: {
+      dataStructure: clamp100(axes5.dataStructure),
+      expressionClarity: clamp100(axes5.expressionClarity),
+      coverage: clamp100(axes5.coverage),
+      documentStructure: clamp100(axes5.documentStructure),
+      trust: clamp100(axes5.trust)
+    },
+    weights5: WEIGHTS5,
+    rationales,
+    evidence: {
+      innerTextLen: ix, jsonldCount: jc, jsonldTypes: s.jsonldTypes,
+      h1: s.h1, h2: s.h2, lists: s.lists, tables: s.tables, links: s.links,
+      hasTel: s.hasTel, hasAddress: s.hasAddress
+    },
+    confidence,
+    source: 'GEMINI_VIA_SCRAPE'
+  };
 }
 
 const express = require('express');
@@ -131,7 +210,7 @@ async function playScrapeMinimal(url) {
   };
 }
 
-// === scrape adapter (FIX v2) ===
+// === scrape adapter (FIX v3: signals) ===
 /**
  * 役割：
  * - /scrape が返す bodyText/html を最優先で拾う
@@ -139,47 +218,53 @@ async function playScrapeMinimal(url) {
  * - JSON-LD はなければ HTML から抽出
  */
 async function scrapeForScoring(url) {
-  // 1) 既存スクレイパの呼び出し
-  //   - playScrapeMinimal が定義されていればそれを使う
-  //   - なければ yourExistingScrape(url) にフォールバック（既存名に合わせてOK）
   const r = (typeof playScrapeMinimal === 'function')
     ? await playScrapeMinimal(url)
     : await yourExistingScrape(url);
 
-  // 2) フィールド名のゆらぎを吸収（/scrape は bodyText / html を返す）
   let innerText = r.innerText || r.bodyText || r.text || '';
   const fullHtml = r.html || r.fullHtml || '';
 
-  // 3) innerText が空で、HTMLはある → HTMLから本文を復元（cheerio）
+  // innerText が空なら HTML→本文復元
   if ((!innerText || innerText.length === 0) && fullHtml) {
     try {
       const $ = cheerio.load(fullHtml);
-      // body テキストを抽出し、空白を整形
       innerText = $('body').text().replace(/\s+\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
-    } catch (e) {
-      console.warn('[adapter] cheerio text fallback failed:', e && e.message ? e.message : e);
-    }
+    } catch (_) {}
   }
 
-  // 4) JSON-LD：なければ HTML から抽出
+  // --- 追加：DOMシグナル抽出（根拠用） ---
+  let h1 = 0, h2 = 0, lists = 0, tables = 0, links = 0;
+  let hasTel = false, hasAddress = false;
   let jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
-  if ((!jsonldArr || jsonldArr.length === 0) && fullHtml) {
+
+  if (fullHtml) {
     try {
       const $ = cheerio.load(fullHtml);
-      jsonldArr = $('script[type="application/ld+json"]')
-        .toArray()
-        .map(n => $(n).text())
-        .filter(Boolean)
-        .flatMap(t => {
-          try {
-            const j = JSON.parse(t);
-            return Array.isArray(j) ? j : [j];
-          } catch { return []; }
+      h1 = $('h1').length;
+      h2 = $('h2').length;
+      lists = $('ul,ol').length;
+      tables = $('table').length;
+      links = $('a[href]').length;
+
+      // JSON-LD 抽出（なければ）
+      if (!jsonldArr || jsonldArr.length === 0) {
+        jsonldArr = $('script[type="application/ld+json"]').toArray().flatMap(n => {
+          const t = $(n).text();
+          try { const j = JSON.parse(t); return Array.isArray(j) ? j : [j]; } catch { return []; }
         });
-    } catch (e) {
-      console.warn('[adapter] cheerio jsonld fallback failed:', e && e.message ? e.message : e);
-    }
+      }
+    } catch (_) {}
   }
+
+  // 連絡先の簡易検出（日本語サイト向けの軽い正規表現）
+  try {
+    const t = (innerText || '').replace(/\s+/g, ' ');
+    hasTel = /0\d{1,4}-\d{1,4}-\d{3,4}/.test(t) || /TEL[:：]?\s*\d/.test(t);
+    hasAddress = /〒?\d{3}-\d{4}/.test(t) || /(東京都|道府県|市|区|町|村)/.test(t);
+  } catch (_) {}
+
+  const signals = { h1, h2, lists, tables, links, hasTel, hasAddress, jsonldTypes: (jsonldArr || []).map(x => x && x['@type']).filter(Boolean) };
 
   return {
     fromScrape: true,
@@ -190,7 +275,8 @@ async function scrapeForScoring(url) {
     waitStrategy: r.waitStrategy || 'main|#app|[id*=root]',
     blockedResources: r.blockedResources || ['font','media'],
     facts: r.facts || {},
-    fallbackJsonld: r.fallbackJsonld || {}
+    fallbackJsonld: r.fallbackJsonld || {},
+    signals // ★ 追加：採点に渡す根拠
   };
 }
 
