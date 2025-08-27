@@ -160,52 +160,85 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// === minimal Playwright scrape (ADD) ===
+// === helper: lazyload対応の自動スクロール ===
+async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } = {}) {
+  let total = 0;
+  for (let i = 0; i < maxScrolls; i++) {
+    total = await page.evaluate((s) => {
+      window.scrollBy(0, s);
+      return window.scrollY || document.documentElement.scrollTop || 0;
+    }, step);
+    await page.waitForTimeout(pauseMs);
+  }
+  // 先頭に戻す（見出し抽出が安定）
+  await page.evaluate(() => window.scrollTo(0, 0));
+}
+
 const playwright = require('playwright');
+// === minimal Playwright scrape (QUALITY MODE) ===
 async function playScrapeMinimal(url) {
   const browser = await playwright.chromium.launch({
     args: ['--no-sandbox','--disable-setuid-sandbox']
   });
   const page = await browser.newPage({ javaScriptEnabled: true });
 
-  // 軽量化：フォント/メディアをブロック
+  // 画像・フォント・メディアはブロック（テキスト優先で高速化）
   await page.route('**/*', (route) => {
     const t = route.request().resourceType();
-    if (['font','media'].includes(t)) return route.abort();
+    if (['image','font','media'].includes(t)) return route.abort();
     return route.continue();
   });
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  // 1) 初期ロード（DOM完成）→ ネットワーク静穏を1回待つ
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  try { await page.waitForLoadState('networkidle', { timeout: 12000 }); } catch(_) {}
 
-  // 追加：ロード完了後にさらに networkidle を待つ（発火しない場合でも catch で続行）
-  try { await page.waitForLoadState('networkidle', { timeout: 10000 }); } catch (_) {}
-
-  // SPA待機
-  const waitSelectors = ['main', '#app', '[id*="root"]'];
+  // 2) SPAレンダ待ち（候補セレクタ）
+  const waitSelectors = ['main', '#app', '[id*="root"]', 'body'];
   for (const sel of waitSelectors) {
-    try { await page.waitForSelector(sel, { timeout: 5000 }); break; } catch (_) {}
+    try { await page.waitForSelector(sel, { timeout: 6000 }); break; } catch (_) {}
   }
+
+  // 3) 遅延読込対策：自動スクロール（下のヘルパを後で追加します）
+  try { await autoScroll(page, { step: 1200, pauseMs: 300, maxScrolls: 8 }); } catch (_) {}
+
+  // 4) スクリプト後レンダ対策：再度 networkidle を短く
+  try { await page.waitForLoadState('networkidle', { timeout: 6000 }); } catch(_) {}
+
+  // 5) 十分な本文長になるまで“しつこく待つ” （質優先）
+  //    閾値は 600 文字に上げます（以前は 200）
+  const THRESH = 600;
   try {
     await page.waitForFunction(
-      () => document.body && document.body.innerText && document.body.innerText.length > 200,
-      { timeout: 8000 }
+      (n) => document.body && document.body.innerText && document.body.innerText.length > n,
+      { timeout: 12000 },
+      THRESH
     );
-  } catch (_) {}
+  } catch (_) {
+    // ここは妥協点。超えなくても続行。
+  }
 
+  // 6) 抽出
   const fullHtml = await page.content();
-  const innerText = await page.evaluate(() => document.body?.innerText || '');
-  const jsonldRaw = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent).filter(Boolean));
+  const innerText = await page.evaluate(() => (document.body?.innerText || '').trim());
+  const jsonldRaw = await page.$$eval(
+    'script[type="application/ld+json"]',
+    nodes => nodes.map(n => n.textContent).filter(Boolean)
+  );
 
+  // JSON-LD パース
   const jsonld = [];
   for (const t of jsonldRaw) {
-    try { const j = JSON.parse(t); Array.isArray(j) ? jsonld.push(...j) : jsonld.push(j); } catch (_) {}
+    try { const j = JSON.parse(t); Array.isArray(j) ? jsonld.push(...j) : jsonld.push(j); }
+    catch (_) {}
   }
 
   await browser.close();
 
   return {
     innerText, html: fullHtml, jsonld,
-    waitStrategy:'main|#app|[id*=root]', blockedResources:['font','media'],
+    waitStrategy:'quality:domcontentloaded→networkidle→autoscroll→networkidle→len>600',
+    blockedResources:['image','font','media'],
     facts:{}, fallbackJsonld:{}
   };
 }
@@ -257,18 +290,37 @@ async function scrapeForScoring(url) {
     } catch (_) {}
   }
 
-  // 連絡先の簡易検出（日本語サイト向けの軽い正規表現）
+  // 連絡先の簡易検出（日本語サイト向け・強化版）
+  let hasTel = false, hasAddress = false;
   try {
-    const t = (innerText || '').replace(/\s+/g, ' ');
-    hasTel = /0\d{1,4}-\d{1,4}-\d{3,4}/.test(t) || /TEL[:：]?\s*\d/.test(t);
-    hasAddress = /〒?\d{3}-\d{4}/.test(t) || /(東京都|道府県|市|区|町|村)/.test(t);
-  } catch (_) {}
+    // 全角数字・ハイフンを半角に寄せる
+    const z2hMap = { '０':'0','１':'1','２':'2','３':'3','４':'4','５':'5','６':'6','７':'7','８':'8','９':'9','－':'-','ー':'-','―':'-' };
+    const norm = (innerText || '')
+      .replace(/[０-９ー―－]/g, ch => z2hMap[ch] || ch)
+      .replace(/\s+/g, ' ')
+      .trim();
 
-  const signals = { h1, h2, lists, tables, links, hasTel, hasAddress, jsonldTypes: (jsonldArr || []).map(x => x && x['@type']).filter(Boolean) };
+    // 電話番号
+    const telRe = /(TEL[:：]?\s*)?(\(0\d{1,4}\)|0\d{1,4})[\s-]?\d{1,4}[\s-]?\d{3,4}/i;
+    hasTel = telRe.test(norm);
+
+    // 住所
+    const zipRe = /(〒?\s*\d{3}-\d{4})/;
+    const prefRe = /(東京都|北海道|大阪府|京都府|(?:\S{2,4}県)|(?:\S{2,4}市)|区|町|村)/;
+    hasAddress = zipRe.test(norm) || prefRe.test(norm);
+  } catch (e) {
+    console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
+  }
+
+  const signals = {
+    h1, h2, lists, tables, links,
+    hasTel, hasAddress,
+    jsonldTypes: (jsonldArr || []).map(x => x && x['@type']).filter(Boolean)
+  };
 
   return {
     fromScrape: true,
-    hydrated: (innerText && innerText.length > 200) ? true : false,
+    hydrated: (innerText && innerText.length > 600) ? true : false,
     innerTextLen: innerText ? innerText.length : 0,
     fullHtmlLen: fullHtml ? fullHtml.length : 0,
     jsonld: jsonldArr,
