@@ -81,13 +81,60 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// === minimal Playwright scrape (ADD) ===
+const playwright = require('playwright');
+async function playScrapeMinimal(url) {
+  const browser = await playwright.chromium.launch({
+    args: ['--no-sandbox','--disable-setuid-sandbox']
+  });
+  const page = await browser.newPage({ javaScriptEnabled: true });
+
+  // 軽量化：フォント/メディアをブロック
+  await page.route('**/*', (route) => {
+    const t = route.request().resourceType();
+    if (['font','media'].includes(t)) return route.abort();
+    return route.continue();
+  });
+
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+
+  // SPA待機
+  const waitSelectors = ['main', '#app', '[id*="root"]'];
+  for (const sel of waitSelectors) {
+    try { await page.waitForSelector(sel, { timeout: 5000 }); break; } catch (_) {}
+  }
+  try {
+    await page.waitForFunction(
+      () => document.body && document.body.innerText && document.body.innerText.length > 200,
+      { timeout: 8000 }
+    );
+  } catch (_) {}
+
+  const fullHtml = await page.content();
+  const innerText = await page.evaluate(() => document.body?.innerText || '');
+  const jsonldRaw = await page.$$eval('script[type="application/ld+json"]', ns => ns.map(n => n.textContent).filter(Boolean));
+
+  const jsonld = [];
+  for (const t of jsonldRaw) {
+    try { const j = JSON.parse(t); Array.isArray(j) ? jsonld.push(...j) : jsonld.push(j); } catch (_) {}
+  }
+
+  await browser.close();
+
+  return {
+    innerText, html: fullHtml, jsonld,
+    waitStrategy:'main|#app|[id*=root]', blockedResources:['font','media'],
+    facts:{}, fallbackJsonld:{}
+  };
+}
+
 // === scrape adapter (ADD) ===
 // 既存のスクレイピングを使って、このフォーマットに整形して返す。
 // 例の中の `yourExistingScrape(url)` を、あなたの関数名に置き換えてください。
 async function scrapeForScoring(url) {
   // ↓↓↓ ここをあなたの既存呼び出しに合わせて変更 ↓↓↓
   // 例: const r = await yourExistingScrape(url);
-  const r = await yourExistingScrape(url); // ←関数名だけ置換
+  const r = await playScrapeMinimal(url);
   // ↑↑↑ ここまで ↑↑↑
 
   // r から innerText/html/jsonld を取り出す。フィールド名はあなたの実装に合わせて変えてOK
