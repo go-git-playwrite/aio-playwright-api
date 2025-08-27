@@ -1,12 +1,1 @@
-services:
-  - type: web
-    name: aio-playwright-api-2
-    env: node
-    plan: free
-    buildCommand: "npm install"
-    startCommand: "npm start"
-    envVars:
-      - key: NODE_VERSION
-        value: 18
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /var/data/playwright
+
