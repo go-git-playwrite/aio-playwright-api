@@ -298,15 +298,12 @@ async function scrapeForScoring(url) {
   try {
     const $all = fullHtml ? cheerio.load(fullHtml) : null;
     const htmlText = $all ? $all('body').text() : '';
-    // innerText + HTMLテキストを結合して判定の材料にする
+    // innerText + HTMLテキストを結合して判定
     const joined = ((innerText || '') + ' ' + (htmlText || '')).trim();
 
     // 全角→半角、全角ハイフン→半角
     const z2hMap = { '０': '0', '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9', '－': '-', 'ー': '-', '―': '-' };
-    const norm = joined
-      .replace(/[０-９ー―－]/g, ch => z2hMap[ch] || ch)
-      .replace(/\s+/g, ' ')
-      .trim();
+    const norm = joined.replace(/[０-９ー―－]/g, ch => z2hMap[ch] || ch).replace(/\s+/g, ' ').trim();
 
     // 電話番号（国内パターンを緩めに網羅）
     const telRe = /(TEL[:：]?\s*)?(\(0\d{1,4}\)|0\d{1,4})[\s-]?\d{1,4}[\s-]?\d{3,4}/i;
@@ -316,6 +313,9 @@ async function scrapeForScoring(url) {
     const zipRe = /(〒?\s*\d{3}-\d{4})/;
     const prefRe = /(北海道|青森県|岩手県|宮城県|秋田県|山形県|福島県|茨城県|栃木県|群馬県|埼玉県|千葉県|東京都|神奈川県|新潟県|富山県|石川県|福井県|山梨県|長野県|岐阜県|静岡県|愛知県|三重県|滋賀県|京都府|大阪府|兵庫県|奈良県|和歌山県|鳥取県|島根県|岡山県|広島県|山口県|徳島県|香川県|愛媛県|高知県|福岡県|佐賀県|長崎県|熊本県|大分県|宮崎県|鹿児島県|沖縄県)/;
     hasAddress = zipRe.test(norm) || prefRe.test(norm);
+
+    // デバッグしやすいようにサンプルも保持
+    var innerTextSample = norm.slice(0, 160);
   } catch (e) {
     console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
   }
@@ -336,7 +336,8 @@ async function scrapeForScoring(url) {
     blockedResources: r.blockedResources || ['font','media'],
     facts: r.facts || {},
     fallbackJsonld: r.fallbackJsonld || {},
-    signals // ★ 追加：採点に渡す根拠
+    signals,                      // ← 既存ならOK
+    innerTextSample: (innerText || '').slice(0, 160), // ← 追加
   };
 }
 
