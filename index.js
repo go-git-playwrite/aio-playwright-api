@@ -128,28 +128,44 @@ async function playScrapeMinimal(url) {
   };
 }
 
-// === scrape adapter (ADD) ===
-// 既存のスクレイピングを使って、このフォーマットに整形して返す。
-// 例の中の `yourExistingScrape(url)` を、あなたの関数名に置き換えてください。
-async function scrapeForScoring(url) {
-  // ↓↓↓ ここをあなたの既存呼び出しに合わせて変更 ↓↓↓
-  // 例: const r = await yourExistingScrape(url);
-  const r = await playScrapeMinimal(url);
-  // ↑↑↑ ここまで ↑↑↑
+// === scrape adapter (FIX) ===
+const cheerio = require('cheerio'); // package.json に既にあります
 
-  // r から innerText/html/jsonld を取り出す。フィールド名はあなたの実装に合わせて変えてOK
-  const innerText = r.innerText || r.text || '';
+async function scrapeForScoring(url) {
+  // 既存のスクレイパ（/scrape の中身と同等）を呼ぶ。
+  // playScrapeMinimal を作ってあるならそれを、なければ yourExistingScrape に差し替え。
+  const r = (typeof playScrapeMinimal === 'function')
+    ? await playScrapeMinimal(url)
+    : await yourExistingScrape(url);
+
+  // 👉 /scrape が返しているフィールド名に合わせる（bodyText / html）
+  const innerText = r.innerText || r.bodyText || r.text || '';
   const fullHtml  = r.html || r.fullHtml || '';
-  const jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
+
+  // JSON-LD が無ければ HTML から抽出
+  let jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
+  if ((!jsonldArr || jsonldArr.length === 0) && fullHtml) {
+    try {
+      const $ = cheerio.load(fullHtml);
+      jsonldArr = $('script[type="application/ld+json"]')
+        .toArray()
+        .map(n => $(n).text())
+        .filter(Boolean)
+        .flatMap(t => {
+          try { const j = JSON.parse(t); return Array.isArray(j) ? j : [j]; }
+          catch { return []; }
+        });
+    } catch { /* no-op */ }
+  }
 
   return {
     fromScrape: true,
     hydrated: innerText.length > 200,
     innerTextLen: innerText.length,
-    fullHtmlLen: fullHtml.length,
+    fullHtmlLen: fullHtml ? fullHtml.length : 0,
     jsonld: jsonldArr,
-    waitStrategy: r.waitStrategy || '(existing)',
-    blockedResources: r.blockedResources || [],
+    waitStrategy: r.waitStrategy || 'main|#app|[id*=root]',
+    blockedResources: r.blockedResources || ['font','media'],
     facts: r.facts || {},
     fallbackJsonld: r.fallbackJsonld || {}
   };
