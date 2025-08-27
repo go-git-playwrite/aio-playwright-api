@@ -129,8 +129,6 @@ async function playScrapeMinimal(url) {
 }
 
 // === scrape adapter (FIX) ===
-const cheerio = require('cheerio'); // package.json に既にあります
-
 async function scrapeForScoring(url) {
   // 既存のスクレイパ（/scrape の中身と同等）を呼ぶ。
   // playScrapeMinimal を作ってあるならそれを、なければ yourExistingScrape に差し替え。
