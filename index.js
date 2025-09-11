@@ -193,6 +193,15 @@ async function playScrapeMinimal(url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   try { await page.waitForLoadState('networkidle', { timeout: 12000 }); } catch(_) {}
 
+  // ★ここに追加
+  const metaDescription = await page.evaluate(() => {
+    const el =
+      document.querySelector('meta[name="description"]') ||
+      document.querySelector('meta[property="og:description"]') ||
+      document.querySelector('meta[name="twitter:description"]');
+    return el ? (el.getAttribute('content') || '').trim() : '';
+  });
+
   // 2) SPAレンダ待ち（候補セレクタ）
   const waitSelectors = ['main', '#app', '[id*="root"]', 'body'];
   for (const sel of waitSelectors) {
@@ -1058,6 +1067,14 @@ const deepText = await page.evaluate(() => {
   return getText(document.documentElement);
 }).catch(() => '');
 
+// === ここからさらに追記（meta description を head から直接取る）===
+const metaDescription = await page.evaluate(() => {
+  const el = document.head?.querySelector(
+    'meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]'
+  );
+  return el?.getAttribute('content')?.replace(/\s+/g, ' ').trim() || '';
+});
+
 // “描画本文”として優先利用
 const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
   ? deepText
@@ -1434,6 +1451,7 @@ const responsePayload = {
   structured,
   jsonldSynth,
   scoring: { html: scoringHtml, bodyText: scoringBody },
+  metaDescription,
   debug: {
     build: BUILD_TAG,
     hydrated,
