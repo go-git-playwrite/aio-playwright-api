@@ -1022,16 +1022,22 @@ app.get('/scrape', async (req, res) => {
 
 async function scrapeOnce(req, res) {
   const urlToFetch = req.query.url;
+
+  // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
+  const noCache = String(req.query.nocache || '').toLowerCase() === '1';
+
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
 
   // --- CACHE CHECK (early return) ---
   try {
-    const cached = cacheGet(urlToFetch);
-    if (cached && cached.json) {
-      const payload = JSON.parse(JSON.stringify(cached.json));
-      if (!payload.debug) payload.debug = {};
-      payload.debug.cache = { hit: true, ageMs: cached.age, ttlMs: CACHE_TTL_MS };
-      return res.status(200).json(payload);
+    if (!noCache) {
+      const cached = cacheGet(urlToFetch);
+      if (cached && cached.json) {
+        const payload = JSON.parse(JSON.stringify(cached.json));
+        if (!payload.debug) payload.debug = {};
+        payload.debug.cache = { hit: true, ageMs: cached.age, ttlMs: CACHE_TTL_MS, nocache: false };
+        return res.status(200).json(payload);
+      }
     }
   } catch(_) {}
 
@@ -1494,13 +1500,54 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
     const scoringBodyB = stripTags(scoringHtml);
     const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
 
-    // === JSON-LD の実出現をピンポイント待機（最大 12 秒） ===
+    // === JSON-LD の実出現をピンポイント待機（最大 20 秒に延長） ===
     await page.waitForFunction(() => {
       return !!document.querySelector('script[type="application/ld+json" i]');
-    }, { timeout: 12000 }).catch(()=>{});
+    }, { timeout: 20000 }).catch(()=>{}); // ← 12s→20s に延長
 
-    // === 出現後は“超短時間”のスナップショットで十分 ===
+    // === 出現後スナップショット（短時間プローブ） ===
     const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 600, pollMs: 100 });
+
+    // === Fallback: app-index.js 内の JSON-LD リテラル検出（DOM挿入前でも実装あり扱い） ===
+    try {
+      if (!__probe.jsonld_detected_once) {
+        const jsBodies = Array.isArray(tappedAppIndexBodies) ? tappedAppIndexBodies : [];
+        const hit = jsBodies.find(txt =>
+          /"@context"\s*:\s*"https?:\/\/schema\.org"/i.test(txt) ||
+          /type\s*[:=]\s*["']application\/ld\+json["']/i.test(txt)
+        );
+        if (hit) {
+          const start = hit.indexOf('{');
+          const head = start >= 0 ? hit.slice(start, start + 80) : hit.slice(0, 80);
+          __probe.jsonld_detected_once = true;
+          __probe.jsonld_detect_count = Math.max(1, __probe.jsonld_detect_count || 0);
+          __probe.jsonld_timed_out = false;
+          __probe.jsonld_sample_head = head;
+        }
+      }
+    } catch (_) {}
+
+    // === Fallback（コピーライト）：CSR前でも静的/レンダ済みから検知 ===
+    try {
+      if (!__probe.copyright_hit) {
+        const hayA = (typeof scoringHtml === 'string' ? scoringHtml : '') + '\n' + (renderedText || '');
+        const hayB = htmlSource || '';
+        const re = /©|&copy;|&#169;|copyright|コピーライト|著作権/i;
+
+        const hitA = re.test(hayA);
+        const hitB = re.test(hayB);
+
+        if (hitA || hitB) {
+          const src = hitA ? hayA : hayB;
+          const i = src.search(re);
+          const excerpt = i >= 0 ? src.slice(Math.max(0, i - 10), i + 90) : src.slice(0, 100);
+
+          __probe.copyright_hit = true;
+          __probe.copyright_hit_token = '©';
+          __probe.copyright_excerpt = excerpt;
+        }
+      }
+    } catch (_) {}
 
     // === Fallback: app-index.js 内の JSON-LD リテラル検出（DOM挿入前でも実装ありとみなす） ===
     try {
@@ -1604,7 +1651,10 @@ const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
 const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
 
 // --- CACHE SET（成功時のみ保存）
-try { cacheSet(urlToFetch, out); } catch(_) {}
+try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
+
+out.debug = out.debug || {};
+if (noCache) out.debug.cache = { hit: false, nocache: true };
 
 // 正常終了
 return res.status(200).json(out);
