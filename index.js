@@ -174,6 +174,78 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
   await page.evaluate(() => window.scrollTo(0, 0));
 }
 
+// === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
+async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 } = {}) {
+  const t0 = Date.now();
+
+  // DOM 安定化（あっても無くてもOK）
+  await page.waitForLoadState('domcontentloaded').catch(()=>{});
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(()=>{});
+
+  const snapshot = async () => {
+    return await page.evaluate(() => {
+      const scripts = Array.from(
+        document.querySelectorAll('script[type="application/ld+json" i]')
+      );
+      const jsonldCount = scripts.length;
+      const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 80);
+
+      const footer = document.querySelector('footer');
+      const footerText = footer ? (footer.textContent || '') : '';
+      const bodyText = document.body ? (document.body.textContent || '') : '';
+      const searchArea = footerText || bodyText; // footer優先
+      const lower = searchArea.toLowerCase();
+
+      const tokenList = ['©', '&copy;', '&#169;', 'copyright', 'コピーライト', '著作権'];
+      const hasHit = /©|&copy;|&#169;|copyright|コピーライト|著作権/i.test(searchArea);
+      const hitToken = hasHit && (
+        tokenList.find(t => (t === '©' ? searchArea.includes('©') : lower.includes(t.toLowerCase())))
+      ) || '';
+
+      return {
+        jsonldCount,
+        jsonldSampleHead,
+        footerPresent: !!footer,
+        copyrightHit: !!hasHit,
+        copyrightToken: hitToken || '',
+        copyrightExcerpt: (searchArea || '').trim().slice(0, 100),
+      };
+    });
+  };
+
+  while ((Date.now() - t0) < maxWaitMs) {
+    const r = await snapshot();
+    if (r.jsonldCount > 0) {
+      return {
+        jsonld_detected_once: true,
+        jsonld_detect_count: r.jsonldCount,
+        jsonld_wait_ms: Date.now() - t0,
+        jsonld_timed_out: false,
+        jsonld_sample_head: r.jsonldSampleHead,
+        copyright_footer_present: r.footerPresent,
+        copyright_hit: r.copyrightHit,
+        copyright_hit_token: r.copyrightToken,
+        copyright_excerpt: r.copyrightExcerpt,
+      };
+    }
+    await page.waitForTimeout(pollMs);
+  }
+
+  // タイムアウト時
+  const r = await snapshot();
+  return {
+    jsonld_detected_once: false,
+    jsonld_detect_count: r.jsonldCount,
+    jsonld_wait_ms: Date.now() - t0,
+    jsonld_timed_out: true,
+    jsonld_sample_head: '',
+    copyright_footer_present: r.footerPresent,
+    copyright_hit: r.copyrightHit,
+    copyright_hit_token: r.copyrightToken,
+    copyright_excerpt: r.copyrightExcerpt,
+  };
+}
+
 const playwright = require('playwright');
 // === minimal Playwright scrape (QUALITY MODE) ===
 async function playScrapeMinimal(url) {
@@ -1024,11 +1096,14 @@ async function scrapeOnce(req, res) {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
-// === ここから追記（本文長しきい値で待機）===
-await page.waitForFunction(() => {
-  const t = (document.documentElement?.innerText || '').replace(/\s+/g,'');
-  return t.length > 200;
-}, { timeout: 8000 }).catch(()=>{});
+    // === ADD: JSON-LD/コピーライトのプローブ（ここで1回だけ） ===
+    const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 15000, pollMs: 200 });
+
+    // === ここから追記（本文長しきい値で待機）===
+    await page.waitForFunction(() => {
+      const t = (document.documentElement?.innerText || '').replace(/\s+/g,'');
+      return t.length > 200;
+    }, { timeout: 8000 }).catch(()=>{});
 
     // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
     await page.waitForFunction(() => {
@@ -1452,6 +1527,18 @@ const responsePayload = {
   jsonldSynth,
   scoring: { html: scoringHtml, bodyText: scoringBody },
   metaDescription,
+
+  // === ADD: Playwright→GAS I/F（トップレベルで返す） ===
+  jsonld_detected_once: __probe.jsonld_detected_once,
+  jsonld_detect_count: __probe.jsonld_detect_count,
+  jsonld_wait_ms: __probe.jsonld_wait_ms,
+  jsonld_timed_out: __probe.jsonld_timed_out,
+  jsonld_sample_head: __probe.jsonld_sample_head,
+  copyright_footer_present: __probe.copyright_footer_present,
+  copyright_hit: __probe.copyright_hit,
+  copyright_hit_token: __probe.copyright_hit_token,
+  copyright_excerpt: __probe.copyright_excerpt,
+
   debug: {
     build: BUILD_TAG,
     hydrated,
@@ -1479,7 +1566,10 @@ const responsePayload = {
     foundingDatePicked: foundFoundingDate || null,
     foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
     sameAsCount: new Set(sameAsClean).size,
-    elapsedMs
+    elapsedMs,
+
+    // === ADD: デバッグ用にプローブ結果も残す（任意）
+    jsonldProbe: __probe
   }
 }; // ← ここで必ず閉じる！
 
