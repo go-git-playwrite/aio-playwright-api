@@ -1096,9 +1096,6 @@ async function scrapeOnce(req, res) {
     const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
     await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
-    // === ADD: JSON-LD/コピーライトのプローブ（ここで1回だけ） ===
-    const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 15000, pollMs: 200 });
-
     // === ここから追記（本文長しきい値で待機）===
     await page.waitForFunction(() => {
       const t = (document.documentElement?.innerText || '').replace(/\s+/g,'');
@@ -1491,11 +1488,19 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
         .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
     ));
 
-// === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
-const scoringHtml  = (aboutHtml || topHtml || htmlSource || '');
-const scoringBodyA = renderedText || '';
-const scoringBodyB = stripTags(scoringHtml);
-const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
+    // === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
+    const scoringHtml  = (aboutHtml || topHtml || htmlSource || '');
+    const scoringBodyA = renderedText || '';
+    const scoringBodyB = stripTags(scoringHtml);
+    const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
+
+    // === JSON-LD の実出現をピンポイント待機（最大 12 秒） ===
+    await page.waitForFunction(() => {
+      return !!document.querySelector('script[type="application/ld+json" i]');
+    }, { timeout: 12000 }).catch(()=>{});
+
+    // === 出現後は“超短時間”のスナップショットで十分 ===
+    const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 600, pollMs: 100 });
 
     // ---- 返却ペイロードを組み立て ----
     const structured = {
