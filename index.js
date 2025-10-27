@@ -1502,6 +1502,26 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
     // === 出現後は“超短時間”のスナップショットで十分 ===
     const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 600, pollMs: 100 });
 
+    // === Fallback: app-index.js 内の JSON-LD リテラル検出（DOM挿入前でも実装ありとみなす） ===
+    try {
+      if (!__probe.jsonld_detected_once) {
+        // すでに上流で収集済み（/app-index.js の本文）
+        const jsBodies = Array.isArray(tappedAppIndexBodies) ? tappedAppIndexBodies : [];
+        const hit = jsBodies.find(txt =>
+          /"@context"\s*:\s*"https?:\/\/schema\.org"/i.test(txt) ||
+          /type\s*[:=]\s*["']application\/ld\+json["']/i.test(txt)
+        );
+        if (hit) {
+          const start = hit.indexOf('{');
+          const head = start >= 0 ? hit.slice(start, start + 80) : hit.slice(0, 80);
+          __probe.jsonld_detected_once = true;
+          __probe.jsonld_detect_count = Math.max(1, __probe.jsonld_detect_count || 0);
+          __probe.jsonld_timed_out = false;
+          __probe.jsonld_sample_head = head;
+        }
+      }
+    } catch (_) {}
+
     // ---- 返却ペイロードを組み立て ----
     const structured = {
       telephone: pickedPhone || null,
