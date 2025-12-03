@@ -246,6 +246,95 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   };
 }
 
+// === [AIO][HEAD_META v1] head/meta 情報を抽出するヘルパー ==================
+async function extractHeadMetaV1(page) {
+  // title
+  let titleText = '';
+  try {
+    // <title> が無い場合は空文字 or 例外になるので try/catch
+    titleText = (await page.title()) || '';
+  } catch (_) {
+    titleText = '';
+  }
+  const hasTitle = !!titleText.trim();
+
+  // meta description
+  let descText = '';
+  try {
+    // head 内の <meta name="description">（大文字小文字ゆらぎも吸収）
+    const handle = await page.$('head meta[name="description" i]');
+    if (handle) {
+      const content = await handle.getAttribute('content');
+      descText = (content || '').trim();
+      await handle.dispose();
+    }
+  } catch (_) {
+    descText = '';
+  }
+
+  const hasMetaDescription = !!descText;
+  const metaDescriptionLen = descText.length;
+
+  return {
+    hasTitle,
+    titleText,
+    hasMetaDescription,
+    metaDescriptionLen,
+    metaDescriptionText: descText
+  };
+}
+
+// === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta を集約するヘルパー ===
+async function buildAuditSigFromPage(page) {
+  // それぞれのヘルパーを並列で実行
+  const [headMeta, jsonldProbe] = await Promise.all([
+    extractHeadMetaV1(page),
+    probeJsonLdAndCopyright(page)
+  ]);
+
+  const hm = headMeta || {};
+  const jp = jsonldProbe || {};
+
+  // JSON-LD 関連
+  const jsonldCount    = Number(jp.jsonld_detect_count || 0);
+  const jsonldDetected = jsonldCount > 0;
+  const jsonldTimedOut = !!jp.jsonld_timed_out;
+
+  // head/meta 関連（タイトル・description）
+  const hasTitle           = !!hm.hasTitle;
+  const hasMetaDescription = !!hm.hasMetaDescription;
+  const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
+  const metaDescriptionText = String(hm.metaDescriptionText || '');
+  const titleText           = String(hm.titleText || '');
+
+  // コピーライト関連
+  const copyrightHit            = !!jp.copyright_hit;
+  const copyrightExcerpt        = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent  = !!jp.copyright_footer_present;
+  const copyrightHitToken       = String(jp.copyright_hit_token || '');
+
+  return {
+    // JSON-LD 周り
+    jsonldDetected,
+    jsonldCount,
+    jsonldTimedOut,
+    jsonldSampleHead: String(jp.jsonld_sample_head || ''),
+
+    // head/meta 周り
+    hasTitle,
+    hasMetaDescription,
+    metaDescriptionLen,
+    metaDescriptionText,
+    titleText,
+
+    // コピーライト周り
+    copyrightHit,
+    copyrightExcerpt,
+    copyrightFooterPresent,
+    copyrightHitToken
+  };
+}
+
 const playwright = require('playwright');
 // === minimal Playwright scrape (QUALITY MODE) ===
 async function playScrapeMinimal(url) {
