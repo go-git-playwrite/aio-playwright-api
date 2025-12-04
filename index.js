@@ -273,20 +273,10 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
     });
   };
 
-  // === JSON-LD と footer の両方が出るまで出来るだけ待つ ===
-  let last = null;
-  let detectedOnce = false;
-
-  while ((Date.now() - t0) < maxWaitMs) {
+  // --- DOM ベースで JSON-LD が出てくるのを待つループ ---
+  while (Date.now() - t0 < maxWaitMs) {
     const r = await snapshot();
-    last = r;
-
     if (r.jsonldCount > 0) {
-      detectedOnce = true;
-    }
-
-    // JSON-LD が検出済み かつ footer も出ていればそこで確定
-    if (detectedOnce && r.footerPresent) {
       return {
         jsonld_detected_once: true,
         jsonld_detect_count: r.jsonldCount,
@@ -296,25 +286,24 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         copyright_footer_present: r.footerPresent,
         copyright_hit: r.copyrightHit,
         copyright_hit_token: r.copyrightToken,
-        copyright_excerpt: r.copyrightExcerpt,
+        copyright_excerpt: r.copyrightExcerpt
       };
     }
-
     await page.waitForTimeout(pollMs);
   }
 
-  // ここまで来たら時間切れ：最後に見えた snapshot で返す
-  const r = last || (await snapshot());
+  // --- タイムアウト: DOM 上は 0 件だった場合のフォールバック ---
+  const r = await snapshot();
   return {
-    jsonld_detected_once: !!(r && r.jsonldCount > 0),
-    jsonld_detect_count: r ? r.jsonldCount : 0,
+    jsonld_detected_once: false,
+    jsonld_detect_count: r.jsonldCount,
     jsonld_wait_ms: Date.now() - t0,
     jsonld_timed_out: true,
-    jsonld_sample_head: r ? r.jsonldSampleHead : '',
-    copyright_footer_present: r ? r.footerPresent : false,
-    copyright_hit: r ? r.copyrightHit : false,
-    copyright_hit_token: r ? r.copyrightToken : '',
-    copyright_excerpt: r ? r.copyrightExcerpt : '',
+    jsonld_sample_head: '',
+    copyright_footer_present: r.footerPresent,
+    copyright_hit: r.copyrightHit,
+    copyright_hit_token: r.copyrightToken,
+    copyright_excerpt: r.copyrightExcerpt
   };
 
   // A案: DOM に JSON-LD が出てこない場合、type="module" の外部 JS（例: /app-index.js）を 1 本だけ見に行く
