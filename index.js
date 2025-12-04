@@ -184,14 +184,31 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
 
   const snapshot = async () => {
     return await page.evaluate(() => {
-      const scripts = Array.from(
-        document.querySelectorAll('script')
-      ).filter(el => {
+      // === JSON-LD 検出: type と中身の両方を見る ===
+      const allScripts = Array.from(document.querySelectorAll('script'));
+
+      // 1) type に ld+json を含むもの（素直なケース）
+      let scripts = allScripts.filter(el => {
         const t = (el.getAttribute('type') || '').toLowerCase().trim();
         if (!t) return false;
         // application/ld+json, application/ld+json; charset=utf-8 などを許容
-        return t.includes('ld+json');
+        return t.indexOf('ld+json') !== -1;
       });
+
+      // 2) それでも 0 件なら、中身が JSON-LD っぽい script も拾う
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(el => {
+          const t = (el.getAttribute('type') || '').toLowerCase().trim();
+          // JSON-LD が紛れ込みがちな type だけ対象
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') {
+            return false;
+          }
+          const txt = (el.textContent || '').trim();
+          if (!txt) return false;
+          // JSON-LD でほぼ必ず出るキーをざっくりチェック
+          return txt.indexOf('"@context"') !== -1 && txt.indexOf('"@type"') !== -1;
+        });
+      }
 
       const jsonldCount = scripts.length;
       const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 80);
