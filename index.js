@@ -1697,11 +1697,20 @@ const responsePayload = {
   scoring: { html: scoringHtml, bodyText: scoringBody },
   metaDescription,
 
-  // ★ NEW: GAS 側に渡す auditSig オブジェクト
+  // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
+  // Playwright 側の auditSig をそのまま噛ませる
+  hasTitle:           auditSig ? !!auditSig.hasTitle           : false,
+  hasMetaDescription: auditSig ? !!auditSig.hasMetaDescription : (
+    typeof metaDescription === 'string' && metaDescription.trim().length > 0
+  ),
+  metaDescriptionLen: auditSig && typeof auditSig.metaDescriptionLen === 'number'
+    ? auditSig.metaDescriptionLen
+    : (typeof metaDescription === 'string' ? metaDescription.length : 0),
+
+  // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り）
   auditSig,
 
-  // === ADD: Playwright→GAS I/F（トップレベルで返す） ===
-  // 互換性のため、従来のフラットなフィールドも残す
+  // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
   jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
   jsonld_detect_count:  auditSig ? auditSig.jsonldCount          : __probe.jsonld_detect_count,
   jsonld_wait_ms:       __probe.jsonld_wait_ms,
