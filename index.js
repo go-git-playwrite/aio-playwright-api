@@ -178,21 +178,34 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
 async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 } = {}) {
   const t0 = Date.now();
 
-  // DOM 安定化（あっても無くてもOK）
-  await page.waitForLoadState('domcontentloaded').catch(()=>{});
-  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(()=>{});
+  // DOM 安定化（初期 HTML）
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
+  // === JS 描画後の DOM をできるだけ待つ ===
+  // footer や app-index.js の module script が見えるまで追加で待つ
+  try {
+    await page.waitForFunction(() => {
+      // JS 描画後にしか出てこない可能性が高い要素たち
+      const hasFooter = !!document.querySelector('footer .copyright, footer p.copyright, footer small');
+      const hasLdJson = !!document.querySelector('script[type*="ld+json" i]');
+      const hasModuleScript = !!document.querySelector('script[type="module"][src]');
+      return hasFooter || hasLdJson || hasModuleScript;
+    }, { timeout: 8000 });
+  } catch (_) {
+    // JS 側の描画が間に合わなくても、ここで落とさずに従来どおり snapshot へ進む
+  }
+
+  // --- DOM スナップショット: JSON-LD + コピーライトを見る ---
   const snapshot = async () => {
     return await page.evaluate(() => {
-      // === JSON-LD 検出: type と中身の両方を見る ===
       const allScripts = Array.from(document.querySelectorAll('script'));
 
-      // 1) type に ld+json を含むもの（素直なケース）
+      // 1) type に ld+json を含む script（素直な JSON-LD）
       let scripts = allScripts.filter(el => {
         const t = (el.getAttribute('type') || '').toLowerCase().trim();
         if (!t) return false;
-        // application/ld+json, application/ld+json; charset=utf-8 などを許容
-        return t.indexOf('ld+json') !== -1;
+        return t.indexOf('ld+json') !== -1; // application/ld+json; charset=utf-8 なども許容
       });
 
       // 2) それでも 0 件なら、中身が JSON-LD っぽい script も拾う
@@ -216,14 +229,18 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       const footer = document.querySelector('footer');
       const footerText = footer ? (footer.textContent || '') : '';
       const bodyText = document.body ? (document.body.textContent || '') : '';
-      const searchArea = footerText || bodyText; // footer優先
+      const searchArea = footerText || bodyText; // footer 優先
       const lower = searchArea.toLowerCase();
 
       const tokenList = ['©', '&copy;', '&#169;', 'copyright', 'コピーライト', '著作権'];
       const hasHit = /©|&copy;|&#169;|copyright|コピーライト|著作権/i.test(searchArea);
-      const hitToken = hasHit && (
-        tokenList.find(t => (t === '©' ? searchArea.includes('©') : lower.includes(t.toLowerCase())))
-      ) || '';
+      const hitToken =
+        (hasHit &&
+          (tokenList.find(t =>
+            t === '©'
+              ? searchArea.includes('©')
+              : lower.includes(t.toLowerCase())
+          ) || '')) || '';
 
       return {
         jsonldCount,
@@ -231,12 +248,13 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         footerPresent: !!footer,
         copyrightHit: !!hasHit,
         copyrightToken: hitToken || '',
-        copyrightExcerpt: (searchArea || '').trim().slice(0, 100),
+        copyrightExcerpt: (searchArea || '').trim().slice(0, 100)
       };
     });
   };
 
-  while ((Date.now() - t0) < maxWaitMs) {
+  // --- DOM ベースで JSON-LD が出てくるのを待つループ ---
+  while (Date.now() - t0 < maxWaitMs) {
     const r = await snapshot();
     if (r.jsonldCount > 0) {
       return {
@@ -248,14 +266,63 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         copyright_footer_present: r.footerPresent,
         copyright_hit: r.copyrightHit,
         copyright_hit_token: r.copyrightToken,
-        copyright_excerpt: r.copyrightExcerpt,
+        copyright_excerpt: r.copyrightExcerpt
       };
     }
     await page.waitForTimeout(pollMs);
   }
 
-  // タイムアウト時
+  // --- タイムアウト: DOM 上は 0 件だった場合のフォールバック ---
   const r = await snapshot();
+
+  // A案: DOM に JSON-LD が出てこない場合、type="module" の外部 JS（例: /app-index.js）を 1 本だけ見に行く
+  try {
+    if (r.jsonldCount === 0) {
+      // JS 実行後 DOM から、module script の src を拾う
+      const moduleSrcs = await page.evaluate(() => {
+        return Array.from(
+          document.querySelectorAll('script[type="module"][src]')
+        ).map(el => el.src || '');
+      });
+
+      if (Array.isArray(moduleSrcs) && moduleSrcs.length > 0) {
+        // app-index.js があれば最優先、それ以外は先頭を使う
+        let target = moduleSrcs.find(u => u.indexOf('app-index.js') !== -1) || moduleSrcs[0];
+
+        if (target) {
+          const resp = await page.context().request.get(target);
+          if (resp && resp.ok()) {
+            const jsText = await resp.text();
+            const idxContext = jsText.indexOf('"@context"');
+            const idxType = jsText.indexOf('"@type"');
+
+            if (idxContext !== -1 && idxType !== -1) {
+              // ざっくり JSON-LD ありとみなす（種類数は "@type" の出現回数ベース）
+              const typeMatches = jsText.match(/"@type"\s*:/g);
+              const count = typeMatches ? Math.max(1, typeMatches.length) : 1;
+              const head = jsText.slice(Math.max(0, idxContext - 40), idxContext + 200);
+
+              return {
+                jsonld_detected_once: true,
+                jsonld_detect_count: count,
+                jsonld_wait_ms: Date.now() - t0,
+                jsonld_timed_out: false,
+                jsonld_sample_head: head,
+                copyright_footer_present: r.footerPresent,
+                copyright_hit: r.copyrightHit,
+                copyright_hit_token: r.copyrightToken,
+                copyright_excerpt: r.copyrightExcerpt
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // フォールバック失敗時は黙って通常のタイムアウト結果に落とす
+  }
+
+  // フォールバックでも JSON-LD を見つけられなかった場合は、従来通り「0件 + timeout」の扱い
   return {
     jsonld_detected_once: false,
     jsonld_detect_count: r.jsonldCount,
@@ -265,7 +332,7 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
     copyright_footer_present: r.footerPresent,
     copyright_hit: r.copyrightHit,
     copyright_hit_token: r.copyrightToken,
-    copyright_excerpt: r.copyrightExcerpt,
+    copyright_excerpt: r.copyrightExcerpt
   };
 }
 
