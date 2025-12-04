@@ -185,8 +185,14 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   const snapshot = async () => {
     return await page.evaluate(() => {
       const scripts = Array.from(
-        document.querySelectorAll('script[type="application/ld+json" i]')
-      );
+        document.querySelectorAll('script')
+      ).filter(el => {
+        const t = (el.getAttribute('type') || '').toLowerCase().trim();
+        if (!t) return false;
+        // application/ld+json, application/ld+json; charset=utf-8 などを許容
+        return t.includes('ld+json');
+      });
+
       const jsonldCount = scripts.length;
       const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 80);
 
