@@ -229,7 +229,27 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       const footer = document.querySelector('footer');
       const footerText = footer ? (footer.textContent || '') : '';
       const bodyText = document.body ? (document.body.textContent || '') : '';
-      const searchArea = footerText || bodyText; // footer 優先
+
+      // === 著作権テキストの優先候補: footer 内の .copyright 要素 ===
+      let copyrightNodeText = '';
+      const cpNode =
+        footer &&
+        (footer.querySelector('p.copyright, .copyright small, .copyright'));
+
+      if (cpNode) {
+        copyrightNodeText = (cpNode.textContent || '').trim();
+      }
+
+      // searchArea の優先順位:
+      // 1) footer 内の .copyright のテキスト
+      // 2) footer 全体
+      // 3) body 全体
+      const searchArea =
+        (copyrightNodeText && copyrightNodeText) ||
+        (footerText && footerText) ||
+        (bodyText && bodyText) ||
+        '';
+
       const lower = searchArea.toLowerCase();
 
       const tokenList = ['©', '&copy;', '&#169;', 'copyright', 'コピーライト', '著作権'];
@@ -248,7 +268,7 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         footerPresent: !!footer,
         copyrightHit: !!hasHit,
         copyrightToken: hitToken || '',
-        copyrightExcerpt: (searchArea || '').trim().slice(0, 100)
+        copyrightExcerpt: searchArea.trim().slice(0, 100)
       };
     });
   };
