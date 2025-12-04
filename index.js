@@ -1679,6 +1679,14 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
 
     const elapsedMs = Date.now() - t0;
 
+// ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
+let auditSig = null;
+try {
+  auditSig = await buildAuditSigFromPage(page);
+} catch (_) {
+  auditSig = null;  // 失敗しても全体は止めない
+}
+
 const responsePayload = {
   url: urlToFetch,
   bodyText,
@@ -1689,16 +1697,20 @@ const responsePayload = {
   scoring: { html: scoringHtml, bodyText: scoringBody },
   metaDescription,
 
+  // ★ NEW: GAS 側に渡す auditSig オブジェクト
+  auditSig,
+
   // === ADD: Playwright→GAS I/F（トップレベルで返す） ===
-  jsonld_detected_once: __probe.jsonld_detected_once,
-  jsonld_detect_count: __probe.jsonld_detect_count,
-  jsonld_wait_ms: __probe.jsonld_wait_ms,
-  jsonld_timed_out: __probe.jsonld_timed_out,
-  jsonld_sample_head: __probe.jsonld_sample_head,
-  copyright_footer_present: __probe.copyright_footer_present,
-  copyright_hit: __probe.copyright_hit,
-  copyright_hit_token: __probe.copyright_hit_token,
-  copyright_excerpt: __probe.copyright_excerpt,
+  // 互換性のため、従来のフラットなフィールドも残す
+  jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
+  jsonld_detect_count:  auditSig ? auditSig.jsonldCount          : __probe.jsonld_detect_count,
+  jsonld_wait_ms:       __probe.jsonld_wait_ms,
+  jsonld_timed_out:     auditSig ? auditSig.jsonldTimedOut       : __probe.jsonld_timed_out,
+  jsonld_sample_head:   auditSig ? auditSig.jsonldSampleHead     : __probe.jsonld_sample_head,
+  copyright_footer_present: auditSig ? auditSig.copyrightFooterPresent : __probe.copyright_footer_present,
+  copyright_hit:           auditSig ? auditSig.copyrightHit           : __probe.copyright_hit,
+  copyright_hit_token:     auditSig ? auditSig.copyrightHitToken      : __probe.copyright_hit_token,
+  copyright_excerpt:       auditSig ? auditSig.copyrightExcerpt       : __probe.copyright_excerpt,
 
   debug: {
     build: BUILD_TAG,
@@ -1733,7 +1745,6 @@ const responsePayload = {
     jsonldProbe: __probe
   }
 }; // ← ここで必ず閉じる！
-
 
 // --- 追加: /scrape で採点も実施して返す ---
 const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
