@@ -322,9 +322,21 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
               const count = typeMatches ? Math.max(1, typeMatches.length) : 1;
               const head = jsText.slice(Math.max(0, idxContext - 40), idxContext + 200);
 
+              // ★ 追加: "@type": "XXX" を全部拾って配列化（例: ["Corporation","WebSite",...])
+              let typeNames = [];
+              try {
+                const mAll = jsText.matchAll(/"@type"\s*:\s*"([^"]+)"/g);
+                for (const m of mAll) {
+                  if (m[1]) typeNames.push(m[1]);
+                }
+              } catch (_) {
+                typeNames = [];
+              }
+
               return {
                 jsonld_detected_once: true,
                 jsonld_detect_count: count,
+                jsonld_types: typeNames, // ★ ここで types を返す
                 jsonld_wait_ms: Date.now() - t0,
                 jsonld_timed_out: false,
                 jsonld_sample_head: head,
@@ -397,47 +409,9 @@ async function extractHeadMetaV1(page) {
 // === [AIO][AUDIT_SIG v2] JSON-LD / コピーライト / head meta を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
   // それぞれのヘルパーを並列で実行
-  const [headMeta, jsonldProbe, jsonldTypesRaw] = await Promise.all([
+  const [headMeta, jsonldProbe] = await Promise.all([
     extractHeadMetaV1(page),
-    probeJsonLdAndCopyright(page),
-
-    // ★ 追加: DOM から JSON-LD の @type 一覧を直接収集
-    page.evaluate(() => {
-      const types = [];
-      try {
-        const scripts = Array.from(
-          document.querySelectorAll('script[type="application/ld+json" i]')
-        );
-        for (const s of scripts) {
-          const txt = (s.textContent || '').trim();
-          if (!txt) continue;
-
-          let parsed;
-          try {
-            parsed = JSON.parse(txt);
-          } catch {
-            continue;
-          }
-
-          const stack = Array.isArray(parsed) ? parsed : [parsed];
-          for (const node of stack) {
-            if (!node || typeof node !== 'object') continue;
-            const t = node['@type'];
-            if (!t) continue;
-
-            if (Array.isArray(t)) {
-              t.forEach(v => {
-                if (v != null) types.push(String(v));
-              });
-            } else {
-              types.push(String(t));
-            }
-          }
-        }
-      } catch (_) {}
-      // 重複を除去して返す
-      return Array.from(new Set(types));
-    }).catch(() => [])
+    probeJsonLdAndCopyright(page)
   ]);
 
   const hm = headMeta || {};
@@ -448,21 +422,24 @@ async function buildAuditSigFromPage(page) {
   const jsonldDetected = jsonldCount > 0;
   const jsonldTimedOut = !!jp.jsonld_timed_out;
 
-  // ★ 追加: @type 一覧（なければ空配列）
-  const jsonldTypes = Array.isArray(jsonldTypesRaw) ? jsonldTypesRaw : [];
+  // ★追加: タイプ配列を統一的に拾う（snake/camel 両対応）
+  const jsonldTypes =
+    Array.isArray(jp.jsonldTypes)  ? jp.jsonldTypes :
+    Array.isArray(jp.jsonld_types) ? jp.jsonld_types :
+    [];
 
   // head/meta 関連（タイトル・description）
-  const hasTitle            = !!hm.hasTitle;
-  const hasMetaDescription  = !!hm.hasMetaDescription;
+  const hasTitle           = !!hm.hasTitle;
+  const hasMetaDescription = !!hm.hasMetaDescription;
   const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
   const metaDescriptionText = String(hm.metaDescriptionText || '');
   const titleText           = String(hm.titleText || '');
 
   // コピーライト関連
-  const copyrightHit           = !!jp.copyright_hit;
-  const copyrightExcerpt       = String(jp.copyright_excerpt || '');
-  const copyrightFooterPresent = !!jp.copyright_footer_present;
-  const copyrightHitToken      = String(jp.copyright_hit_token || '');
+  const copyrightHit            = !!jp.copyright_hit;
+  const copyrightExcerpt        = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent  = !!jp.copyright_footer_present;
+  const copyrightHitToken       = String(jp.copyright_hit_token || '');
 
   return {
     // JSON-LD 周り
@@ -470,7 +447,7 @@ async function buildAuditSigFromPage(page) {
     jsonldCount,
     jsonldTimedOut,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
-    jsonldTypes, // ★ ここで types を載せる
+    jsonldTypes, // ★ ここに出す
 
     // head/meta 周り
     hasTitle,
