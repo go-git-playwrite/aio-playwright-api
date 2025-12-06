@@ -1445,6 +1445,26 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
       return arr;
     }).catch(()=>[]);
 
+    // === [JSONLD][ORG-WEBSITE-FLAGS v1] Org / WebSite 用フラグを算出 ===
+    // /about 優先の JSON-LD（jsonldPref）があればそれを SSOT として採用し、
+    // 無ければ DOM から拾った jsonld を使う。
+    const jsonldForFlags = (Array.isArray(jsonldPref) && jsonldPref.length)
+      ? jsonldPref
+      : (Array.isArray(jsonld) ? jsonld : []);
+
+    const jsonldTypesAll = flatTypesFromJsonLd(jsonldForFlags);
+
+    const hasJsonLdFlag =
+      Array.isArray(jsonldForFlags) && jsonldForFlags.length > 0;
+
+    const hasOrgJsonLdFlag = jsonldTypesAll.some(t =>
+      /^(Organization|Corporation|LocalBusiness)$/i.test(String(t))
+    );
+
+    const hasWebsiteJsonLdFlag = jsonldTypesAll.some(t =>
+      /^(WebSite|WebPage)$/i.test(String(t))
+    );
+
     // ---- script/src と modulepreload から JS 候補URLを収集 ----
     const { scriptSrcs, preloadHrefs } = await page.evaluate(() => {
       const s = Array.from(document.querySelectorAll('script[src]')).map(el => el.getAttribute('src')).filter(Boolean);
@@ -1817,6 +1837,11 @@ const responsePayload = {
   jsonldSynth,
   scoring: { html: scoringHtml, bodyText: scoringBody },
   metaDescription,
+
+  // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
+  hasJsonLd: hasJsonLdFlag,
+  hasOrgJsonLd: hasOrgJsonLdFlag,
+  hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
 
   // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
   // Playwright 側の auditSig をそのまま噛ませる
