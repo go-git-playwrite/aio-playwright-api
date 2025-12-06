@@ -407,32 +407,92 @@ async function extractHeadMetaV1(page) {
 
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
-  // それぞれのヘルパーを並列で実行
-  const [headMeta, jsonldProbe] = await Promise.all([
+  // 1) head/meta, JSON-LD プローブ, JSON-LD の @type 一覧 を並列で取得
+  const [headMeta, jsonldProbe, jsonldTypesRaw] = await Promise.all([
     extractHeadMetaV1(page),
-    probeJsonLdAndCopyright(page)
-  ]);
+    probeJsonLdAndCopyright(page),
+    // DOM 内の JSON-LD から @type を収集
+    page.evaluate(() => {
+      const types = [];
+
+      const pushTypes = (node) => {
+        if (!node || typeof node !== 'object') return;
+
+        // @type が string の場合
+        if (typeof node['@type'] === 'string') {
+          types.push(node['@type']);
+        }
+        // @type が配列の場合
+        else if (Array.isArray(node['@type'])) {
+          node['@type'].forEach(t => {
+            if (t) types.push(String(t));
+          });
+        }
+
+        // ネストも再帰探索
+        for (const key in node) {
+          if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
+          const v = node[key];
+          if (v && typeof v === 'object') {
+            pushTypes(v);
+          }
+        }
+      };
+
+      const scripts = Array.from(
+        document.querySelectorAll('script[type="application/ld+json" i]')
+      );
+
+      for (const s of scripts) {
+        const txt = (s.textContent || '').trim();
+        if (!txt) continue;
+        try {
+          const parsed = JSON.parse(txt);
+          pushTypes(parsed);
+        } catch (_) {
+          // JSON でなければ無視
+        }
+      }
+
+      // 重複・空文字を除去
+      return Array.from(
+        new Set(
+          types
+            .map(t => String(t || '').trim())
+            .filter(Boolean)
+        )
+      );
+    })
+  ]).catch(async (err) => {
+    // どれかが失敗した場合でも、他はできるだけ使う
+    try { console.error('[AUDIT_SIG][ERR]', err); } catch (_) {}
+    const hm = await extractHeadMetaV1(page).catch(() => null);
+    const jp = await probeJsonLdAndCopyright(page).catch(() => null);
+    return [hm, jp, []];
+  });
 
   const hm = headMeta || {};
   const jp = jsonldProbe || {};
+  const jsonldTypes = Array.isArray(jsonldTypesRaw) ? jsonldTypesRaw : [];
 
   // JSON-LD 関連
-  const jsonldCount    = Number(jp.jsonld_detect_count || 0);
-  const jsonldDetected = jsonldCount > 0;
-  const jsonldTimedOut = !!jp.jsonld_timed_out;
+  const jsonldCountProbe = Number(jp.jsonld_detect_count || 0);
+  const jsonldCount      = jsonldCountProbe || jsonldTypes.length;
+  const jsonldDetected   = (jsonldCountProbe > 0) || jsonldTypes.length > 0;
+  const jsonldTimedOut   = !!jp.jsonld_timed_out;
 
   // head/meta 関連（タイトル・description）
-  const hasTitle           = !!hm.hasTitle;
-  const hasMetaDescription = !!hm.hasMetaDescription;
+  const hasTitle            = !!hm.hasTitle;
+  const hasMetaDescription  = !!hm.hasMetaDescription;
   const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
   const metaDescriptionText = String(hm.metaDescriptionText || '');
   const titleText           = String(hm.titleText || '');
 
   // コピーライト関連
-  const copyrightHit            = !!jp.copyright_hit;
-  const copyrightExcerpt        = String(jp.copyright_excerpt || '');
-  const copyrightFooterPresent  = !!jp.copyright_footer_present;
-  const copyrightHitToken       = String(jp.copyright_hit_token || '');
+  const copyrightHit           = !!jp.copyright_hit;
+  const copyrightExcerpt       = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent = !!jp.copyright_footer_present;
+  const copyrightHitToken      = String(jp.copyright_hit_token || '');
 
   return {
     // JSON-LD 周り
@@ -440,6 +500,7 @@ async function buildAuditSigFromPage(page) {
     jsonldCount,
     jsonldTimedOut,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
+    jsonldTypes,  // ★★★ ここが GAS 側で使う決定打 ★★★
 
     // head/meta 周り
     hasTitle,
@@ -1819,6 +1880,35 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
     }];
 
     const elapsedMs = Date.now() - t0;
+
+    // === JSON-LD 種別フラグ（Org / WebSite）を算出 ===
+    let hasJsonLdFlag = false;
+    let hasOrgJsonLdFlag = false;
+    let hasWebsiteJsonLdFlag = false;
+
+    try {
+      // /about 側を優先して JSON-LD を見る（なければトップ or DOM 由来）
+      const baseJsonLd = Array.isArray(jsonldPref) && jsonldPref.length
+        ? jsonldPref
+        : jsonld;
+
+      const flatTypes = flatTypesFromJsonLd(baseJsonLd || []);
+
+      hasJsonLdFlag = !!(baseJsonLd && baseJsonLd.length > 0);
+      hasOrgJsonLdFlag = flatTypes.some(t =>
+        /^(Organization|LocalBusiness|Corporation)$/i.test(String(t))
+      );
+      hasWebsiteJsonLdFlag = flatTypes.some(t =>
+        /^(WebSite|WebPage)$/i.test(String(t))
+      );
+
+      // （必要ならデバッグ用ログ）
+      // console.log('[JSONLD-FLAGS][probe]', {
+      //   hasJsonLdFlag, hasOrgJsonLdFlag, hasWebsiteJsonLdFlag, flatTypes
+      // });
+    } catch (_) {
+      // フラグ計算に失敗しても全体は止めない
+    }
 
 // ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
 let auditSig = null;
