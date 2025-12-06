@@ -294,17 +294,6 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
 
   // --- タイムアウト: DOM 上は 0 件だった場合のフォールバック ---
   const r = await snapshot();
-  return {
-    jsonld_detected_once: false,
-    jsonld_detect_count: r.jsonldCount,
-    jsonld_wait_ms: Date.now() - t0,
-    jsonld_timed_out: true,
-    jsonld_sample_head: '',
-    copyright_footer_present: r.footerPresent,
-    copyright_hit: r.copyrightHit,
-    copyright_hit_token: r.copyrightToken,
-    copyright_excerpt: r.copyrightExcerpt
-  };
 
   // A案: DOM に JSON-LD が出てこない場合、type="module" の外部 JS（例: /app-index.js）を 1 本だけ見に行く
   try {
