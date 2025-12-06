@@ -406,7 +406,7 @@ async function extractHeadMetaV1(page) {
   };
 }
 
-// === [AIO][AUDIT_SIG v2] JSON-LD / コピーライト / head meta を集約するヘルパー ===
+// === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
   // それぞれのヘルパーを並列で実行
   const [headMeta, jsonldProbe] = await Promise.all([
@@ -421,25 +421,81 @@ async function buildAuditSigFromPage(page) {
   const jsonldCount    = Number(jp.jsonld_detect_count || 0);
   const jsonldDetected = jsonldCount > 0;
   const jsonldTimedOut = !!jp.jsonld_timed_out;
-
-  // ★追加: タイプ配列を統一的に拾う（snake/camel 両対応）
-  const jsonldTypes =
-    Array.isArray(jp.jsonldTypes)  ? jp.jsonldTypes :
-    Array.isArray(jp.jsonld_types) ? jp.jsonld_types :
-    [];
+  const jsonldTypesAll = Array.isArray(jp.jsonld_types_all)
+    ? jp.jsonld_types_all
+    : [];
 
   // head/meta 関連（タイトル・description）
-  const hasTitle           = !!hm.hasTitle;
-  const hasMetaDescription = !!hm.hasMetaDescription;
+  const hasTitle            = !!hm.hasTitle;
+  const hasMetaDescription  = !!hm.hasMetaDescription;
   const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
   const metaDescriptionText = String(hm.metaDescriptionText || '');
   const titleText           = String(hm.titleText || '');
 
   // コピーライト関連
-  const copyrightHit            = !!jp.copyright_hit;
-  const copyrightExcerpt        = String(jp.copyright_excerpt || '');
-  const copyrightFooterPresent  = !!jp.copyright_footer_present;
-  const copyrightHitToken       = String(jp.copyright_hit_token || '');
+  const copyrightHit           = !!jp.copyright_hit;
+  const copyrightExcerpt       = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent = !!jp.copyright_footer_present;
+  const copyrightHitToken      = String(jp.copyright_hit_token || '');
+
+  // --- NEW: ナビ/フッターを含めた coverage 導線フラグ検出 ---
+  let coverageNav = {
+    hasCompanyNav: false,
+    hasServiceNav: false,
+    hasContactNav: false,
+    hasFaqNav: false
+  };
+
+  try {
+    const html = await page.content();
+    const htmlStr = String(html || '');
+    const htmlLower = htmlStr.toLowerCase();
+
+    function hasJP(re: RegExp): boolean {
+      try {
+        return re.test(htmlStr);
+      } catch {
+        return false;
+      }
+    }
+
+    function hasEN(re: RegExp): boolean {
+      try {
+        return re.test(htmlLower);
+      } catch {
+        return false;
+      }
+    }
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyNav =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/about\s+us|about\s+company|company(\s+(info|information|profile))?|corporate(\s+(profile|info))?/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServiceNav =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactNav =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact(\s+us)?/);
+
+    // FAQ / よくある質問 / Q&A
+    const hasFaqNav =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/\bfaq\b/);
+
+    coverageNav = {
+      hasCompanyNav: !!hasCompanyNav,
+      hasServiceNav: !!hasServiceNav,
+      hasContactNav: !!hasContactNav,
+      hasFaqNav:     !!hasFaqNav
+    };
+  } catch {
+    // 失敗しても coverageNav はデフォルト(false)のまま
+  }
 
   return {
     // JSON-LD 周り
@@ -447,7 +503,7 @@ async function buildAuditSigFromPage(page) {
     jsonldCount,
     jsonldTimedOut,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
-    jsonldTypes, // ★ ここに出す
+    jsonldTypes: jsonldTypesAll,
 
     // head/meta 周り
     hasTitle,
@@ -460,8 +516,87 @@ async function buildAuditSigFromPage(page) {
     copyrightHit,
     copyrightExcerpt,
     copyrightFooterPresent,
-    copyrightHitToken
+    copyrightHitToken,
+
+    // NEW: ナビ導線フラグ
+    coverageNav
   };
+}
+
+// === [COV_NAV][DETECT v2] HTML から会社情報/サービス/お問い合わせ/FAQ 導線をざっくり検出 ===
+function detectCoverageNavFromHtml(html) {
+  try {
+    html = String(html || '');
+    if (!html) {
+      return {
+        hasCompanyInfoLink: false,
+        hasServicePageLink: false,
+        hasContactLink: false,
+        hasRecruitLink: false,
+        hasFaqLink: false
+      };
+    }
+
+    const htmlLower = html.toLowerCase();
+
+    const hasJP = (re) => {
+      try { return re.test(html); } catch (_) { return false; }
+    };
+    const hasEN = (re) => {
+      try { return re.test(htmlLower); } catch (_) { return false; }
+    };
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyInfoLink =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/corporate\s+profile|corporate\s+info|about\s+us|about\s+company/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServicePageLink =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactLink =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact\s*us|contact/);
+
+    // 採用情報 / CAREER
+    const hasRecruitLink =
+      hasJP(/採用情報|求人情報|キャリア採用|新卒採用|中途採用/) ||
+      hasEN(/careers?|recruit/);
+
+    // FAQ / よくある質問
+    const hasFaqLink =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/faq/);
+
+    const flags = {
+      hasCompanyInfoLink,
+      hasServicePageLink,
+      hasContactLink,
+      hasRecruitLink,
+      hasFaqLink
+    };
+
+    try {
+      console.log('[COV_NAV][FLAGS]', flags);
+    } catch (_) {}
+
+    return flags;
+  } catch (e) {
+    try {
+      console.warn('[COV_NAV][ERR]', e);
+    } catch (_) {}
+
+    return {
+      hasCompanyInfoLink: false,
+      hasServicePageLink: false,
+      hasContactLink: false,
+      hasRecruitLink: false,
+      hasFaqLink: false
+    };
+  }
 }
 
 const playwright = require('playwright');
@@ -524,6 +659,9 @@ async function playScrapeMinimal(url) {
     'script[type="application/ld+json"]',
     nodes => nodes.map(n => n.textContent).filter(Boolean)
   );
+
+  // ★ coverage ナビ導線フラグ（会社情報・サービス・お問い合わせなど）
+  const coverageNavFlags = detectCoverageNavFromHtml(fullHtml);
 
   // JSON-LD パース
   const jsonld = [];
