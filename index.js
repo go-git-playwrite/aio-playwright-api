@@ -407,92 +407,81 @@ async function extractHeadMetaV1(page) {
 
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
-  // 1) head/meta, JSON-LD プローブ, JSON-LD の @type 一覧 を並列で取得
-  const [headMeta, jsonldProbe, jsonldTypesRaw] = await Promise.all([
-    extractHeadMetaV1(page),
-    probeJsonLdAndCopyright(page),
-    // DOM 内の JSON-LD から @type を収集
-    page.evaluate(() => {
-      const types = [];
+  // DOM から ld+json を直接拾う（@type 抽出用）
+  const domJsonLd = await page.evaluate(() => {
+    const out = [];
+    const scripts = document.querySelectorAll('script[type="application/ld+json" i]');
+    for (const s of scripts) {
+      const txt = s.textContent || '';
+      if (!txt.trim()) continue;
+      try {
+        out.push(JSON.parse(txt));
+      } catch (_) {
+        // 1個壊れていても全体は止めない
+      }
+    }
+    return out;
+  }).catch(() => []);
 
-      const pushTypes = (node) => {
-        if (!node || typeof node !== 'object') return;
+  // @type だけをフラットに集めてユニーク化
+  function collectJsonLdTypes(jsonldArr) {
+    const types = [];
 
-        // @type が string の場合
-        if (typeof node['@type'] === 'string') {
-          types.push(node['@type']);
-        }
-        // @type が配列の場合
-        else if (Array.isArray(node['@type'])) {
-          node['@type'].forEach(t => {
-            if (t) types.push(String(t));
-          });
-        }
+    function pushType(v) {
+      if (!v) return;
+      if (Array.isArray(v)) {
+        v.forEach(pushType);
+      } else {
+        types.push(String(v));
+      }
+    }
 
-        // ネストも再帰探索
-        for (const key in node) {
-          if (!Object.prototype.hasOwnProperty.call(node, key)) continue;
-          const v = node[key];
-          if (v && typeof v === 'object') {
-            pushTypes(v);
-          }
-        }
-      };
+    function walk(obj) {
+      if (!obj || typeof obj !== 'object') return;
 
-      const scripts = Array.from(
-        document.querySelectorAll('script[type="application/ld+json" i]')
-      );
-
-      for (const s of scripts) {
-        const txt = (s.textContent || '').trim();
-        if (!txt) continue;
-        try {
-          const parsed = JSON.parse(txt);
-          pushTypes(parsed);
-        } catch (_) {
-          // JSON でなければ無視
-        }
+      if (Object.prototype.hasOwnProperty.call(obj, '@type')) {
+        pushType(obj['@type']);
       }
 
-      // 重複・空文字を除去
-      return Array.from(
-        new Set(
-          types
-            .map(t => String(t || '').trim())
-            .filter(Boolean)
-        )
-      );
-    })
-  ]).catch(async (err) => {
-    // どれかが失敗した場合でも、他はできるだけ使う
-    try { console.error('[AUDIT_SIG][ERR]', err); } catch (_) {}
-    const hm = await extractHeadMetaV1(page).catch(() => null);
-    const jp = await probeJsonLdAndCopyright(page).catch(() => null);
-    return [hm, jp, []];
-  });
+      for (const k in obj) {
+        if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+        const v = obj[k];
+        if (v && typeof v === 'object') walk(v);
+      }
+    }
+
+    (jsonldArr || []).forEach(walk);
+    return Array.from(new Set(types));
+  }
+
+  const jsonldTypes = collectJsonLdTypes(domJsonLd);
+
+  // それぞれのヘルパーを並列で実行
+  const [headMeta, jsonldProbe] = await Promise.all([
+    extractHeadMetaV1(page),
+    probeJsonLdAndCopyright(page)
+  ]);
 
   const hm = headMeta || {};
   const jp = jsonldProbe || {};
-  const jsonldTypes = Array.isArray(jsonldTypesRaw) ? jsonldTypesRaw : [];
 
   // JSON-LD 関連
-  const jsonldCountProbe = Number(jp.jsonld_detect_count || 0);
-  const jsonldCount      = jsonldCountProbe || jsonldTypes.length;
-  const jsonldDetected   = (jsonldCountProbe > 0) || jsonldTypes.length > 0;
-  const jsonldTimedOut   = !!jp.jsonld_timed_out;
+  const jsonldCount    = Number(jp.jsonld_detect_count || 0);
+  const jsonldDetected = jsonldCount > 0;
+  const jsonldTimedOut = !!jp.jsonld_timed_out;
 
   // head/meta 関連（タイトル・description）
-  const hasTitle            = !!hm.hasTitle;
-  const hasMetaDescription  = !!hm.hasMetaDescription;
+  const hasTitle           = !!hm.hasTitle;
+  const hasMetaDescription = !!hm.hasMetaDescription;
   const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
   const metaDescriptionText = String(hm.metaDescriptionText || '');
   const titleText           = String(hm.titleText || '');
 
   // コピーライト関連
-  const copyrightHit           = !!jp.copyright_hit;
-  const copyrightExcerpt       = String(jp.copyright_excerpt || '');
-  const copyrightFooterPresent = !!jp.copyright_footer_present;
-  const copyrightHitToken      = String(jp.copyright_hit_token || '');
+  const copyrightHit            = !!jp.copyright_hit;
+  const copyrightExcerpt        = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent  = !!jp.copyright_footer_present;
+  const copyrightHitToken       = String(jp.copyright_hit_token || '');
 
   return {
     // JSON-LD 周り
@@ -500,7 +489,7 @@ async function buildAuditSigFromPage(page) {
     jsonldCount,
     jsonldTimedOut,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
-    jsonldTypes,  // ★★★ ここが GAS 側で使う決定打 ★★★
+    jsonldTypes,                           // ★★ ここが GAS 側から見えるフィールド ★★
 
     // head/meta 周り
     hasTitle,
