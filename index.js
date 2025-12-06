@@ -1515,16 +1515,16 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
 
     const jsonldTypesAll = flatTypesFromJsonLd(jsonldForFlags);
 
-    const hasJsonLdFlag =
-      Array.isArray(jsonldForFlags) && jsonldForFlags.length > 0;
+    // const hasJsonLdFlag =
+    //   Array.isArray(jsonldForFlags) && jsonldForFlags.length > 0;
 
     // const hasOrgJsonLdFlag = jsonldTypesAll.some(t =>
     //   /^(Organization|Corporation|LocalBusiness)$/i.test(String(t))
     // );
 
-    const hasWebsiteJsonLdFlag = jsonldTypesAll.some(t =>
-      /^(WebSite|WebPage)$/i.test(String(t))
-    );
+    // const hasWebsiteJsonLdFlag = jsonldTypesAll.some(t =>
+    //   /^(WebSite|WebPage)$/i.test(String(t))
+    // );
 
     // ---- script/src と modulepreload から JS 候補URLを収集 ----
     const { scriptSrcs, preloadHrefs } = await page.evaluate(() => {
