@@ -448,23 +448,17 @@ async function buildAuditSigFromPage(page) {
 
   try {
     const html = await page.content();
-    const htmlStr = String(html || '');
+    const htmlStr   = String(html || '');
     const htmlLower = htmlStr.toLowerCase();
 
-    function hasJP(re: RegExp): boolean {
-      try {
-        return re.test(htmlStr);
-      } catch {
-        return false;
-      }
+    function hasJP(re) {
+      try { return re.test(htmlStr); }
+      catch (_) { return false; }
     }
 
-    function hasEN(re: RegExp): boolean {
-      try {
-        return re.test(htmlLower);
-      } catch {
-        return false;
-      }
+    function hasEN(re) {
+      try { return re.test(htmlLower); }
+      catch (_) { return false; }
     }
 
     // 会社情報 / 企業情報 / コーポレート系
@@ -493,7 +487,7 @@ async function buildAuditSigFromPage(page) {
       hasContactNav: !!hasContactNav,
       hasFaqNav:     !!hasFaqNav
     };
-  } catch {
+  } catch (_) {
     // 失敗しても coverageNav はデフォルト(false)のまま
   }
 
