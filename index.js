@@ -1791,10 +1791,33 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
         if (hit) {
           const start = hit.indexOf('{');
           const head = start >= 0 ? hit.slice(start, start + 80) : hit.slice(0, 80);
+
+          // 1) JSON-LD が「ありそう」というフラグ類
           __probe.jsonld_detected_once = true;
-          __probe.jsonld_detect_count = Math.max(1, __probe.jsonld_detect_count || 0);
-          __probe.jsonld_timed_out = false;
-          __probe.jsonld_sample_head = head;
+          __probe.jsonld_detect_count  = Math.max(1, __probe.jsonld_detect_count || 0);
+          __probe.jsonld_timed_out     = false;
+          __probe.jsonld_sample_head   = head;
+
+          // 2) "@type" をざっくり抜き出して jsonld_types に積む
+          try {
+            const types = [];
+            const re = /"@type"\s*:\s*"([^"]+)"/g;
+            let m;
+            while ((m = re.exec(hit)) !== null) {
+              const typ = (m[1] || '').trim();
+              if (typ) types.push(typ);
+            }
+            if (types.length) {
+              const uniqTypes = Array.from(new Set(types));
+              if (!Array.isArray(__probe.jsonld_types)) {
+                __probe.jsonld_types = uniqTypes;
+              } else {
+                __probe.jsonld_types = Array.from(
+                  new Set(__probe.jsonld_types.concat(uniqTypes))
+                );
+              }
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
