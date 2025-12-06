@@ -1888,6 +1888,32 @@ try {
   auditSig = null;  // 失敗しても全体は止めない
 }
 
+// ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
+try {
+  if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
+    const typesFromAudit = auditSig.jsonldTypes.map(t => String(t || ''));
+
+    // 何か 1 つでも type があれば「JSON-LD あり」とみなす
+    if (!hasJsonLdFlag && typesFromAudit.length > 0) {
+      hasJsonLdFlag = true;
+    }
+
+    // Organization / Corporation / LocalBusiness が 1 つでもあれば Org フラグ ON
+    if (!hasOrgJsonLdFlag &&
+        typesFromAudit.some(t => /(Organization|Corporation|LocalBusiness)/i.test(t))) {
+      hasOrgJsonLdFlag = true;
+    }
+
+    // WebSite / WebPage があれば WebSite フラグ ON（あれば）
+    if (!hasWebsiteJsonLdFlag &&
+        typesFromAudit.some(t => /(WebSite|WebPage)/i.test(t))) {
+      hasWebsiteJsonLdFlag = true;
+    }
+  }
+} catch (_) {
+  // 補強に失敗しても全体は止めない
+}
+
 const responsePayload = {
   url: urlToFetch,
   bodyText,
