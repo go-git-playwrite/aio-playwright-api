@@ -1518,9 +1518,9 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
     const hasJsonLdFlag =
       Array.isArray(jsonldForFlags) && jsonldForFlags.length > 0;
 
-    const hasOrgJsonLdFlag = jsonldTypesAll.some(t =>
-      /^(Organization|Corporation|LocalBusiness)$/i.test(String(t))
-    );
+    // const hasOrgJsonLdFlag = jsonldTypesAll.some(t =>
+    //   /^(Organization|Corporation|LocalBusiness)$/i.test(String(t))
+    // );
 
     const hasWebsiteJsonLdFlag = jsonldTypesAll.some(t =>
       /^(WebSite|WebPage)$/i.test(String(t))
