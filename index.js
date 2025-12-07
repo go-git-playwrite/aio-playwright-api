@@ -2113,14 +2113,16 @@ async function scrapeOnce(req, res) {
     url: urlToFetch,
     bodyText,
     html: htmlSource,
+
+    // ★ 追加：レンダリング後のテキスト（deepText 優先）
+    //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
+    renderedText,
+
     jsonld,
     structured,
     jsonldSynth,
     scoring: { html: scoringHtml, bodyText: scoringBody },
     metaDescription,
-
-    // ★ NEW: coverage ナビ検出結果（GAS からもそのまま読めるようにする）
-    coverageNav,
 
     // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
     hasJsonLd: hasJsonLdFlag,
@@ -2183,7 +2185,7 @@ async function scrapeOnce(req, res) {
       // === ADD: デバッグ用にプローブ結果も残す（任意）
       jsonldProbe: __probe
     }
-}; // ← ここで必ず閉じる！
+  }; // ← ここで必ず閉じる！
 
 // --- 追加: /scrape で採点も実施して返す ---
 const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
