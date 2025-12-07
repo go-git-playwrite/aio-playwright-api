@@ -2109,6 +2109,44 @@ async function scrapeOnce(req, res) {
     topHtml || htmlSource || scoringHtml || bodyText
   );
 
+  // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
+  let hasSitemapXml = false;
+  try {
+    let origin = null;
+    try {
+      origin = new URL(urlToFetch).origin;
+    } catch (_) {
+      origin = null;
+    }
+
+    if (origin) {
+      const sitemapUrl = origin.replace(/\/+$/, '') + '/sitemap.xml';
+
+      const sitemapResp = await page.request.get(sitemapUrl, { timeout: 8000 });
+      if (sitemapResp.ok()) {
+        const ctype = (sitemapResp.headers()['content-type'] || '').toLowerCase();
+
+        // content-type に xml が含まれていればほぼ sitemap とみなす
+        if (ctype.includes('xml')) {
+          hasSitemapXml = true;
+        } else {
+          // content-type が微妙な場合は先頭だけテキストを見て XML っぽいか確認
+          const head = (await sitemapResp.text()).slice(0, 512);
+          if (/^\s*</.test(head)) {
+            hasSitemapXml = true;
+          }
+        }
+      }
+    }
+
+    // auditSig があれば、ついでにそこにも載せておく（GAS 側互換用）
+    if (auditSig && typeof auditSig === 'object') {
+      auditSig.hasSitemapXml = hasSitemapXml;
+    }
+  } catch (_) {
+    // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
+  }
+
   const responsePayload = {
     url: urlToFetch,
     bodyText,
@@ -2126,6 +2164,9 @@ async function scrapeOnce(req, res) {
 
     // ★ ADD: HTTPS 判定（GAS facts 用）
     isHttps: urlToFetch.startsWith('https://'),
+
+    // ★ ADD: XML サイトマップ有無（GAS facts 用）
+    hasSitemapXml,
 
     // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
     hasJsonLd: hasJsonLdFlag,
