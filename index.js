@@ -864,6 +864,64 @@ function extractJsonLdFromHtml(html) {
   return out;
 }
 
+// === [COVNAV][NODE-DETECT v1] HTMLから会社情報/サービス/お問い合わせ/FAQナビをざっくり検出 ===
+function detectCoverageNavFromHtmlNode(html) {
+  try {
+    html = String(html || '');
+    if (!html) {
+      return {
+        hasCompanyNav: false,
+        hasServiceNav: false,
+        hasContactNav: false,
+        hasFaqNav:     false
+      };
+    }
+
+    const htmlLower = html.toLowerCase();
+
+    const hasJP = (re) => {
+      try { return re.test(html); } catch { return false; }
+    };
+    const hasEN = (re) => {
+      try { return re.test(htmlLower); } catch { return false; }
+    };
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyNav =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/corporate\s+profile|corporate\s+info|about\s+us|about\s+company/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServiceNav =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactNav =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact\s*us|contact/);
+
+    // FAQ / よくある質問 / Q&A
+    const hasFaqNav =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/faq/);
+
+    return {
+      hasCompanyNav: !!hasCompanyNav,
+      hasServiceNav: !!hasServiceNav,
+      hasContactNav: !!hasContactNav,
+      hasFaqNav:     !!hasFaqNav
+    };
+  } catch {
+    return {
+      hasCompanyNav: false,
+      hasServiceNav: false,
+      hasContactNav: false,
+      hasFaqNav:     false
+    };
+  }
+}
+
 // JSON-LD から Organization/Corporation 類や住所/電話/設立が入っていそうなノードだけを抽出
 function pickOrgNodes(jsonldArray) {
   const arr = Array.isArray(jsonldArray) ? jsonldArray : [];
@@ -1471,67 +1529,67 @@ async function scrapeOnce(req, res) {
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
 
-// === ここから追記（Shadow DOMも含めて深くテキストを収集）===
-const deepText = await page.evaluate(() => {
-  const seen = new WeakSet();
-  const getText = (root) => {
-    let out = '';
-    const walk = (node) => {
-      if (!node || seen.has(node)) return;
-      seen.add(node);
-      if (node.nodeType === Node.TEXT_NODE) {
-        out += (node.nodeValue || '') + '\n';
-        return;
-      }
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const sr = node.shadowRoot;
-        if (sr) Array.from(sr.childNodes).forEach(walk);   // Shadow root
-        Array.from(node.childNodes).forEach(walk);         // 通常DOM
-      }
+  // === ここから追記（Shadow DOMも含めて深くテキストを収集）===
+  const deepText = await page.evaluate(() => {
+    const seen = new WeakSet();
+    const getText = (root) => {
+      let out = '';
+      const walk = (node) => {
+        if (!node || seen.has(node)) return;
+        seen.add(node);
+        if (node.nodeType === Node.TEXT_NODE) {
+          out += (node.nodeValue || '') + '\n';
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const sr = node.shadowRoot;
+          if (sr) Array.from(sr.childNodes).forEach(walk);   // Shadow root
+          Array.from(node.childNodes).forEach(walk);         // 通常DOM
+        }
+      };
+      walk(root);
+      return out.replace(/\s+\n/g, '\n').trim();
     };
-    walk(root);
-    return out.replace(/\s+\n/g, '\n').trim();
-  };
-  return getText(document.documentElement);
-}).catch(() => '');
+    return getText(document.documentElement);
+  }).catch(() => '');
 
-// === ここからさらに追記（meta description を head から直接取る）===
-const metaDescription = await page.evaluate(() => {
-  const el = document.head?.querySelector(
-    'meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]'
-  );
-  return el?.getAttribute('content')?.replace(/\s+/g, ' ').trim() || '';
-});
+  // === ここからさらに追記（meta description を head から直接取る）===
+  const metaDescription = await page.evaluate(() => {
+    const el = document.head?.querySelector(
+      'meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]'
+    );
+    return el?.getAttribute('content')?.replace(/\s+/g, ' ').trim() || '';
+  });
 
-// “描画本文”として優先利用
-const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
-  ? deepText
-  : (innerText || docText || '');
+  // “描画本文”として優先利用
+  const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
+    ? deepText
+    : (innerText || docText || '');
 
-// --- トップと /about の JSON-LD を比較 ---
-const targetUrl = normalizeUrl(urlToFetch);
-const u = new URL(targetUrl);
-const topUrl   = u.origin + '/';
-const aboutUrl = u.origin + '/about';
+  // --- トップと /about の JSON-LD を比較 ---
+  const targetUrl = normalizeUrl(urlToFetch);
+  const u = new URL(targetUrl);
+  const topUrl   = u.origin + '/';
+  const aboutUrl = u.origin + '/about';
 
-// HTML を取得（ナビゲーションはしない・request 経由）
-let topHtml = '';
-let aboutHtml = '';
-try {
-  const r1 = await page.request.get(topUrl, { timeout: 20000 });
-  if (r1.ok()) topHtml = await r1.text();
-} catch(_) {}
-try {
-  const r2 = await page.request.get(aboutUrl, { timeout: 20000 });
-  if (r2.ok()) aboutHtml = await r2.text();
-} catch(_) {}
+  // HTML を取得（ナビゲーションはしない・request 経由）
+  let topHtml = '';
+  let aboutHtml = '';
+  try {
+    const r1 = await page.request.get(topUrl, { timeout: 20000 });
+    if (r1.ok()) topHtml = await r1.text();
+  } catch(_) {}
+  try {
+    const r2 = await page.request.get(aboutUrl, { timeout: 20000 });
+    if (r2.ok()) aboutHtml = await r2.text();
+  } catch(_) {}
 
-const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
-const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
-const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
+  const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
+  const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
+  const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
 
-const gtmTop   = hasGtmOrExternal(topHtml);
-const gtmAbout = hasGtmOrExternal(aboutHtml);
+  const gtmTop   = hasGtmOrExternal(topHtml);
+  const gtmAbout = hasGtmOrExternal(aboutHtml);
 
 // 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
 
@@ -2012,111 +2070,119 @@ const gtmAbout = hasGtmOrExternal(aboutHtml);
       // フラグ計算に失敗しても全体は止めない
     }
 
-// ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
-let auditSig = null;
-try {
-  auditSig = await buildAuditSigFromPage(page);
-} catch (_) {
-  auditSig = null;  // 失敗しても全体は止めない
-}
-
-// ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
-try {
-  if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
-    const typesFromAudit = auditSig.jsonldTypes.map(t => String(t || ''));
-
-    // 何か 1 つでも type があれば「JSON-LD あり」とみなす
-    if (!hasJsonLdFlag && typesFromAudit.length > 0) {
-      hasJsonLdFlag = true;
+    // ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
+    let auditSig = null;
+    try {
+      auditSig = await buildAuditSigFromPage(page);
+    } catch (_) {
+      auditSig = null;  // 失敗しても全体は止めない
     }
 
-    // Organization / Corporation / LocalBusiness が 1 つでもあれば Org フラグ ON
-    if (!hasOrgJsonLdFlag &&
-        typesFromAudit.some(t => /(Organization|Corporation|LocalBusiness)/i.test(t))) {
-      hasOrgJsonLdFlag = true;
+    // ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
+    try {
+      if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
+        const typesFromAudit = auditSig.jsonldTypes.map(t => String(t || ''));
+
+        // 何か 1 つでも type があれば「JSON-LD あり」とみなす
+        if (!hasJsonLdFlag && typesFromAudit.length > 0) {
+          hasJsonLdFlag = true;
+        }
+
+        // Organization / Corporation / LocalBusiness が 1 つでもあれば Org フラグ ON
+        if (!hasOrgJsonLdFlag &&
+            typesFromAudit.some(t => /(Organization|Corporation|LocalBusiness)/i.test(t))) {
+          hasOrgJsonLdFlag = true;
+        }
+
+        // WebSite / WebPage があれば WebSite フラグ ON（あれば）
+        if (!hasWebsiteJsonLdFlag &&
+            typesFromAudit.some(t => /(WebSite|WebPage)/i.test(t))) {
+          hasWebsiteJsonLdFlag = true;
+        }
+      }
+    } catch (_) {
+      // 補強に失敗しても全体は止めない
     }
 
-    // WebSite / WebPage があれば WebSite フラグ ON（あれば）
-    if (!hasWebsiteJsonLdFlag &&
-        typesFromAudit.some(t => /(WebSite|WebPage)/i.test(t))) {
-      hasWebsiteJsonLdFlag = true;
+  // ★ coverage ナビフラグ：/about やトップのHTMLを優先しつつ検出
+  const coverageNav = detectCoverageNavFromHtmlNode(
+    topHtml || htmlSource || scoringHtml || bodyText
+  );
+
+  const responsePayload = {
+    url: urlToFetch,
+    bodyText,
+    html: htmlSource,
+    jsonld,
+    structured,
+    jsonldSynth,
+    scoring: { html: scoringHtml, bodyText: scoringBody },
+    metaDescription,
+
+    // ★ NEW: coverage ナビ検出結果（GAS からもそのまま読めるようにする）
+    coverageNav,
+
+    // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
+    hasJsonLd: hasJsonLdFlag,
+    hasOrgJsonLd: hasOrgJsonLdFlag,
+    hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
+
+    // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
+    // Playwright 側の auditSig をそのまま噛ませる
+    hasTitle:           auditSig ? !!auditSig.hasTitle           : false,
+    hasMetaDescription: auditSig ? !!auditSig.hasMetaDescription : (
+      typeof metaDescription === 'string' && metaDescription.trim().length > 0
+    ),
+    metaDescriptionLen: auditSig && typeof auditSig.metaDescriptionLen === 'number'
+      ? auditSig.metaDescriptionLen
+      : (typeof metaDescription === 'string' ? metaDescription.length : 0),
+
+    // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り）
+    auditSig,
+
+    // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
+    jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
+    jsonld_detect_count:  auditSig ? auditSig.jsonldCount          : __probe.jsonld_detect_count,
+    jsonld_wait_ms:       __probe.jsonld_wait_ms,
+    jsonld_timed_out:     auditSig ? auditSig.jsonldTimedOut       : __probe.jsonld_timed_out,
+    jsonld_sample_head:   auditSig ? auditSig.jsonldSampleHead     : __probe.jsonld_sample_head,
+    copyright_footer_present: auditSig ? auditSig.copyrightFooterPresent : __probe.copyright_footer_present,
+    copyright_hit:           auditSig ? auditSig.copyrightHit           : __probe.copyright_hit,
+    copyright_hit_token:     auditSig ? auditSig.copyrightHitToken      : __probe.copyright_hit_token,
+    copyright_excerpt:       auditSig ? auditSig.copyrightExcerpt       : __probe.copyright_excerpt,
+
+    debug: {
+      build: BUILD_TAG,
+      hydrated,
+      innerTextLen: innerText.length,
+      docTextLen: docText.length,
+      jsUrls: jsUrls.slice(0, 10),
+      tappedUrls: tappedUrls.slice(0, 40),
+      tappedBodiesMeta: fetchedMeta.slice(0, 10),
+      bundlePhones: phones.slice(0, 10),
+      bundleZips: zips.slice(0, 10),
+      bundleAddrs: addrs.slice(0, 10),
+      pickedPhone: pickedPhone || null,
+      pickedAddressPreview: pickedAddress
+        ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
+            .filter(Boolean).join(' ')
+        : null,
+      jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
+      jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
+      jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
+      jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
+      hasGtmTop: !!gtmTop,
+      hasGtmAbout: !!gtmAbout,
+      normalizedUrl: normalizeUrl(urlToFetch),
+      labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
+      foundingDatePicked: foundFoundingDate || null,
+      foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
+      sameAsCount: new Set(sameAsClean).size,
+      elapsedMs,
+
+      // === ADD: デバッグ用にプローブ結果も残す（任意）
+      jsonldProbe: __probe
     }
-  }
-} catch (_) {
-  // 補強に失敗しても全体は止めない
-}
-
-const responsePayload = {
-  url: urlToFetch,
-  bodyText,
-  html: htmlSource,
-  jsonld,
-  structured,
-  jsonldSynth,
-  scoring: { html: scoringHtml, bodyText: scoringBody },
-  metaDescription,
-
-  // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
-  hasJsonLd: hasJsonLdFlag,
-  hasOrgJsonLd: hasOrgJsonLdFlag,
-  hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
-
-  // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
-  // Playwright 側の auditSig をそのまま噛ませる
-  hasTitle:           auditSig ? !!auditSig.hasTitle           : false,
-  hasMetaDescription: auditSig ? !!auditSig.hasMetaDescription : (
-    typeof metaDescription === 'string' && metaDescription.trim().length > 0
-  ),
-  metaDescriptionLen: auditSig && typeof auditSig.metaDescriptionLen === 'number'
-    ? auditSig.metaDescriptionLen
-    : (typeof metaDescription === 'string' ? metaDescription.length : 0),
-
-  // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り）
-  auditSig,
-
-  // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
-  jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
-  jsonld_detect_count:  auditSig ? auditSig.jsonldCount          : __probe.jsonld_detect_count,
-  jsonld_wait_ms:       __probe.jsonld_wait_ms,
-  jsonld_timed_out:     auditSig ? auditSig.jsonldTimedOut       : __probe.jsonld_timed_out,
-  jsonld_sample_head:   auditSig ? auditSig.jsonldSampleHead     : __probe.jsonld_sample_head,
-  copyright_footer_present: auditSig ? auditSig.copyrightFooterPresent : __probe.copyright_footer_present,
-  copyright_hit:           auditSig ? auditSig.copyrightHit           : __probe.copyright_hit,
-  copyright_hit_token:     auditSig ? auditSig.copyrightHitToken      : __probe.copyright_hit_token,
-  copyright_excerpt:       auditSig ? auditSig.copyrightExcerpt       : __probe.copyright_excerpt,
-
-  debug: {
-    build: BUILD_TAG,
-    hydrated,
-    innerTextLen: innerText.length,
-    docTextLen: docText.length,
-    jsUrls: jsUrls.slice(0, 10),
-    tappedUrls: tappedUrls.slice(0, 40),
-    tappedBodiesMeta: fetchedMeta.slice(0, 10),
-    bundlePhones: phones.slice(0, 10),
-    bundleZips: zips.slice(0, 10),
-    bundleAddrs: addrs.slice(0, 10),
-    pickedPhone: pickedPhone || null,
-    pickedAddressPreview: pickedAddress
-      ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
-          .filter(Boolean).join(' ')
-      : null,
-    jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
-    jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
-    jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
-    jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
-    hasGtmTop: !!gtmTop,
-    hasGtmAbout: !!gtmAbout,
-    normalizedUrl: normalizeUrl(urlToFetch),
-    labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
-    foundingDatePicked: foundFoundingDate || null,
-    foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
-    sameAsCount: new Set(sameAsClean).size,
-    elapsedMs,
-
-    // === ADD: デバッグ用にプローブ結果も残す（任意）
-    jsonldProbe: __probe
-  }
 }; // ← ここで必ず閉じる！
 
 // --- 追加: /scrape で採点も実施して返す ---
