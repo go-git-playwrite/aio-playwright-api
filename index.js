@@ -2124,6 +2124,9 @@ async function scrapeOnce(req, res) {
     scoring: { html: scoringHtml, bodyText: scoringBody },
     metaDescription,
 
+    // ★ ADD: HTTPS 判定（GAS facts 用）
+    isHttps: urlToFetch.startsWith('https://'),
+
     // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
     hasJsonLd: hasJsonLdFlag,
     hasOrgJsonLd: hasOrgJsonLdFlag,
