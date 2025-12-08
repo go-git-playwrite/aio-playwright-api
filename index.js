@@ -2183,7 +2183,60 @@ async function scrapeOnce(req, res) {
       ? auditSig.metaDescriptionLen
       : (typeof metaDescription === 'string' ? metaDescription.length : 0),
 
-    // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り）
+    // ★ NEW: JSON-LD 種別フラグ（Organization / WebSite）を auditSig に付与
+    ...(function () {
+      try {
+        if (!auditSig || typeof auditSig !== 'object') return {};
+
+        // JSON-LD ノード集合（優先: jsonldPref → なければ top+about）
+        var nodes = [];
+        if (Array.isArray(jsonldPref) && jsonldPref.length) {
+          nodes = jsonldPref;
+        } else {
+          if (Array.isArray(jsonldTopAll))   nodes = nodes.concat(jsonldTopAll);
+          if (Array.isArray(jsonldAboutAll)) nodes = nodes.concat(jsonldAboutAll);
+        }
+
+        var hasOrg  = false;
+        var hasSite = false;
+
+        nodes.forEach(function (node) {
+          if (!node || typeof node !== 'object') return;
+          var t = node['@type'];
+          var types = Array.isArray(t) ? t : (t ? [t] : []);
+
+          types.forEach(function (tt) {
+            if (typeof tt !== 'string') return;
+            if (/Organization|Corporation|LocalBusiness/i.test(tt)) {
+              hasOrg = true;
+            }
+            if (/WebSite/i.test(tt)) {
+              hasSite = true;
+            }
+          });
+        });
+
+        auditSig.hasOrgJsonLd     = hasOrg;
+        auditSig.hasWebsiteJsonLd = hasSite;
+
+        // auditSig 自体にも書き込むので、GAS 側からは auditSig.hasOrgJsonLd で参照可能
+        try {
+          Logger && Logger.log &&
+            Logger.log('[PW][JSONLD-FLAGS] hasOrg=%s hasWebsite=%s nodes=%s',
+                       hasOrg, hasSite, nodes.length);
+        } catch (_){}
+
+        // ここで返すオブジェクトは「トップレベル facts にもフラグをコピー」するため
+        return {
+          hasOrgJsonLd: hasOrg,
+          hasWebsiteJsonLd: hasSite
+        };
+      } catch (_e) {
+        return {};
+      }
+    })(),
+
+    // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
     auditSig,
 
     // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
