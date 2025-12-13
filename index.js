@@ -1591,7 +1591,7 @@ async function scrapeOnce(req, res) {
   const gtmTop   = hasGtmOrExternal(topHtml);
   const gtmAbout = hasGtmOrExternal(aboutHtml);
 
-// 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
+  // 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
 
     // ---- HTMLソース（タグあり）----
     const htmlSource = await page.content().catch(() => '');
@@ -2109,6 +2109,9 @@ async function scrapeOnce(req, res) {
     topHtml || htmlSource || scoringHtml || bodyText
   );
 
+  // ★ 追加：auditSig にも載せる（GAS 側で auditSig.coverageNav を参照できるように）
+  if (auditSig && typeof auditSig === 'object') auditSig.coverageNav = coverageNav;
+
   // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
   let hasSitemapXml = false;
   try {
@@ -2183,7 +2186,7 @@ async function scrapeOnce(req, res) {
       ? auditSig.metaDescriptionLen
       : (typeof metaDescription === 'string' ? metaDescription.length : 0),
 
-    // ★ NEW: JSON-LD 種別フラグ（Organization / WebSite）を auditSig に付与
+    // ★ NEW: JSON-LD 種別フラグ（Organization / WebSite）を計算して auditSig ＋トップレベルに載せる
     ...(function () {
       try {
         if (!auditSig || typeof auditSig !== 'object') return {};
@@ -2191,7 +2194,7 @@ async function scrapeOnce(req, res) {
         // JSON-LD ノード集合（優先: jsonldPref → なければ top+about）
         var nodes = [];
         if (Array.isArray(jsonldPref) && jsonldPref.length) {
-          nodes = jsonldPref;
+          nodes = jsonldPref.slice();
         } else {
           if (Array.isArray(jsonldTopAll))   nodes = nodes.concat(jsonldTopAll);
           if (Array.isArray(jsonldAboutAll)) nodes = nodes.concat(jsonldAboutAll);
@@ -2216,22 +2219,28 @@ async function scrapeOnce(req, res) {
           });
         });
 
+        // auditSig 自体にもフラグを書き込む（GAS 側では auditSig.hasOrgJsonLd で参照）
         auditSig.hasOrgJsonLd     = hasOrg;
         auditSig.hasWebsiteJsonLd = hasSite;
 
-        // auditSig 自体にも書き込むので、GAS 側からは auditSig.hasOrgJsonLd で参照可能
+        // Node 環境なので console.log を使う
         try {
-          Logger && Logger.log &&
-            Logger.log('[PW][JSONLD-FLAGS] hasOrg=%s hasWebsite=%s nodes=%s',
-                       hasOrg, hasSite, nodes.length);
-        } catch (_){}
+          console.log('[PW][JSONLD-FLAGS]', {
+            hasOrgJsonLd: hasOrg,
+            hasWebsiteJsonLd: hasSite,
+            nodeCount: nodes.length
+          });
+        } catch (e) {}
 
-        // ここで返すオブジェクトは「トップレベル facts にもフラグをコピー」するため
+        // トップレベル facts にもコピーして返す
         return {
           hasOrgJsonLd: hasOrg,
           hasWebsiteJsonLd: hasSite
         };
-      } catch (_e) {
+      } catch (e) {
+        try {
+          console.log('[PW][JSONLD-FLAGS][ERR]', String(e && e.stack || e));
+        } catch (_) {}
         return {};
       }
     })(),
@@ -2284,18 +2293,18 @@ async function scrapeOnce(req, res) {
     }
   }; // ← ここで必ず閉じる！
 
-// --- 追加: /scrape で採点も実施して返す ---
-const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
-const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
+  // --- 追加: /scrape で採点も実施して返す ---
+  const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
+  const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
 
-// --- CACHE SET（成功時のみ保存）
-try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
+  // --- CACHE SET（成功時のみ保存）
+  try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
 
-out.debug = out.debug || {};
-if (noCache) out.debug.cache = { hit: false, nocache: true };
+  out.debug = out.debug || {};
+  if (noCache) out.debug.cache = { hit: false, nocache: true };
 
-// 正常終了
-return res.status(200).json(out);
+  // 正常終了
+  return res.status(200).json(out);
 
   } catch (err) {
     const elapsedMs = Date.now() - t0;
