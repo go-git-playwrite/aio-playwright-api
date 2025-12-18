@@ -493,6 +493,15 @@ async function buildAuditSigFromPage(page) {
 
   console.log('[AUDIT_SIG][coverageNav]', coverageNav);
 
+  const traceId = `covnav|${(await page.url()).replace(/[#?].*$/,'').replace(/\/+$/,'')}|${Date.now()}`;
+
+  console.log('[TRACE_COVNAV][NODE][auditSig-ready]', {
+    traceId,
+    url: await page.url(),
+    coverageNav,
+    htmlLen: (await page.content()).length
+  });
+
   return {
     // JSON-LD 周り
     jsonldDetected,
@@ -1446,6 +1455,14 @@ async function scrapeOnce(req, res) {
         const payload = JSON.parse(JSON.stringify(cached.json));
         if (!payload.debug) payload.debug = {};
         payload.debug.cache = { hit: true, ageMs: cached.age, ttlMs: CACHE_TTL_MS, nocache: false };
+
+        console.log('[TRACE_COVNAV][NODE][cache-hit-return]', {
+          url: urlToFetch,
+          hasAuditSig: !!payload.auditSig,
+          hasCoverageNav: !!(payload.auditSig && payload.auditSig.coverageNav),
+          coverageNav: payload.auditSig && payload.auditSig.coverageNav
+        });
+
         return res.status(200).json(payload);
       }
     }
@@ -2380,6 +2397,34 @@ app.get('/api/score', async (req, res) => {
     afterObj: { source: 'FALLBACK_BUILD', jsonld: s?.fallbackJsonld || {} },
     debug: { wait: s?.waitStrategy, blockedResources: s?.blockedResources, scorerModel: real ? 'gemini-1.5-pro' : 'dummy' }
   };
+
+  if (!payload.auditSig) payload.auditSig = {};
+  if (!payload.auditSig.coverageNav) {
+    payload.auditSig.coverageNav =
+      s?.auditSig?.coverageNav ||
+      s?.facts?.auditSig?.coverageNav ||
+      s?.facts?.coverageNav ||
+      null;
+  }
+
+  try {
+    const covNav =
+      payload?.auditSig?.coverageNav ||
+      payload?.before?.facts?.auditSig?.coverageNav ||
+      payload?.before?.facts?.coverageNav ||
+      s?.auditSig?.coverageNav ||
+      s?.facts?.auditSig?.coverageNav ||
+      null;
+
+    console.log('[TRACE_COVNAV][NODE][payload-ready]', {
+      url: urlToFetch,
+      hasAuditSig: !!(payload?.auditSig || payload?.before?.facts?.auditSig || s?.auditSig || s?.facts?.auditSig),
+      hasCoverageNav: !!covNav,
+      coverageNav: covNav
+    });
+  } catch (e) {
+    console.log('[TRACE_COVNAV][NODE][payload-ready][ERR]', String(e && (e.stack || e)));
+  }
 
   if (force === 'dummy') payload.scores.real = null;
   res.json(payload);
