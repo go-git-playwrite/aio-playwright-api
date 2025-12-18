@@ -491,6 +491,8 @@ async function buildAuditSigFromPage(page) {
     // 失敗しても coverageNav はデフォルト(false)のまま
   }
 
+  console.log('[AUDIT_SIG][coverageNav]', coverageNav);
+
   return {
     // JSON-LD 周り
     jsonldDetected,
