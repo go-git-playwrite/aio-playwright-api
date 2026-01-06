@@ -266,6 +266,7 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         jsonldCount,
         jsonldSampleHead,
         footerPresent: !!footer,
+        hasMainLandmark: !!document.querySelector('main,[role="main"]'),
         copyrightHit: !!hasHit,
         copyrightToken: hitToken || '',
         copyrightExcerpt: searchArea.trim().slice(0, 100)
