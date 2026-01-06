@@ -442,6 +442,9 @@ async function buildAuditSigFromPage(page) {
   const copyrightFooterPresent = !!jp.copyright_footer_present;
   const copyrightHitToken      = String(jp.copyright_hit_token || '');
 
+  // ★ 追加（ここ）
+  const hasMainLandmark        = !!jp.hasMainLandmark;
+
   // --- NEW: ナビ/フッターを含めた coverage 導線フラグ検出 ---
   let coverageNav = {
     hasCompanyNav: false,
@@ -506,6 +509,15 @@ async function buildAuditSigFromPage(page) {
     htmlLen: (await page.content()).length
   });
 
+  console.log(
+    '[AUDIT_SIG][FINAL]',
+    {
+      url: await page.url(),
+      hasMainLandmark_from_probe: jp.hasMainLandmark,
+      hasMainLandmark_final: hasMainLandmark
+    }
+  );
+
   return {
     // JSON-LD 周り
     jsonldDetected,
@@ -513,6 +525,9 @@ async function buildAuditSigFromPage(page) {
     jsonldTimedOut,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
     jsonldTypes: jsonldTypesAll,
+
+    // ★ 追加（ここ）
+    hasMainLandmark,
 
     // head/meta 周り
     hasTitle,
