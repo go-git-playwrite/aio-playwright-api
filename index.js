@@ -497,8 +497,14 @@ async function buildAuditSigFromPage(page) {
   const copyrightFooterPresent = !!jp.copyright_footer_present;
   const copyrightHitToken      = String(jp.copyright_hit_token || '');
 
-  // ★ 追加（ここ）
-  const hasMainLandmark        = !!jp.hasMainLandmark;
+  // ★ SPA観測値（probe 側のラッチ結果を拾う）
+  const hasMainLandmark = !!jp.hasMainLandmark;
+
+  // probe 側が snake_case で返してくる想定（header_present / nav_count / h1_count）
+  const headerPresent = !!jp.header_present;
+  const footerPresent = !!jp.footer_present;
+  const navCount      = Number(jp.nav_count || 0);
+  const h1Count       = Number(jp.h1_count  || 0);
 
   // --- NEW: ナビ/フッターを含めた coverage 導線フラグ検出 ---
   let coverageNav = {
@@ -583,6 +589,12 @@ async function buildAuditSigFromPage(page) {
 
     // ★ 追加（ここ）
     hasMainLandmark,
+
+    // ★ 追加（SPA観測値）
+    headerPresent,
+    footerPresent,
+    navCount,
+    h1Count,
 
     // head/meta 周り
     hasTitle,
