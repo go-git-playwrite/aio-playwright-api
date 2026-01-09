@@ -197,6 +197,12 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   }
 
   // --- DOM スナップショット: JSON-LD + コピーライトを見る ---
+  let mainSeen   = false;
+  let headerSeen = false;
+  let footerSeen = false;
+  let navMax     = 0;
+  let h1Max      = 0;
+
   const snapshot = async () => {
     return await page.evaluate(() => {
       const allScripts = Array.from(document.querySelectorAll('script'));
@@ -262,11 +268,24 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
               : lower.includes(t.toLowerCase())
           ) || '')) || '';
 
+      const header = document.querySelector('header,[role="banner"]');
+      const footer2 = document.querySelector('footer,[role="contentinfo"]');
+
+      const h1Count = document.querySelectorAll('h1').length;
+      const navCount = document.querySelectorAll('nav,[role="navigation"]').length;
+
       return {
         jsonldCount,
         jsonldSampleHead,
-        footerPresent: !!footer,
+
+        // ★ SPAでも後段で使える“観測値”を増やす（ラッチは次ステップで）
+        headerPresent: !!header,
+        footerPresent: !!footer2,
+        navCount,
+        h1Count,
+
         hasMainLandmark: !!document.querySelector('main,[role="main"]'),
+
         copyrightHit: !!hasHit,
         copyrightToken: hitToken || '',
         copyrightExcerpt: searchArea.trim().slice(0, 100)
@@ -277,6 +296,14 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   // --- DOM ベースで JSON-LD が出てくるのを待つループ ---
   while (Date.now() - t0 < maxWaitMs) {
     const r = await snapshot();
+
+    // ★ latch: 一度でも見えた/最大になった値を保持（SPA対策）
+    if (r.hasMainLandmark) mainSeen = true;
+    if (r.headerPresent)   headerSeen = true;
+    if (r.footerPresent)   footerSeen = true;
+    if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+    if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
+
     if (r.jsonldCount > 0) {
       return {
         jsonld_detected_once: true,
@@ -284,7 +311,15 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         jsonld_wait_ms: Date.now() - t0,
         jsonld_timed_out: false,
         jsonld_sample_head: r.jsonldSampleHead,
-        hasMainLandmark: !!r.hasMainLandmark,
+
+        hasMainLandmark: mainSeen,
+
+        // ★追加（ラッチ結果を返す）
+        header_present: headerSeen,
+        footer_present: footerSeen,
+        nav_count: navMax,
+        h1_count: h1Max,
+
         copyright_footer_present: r.footerPresent,
         copyright_hit: r.copyrightHit,
         copyright_hit_token: r.copyrightToken,
@@ -296,6 +331,12 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
 
   // --- タイムアウト: DOM 上は 0 件だった場合のフォールバック ---
   const r = await snapshot();
+
+  if (r.hasMainLandmark) mainSeen = true;
+  if (r.headerPresent)   headerSeen = true;
+  if (r.footerPresent)   footerSeen = true;
+  if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+  if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
 
   // A案: DOM に JSON-LD が出てこない場合、type="module" の外部 JS（例: /app-index.js）を 1 本だけ見に行く
   try {
@@ -338,11 +379,18 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
               return {
                 jsonld_detected_once: true,
                 jsonld_detect_count: count,
-                jsonld_types: typeNames, // ★ ここで types を返す
+                jsonld_types: typeNames,
                 jsonld_wait_ms: Date.now() - t0,
                 jsonld_timed_out: false,
                 jsonld_sample_head: head,
-                hasMainLandmark: !!r.hasMainLandmark,
+                hasMainLandmark: mainSeen,
+
+                // ★追加（ラッチ結果を返す）
+                header_present: headerSeen,
+                footer_present: footerSeen,
+                nav_count: navMax,
+                h1_count: h1Max,
+
                 copyright_footer_present: r.footerPresent,
                 copyright_hit: r.copyrightHit,
                 copyright_hit_token: r.copyrightToken,
@@ -364,7 +412,14 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
     jsonld_wait_ms: Date.now() - t0,
     jsonld_timed_out: true,
     jsonld_sample_head: '',
-    hasMainLandmark: !!r.hasMainLandmark,
+    hasMainLandmark: mainSeen,
+
+    // ★追加（ラッチ結果を返す）
+    header_present: headerSeen,
+    footer_present: footerSeen,
+    nav_count: navMax,
+    h1_count: h1Max,
+
     copyright_footer_present: r.footerPresent,
     copyright_hit: r.copyrightHit,
     copyright_hit_token: r.copyrightToken,
