@@ -268,23 +268,38 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
               : lower.includes(t.toLowerCase())
           ) || '')) || '';
 
-      const header = document.querySelector('header,[role="banner"]');
-      const footer2 = document.querySelector('footer,[role="contentinfo"]');
+      function pickFirst(selectors){
+        for (const sel of selectors){
+          const el = document.querySelector(sel);
+          if (el) return { el, sel };
+        }
+        return { el: null, sel: '' };
+      }
 
-      const h1Count = document.querySelectorAll('h1').length;
+      const H = pickFirst(['header', '[role="banner"]', '#header', '.header', '.l-header', '.site-header']);
+      const F = pickFirst(['footer', '[role="contentinfo"]', '#footer', '.footer', '.l-footer', '.site-footer']);
+
+      // nav は「要素数」と「role」も見る（class nav 系は次で増やせる）
       const navCount = document.querySelectorAll('nav,[role="navigation"]').length;
+      const h1Count  = document.querySelectorAll('h1').length;
+
+      // main も “どれで当たったか” を見る
+      const M = pickFirst(['main', '[role="main"]', '#main', '.main', '.l-main', '.site-main']);
 
       return {
         jsonldCount,
         jsonldSampleHead,
 
-        // ★ SPAでも後段で使える“観測値”を増やす（ラッチは次ステップで）
         headerPresent: !!header,
         footerPresent: !!footer2,
         navCount,
         h1Count,
 
         hasMainLandmark: !!document.querySelector('main,[role="main"]'),
+
+        headerSel: header ? 'header/[role=banner]' : '',
+        footerSel: footer2 ? 'footer/[role=contentinfo]' : '',
+        mainSel: document.querySelector('main,[role="main"]') ? 'main/[role=main]' : '',
 
         copyrightHit: !!hasHit,
         copyrightToken: hitToken || '',
