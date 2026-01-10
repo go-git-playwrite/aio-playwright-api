@@ -175,113 +175,316 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
 }
 
 // === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
+// 目的：SPA でも「一瞬でも出た main/header/footer/nav/h1」をラッチして取りこぼさない。
+// 戻り値は probe 側(snake_case)で統一：buildAuditSigFromPage 側で header_present→headerPresent に合流する想定。
 async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 } = {}) {
   const t0 = Date.now();
 
+  // Playwright のロード状態は「補助」。これだけでは SPA の DOM 出現を保証できない。
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
-  // --- ラッチ用 ---
-  let mainSeen   = false;
-  let headerSeen = false;
-  let footerSeen = false;
-  let navMax     = 0;
-  let h1Max      = 0;
+  // --- DOM スナップショット（1回分） ---
+  const snapshot = async () => {
+    return await page.evaluate(() => {
+      // ---------- JSON-LD 検出 ----------
+      const allScripts = Array.from(document.querySelectorAll('script'));
 
-  // --- DOM snapshot ---
-  async function snapshot() {
-    return page.evaluate(() => {
-      const scripts = Array.from(document.querySelectorAll('script')).filter(el => {
-        const t = (el.getAttribute('type') || '').toLowerCase();
-        if (t.includes('ld+json')) return true;
-        if (t && t !== 'application/json' && t !== 'text/plain') return false;
-        const txt = (el.textContent || '');
-        return txt.includes('"@context"') && txt.includes('"@type"');
+      // 1) type に ld+json を含む script（素直な JSON-LD）
+      let scripts = allScripts.filter(el => {
+        const t = (el.getAttribute('type') || '').toLowerCase().trim();
+        return t.includes('ld+json');
       });
 
-      const jsonldCount = scripts.length;
-      const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 80);
+      // 2) それでも 0 件なら、中身が JSON-LD っぽい script も拾う
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(el => {
+          const t = (el.getAttribute('type') || '').toLowerCase().trim();
+          // JSON-LD が紛れ込みがちな type だけ対象（厳しすぎると拾えないので緩め）
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
+          const txt = (el.textContent || '').trim();
+          if (!txt) return false;
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }
 
-      const header = document.querySelector('header,[role="banner"]');
-      const footer = document.querySelector('footer,[role="contentinfo"]');
-      const main   = document.querySelector('main,[role="main"]');
+      const jsonldCount = scripts.length;
+      const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 200);
+
+      // types をできるだけ集める（script内 JSON をパースできれば拾う／無理なら正規表現）
+      const typesAll = [];
+      for (const sc of scripts) {
+        const raw = (sc.textContent || '').trim();
+        if (!raw) continue;
+
+        // まず JSON.parse できそうなら試す（配列/オブジェクト両対応）
+        let parsed = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (_) {
+          parsed = null;
+        }
+
+        const collectTypes = (obj) => {
+          if (!obj) return;
+          if (Array.isArray(obj)) {
+            obj.forEach(collectTypes);
+            return;
+          }
+          if (typeof obj !== 'object') return;
+
+          const t = obj['@type'];
+          if (typeof t === 'string') typesAll.push(t);
+          else if (Array.isArray(t)) t.forEach(x => typeof x === 'string' && typesAll.push(x));
+        };
+
+        if (parsed) {
+          collectTypes(parsed);
+        } else {
+          // パース不能でも "@type": "XXX" は拾えることがある
+          try {
+            const m = raw.matchAll(/"@type"\s*:\s*"([^"]+)"/g);
+            for (const mm of m) if (mm && mm[1]) typesAll.push(mm[1]);
+          } catch (_) {}
+        }
+      }
+
+      // ---------- Copyright 検出 ----------
+      const footer = document.querySelector('footer');
+      const footerText = footer ? (footer.textContent || '') : '';
+      const bodyText = document.body ? (document.body.textContent || '') : '';
+
+      let copyrightNodeText = '';
+      const cpNode =
+        footer &&
+        (footer.querySelector('p.copyright, .copyright small, .copyright, small, p, span'));
+
+      if (cpNode) {
+        copyrightNodeText = (cpNode.textContent || '').trim();
+      }
+
+      const searchArea =
+        (copyrightNodeText && copyrightNodeText) ||
+        (footerText && footerText) ||
+        (bodyText && bodyText) ||
+        '';
+
+      const lower = searchArea.toLowerCase();
+      const tokenList = ['©', '&copy;', '&#169;', 'copyright', 'コピーライト', '著作権'];
+
+      const copyrightHit = /©|&copy;|&#169;|copyright|コピーライト|著作権/i.test(searchArea);
+      const copyrightHitToken =
+        (copyrightHit &&
+          (tokenList.find(t =>
+            t === '©' ? searchArea.includes('©') : lower.includes(String(t).toLowerCase())
+          ) || '')) || '';
+
+      // ---------- SPA観測（semantic DOM） ----------
+      const headerPresent = !!document.querySelector('header,[role="banner"]');
+      const footerPresent = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasMainLandmark = !!document.querySelector('main,[role="main"]');
 
       const navCount = document.querySelectorAll('nav,[role="navigation"]').length;
       const h1Count  = document.querySelectorAll('h1').length;
 
-      const bodyText = document.body ? document.body.textContent || '' : '';
-      const hasHit = /©|&copy;|&#169;|copyright|コピーライト|著作権/i.test(bodyText);
+      // module script の src（フォールバック用）
+      const moduleScriptSrcs = Array.from(document.querySelectorAll('script[type="module"][src]'))
+        .map(el => el.getAttribute('src') || '')
+        .filter(Boolean);
 
       return {
         jsonldCount,
         jsonldSampleHead,
-        headerPresent: !!header,
-        footerPresent: !!footer,
-        hasMainLandmark: !!main,
+        jsonldTypesAll: typesAll,
+
+        headerPresent,
+        footerPresent,
+        hasMainLandmark,
         navCount,
         h1Count,
-        copyrightHit: hasHit,
-        copyrightExcerpt: bodyText.trim().slice(0, 100)
+
+        moduleScriptSrcs,
+
+        copyrightHit,
+        copyrightHitToken,
+        copyrightExcerpt: searchArea.trim().slice(0, 200),
+
+        // footer の有無（copyright_footer_present の補助）
+        footerElementPresent: !!footer
       };
     });
+  };
+
+  // --- ラッチ（取りこぼし防止） ---
+  let headerSeen = false;
+  let footerSeen = false;
+  let mainSeen   = false;
+  let navMax     = 0;
+  let h1Max      = 0;
+
+  let lastSnap = null;
+
+  // まずは「JS描画で必要そうな要素が1つでも出る」まで軽く待つ（最大8秒）
+  // ※ “文字量” は当てにならないので、DOM/JS痕跡を条件にする
+  try {
+    await page.waitForFunction(() => {
+      const hasMain   = !!document.querySelector('main,[role="main"]');
+      const hasHeader = !!document.querySelector('header,[role="banner"]');
+      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasLdJson = !!document.querySelector('script[type*="ld+json" i]');
+      const hasModule = !!document.querySelector('script[type="module"][src]');
+      return hasMain || hasHeader || hasFooter || hasLdJson || hasModule;
+    }, { timeout: 8000 });
+  } catch (_) {
+    // ここで落とさない（この後のポーリングで拾う）
   }
 
-  // --- wait loop ---
+  // --- ポーリング：JSON-LD or semantic DOM の出現を待ちつつ、最大値をラッチ ---
   while (Date.now() - t0 < maxWaitMs) {
     const r = await snapshot();
+    lastSnap = r;
 
     if (r.headerPresent) headerSeen = true;
     if (r.footerPresent) footerSeen = true;
     if (r.hasMainLandmark) mainSeen = true;
-    if (r.navCount > navMax) navMax = r.navCount;
-    if (r.h1Count > h1Max) h1Max = r.h1Count;
 
-    if (r.jsonldCount > 0) {
+    if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+    if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
+
+    // JSON-LD が DOM で出たら即勝ち
+    if (Number(r.jsonldCount || 0) > 0) {
       return {
         jsonld_detected_once: true,
-        jsonld_detect_count: r.jsonldCount,
-        jsonld_sample_head: r.jsonldSampleHead,
-        jsonld_wait_ms: Date.now() - t0,
+        jsonld_detect_count: Number(r.jsonldCount || 0),
+        jsonld_types_all: Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [],
+        jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
+        jsonld_wait_ms:   Date.now() - t0,
         jsonld_timed_out: false,
+        jsonld_sample_head: String(r.jsonldSampleHead || ''),
 
-        hasMainLandmark: mainSeen,
+        // ★ ラッチ結果（snake_case）
         header_present: headerSeen,
         footer_present: footerSeen,
         nav_count: navMax,
         h1_count: h1Max,
+        hasMainLandmark: mainSeen,
 
-        copyright_hit: r.copyrightHit,
-        copyright_excerpt: r.copyrightExcerpt
+        // copyright（snake_case）
+        copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+        copyright_hit: !!r.copyrightHit,
+        copyright_hit_token: String(r.copyrightHitToken || ''),
+        copyright_excerpt: String(r.copyrightExcerpt || '')
       };
     }
+
+    // JSON-LD は無くても、semantic DOM が一度でも出たら「観測値」は確保できる
+    // ただし JSON-LD をもう少し待ちたいので、ここでは抜けない（maxWaitMs まで続ける）
 
     await page.waitForTimeout(pollMs);
   }
 
-  // --- timeout fallback ---
-  const r = await snapshot();
+  // --- タイムアウト時：最後のスナップでラッチを更新 ---
+  const r = lastSnap || await snapshot();
 
   if (r.headerPresent) headerSeen = true;
   if (r.footerPresent) footerSeen = true;
   if (r.hasMainLandmark) mainSeen = true;
-  if (r.navCount > navMax) navMax = r.navCount;
-  if (r.h1Count > h1Max) h1Max = r.h1Count;
 
+  if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+  if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
+
+  // --- フォールバック：DOMに JSON-LD が出ない SPA 用（module script から探索） ---
+  // module script を 1本だけ GET して "@context" & "@type" を探す（軽量）
+  try {
+    if (Number(r.jsonldCount || 0) === 0) {
+      // module src 候補（相対/絶対を正規化）
+      let moduleSrcs = Array.isArray(r.moduleScriptSrcs) ? r.moduleScriptSrcs : [];
+
+      // 相対パスを絶対化
+      const pageUrl = await page.url();
+      try {
+        moduleSrcs = moduleSrcs.map(s => {
+          try { return new URL(s, pageUrl).toString(); } catch(_) { return s; }
+        });
+      } catch(_) {}
+
+      if (moduleSrcs.length > 0) {
+        // app-index.js 優先、それ以外は先頭
+        const target =
+          moduleSrcs.find(u => String(u).includes('app-index.js')) ||
+          moduleSrcs[0];
+
+        if (target) {
+          const resp = await page.context().request.get(target).catch(() => null);
+          if (resp && resp.ok()) {
+            const jsText = await resp.text();
+            const idxContext = jsText.indexOf('"@context"');
+            const idxType    = jsText.indexOf('"@type"');
+
+            if (idxContext !== -1 && idxType !== -1) {
+              // "@type" を列挙
+              let typeNames = [];
+              try {
+                const mAll = jsText.matchAll(/"@type"\s*:\s*"([^"]+)"/g);
+                for (const m of mAll) if (m && m[1]) typeNames.push(m[1]);
+              } catch (_) {}
+
+              // sample head
+              const head = jsText.slice(Math.max(0, idxContext - 40), idxContext + 240);
+
+              // detect_count は type の出現数をざっくり採用（最低1）
+              const typeMatches = jsText.match(/"@type"\s*:/g);
+              const count = typeMatches ? Math.max(1, typeMatches.length) : 1;
+
+              return {
+                jsonld_detected_once: true,
+                jsonld_detect_count: count,
+                jsonld_types_all: typeNames,
+                jsonld_types:     typeNames, // 互換
+                jsonld_wait_ms:   Date.now() - t0,
+                jsonld_timed_out: false,
+                jsonld_sample_head: String(head || ''),
+
+                header_present: headerSeen,
+                footer_present: footerSeen,
+                nav_count: navMax,
+                h1_count: h1Max,
+                hasMainLandmark: mainSeen,
+
+                copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+                copyright_hit: !!r.copyrightHit,
+                copyright_hit_token: String(r.copyrightHitToken || ''),
+                copyright_excerpt: String(r.copyrightExcerpt || '')
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // フォールバック失敗は無視して通常の timeout 結果へ
+  }
+
+  // --- ここまで来たら「見つからなかった」 ---
   return {
     jsonld_detected_once: false,
-    jsonld_detect_count: r.jsonldCount,
-    jsonld_sample_head: '',
-    jsonld_wait_ms: Date.now() - t0,
+    jsonld_detect_count: Number(r.jsonldCount || 0),
+    jsonld_types_all: Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [],
+    jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
+    jsonld_wait_ms:   Date.now() - t0,
     jsonld_timed_out: true,
+    jsonld_sample_head: String(r.jsonldSampleHead || ''),
 
-    hasMainLandmark: mainSeen,
     header_present: headerSeen,
     footer_present: footerSeen,
     nav_count: navMax,
     h1_count: h1Max,
+    hasMainLandmark: mainSeen,
 
-    copyright_hit: r.copyrightHit,
-    copyright_excerpt: r.copyrightExcerpt
+    copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+    copyright_hit: !!r.copyrightHit,
+    copyright_hit_token: String(r.copyrightHitToken || ''),
+    copyright_excerpt: String(r.copyrightExcerpt || '')
   };
 }
 
