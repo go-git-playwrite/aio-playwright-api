@@ -579,6 +579,8 @@ async function buildAuditSigFromPage(page) {
     }
   );
 
+  console.log('[AUDIT_SIG][HAS-SPA4]', { headerPresent, footerPresent, navCount, h1Count });
+
   return {
     // JSON-LD 周り
     jsonldDetected,
