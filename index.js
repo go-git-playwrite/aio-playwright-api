@@ -348,6 +348,32 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
 
     console.log('[DBG][DOM-TOPOLOGY]', topo);
 
+    try{
+      // 1) 展開できない問題を確実に潰す
+      console.log('[DBG][DOM-TOPOLOGY][JSON]', JSON.stringify(topo));
+    }catch(e){
+      console.log('[DBG][DOM-TOPOLOGY][JSON][ERR]', String(e && (e.message || e)));
+    }
+
+    try{
+      // 2) Shadow の “先頭だけ” を人間が読める形で抜く（JSONより見やすいことが多い）
+      const s = topo && topo.shadowTopology && topo.shadowTopology.samples;
+      console.log('[DBG][DOM-TOPOLOGY][SHADOW-SAMPLES]', Array.isArray(s) ? s : '(none)');
+    }catch(e){
+      console.log('[DBG][DOM-TOPOLOGY][SHADOW-SAMPLES][ERR]', String(e && (e.message || e)));
+    }
+
+    try{
+      // 3) 重要シグナルだけを短く1行で（ログ検索が楽）
+      console.log('[DBG][DOM-TOPOPOLOGY][SIG]', {
+        url: topo && topo.url,
+        module: topo && topo.counts && topo.counts.module,
+        bodyTextLen: topo && topo.metrics && topo.metrics.bodyTextLen,
+        openShadowRoots: topo && topo.shadowCounts && topo.shadowCounts.roots,
+        shadowHasMain: topo && topo.shadowHasMain
+      });
+    }catch(_){}
+
     // === [DBG][DOM-ROOT-CHECK v1] 1回で「どこにDOMがあるか」を確定 ===
     try {
       // 1) 現在フレームの URL と、最終的に見てるページ URL のズレ
