@@ -175,7 +175,6 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
 }
 
 // === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
-// === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
 async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 } = {}) {
   const t0 = Date.now();
 
@@ -1478,8 +1477,10 @@ async function scrapeOnce(req, res) {
 
     // === ここから追記（本文長しきい値で待機）===
     await page.waitForFunction(() => {
-      const t = (document.documentElement?.innerText || '').replace(/\s+/g,'');
-      return t.length > 200;
+      const hasHeader = !!document.querySelector('header,[role="banner"]');
+      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasMain   = !!document.querySelector('main,[role="main"]');
+      return hasHeader || hasFooter || hasMain;
     }, { timeout: 8000 }).catch(()=>{});
 
     // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
