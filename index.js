@@ -184,6 +184,78 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
+  // === [DBG][DOM-TOPOLOGY v1] 1回で「観測対象ズレ」を潰す ===
+  try {
+    const topo = await page.evaluate(() => {
+      const out = {};
+
+      // ---- 基本カウント（現ドキュメント）----
+      out.url = location.href;
+      out.readyState = document.readyState;
+      out.title = document.title || '';
+      out.bodyChildCount = document.body ? document.body.childElementCount : -1;
+
+      out.counts = {
+        header: document.querySelectorAll('header,[role="banner"]').length,
+        footer: document.querySelectorAll('footer,[role="contentinfo"]').length,
+        main:   document.querySelectorAll('main,[role="main"]').length,
+        nav:    document.querySelectorAll('nav,[role="navigation"]').length,
+        h1:     document.querySelectorAll('h1').length,
+        ldjson:  document.querySelectorAll('script[type*="ld+json" i]').length,
+        module:  document.querySelectorAll('script[type="module"][src]').length,
+        iframe:  document.querySelectorAll('iframe').length
+      };
+
+      // ---- 画面に実体があるか（超ざっくり）----
+      out.metrics = {
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen:  (document.body?.innerText || '').length,
+      };
+
+      // ---- iframe: 同一オリジンだけ覗ける範囲で「中にmain等があるか」----
+      const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12);
+      out.iframes = iframes.map((f, idx) => {
+        let ok = false, counts = null, src = '';
+        try {
+          src = f.getAttribute('src') || '';
+          const d = f.contentDocument; // cross-origin だと例外/ null
+          if (d) {
+            ok = true;
+            counts = {
+              header: d.querySelectorAll('header,[role="banner"]').length,
+              footer: d.querySelectorAll('footer,[role="contentinfo"]').length,
+              main:   d.querySelectorAll('main,[role="main"]').length,
+              nav:    d.querySelectorAll('nav,[role="navigation"]').length,
+              h1:     d.querySelectorAll('h1').length,
+              ldjson: d.querySelectorAll('script[type*="ld+json" i]').length
+            };
+          }
+        } catch (e) {
+          ok = false;
+        }
+        return { idx, src: src.slice(0, 160), sameOriginReadable: ok, counts };
+      });
+
+      // ---- Shadow DOM: open root の有無だけ（closed は“推定”もできないので存在確認はここまで）----
+      const nodes = Array.from(document.querySelectorAll('*'));
+      let openRoots = 0;
+      for (const el of nodes) if (el.shadowRoot) openRoots++;
+      out.shadow = { openRoots };
+
+      // ---- 代表的な SPA ルート候補（あれば名前を見る）----
+      const roots = ['#app', '#root', '#__next', '#svelte', '#nuxt', '#main', '#content'];
+      out.spaRoots = roots
+        .map(sel => ({ sel, hit: !!document.querySelector(sel) }))
+        .filter(x => x.hit);
+
+      return out;
+    });
+
+    console.log('[DBG][DOM-TOPOLOGY]', topo);
+  } catch (e) {
+    console.log('[DBG][DOM-TOPOLOGY][ERR]', String(e && (e.message || e)));
+  }
+
   // --- DOM スナップショット（1回分） ---
   const snapshot = async () => {
     return await page.evaluate(() => {
@@ -303,13 +375,28 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         navCount,
         h1Count,
 
+        // 追加：なぜ false なのか切り分け用
+        dbg: {
+          readyState: document.readyState,
+          locationHref: location.href,
+          mainCount: document.querySelectorAll('main,[role="main"]').length,
+          mainAltCount: document.querySelectorAll('#main,.main,.l-main,.site-main,[data-main]').length,
+          mainOuterHead: (() => {
+            const el =
+              document.querySelector('main,[role="main"]') ||
+              document.querySelector('#main,.main,.l-main,.site-main,[data-main]');
+            return el ? String(el.outerHTML || '').slice(0, 200) : '';
+          })(),
+          bodyTextLen: (document.body?.innerText || '').length,
+          bodyHtmlLen: (document.body?.innerHTML || '').length,
+        },
+
         moduleScriptSrcs,
 
         copyrightHit,
         copyrightHitToken,
         copyrightExcerpt: searchArea.trim().slice(0, 200),
 
-        // footer の有無（copyright_footer_present の補助）
         footerElementPresent: !!footer
       };
     });
@@ -325,7 +412,6 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   let lastSnap = null;
 
   // まずは「JS描画で必要そうな要素が1つでも出る」まで軽く待つ（最大8秒）
-  // ※ “文字量” は当てにならないので、DOM/JS痕跡を条件にする
   try {
     await page.waitForFunction(() => {
       const hasMain   = !!document.querySelector('main,[role="main"]');
@@ -335,8 +421,21 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       const hasModule = !!document.querySelector('script[type="module"][src]');
       return hasMain || hasHeader || hasFooter || hasLdJson || hasModule;
     }, { timeout: 8000 });
-  } catch (_) {
-    // ここで落とさない（この後のポーリングで拾う）
+  } catch (_) {}
+
+  // ★★★★★ ここに「IFRAME-CHECK」を挿入（この1箇所だけ） ★★★★★
+  try {
+    const iframes = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+        index: i,
+        src: f.getAttribute('src'),
+        id: f.id || null,
+        class: f.className || null
+      }));
+    });
+    console.log('[DEBUG][IFRAME-CHECK]', iframes);
+  } catch (e) {
+    console.log('[DEBUG][IFRAME-CHECK][ERR]', e && e.message);
   }
 
   // --- ポーリング：JSON-LD or semantic DOM の出現を待ちつつ、最大値をラッチ ---
