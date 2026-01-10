@@ -370,145 +370,122 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   // --- DOM スナップショット（1回分） ---
   const snapshot = async () => {
     return await page.evaluate(() => {
-      // ---------- JSON-LD 検出 ----------
-      const allScripts = Array.from(document.querySelectorAll('script'));
+      // --------- helpers ----------
+      const q = (root, sel) => {
+        try { return root ? root.querySelector(sel) : null; } catch (_) { return null; }
+      };
+      const qa = (root, sel) => {
+        try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+      };
+      const textLen = (root) => {
+        try { return (root && root.innerText) ? root.innerText.length : 0; } catch (_) { return 0; }
+      };
 
-      // 1) type に ld+json を含む script（素直な JSON-LD）
+      // --------- shadow roots (open only) ----------
+      const hosts = Array.from(document.querySelectorAll('*'));
+      const openRoots = [];
+      for (const el of hosts) {
+        if (el && el.shadowRoot) openRoots.push({ tag: el.tagName.toLowerCase(), root: el.shadowRoot });
+        if (openRoots.length >= 8) break; // 多すぎると重いので上限
+      }
+
+      // Light DOM counts
+      const light = {
+        header: qa(document, 'header,[role="banner"]').length,
+        footer: qa(document, 'footer,[role="contentinfo"]').length,
+        main:   qa(document, 'main,[role="main"]').length,
+        nav:    qa(document, 'nav,[role="navigation"]').length,
+        h1:     qa(document, 'h1').length,
+        ldjson: qa(document, 'script[type*="ld+json" i]').length,
+        module: qa(document, 'script[type="module"][src]').length
+      };
+
+      // Shadow DOM counts（open root を合算）
+      const shadow = {
+        openRoots: openRoots.length,
+        counts: { header: 0, footer: 0, main: 0, nav: 0, h1: 0, ldjson: 0 },
+        textLenMax: 0,
+        samples: [] // どのhostに入ってるかのヒント
+      };
+
+      for (const it of openRoots) {
+        const r = it.root;
+        const c = {
+          header: qa(r, 'header,[role="banner"]').length,
+          footer: qa(r, 'footer,[role="contentinfo"]').length,
+          main:   qa(r, 'main,[role="main"]').length,
+          nav:    qa(r, 'nav,[role="navigation"]').length,
+          h1:     qa(r, 'h1').length,
+          ldjson: qa(r, 'script[type*="ld+json" i]').length
+        };
+        shadow.counts.header += c.header;
+        shadow.counts.footer += c.footer;
+        shadow.counts.main   += c.main;
+        shadow.counts.nav    += c.nav;
+        shadow.counts.h1     += c.h1;
+        shadow.counts.ldjson += c.ldjson;
+
+        const tl = textLen(r);
+        if (tl > shadow.textLenMax) shadow.textLenMax = tl;
+
+        if (shadow.samples.length < 6) {
+          shadow.samples.push({ host: it.tag, ...c, textLen: tl });
+        }
+      }
+
+      // --------- JSON-LD 検出（Light + Shadow） ----------
+      const allScriptsLight = qa(document, 'script');
+      const allScriptsShadow = openRoots.flatMap(it => qa(it.root, 'script'));
+      const allScripts = allScriptsLight.concat(allScriptsShadow);
+
       let scripts = allScripts.filter(el => {
-        const t = (el.getAttribute('type') || '').toLowerCase().trim();
+        const t = String(el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
         return t.includes('ld+json');
       });
 
-      // 2) それでも 0 件なら、中身が JSON-LD っぽい script も拾う
       if (scripts.length === 0) {
         scripts = allScripts.filter(el => {
-          const t = (el.getAttribute('type') || '').toLowerCase().trim();
-          // JSON-LD が紛れ込みがちな type だけ対象（厳しすぎると拾えないので緩め）
+          const t = String(el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
           if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
-          const txt = (el.textContent || '').trim();
-          if (!txt) return false;
+          const txt = String(el.textContent || '').trim();
           return txt.includes('"@context"') && txt.includes('"@type"');
         });
       }
 
       const jsonldCount = scripts.length;
-      const jsonldSampleHead = (scripts[0]?.textContent || '').slice(0, 200);
+      const jsonldSampleHead = String(scripts[0]?.textContent || '').slice(0, 200);
 
-      // types をできるだけ集める（script内 JSON をパースできれば拾う／無理なら正規表現）
-      const typesAll = [];
-      for (const sc of scripts) {
-        const raw = (sc.textContent || '').trim();
-        if (!raw) continue;
+      // --------- semantic DOM flags（Light OR Shadow） ----------
+      const headerPresent = (light.header > 0) || (shadow.counts.header > 0);
+      const footerPresent = (light.footer > 0) || (shadow.counts.footer > 0);
+      const hasMainLandmark = (light.main > 0) || (shadow.counts.main > 0);
+      const navCount = light.nav + shadow.counts.nav;
+      const h1Count  = light.h1  + shadow.counts.h1;
 
-        // まず JSON.parse できそうなら試す（配列/オブジェクト両対応）
-        let parsed = null;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (_) {
-          parsed = null;
-        }
-
-        const collectTypes = (obj) => {
-          if (!obj) return;
-          if (Array.isArray(obj)) {
-            obj.forEach(collectTypes);
-            return;
-          }
-          if (typeof obj !== 'object') return;
-
-          const t = obj['@type'];
-          if (typeof t === 'string') typesAll.push(t);
-          else if (Array.isArray(t)) t.forEach(x => typeof x === 'string' && typesAll.push(x));
-        };
-
-        if (parsed) {
-          collectTypes(parsed);
-        } else {
-          // パース不能でも "@type": "XXX" は拾えることがある
-          try {
-            const m = raw.matchAll(/"@type"\s*:\s*"([^"]+)"/g);
-            for (const mm of m) if (mm && mm[1]) typesAll.push(mm[1]);
-          } catch (_) {}
-        }
-      }
-
-      // ---------- Copyright 検出 ----------
-      const footer = document.querySelector('footer');
-      const footerText = footer ? (footer.textContent || '') : '';
-      const bodyText = document.body ? (document.body.textContent || '') : '';
-
-      let copyrightNodeText = '';
-      const cpNode =
-        footer &&
-        (footer.querySelector('p.copyright, .copyright small, .copyright, small, p, span'));
-
-      if (cpNode) {
-        copyrightNodeText = (cpNode.textContent || '').trim();
-      }
-
-      const searchArea =
-        (copyrightNodeText && copyrightNodeText) ||
-        (footerText && footerText) ||
-        (bodyText && bodyText) ||
-        '';
-
-      const lower = searchArea.toLowerCase();
-      const tokenList = ['©', '&copy;', '&#169;', 'copyright', 'コピーライト', '著作権'];
-
-      const copyrightHit = /©|&copy;|&#169;|copyright|コピーライト|著作権/i.test(searchArea);
-      const copyrightHitToken =
-        (copyrightHit &&
-          (tokenList.find(t =>
-            t === '©' ? searchArea.includes('©') : lower.includes(String(t).toLowerCase())
-          ) || '')) || '';
-
-      // ---------- SPA観測（semantic DOM） ----------
-      const headerPresent = !!document.querySelector('header,[role="banner"]');
-      const footerPresent = !!document.querySelector('footer,[role="contentinfo"]');
-      const hasMainLandmark = !!document.querySelector('main,[role="main"]');
-
-      const navCount = document.querySelectorAll('nav,[role="navigation"]').length;
-      const h1Count  = document.querySelectorAll('h1').length;
-
-      // module script の src（フォールバック用）
-      const moduleScriptSrcs = Array.from(document.querySelectorAll('script[type="module"][src]'))
+      // --------- module script srcs（Lightのみで十分） ----------
+      const moduleScriptSrcs = qa(document, 'script[type="module"][src]')
         .map(el => el.getAttribute('src') || '')
         .filter(Boolean);
 
       return {
+        // JSON-LD
         jsonldCount,
         jsonldSampleHead,
-        jsonldTypesAll: typesAll,
 
+        // SPA観測（Shadow込み）
         headerPresent,
         footerPresent,
         hasMainLandmark,
         navCount,
         h1Count,
 
-        // 追加：なぜ false なのか切り分け用
-        dbg: {
-          readyState: document.readyState,
-          locationHref: location.href,
-          mainCount: document.querySelectorAll('main,[role="main"]').length,
-          mainAltCount: document.querySelectorAll('#main,.main,.l-main,.site-main,[data-main]').length,
-          mainOuterHead: (() => {
-            const el =
-              document.querySelector('main,[role="main"]') ||
-              document.querySelector('#main,.main,.l-main,.site-main,[data-main]');
-            return el ? String(el.outerHTML || '').slice(0, 200) : '';
-          })(),
-          bodyTextLen: (document.body?.innerText || '').length,
-          bodyHtmlLen: (document.body?.innerHTML || '').length,
-        },
-
+        // デバッグ
         moduleScriptSrcs,
+        shadowTopology: shadow,
 
-        copyrightHit,
-        copyrightHitToken,
-        copyrightExcerpt: searchArea.trim().slice(0, 200),
-
-        footerElementPresent: !!footer
+        // 参考：Light側テキスト長（shadowはshadowTopology.textLenMax）
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen:  (document.body?.innerText || '').length
       };
     });
   };
