@@ -619,14 +619,39 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
     console.log('[DEBUG][IFRAME-CHECK][ERR]', e && e.message);
   }
 
+  // ★★★★★ A11Y（アクセシビリティツリー）経由の landmark 検出 ★★★★★
+  let a11yMainSeen = false;
+
+  try {
+    // Playwright の role selector（closed shadow でも見える可能性あり）
+    const a11yMainCount = await page.getByRole('main').count().catch(() => 0);
+    const a11yBanner    = await page.getByRole('banner').count().catch(() => 0);
+    const a11yFooter    = await page.getByRole('contentinfo').count().catch(() => 0);
+
+    console.log('[DBG][A11Y-LANDMARKS]', {
+      main: a11yMainCount,
+      banner: a11yBanner,
+      footer: a11yFooter
+    });
+
+    if (a11yMainCount > 0) a11yMainSeen = true;
+  } catch (e) {
+    console.log('[DBG][A11Y-LANDMARKS][ERR]', String(e && (e.message || e)));
+  }
+
   // --- ポーリング：JSON-LD or semantic DOM の出現を待ちつつ、最大値をラッチ ---
   while (Date.now() - t0 < maxWaitMs) {
     const r = await snapshot();
     lastSnap = r;
 
+    if (!a11yMainSeen) {
+      const c = await page.getByRole('main').count().catch(() => 0);
+      if (c > 0) a11yMainSeen = true;
+    }
+
     if (r.headerPresent) headerSeen = true;
     if (r.footerPresent) footerSeen = true;
-    if (r.hasMainLandmark) mainSeen = true;
+    if (r.hasMainLandmark || a11yMainSeen) mainSeen = true;
 
     if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
     if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
@@ -668,7 +693,7 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
 
   if (r.headerPresent) headerSeen = true;
   if (r.footerPresent) footerSeen = true;
-  if (r.hasMainLandmark) mainSeen = true;
+  if (r.hasMainLandmark || a11yMainSeen) mainSeen = true;
 
   if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
   if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
