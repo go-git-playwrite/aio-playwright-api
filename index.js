@@ -184,6 +184,9 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
   await page.waitForLoadState('domcontentloaded').catch(() => {});
   await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
+  console.log('[DBG][DOM-TOPOLOGY][ENTER]', { url: await page.url(), t: Date.now() });
+  try { console.log('[DBG][DOM-TOPOLOGY][FRAMECOUNT]', page.frames().length); } catch(_){}
+
   // === [DBG][DOM-TOPOLOGY v1] 1回で「観測対象ズレ」を潰す ===
   try {
     const topo = await page.evaluate(() => {
@@ -251,7 +254,115 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       return out;
     });
 
+    // ---- Playwright frames: evaluateできる範囲で main 等を各frameで確認 ----
+    try {
+      const frames = page.frames();
+      const framesInfo = [];
+      for (const f of frames) {
+        try {
+          const r = await f.evaluate(() => ({
+            url: location.href,
+            hasMain: !!document.querySelector('main,[role="main"]'),
+            hasHeader: !!document.querySelector('header,[role="banner"]'),
+            hasFooter: !!document.querySelector('footer,[role="contentinfo"]'),
+            navCount: document.querySelectorAll('nav,[role="navigation"]').length,
+            h1Count: document.querySelectorAll('h1').length,
+            bodyTextLen: (document.body?.innerText || '').length
+          }));
+          framesInfo.push(r);
+        } catch (e) {
+          framesInfo.push({ url: String(f.url()), err: String(e && (e.message || e)) });
+        }
+      }
+      console.log('[DBG][DOM-TOPOLOGY][FRAMES]', { frameCount: frames.length, frames: framesInfo });
+    } catch (e) {
+      console.log('[DBG][DOM-TOPOLOGY][FRAMES][ERR]', String(e && (e.message || e)));
+    }
+
     console.log('[DBG][DOM-TOPOLOGY]', topo);
+
+    // === [DBG][DOM-ROOT-CHECK v1] 1回で「どこにDOMがあるか」を確定 ===
+    try {
+      // 1) 現在フレームの URL と、最終的に見てるページ URL のズレ
+      const pageUrl = await page.url();
+      const mainFrameUrl = page.mainFrame().url();
+      console.log('[DBG][DOM-ROOT-CHECK][URL]', { pageUrl, mainFrameUrl });
+
+      // 2) 画面が “真っ白” なのか / テキストはあるのか / body自体があるのか
+      const surface = await page.evaluate(() => ({
+        readyState: document.readyState,
+        hasBody: !!document.body,
+        bodyChildren: document.body ? document.body.childElementCount : -1,
+        docElChildren: document.documentElement ? document.documentElement.childElementCount : -1,
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen: (document.body?.innerText || '').length,
+        bodyHTMLLen: (document.body?.innerHTML || '').length,
+        title: document.title || '',
+        locationHref: location.href
+      }));
+      console.log('[DBG][DOM-ROOT-CHECK][SURFACE]', surface);
+
+      // 3) “mainが無い”のではなく「別のセレクタで main 相当がある」ケースを拾う
+      const altMain = await page.evaluate(() => {
+        const candidates = [
+          '#app', '#root', '#__next', '#nuxt', '#svelte',
+          '#content', '#contents', '#main', '.main', '.l-main', '.site-main',
+          '[data-testid="main"]', '[data-main]', '[role="document"]'
+        ];
+
+        const hits = [];
+        for (const sel of candidates) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const txtLen = (el.innerText || '').length;
+          const child = el.childElementCount;
+          hits.push({ sel, child, txtLen });
+        }
+
+        // body直下の代表タグを列挙（何で構成されてるか）
+        const bodyTop = Array.from(document.body ? document.body.children : [])
+          .slice(0, 20)
+          .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            id: el.id || '',
+            cls: (el.className && String(el.className).split(/\s+/).slice(0, 4).join(' ')) || '',
+            child: el.childElementCount
+          }));
+
+        return { altRoots: hits, bodyTop };
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][ALT_MAIN]', altMain);
+
+      // 4) “main等が0”の原因が Shadow DOM かを一発で判断（open rootsだけでも十分ヒントになる）
+      const shadow = await page.evaluate(() => {
+        const nodes = Array.from(document.querySelectorAll('*'));
+        let openRoots = 0;
+        let openRootTags = [];
+        for (const el of nodes) {
+          if (el.shadowRoot) {
+            openRoots++;
+            if (openRootTags.length < 12) openRootTags.push(el.tagName.toLowerCase());
+          }
+        }
+        return { openRoots, openRootTags };
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][SHADOW]', shadow);
+
+      // 5) iframe が “別ドキュメント本体” になっていないか（cross-originかどうかも見える）
+      const iframeInfo = await page.evaluate(() => {
+        const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12);
+        return iframes.map((f, i) => ({
+          i,
+          src: (f.getAttribute('src') || '').slice(0, 180),
+          hasSrcdoc: !!f.getAttribute('srcdoc')
+        }));
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][IFRAMES]', iframeInfo);
+
+    } catch (e) {
+      console.log('[DBG][DOM-ROOT-CHECK][ERR]', String(e && (e.stack || e)));
+    }
+
   } catch (e) {
     console.log('[DBG][DOM-TOPOLOGY][ERR]', String(e && (e.message || e)));
   }
