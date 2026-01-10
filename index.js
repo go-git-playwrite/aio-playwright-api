@@ -215,6 +215,20 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         bodyTextLen:  (document.body?.innerText || '').length,
       };
 
+      // ---- JS進行の目安（1回で「JSが動いてるか」を見る）----
+      out.runtime = {
+        perfNow: (typeof performance !== 'undefined' && performance.now) ? Math.floor(performance.now()) : null,
+        hasHydrationMarks: !!document.querySelector('script[type="module"], link[rel="modulepreload"]'),
+        rafCallable: false
+      };
+
+      try {
+        // requestAnimationFrame が存在して呼べる＝JSの実行環境としては動いている目安
+        out.runtime.rafCallable = (typeof requestAnimationFrame === 'function');
+      } catch (_) {
+        out.runtime.rafCallable = false;
+      }
+
       // ---- iframe: 同一オリジンだけ覗ける範囲で「中にmain等があるか」----
       const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12);
       out.iframes = iframes.map((f, idx) => {
@@ -243,7 +257,60 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       const nodes = Array.from(document.querySelectorAll('*'));
       let openRoots = 0;
       for (const el of nodes) if (el.shadowRoot) openRoots++;
-      out.shadow = { openRoots };
+
+      // ---- Shadow DOM(open) の中に main/header/footer/nav/h1 が居ないかをスキャン ----
+      try {
+        // open shadowRoot だけ辿る（closed は辿れない）
+        const roots = [];
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) roots.push(el.shadowRoot);
+        }
+
+        const shadowCounts = {
+          roots: roots.length,
+          header: 0,
+          footer: 0,
+          main: 0,
+          nav: 0,
+          h1: 0
+        };
+
+        // ルートごとにカウント（重複は許容：まず “居る/居ない” を確定したい）
+        for (const r of roots) {
+          try {
+            shadowCounts.header += r.querySelectorAll('header,[role="banner"]').length;
+            shadowCounts.footer += r.querySelectorAll('footer,[role="contentinfo"]').length;
+            shadowCounts.main   += r.querySelectorAll('main,[role="main"]').length;
+            shadowCounts.nav    += r.querySelectorAll('nav,[role="navigation"]').length;
+            shadowCounts.h1     += r.querySelectorAll('h1').length;
+          } catch (_) {}
+        }
+
+        out.shadowCounts = shadowCounts;
+
+        // “main が Shadow 内にある” をフラグで返す
+        out.shadowHasMain = shadowCounts.main > 0;
+
+        // ついでに「Shadow の最上位タグ」を少しだけサンプル（観測用）
+        out.shadowTopology = {
+          samples: roots.slice(0, 3).map((r, i) => {
+            try {
+              const top = Array.from(r.children || []).slice(0, 8).map(el => ({
+                tag: (el.tagName || '').toLowerCase(),
+                id: el.id || '',
+                cls: (el.className && String(el.className).split(/\s+/).slice(0, 4).join(' ')) || '',
+                child: el.childElementCount
+              }));
+              return { i, top };
+            } catch (e) {
+              return { i, err: String(e && (e.message || e)) };
+            }
+          })
+        };
+      } catch (e) {
+        out.shadowCounts = { err: String(e && (e.message || e)) };
+      }
 
       // ---- 代表的な SPA ルート候補（あれば名前を見る）----
       const roots = ['#app', '#root', '#__next', '#svelte', '#nuxt', '#main', '#content'];
