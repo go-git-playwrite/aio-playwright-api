@@ -2914,7 +2914,28 @@ app.get('/api/score', async (req, res) => {
   };
 
   if (!payload.auditSig) payload.auditSig = {};
-  if (!payload.auditSig.coverageNav) {
+
+  // === [AUDITSIG-MERGE v1] facts.auditSig を payload.auditSig に合流（coverageNav 以外も運ぶ） ===
+  try{
+    const srcAuditSig =
+      s?.facts?.auditSig ||
+      s?.facts?.auditSigV2 ||
+      s?.auditSig ||
+      null;
+
+    if (srcAuditSig && typeof srcAuditSig === 'object'){
+      // 既存payload.auditSigを優先しつつ、足りないキーだけ補完
+      payload.auditSig = payload.auditSig || {};
+      Object.keys(srcAuditSig).forEach(k=>{
+        if (payload.auditSig[k] === undefined) payload.auditSig[k] = srcAuditSig[k];
+      });
+    }
+  }catch(e){
+    console.log('[AUDITSIG-MERGE][ERR]', String(e && (e.stack || e)));
+  }
+  // === [AUDITSIG-MERGE v1] ここまで ===
+
+  if (payload.auditSig.coverageNav == null) { // null/undefined のときだけ補完
     payload.auditSig.coverageNav =
       s?.auditSig?.coverageNav ||
       s?.facts?.auditSig?.coverageNav ||
