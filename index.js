@@ -1216,6 +1216,65 @@ async function scrapeForScoring(url) {
     console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
   }
 
+  // === [SITE-FACTS-LITE v1] 汎用の “存在事実” を抽出して auditSig に保存 ===
+  // 目的: LLMの推測で「採用がない/OGPがない/更新日がない/実績がない」等の嘘カードが出るのを恒久的に防ぐ
+  let __siteFactsLite = null;
+  try{
+    const __html = String(fullHtml || '');
+    const __text = String(innerText || '');
+
+    // meta: OGP/Twitter
+    const __og = (__html.match(/<meta[^>]+property=["']og:/ig) || []).length;
+    const __tw = (__html.match(/<meta[^>]+name=["']twitter:/ig) || []).length;
+    const __ogpDetected = (__og + __tw) > 0;
+
+    // links: 採用/実績/お知らせ/FAQ の導線（href とテキスト両方で汎用検知）
+    const __hrefs = Array.from(__html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/ig)).map(m=>String(m[1]||''));
+    const __aTexts = Array.from(__html.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/ig)).map(m=>String(m[1]||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim());
+
+    const __H = (' ' + __hrefs.join(' ') + ' ').toLowerCase();
+    const __T = (' ' + __aTexts.join(' ') + ' ').toLowerCase();
+
+    const __hasRecruit = /\/recruit\b|\/career\b|\/jobs?\b/.test(__H) || /(採用|求人|キャリア)/.test(__T);
+    const __hasWorks   = /\/case\b|\/works\b|\/portfolio\b/.test(__H) || /(実績|事例|works|case|portfolio)/.test(__T);
+    const __hasNews    = /\/information\b|\/news\b|\/press\b|\/info\b/.test(__H) || /(お知らせ|ニュース|press|information)/.test(__T);
+    const __hasFaq     = /\/faq\b/.test(__H) || /(faq|よくある質問)/.test(__T);
+
+    // sections: 日付シグナル（ニュース欄や更新日らしき表示）
+    const __dateRe = /(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})|(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)/g;
+    const __dates = Array.from(new Set((__text.match(__dateRe) || []).map(s=>String(s).trim()))).slice(0,20);
+
+    // sections: 実績件数の目安（liの繰り返し or "role=listitem"）
+    const __roleListitem = (__html.match(/role=["']listitem["']/ig) || []).length;
+    const __liCount = (__html.match(/<li\b/ig) || []).length;
+    const __worksCount = Math.max(__roleListitem, __liCount);
+
+    __siteFactsLite = {
+      meta: { ogCount: __og, twCount: __tw, ogpDetected: __ogpDetected },
+      links: { hasRecruit: __hasRecruit, hasWorks: __hasWorks, hasNews: __hasNews, hasFaq: __hasFaq },
+      sections: { dates: __dates, worksCount: __worksCount }
+    };
+
+    // ★ auditSig にマージ（SSOTに残すのが目的）
+    try{
+      r.facts = r.facts || {};
+      r.facts.auditSig = r.facts.auditSig || {};
+      r.facts.auditSig.siteFactsLite = __siteFactsLite;
+
+      // 互換用ショートフラグ（後段のカード制御が書きやすい）
+      r.facts.auditSig.hasOgpMetaLite       = !!__ogpDetected;
+      r.facts.auditSig.hasRecruitLinkLite   = !!__hasRecruit;
+      r.facts.auditSig.hasWorksLinkLite     = !!__hasWorks;
+      r.facts.auditSig.hasNewsLinkLite      = !!__hasNews;
+      r.facts.auditSig.newsDatesCountLite   = __dates.length;
+      r.facts.auditSig.worksCountLite       = __worksCount;
+    }catch(_){}
+  }catch(e){
+    // 抽出に失敗してもスクレイプ自体は継続（空でよい）
+    __siteFactsLite = null;
+  }
+  // === [SITE-FACTS-LITE v1] ここまで ===
+
   const signals = {
     h1, h2, lists, tables, links,
     hasTel, hasAddress,
