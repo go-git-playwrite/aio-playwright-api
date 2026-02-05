@@ -906,9 +906,30 @@ async function buildAuditSigFromPage(page) {
     out.jsonld_scan_started = true;
 
     // 1) まず “出現待ち” をする（無ければ timeout）
+    //    - type="application/ld+json" だけでなく、typeゆらぎや中身("@context"+"@type")でも拾う
     let selectorFound = false;
     try{
-      await page.waitForSelector('script[type="application/ld+json"]', { timeout: T_MS, state: 'attached' });
+      await page.waitForFunction(() => {
+        // 1) 正攻法：ld+json
+        const ld = document.querySelector('script[type*="ld+json" i]');
+        if (ld) return true;
+
+        // 2) typeゆらぎ救済：type無し/別typeでも中身で判定（重くしない）
+        const scripts = Array.from(document.querySelectorAll('script')).slice(0, 50);
+        return scripts.some(s => {
+          const t = String(s.getAttribute('type') || '').toLowerCase().trim();
+
+          // JSONっぽいtype or type無しだけ対象（雑に広げすぎない）
+          if (t && !(t.includes('json') || t.includes('ld+json'))) return false;
+
+          const txt = String(s.textContent || '').trim();
+          if (!txt) return false;
+
+          // 最小条件：JSON-LDっぽいキーが両方ある
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }, { timeout: T_MS });
+
       selectorFound = true;
     }catch(_){
       selectorFound = false;
@@ -965,7 +986,7 @@ async function buildAuditSigFromPage(page) {
   // それぞれのヘルパーを並列で実行
   const [headMeta, jsonldProbe] = await Promise.all([
     extractHeadMetaV1(page),
-    probeJsonLdAndCopyright(page, { maxWaitMs: 15000, pollMs: 200 })
+    probeJsonLdAndCopyrightWithWaitV1(page, { timeoutMs: 7000 })
   ]);
 
   const hm = headMeta || {};
@@ -1124,16 +1145,15 @@ async function buildAuditSigFromPage(page) {
 }
 
 // === [COV_NAV][DETECT v2] HTML から会社情報/サービス/お問い合わせ/FAQ 導線をざっくり検出 ===
-function detectCoverageNavFromHtml(html) {
+function detectCoverageNavFromHtml_FOR_SCORING_ONLY(html) {
   try {
     html = String(html || '');
     if (!html) {
       return {
-        hasCompanyInfoLink: false,
-        hasServicePageLink: false,
-        hasContactLink: false,
-        hasRecruitLink: false,
-        hasFaqLink: false
+        hasCompanyNav: false,
+        hasServiceNav: false,
+        hasContactNav: false,
+        hasFaqNav: false
       };
     }
 
@@ -1171,13 +1191,12 @@ function detectCoverageNavFromHtml(html) {
       hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
       hasEN(/faq/);
 
-    const flags = {
-      hasCompanyInfoLink,
-      hasServicePageLink,
-      hasContactLink,
-      hasRecruitLink,
-      hasFaqLink
-    };
+      const flags = {
+        hasCompanyNav: !!hasCompanyInfoLink,
+        hasServiceNav: !!hasServicePageLink,
+        hasContactNav: !!hasContactLink,
+        hasFaqNav:     !!hasFaqLink
+      };
 
     try {
       console.log('[COV_NAV][FLAGS]', flags);
@@ -1261,7 +1280,30 @@ async function playScrapeMinimal(url) {
   );
 
   // ★ coverage ナビ導線フラグ（会社情報・サービス・お問い合わせなど）
-  const coverageNavFlags = detectCoverageNavFromHtml(fullHtml);
+  const coverageNavFlags = detectCoverageNavFromHtml_FOR_SCORING_ONLY(fullHtml);
+
+  // ★ 互換：GAS側が hasCompanyNav 等を見る場合に備えて“同義キー”も用意（既存を壊さない）
+  const coverageNavCompat = (function(){
+    try{
+      const f = coverageNavFlags || {};
+      // すでに hasCompanyNav 形式ならそのまま
+      if (typeof f.hasCompanyNav === 'boolean' ||
+          typeof f.hasServiceNav === 'boolean' ||
+          typeof f.hasContactNav === 'boolean' ||
+          typeof f.hasFaqNav === 'boolean') {
+        return f;
+      }
+      // FOR_SCORING_ONLY が hasCompanyInfoLink 形式ならマップする
+      return {
+        hasCompanyNav: !!f.hasCompanyInfoLink,
+        hasServiceNav: !!f.hasServicePageLink,
+        hasContactNav: !!f.hasContactLink,
+        hasFaqNav:     !!f.hasFaqLink
+      };
+    }catch(_){
+      return coverageNavFlags || { hasCompanyNav:false, hasServiceNav:false, hasContactNav:false, hasFaqNav:false };
+    }
+  })();
 
   // JSON-LD パース
   const jsonld = [];
@@ -1273,10 +1315,26 @@ async function playScrapeMinimal(url) {
   await browser.close();
 
   return {
-    innerText, html: fullHtml, jsonld,
+    innerText,
+    html: fullHtml,
+    jsonld,
+
+    // ★ 互換キーも返す
+    metaDescription,                  // ← page.evaluate で取ったやつ
+    coverageNav: coverageNavCompat,   // ← GAS互換（hasCompanyNav形式）
+    coverageNavRaw: coverageNavFlags, // ← 元の検出結果（デバッグ/後方互換）
+
+    // ★ SSOT：下流がどこを見ても拾えるようにここに入れる
+    facts: {
+      auditSig: {
+        coverageNav: coverageNavCompat,     // ← “互換の正” を入れるのが安全
+        coverageNavRaw: coverageNavFlags    // ← 元も残すならここにも
+      }
+    },
+
     waitStrategy:'quality:domcontentloaded→networkidle→autoscroll→networkidle→len>600',
     blockedResources:['image','font','media'],
-    facts:{}, fallbackJsonld:{}
+    fallbackJsonld:{}
   };
 }
 
@@ -3107,7 +3165,7 @@ app.get('/api/score', async (req, res) => {
       null;
 
     console.log('[TRACE_COVNAV][NODE][payload-ready]', {
-      url: urlToFetch,
+      url,
       hasAuditSig: !!(payload?.auditSig || payload?.before?.facts?.auditSig || s?.auditSig || s?.facts?.auditSig),
       hasCoverageNav: !!covNav,
       coverageNav: covNav
