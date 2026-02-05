@@ -3049,6 +3049,26 @@ async function scrapeOnce(req, res) {
   out.debug = out.debug || {};
   if (noCache) out.debug.cache = { hit: false, nocache: true };
 
+  // ★ COVNAV 最終スナップショット（必ず1回出る・検索しやすい）
+  try{
+    const covTop  = out && (out.coverageNav || out.coverageNavRaw);
+    const covSig  = out && out.auditSig && out.auditSig.coverageNav;
+    const covFact = out && out.facts && out.facts.auditSig && out.facts.auditSig.coverageNav;
+
+    console.log('[COVNAV][SCRAPE][OUT v1]', {
+      url: urlToFetch,
+      has_cov_top:  !!covTop,
+      has_cov_sig:  !!covSig,
+      has_cov_fact: !!covFact,
+      cov_top:  covTop || null,
+      cov_sig:  covSig || null,
+      cov_fact: covFact || null,
+      auditSig_keys: out && out.auditSig ? Object.keys(out.auditSig).slice(0,40) : []
+    });
+  }catch(e){
+    console.log('[COVNAV][SCRAPE][OUT v1][ERR]', String(e && (e.stack||e)));
+  }
+
   // 正常終了
   return res.status(200).json(out);
 
