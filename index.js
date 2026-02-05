@@ -548,6 +548,43 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
       const jsonldCount = scripts.length;
       const jsonldSampleHead = String(scripts[0]?.textContent || '').slice(0, 200);
 
+      // ★ 追加：jsonldTypesAll 抽出（最大5本・各テキスト最大50KB） + parseFailed
+      let jsonldParseFailed = false;
+      let jsonldTypesAll = [];
+      try{
+        const typeSet = new Set();
+
+        const take = scripts.slice(0, 5);
+        for (const sc of take){
+          let txt = '';
+          try{ txt = String(sc && sc.textContent || ''); }catch(_){ txt=''; }
+          txt = txt.trim();
+          if (!txt) continue;
+          if (txt.length > 50000) txt = txt.slice(0, 50000); // ★重さ対策
+
+          try{
+            const obj = JSON.parse(txt);
+
+            const nodes = Array.isArray(obj) ? obj : [obj];
+            for (const node of nodes){
+              if (!node || typeof node !== 'object') continue;
+              const t = node['@type'];
+              const types = Array.isArray(t) ? t : (t ? [t] : []);
+              for (const tt of types){
+                if (typeof tt === 'string' && tt) typeSet.add(tt);
+              }
+            }
+          }catch(_e){
+            // JSON-LD scriptがあるのにパースできない → “存在はするが確定不能”の重要シグナル
+            jsonldParseFailed = true;
+          }
+        }
+
+        jsonldTypesAll = Array.from(typeSet);
+      }catch(_){
+        jsonldParseFailed = true;
+      }
+
       // --------- semantic DOM flags（Light OR Shadow） ----------
       const headerPresent = (light.header > 0) || (shadow.counts.header > 0);
       const footerPresent = (light.footer > 0) || (shadow.counts.footer > 0);
@@ -564,6 +601,8 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         // JSON-LD
         jsonldCount,
         jsonldSampleHead,
+        jsonldTypesAll,        // ★ 追加
+        jsonldParseFailed,     // ★ 追加
 
         // SPA観測（Shadow込み）
         headerPresent,
@@ -665,6 +704,15 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
         jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
         jsonld_wait_ms:   Date.now() - t0,
         jsonld_timed_out: false,
+
+        // ★ 追加：進捗状態（永続未判定の切り分け用）
+        jsonld_scan_started: true,
+        jsonld_scan_finished: true,
+        jsonld_parse_failed: !!(r && r.jsonldParseFailed),
+
+        // ★ 追加：同意壁の疑い（ここはDOM成功なので基本false）
+        consent_wall_suspected: false,
+
         jsonld_sample_head: String(r.jsonldSampleHead || ''),
 
         // ★ ラッチ結果（snake_case）
@@ -748,6 +796,15 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
                 jsonld_types:     typeNames, // 互換
                 jsonld_wait_ms:   Date.now() - t0,
                 jsonld_timed_out: false,
+
+                // ★ 追加：進捗状態
+                jsonld_scan_started: true,
+                jsonld_scan_finished: true,
+                jsonld_parse_failed: false,          // jsTextから拾えたのでparse失敗ではない
+
+                // ★ 追加：同意壁疑い（timeout経由なのであり得る）
+                consent_wall_suspected: false,       // ※ここは後で必要なら推定する（今は固定でOK）
+
                 jsonld_sample_head: String(head || ''),
 
                 header_present: headerSeen,
@@ -833,10 +890,82 @@ async function extractHeadMetaV1(page) {
 
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
+  // === [AIO][JSONLD_WAIT v1] JSON-LDの出現待ち＋状態を付けて probe をラップ ===
+  async function probeJsonLdAndCopyrightWithWaitV1(page, opt){
+    opt = opt || {};
+    const T_MS = Number(opt.timeoutMs || 7000); // ★ 5〜8秒：まずは7秒
+    const out = {
+      jsonld_scan_started: false,
+      jsonld_scan_finished: false,
+      jsonld_parse_failed: false,
+      consent_wall_suspected: false,
+      jsonld_wait_ms: 0
+    };
+
+    const t0 = Date.now();
+    out.jsonld_scan_started = true;
+
+    // 1) まず “出現待ち” をする（無ければ timeout）
+    let selectorFound = false;
+    try{
+      await page.waitForSelector('script[type="application/ld+json"]', { timeout: T_MS, state: 'attached' });
+      selectorFound = true;
+    }catch(_){
+      selectorFound = false;
+    }
+    out.jsonld_wait_ms = Date.now() - t0;
+
+    // 2) consent wall 疑い（timeoutのときだけ軽く判定）
+    if (!selectorFound){
+      try{
+        const htmlLower = String(await page.content() || '').toLowerCase();
+        // 最小セット：cookie/同意/consent が濃いと疑う
+        out.consent_wall_suspected =
+          /cookie|consent|同意|クッキー|プライバシー|privacy/.test(htmlLower) &&
+          /同意|accept|agree|consent|許可/.test(htmlLower);
+      }catch(_){
+        out.consent_wall_suspected = false;
+      }
+    }
+
+    // 3) 既存プローブを実行（ここは既存資産を活かす）
+    let jp = {};
+    try{
+      jp = await probeJsonLdAndCopyright(page);
+    }catch(e){
+      jp = { jsonld_scan_failed: true, jsonld_probe_err: String(e && (e.stack||e.message||e)) };
+    }
+
+    // 4) 状態を jp にマージして返す（snake_caseで揃える）
+    //    - “出現待ちtimeout” が起きた場合のみ timed_out を真にする（雑な0件=timeoutを防ぐ）
+    try{
+      const detectCount = Number((jp && jp.jsonld_detect_count) || 0);
+      const scanFailed  = !!(jp && jp.jsonld_scan_failed);
+
+      jp = jp || {};
+      jp.jsonld_scan_started = out.jsonld_scan_started;
+      jp.jsonld_scan_finished = true;
+      jp.jsonld_parse_failed = !!(jp && jp.jsonld_parse_failed); // 既存があれば尊重
+      jp.consent_wall_suspected = out.consent_wall_suspected;
+      jp.jsonld_wait_ms = out.jsonld_wait_ms;
+
+      // ★ timeout判定は “出現待ち” 基準に統一
+      //    - selectorが見つかったなら timed_out=false
+      //    - 見つからず、かつ検出0で、scanFailedでないなら timed_out=true
+      if (selectorFound){
+        jp.jsonld_timed_out = false;
+      }else{
+        jp.jsonld_timed_out = (!scanFailed && detectCount === 0);
+      }
+    }catch(_){}
+
+    return jp;
+  }
+
   // それぞれのヘルパーを並列で実行
   const [headMeta, jsonldProbe] = await Promise.all([
     extractHeadMetaV1(page),
-    probeJsonLdAndCopyright(page)
+    probeJsonLdAndCopyrightWithWaitV1(page, { timeoutMs: 7000 })
   ]);
 
   const hm = headMeta || {};
@@ -849,6 +978,13 @@ async function buildAuditSigFromPage(page) {
   const jsonldTypesAll = Array.isArray(jp.jsonld_types_all)
     ? jp.jsonld_types_all
     : [];
+
+  // ★ 追加：どこまで進んだか（永続未判定の原因切り分け用）
+  const jsonldScanStarted   = !!jp.jsonld_scan_started;
+  const jsonldScanFinished  = !!jp.jsonld_scan_finished;
+  const jsonldParseFailed   = !!jp.jsonld_parse_failed;
+  const consentWallSuspected = !!jp.consent_wall_suspected;
+  const jsonldWaitMs        = Number(jp.jsonld_wait_ms || 0);
 
   // head/meta 関連（タイトル・description）
   const hasTitle            = !!hm.hasTitle;
@@ -952,6 +1088,11 @@ async function buildAuditSigFromPage(page) {
     jsonldDetected,
     jsonldCount,
     jsonldTimedOut,
+    jsonldWaitMs,                 // ★ 既にsigKeysにあったが、確実にここで埋める
+    jsonldScanStarted,            // ★ 追加
+    jsonldScanFinished,           // ★ 追加
+    jsonldParseFailed,            // ★ 追加
+    consentWallSuspected,         // ★ 追加
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
     jsonldTypes: jsonldTypesAll,
 
