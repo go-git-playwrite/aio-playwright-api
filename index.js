@@ -965,7 +965,7 @@ async function buildAuditSigFromPage(page) {
   // それぞれのヘルパーを並列で実行
   const [headMeta, jsonldProbe] = await Promise.all([
     extractHeadMetaV1(page),
-    probeJsonLdAndCopyrightWithWaitV1(page, { timeoutMs: 7000 })
+    probeJsonLdAndCopyright(page, { maxWaitMs: 15000, pollMs: 200 })
   ]);
 
   const hm = headMeta || {};
