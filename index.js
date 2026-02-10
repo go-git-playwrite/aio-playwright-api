@@ -3236,53 +3236,43 @@ app.get('/api/score', async (req, res) => {
     }catch(_){}
   }
 
-  // ===== ADD: compare用に coverageNav / navCount をレスポンスへ載せる（既存キーは壊さない）=====
-  try {
-    // coverageNav: 置き場所が揺れても拾う（GAS側で想定してる候補に合わせる）
-    const c =
-      (payload && payload.coverageNav && typeof payload.coverageNav === 'object') ? payload.coverageNav :
-      (payload && payload.scoring && payload.scoring.coverageNav && typeof payload.scoring.coverageNav === 'object') ? payload.scoring.coverageNav :
-      (payload && payload.snapshot && payload.snapshot.coverageNav && typeof payload.snapshot.coverageNav === 'object') ? payload.snapshot.coverageNav :
-      (payload && payload.dom && payload.dom.coverageNav && typeof payload.dom.coverageNav === 'object') ? payload.dom.coverageNav :
+  // ===== ADD: compare用に coverageNav / navCount をレスポンスへ載せる（siteFactsLite優先・既存キーは壊さない）=====
+  try{
+    const sfl =
+      (srcAuditSig && srcAuditSig.siteFactsLite && typeof srcAuditSig.siteFactsLite === 'object') ? srcAuditSig.siteFactsLite :
+      (payload && payload.auditSig && payload.auditSig.siteFactsLite && typeof payload.auditSig.siteFactsLite === 'object') ? payload.auditSig.siteFactsLite :
       null;
 
-    if (c && typeof c === 'object') {
+    // coverageNav は siteFactsLite から作る（payload側に無いのが今回の原因）
+    if (payload.coverageNav == null && sfl && sfl.coverageNav && typeof sfl.coverageNav === 'object'){
+      const c = sfl.coverageNav;
       payload.coverageNav = {
         hasCompanyNav: (typeof c.hasCompanyNav === 'boolean') ? c.hasCompanyNav : null,
         hasServiceNav: (typeof c.hasServiceNav === 'boolean') ? c.hasServiceNav : null,
         hasContactNav: (typeof c.hasContactNav === 'boolean') ? c.hasContactNav : null,
         hasFaqNav:     (typeof c.hasFaqNav     === 'boolean') ? c.hasFaqNav     : null,
         hasPricingNav: (typeof c.hasPricingNav === 'boolean') ? c.hasPricingNav : null,
-        hasCasesNav:   (typeof c.hasCasesNav   === 'boolean') ? c.hasCasesNav   : null,
+        hasCasesNav:   (typeof c.hasCasesNav   === 'boolean') ? c.hasCasesNav   : null
       };
-    } else if (payload.coverageNav == null) {
-      payload.coverageNav = null;
     }
 
-    // navCount: 候補を広めに拾う
-    let n =
-      (payload && typeof payload.navCount === 'number') ? payload.navCount :
-      (payload && typeof payload.nav_count === 'number') ? payload.nav_count :
-      (payload && payload.scoring && typeof payload.scoring.navCount === 'number') ? payload.scoring.navCount :
-      (payload && payload.scoring && typeof payload.scoring.nav_count === 'number') ? payload.scoring.nav_count :
-      null;
+    // navCount も siteFactsLite から（無ければ触らない）
+    if (payload.navCount == null && sfl){
+      const n =
+        (typeof sfl.navCount === 'number' && Number.isFinite(sfl.navCount)) ? sfl.navCount :
+        (typeof sfl.nav_count === 'number' && Number.isFinite(sfl.nav_count)) ? sfl.nav_count :
+        null;
 
-    if (typeof n === 'number' && Number.isFinite(n)) {
-      payload.navCount = n;
-    } else if (typeof n === 'string') {
-      const nn = Number(String(n).trim());
-      payload.navCount = Number.isFinite(nn) ? nn : null;
-    } else if (payload.navCount == null) {
-      payload.navCount = null;
+      if (n != null) payload.navCount = n;
     }
 
-    // 任意ログ（必要なら）：ここが埋まったか確認
-    console.log('[AUDITSIG][COVNAV][FINAL v1] navCount=%s cov=%s',
+    console.log('[AUDITSIG][COVNAV][FINAL v2] navCount=%s cov=%s hasSFL=%s',
       String(payload.navCount),
-      payload.coverageNav ? JSON.stringify(payload.coverageNav) : 'null'
+      payload.coverageNav ? JSON.stringify(payload.coverageNav) : 'null',
+      String(!!sfl)
     );
-  } catch (e) {
-    console.log('[AUDITSIG][COVNAV][FINAL v1][ERR]', String(e && (e.stack || e)));
+  }catch(e){
+    console.log('[AUDITSIG][COVNAV][FINAL v2][ERR]', String(e && (e.stack || e)));
   }
   // ===== /ADD =====
 
