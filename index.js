@@ -1104,27 +1104,38 @@ async function buildAuditSigFromPage(page) {
 
   console.log('[AUDIT_SIG][HAS-SPA4]', { headerPresent, footerPresent, navCount, h1Count });
 
+  let htmlLang = await page.evaluate(() => {
+    const el = document.documentElement;
+    return el ? (el.getAttribute('lang') || '') : '';
+  });
+
+  htmlLang = String(htmlLang || '').trim(); // ★ 正規化（空白やnullを潰す）
+
   return {
     // JSON-LD 周り
     jsonldDetected,
     jsonldCount,
     jsonldTimedOut,
-    jsonldWaitMs,                 // ★ 既にsigKeysにあったが、確実にここで埋める
-    jsonldScanStarted,            // ★ 追加
-    jsonldScanFinished,           // ★ 追加
-    jsonldParseFailed,            // ★ 追加
-    consentWallSuspected,         // ★ 追加
+    jsonldWaitMs,
+    jsonldScanStarted,
+    jsonldScanFinished,
+    jsonldParseFailed,
+    consentWallSuspected,
     jsonldSampleHead: String(jp.jsonld_sample_head || ''),
     jsonldTypes: jsonldTypesAll,
 
-    // ★ 追加（ここ）
+    // ★ main
     hasMainLandmark,
 
-    // ★ 追加（SPA観測値）
+    // ★ header/footer
     headerPresent,
     footerPresent,
     navCount,
     h1Count,
+
+    // ★ html lang（追加）
+    htmlLang: htmlLang || '',
+    hasHtmlLang: !!htmlLang,
 
     // head/meta 周り
     hasTitle,
