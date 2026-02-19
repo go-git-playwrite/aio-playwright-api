@@ -3081,6 +3081,11 @@ async function scrapeOnce(req, res) {
     jsonld_wait_ms:       __probe.jsonld_wait_ms,
     jsonld_timed_out:     auditSig ? auditSig.jsonldTimedOut       : __probe.jsonld_timed_out,
     jsonld_sample_head:   auditSig ? auditSig.jsonldSampleHead     : __probe.jsonld_sample_head,
+
+    // ★ 追加：同意クリックの試行結果（compareの原因切り分け用）
+    consent_click_tried:     !!(__probe && __probe.consent_click_tried),
+    consent_click_succeeded: !!(__probe && __probe.consent_click_succeeded),
+
     copyright_footer_present: auditSig ? auditSig.copyrightFooterPresent : __probe.copyright_footer_present,
     copyright_hit:           auditSig ? auditSig.copyrightHit           : __probe.copyright_hit,
     copyright_hit_token:     auditSig ? auditSig.copyrightHitToken      : __probe.copyright_hit_token,
