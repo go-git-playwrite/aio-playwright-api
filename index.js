@@ -973,11 +973,7 @@ async function buildAuditSigFromPage(page) {
       // ★ timeout判定は “出現待ち” 基準に統一
       //    - selectorが見つかったなら timed_out=false
       //    - 見つからず、かつ検出0で、scanFailedでないなら timed_out=true
-      if (selectorFound){
-        jp.jsonld_timed_out = false;
-      }else{
-        jp.jsonld_timed_out = (!scanFailed && detectCount === 0);
-      }
+      jp.jsonld_timed_out = (!selectorFound && !scanFailed && detectCount === 0 && out.consent_wall_suspected === true);
     }catch(_){}
 
     return jp;
