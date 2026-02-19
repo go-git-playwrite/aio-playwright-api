@@ -962,7 +962,10 @@ async function buildAuditSigFromPage(page) {
               return t && t.includes(txt);
             });
             if (hit){
-              (hit as any).click?.();
+              try{
+                if (typeof hit.click === 'function') hit.click();
+                else hit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              }catch(_){}
               return true;
             }
             return false;
