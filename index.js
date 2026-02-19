@@ -995,7 +995,7 @@ async function buildAuditSigFromPage(page) {
   // JSON-LD 関連
   const jsonldCount    = Number(jp.jsonld_detect_count || 0);
   const jsonldDetected = jsonldCount > 0;
-  const jsonldTimedOut = !!jp.jsonld_timed_out;
+  const jsonldTimedOut = (/application\/ld\+json/i.test(String(await page.content()||''))) ? !!jp.jsonld_timed_out : false;
   const jsonldTypesAll = Array.isArray(jp.jsonld_types_all)
     ? jp.jsonld_types_all
     : [];
