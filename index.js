@@ -949,6 +949,66 @@ async function buildAuditSigFromPage(page) {
       }
     }
 
+    // 2.5) consent wall 疑いなら「同意操作」を1回だけ試してから再度 wait をやり直す
+    //      - 成功したら selectorFound=true に寄せ、consent_wall_suspected も false に戻す
+    if (!selectorFound && out.consent_wall_suspected){
+      try{
+        // よくある同意ボタン候補（最小セット）
+        const clicked = await page.evaluate(() => {
+          function clickByText(txt){
+            const els = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+            const hit = els.find(el => {
+              const t = (el.innerText || el.value || '').trim();
+              return t && t.includes(txt);
+            });
+            if (hit){
+              (hit as any).click?.();
+              return true;
+            }
+            return false;
+          }
+
+          // 日本語/英語の最低限
+          return (
+            clickByText('同意') ||
+            clickByText('許可') ||
+            clickByText('OK') ||
+            clickByText('Accept') ||
+            clickByText('Agree')
+          );
+        });
+
+        if (clicked){
+          // クリック後の反映待ち
+          await page.waitForTimeout(1200);
+
+          // もう一回だけ “出現待ち” をやり直す（短めでOK）
+          try{
+            await page.waitForFunction(() => {
+              const ld = document.querySelector('script[type*="ld+json" i]');
+              if (ld) return true;
+
+              const scripts = Array.from(document.querySelectorAll('script')).slice(0, 50);
+              return scripts.some(s => {
+                const t = String(s.getAttribute('type') || '').toLowerCase().trim();
+                if (t && !(t.includes('json') || t.includes('ld+json'))) return false;
+                const txt = String(s.textContent || '').trim();
+                if (!txt) return false;
+                return txt.includes('"@context"') && txt.includes('"@type"');
+              });
+            }, { timeout: Math.min(2500, T_MS) });
+
+            selectorFound = true;
+            out.consent_wall_suspected = false;
+          }catch(_){
+            // まだ見つからないなら従来どおり（suspected=true のまま）
+          }
+        }
+      }catch(_){
+        // 失敗しても従来どおり
+      }
+    }
+
     // 3) 既存プローブを実行（ここは既存資産を活かす）
     let jp = {};
     try{
