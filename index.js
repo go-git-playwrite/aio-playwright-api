@@ -899,7 +899,11 @@ async function buildAuditSigFromPage(page) {
       jsonld_scan_finished: false,
       jsonld_parse_failed: false,
       consent_wall_suspected: false,
-      jsonld_wait_ms: 0
+      jsonld_wait_ms: 0,
+
+      // ★追加：同意クリックの試行結果（原因切り分け用）
+      consent_click_tried: false,
+      consent_click_succeeded: false
     };
 
     const t0 = Date.now();
@@ -981,7 +985,11 @@ async function buildAuditSigFromPage(page) {
           );
         });
 
+        out.consent_click_tried = true;
+
         if (clicked){
+          out.consent_click_succeeded = true;
+
           // クリック後の反映待ち
           await page.waitForTimeout(1200);
 
@@ -1032,6 +1040,9 @@ async function buildAuditSigFromPage(page) {
       jp.jsonld_parse_failed = !!(jp && jp.jsonld_parse_failed); // 既存があれば尊重
       jp.consent_wall_suspected = out.consent_wall_suspected;
       jp.jsonld_wait_ms = out.jsonld_wait_ms;
+
+      jp.consent_click_tried = out.consent_click_tried;
+      jp.consent_click_succeeded = out.consent_click_succeeded;
 
       // ★ timeout判定は “出現待ち” 基準に統一
       //    - selectorが見つかったなら timed_out=false
