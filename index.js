@@ -2323,7 +2323,7 @@ async function scrapeOnce(req, res) {
     });
 
     // ---- 主要待機（軽め） ----
-    await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await Promise.race([
       page.waitForResponse(r => {
         const u = r.url();
@@ -2348,6 +2348,70 @@ async function scrapeOnce(req, res) {
       const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
       return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
     }, { timeout: 8000 }).catch(()=>{});
+
+    // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
+    const obs = {};
+
+    // --- HTTP headers ---
+    try{
+      const h = (resp && resp.headers) ? resp.headers() : {};
+      obs.http = {
+        ok: !!resp,
+        status: resp ? resp.status() : null,
+        // Playwrightは小文字キーのことが多い
+        hsts: !!h['strict-transport-security'],
+        xfo:  !!h['x-frame-options'],
+        nosniff: !!h['x-content-type-options'],
+        csp:  !!h['content-security-policy'],
+        // 監査用に生ヘッダも残す（必要なら後で削る）
+        headers: h
+      };
+    }catch(e){
+      obs.http = { ok:false, reason:String(e && e.message || e) };
+    }
+
+    // --- DOM観測（nav / anchors / headings）---
+    const domObs = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g,' ').trim();
+      const text = (el) => norm(el && (el.textContent || ''));
+      const href = (a) => norm(a && a.getAttribute && a.getAttribute('href'));
+
+      // nav 実在
+      const navs = Array.from(document.querySelectorAll('nav'));
+      const navAnchors = navs.flatMap(n => Array.from(n.querySelectorAll('a')));
+
+      // nav が ul/li 構造か（今回あなたのDOM例は a 直下なので false になり得る）
+      const navHasList = navs.some(n => n.querySelector('ul li'));
+
+      // アンカーテキスト汎用語検知（「こちら」「次へ」「もっと見る」等）
+      const generic = new Set(['こちら','次へ','もっと見る','詳細を見る','詳しく見る','続きを読む','click','クリック','more','detail']);
+      const allA = Array.from(document.querySelectorAll('a'));
+      const genericHits = [];
+      for (const a of allA){
+        const t = text(a);
+        if (!t) continue;
+        if (generic.has(t)) genericHits.push({ t, href: href(a) });
+      }
+
+      // 見出し
+      const hs = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+        .map(h => ({ tag: h.tagName.toLowerCase(), text: text(h) }))
+        .filter(x => x.text);
+
+      return {
+        navCount: navs.length,
+        navAnchorCount: navAnchors.length,
+        navHasList,
+        genericAnchorCount: genericHits.length,
+        genericAnchorSamples: genericHits.slice(0, 10),
+        headings: hs,
+        hasH1: hs.some(x => x.tag === 'h1')
+      };
+    }).catch(()=>null);
+
+    obs.dom = domObs || { ok:false };
+
+    // ここで obs を返却payloadに合流させる（下流が壊れない場所に）
 
     // ---- DOMテキスト（空でもOK）----
     const [innerText, docText] = await Promise.all([
@@ -2982,6 +3046,18 @@ async function scrapeOnce(req, res) {
     bodyText,
     html: htmlSource,
 
+    confirmed: {
+      has_hsts: !!(obs.http && obs.http.ok && obs.http.hsts),
+      has_xfo: !!(obs.http && obs.http.ok && obs.http.xfo),
+      has_nosniff: !!(obs.http && obs.http.ok && obs.http.nosniff),
+      has_csp: !!(obs.http && obs.http.ok && obs.http.csp),
+      has_generic_anchor_text: !!(obs.dom && typeof obs.dom.genericAnchorCount === 'number' && obs.dom.genericAnchorCount > 0),
+      generic_anchor_count: (obs.dom && typeof obs.dom.genericAnchorCount === 'number') ? obs.dom.genericAnchorCount : null,
+      has_nav_element: !!(obs.dom && typeof obs.dom.navCount === 'number' && obs.dom.navCount > 0),
+      nav_count: (obs.dom && typeof obs.dom.navCount === 'number') ? obs.dom.navCount : null,
+      nav_has_list: (obs.dom && typeof obs.dom.navHasList === 'boolean') ? obs.dom.navHasList : null
+    },
+
     // ★ 追加：レンダリング後のテキスト（deepText 優先）
     //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
     renderedText,
@@ -3121,7 +3197,9 @@ async function scrapeOnce(req, res) {
       elapsedMs,
 
       // === ADD: デバッグ用にプローブ結果も残す（任意）
-      jsonldProbe: __probe
+      jsonldProbe: __probe,
+
+      obs: { http: obs.http ? { ok:obs.http.ok, status:obs.http.status, hsts:obs.http.hsts, xfo:obs.http.xfo, nosniff:obs.http.nosniff, csp:obs.http.csp } : null, dom: obs.dom || null },
     }
   }; // ← ここで必ず閉じる！
 
