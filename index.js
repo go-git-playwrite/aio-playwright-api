@@ -2373,19 +2373,79 @@ async function scrapeOnce(req, res) {
     // --- DOM観測（nav / anchors / headings）---
     const domObs = await page.evaluate(() => {
       const norm = (s) => String(s || '').replace(/\s+/g,' ').trim();
+
+      // Shadow DOM を含めて要素を列挙
+      const allElementsDeep = () => {
+        const out = [];
+        const seen = new WeakSet();
+
+        const walk = (root) => {
+          if (!root) return;
+          const nodes = (root instanceof Document)
+            ? [root.documentElement]
+            : [root];
+
+          for (const n of nodes) {
+            if (!n) continue;
+            const stack = [n];
+            while (stack.length) {
+              const el = stack.pop();
+              if (!el || seen.has(el)) continue;
+              seen.add(el);
+
+              if (el.nodeType === Node.ELEMENT_NODE) {
+                out.push(el);
+                // shadow root
+                const sr = el.shadowRoot;
+                if (sr) {
+                  Array.from(sr.children || []).forEach(c => stack.push(c));
+                  Array.from(sr.childNodes || []).forEach(c => {
+                    if (c && c.nodeType === Node.ELEMENT_NODE) stack.push(c);
+                  });
+                }
+                // normal children
+                Array.from(el.children || []).forEach(c => stack.push(c));
+              }
+            }
+          }
+        };
+
+        walk(document);
+        return out;
+      };
+
+      const els = allElementsDeep();
+
+      const isTag = (el, tag) => el && el.tagName && el.tagName.toLowerCase() === tag;
       const text = (el) => norm(el && (el.textContent || ''));
       const href = (a) => norm(a && a.getAttribute && a.getAttribute('href'));
 
-      // nav 実在
-      const navs = Array.from(document.querySelectorAll('nav'));
-      const navAnchors = navs.flatMap(n => Array.from(n.querySelectorAll('a')));
+      // nav（shadow含む）
+      const navs = els.filter(el => isTag(el, 'nav'));
+      const navAnchors = [];
+      for (const n of navs) {
+        // nav配下のaも shadow を掘る必要があるので、全要素から “nav内にいるa” を集める
+        // （closest は shadow 境界で壊れることがあるので contains ベース）
+        for (const el of els) {
+          if (!isTag(el, 'a')) continue;
+          try { if (n.contains(el)) navAnchors.push(el); } catch(_) {}
+        }
+      }
 
-      // nav が ul/li 構造か（今回あなたのDOM例は a 直下なので false になり得る）
-      const navHasList = navs.some(n => n.querySelector('ul li'));
+      // ul/li 構造（shadow含む）
+      const navHasList = navs.some(n => {
+        for (const el of els) {
+          if (!el || !el.tagName) continue;
+          const t = el.tagName.toLowerCase();
+          if (t !== 'li') continue;
+          try { if (n.contains(el)) return true; } catch(_) {}
+        }
+        return false;
+      });
 
-      // アンカーテキスト汎用語検知（「こちら」「次へ」「もっと見る」等）
+      // アンカーテキスト汎用語（shadow含む）
       const generic = new Set(['こちら','次へ','もっと見る','詳細を見る','詳しく見る','続きを読む','click','クリック','more','detail']);
-      const allA = Array.from(document.querySelectorAll('a'));
+      const allA = els.filter(el => isTag(el, 'a'));
       const genericHits = [];
       for (const a of allA){
         const t = text(a);
@@ -2393,8 +2453,9 @@ async function scrapeOnce(req, res) {
         if (generic.has(t)) genericHits.push({ t, href: href(a) });
       }
 
-      // 見出し
-      const hs = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+      // 見出し（shadow含む）
+      const hs = els
+        .filter(el => /^h[1-6]$/.test((el.tagName || '').toLowerCase()))
         .map(h => ({ tag: h.tagName.toLowerCase(), text: text(h) }))
         .filter(x => x.text);
 
@@ -2410,6 +2471,26 @@ async function scrapeOnce(req, res) {
     }).catch(()=>null);
 
     obs.dom = domObs || { ok:false };
+
+    // === DOM観測リトライ（レンダ遅延対策）===
+    if (obs.dom && typeof obs.dom.navCount === 'number' && obs.dom.navCount === 0) {
+      await page.waitForTimeout(1200).catch(()=>{});
+      const domObs2 = await page.evaluate(() => {
+        const navs = Array.from(document.querySelectorAll('nav'));
+        const navAnchors = navs.flatMap(n => Array.from(n.querySelectorAll('a')));
+        const navHasList = navs.some(n => n.querySelector('ul li'));
+
+        return {
+          navCount: navs.length,
+          navAnchorCount: navAnchors.length,
+          navHasList
+        };
+      }).catch(()=>null);
+
+      if (domObs2 && typeof domObs2.navCount === 'number' && domObs2.navCount > 0) {
+        obs.dom = { ...obs.dom, ...domObs2 };
+      }
+    }
 
     // ここで obs を返却payloadに合流させる（下流が壊れない場所に）
 
