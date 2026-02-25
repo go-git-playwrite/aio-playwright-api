@@ -3408,6 +3408,34 @@ app.get('/api/score', async (req, res) => {
       });
     }
   }catch(e){
+
+    // srcAuditSig が取れなかった（または空）なら、フラット形式を auditSig に昇格
+    try{
+      const as = payload.auditSig || (payload.auditSig = {});
+      const hasAny = Object.keys(as).length > 0;
+
+      if (!hasAny){
+        const keys = [
+          // jsonld系
+          'jsonldDetected','jsonldCount','jsonldTimedOut','jsonldWaitMs',
+          'jsonldScanStarted','jsonldScanFinished','jsonldParseFailed','consentWallSuspected',
+          'jsonldTypes','hasJsonLd','hasOrgJsonLd','hasWebsiteJsonLd','hasBreadcrumbJsonLd',
+          // doc系
+          'htmlLang','hasHtmlLang','hasTitle','hasMetaDescription','metaDescriptionLen','titleText',
+          'h1Count','headerPresent','footerPresent','navCount','hasMainLandmark',
+          // coverage/trust系
+          'hasSitemapXml','coverageNav',
+          'hasPrivacyPolicyLink','hasLegalLink','hasFooterNavForTrust',
+          // 連絡先系（あるなら）
+          'telephone','address','sameAsCount'
+        ];
+
+        keys.forEach(k=>{
+          if (payload[k] !== undefined && as[k] === undefined) as[k] = payload[k];
+        });
+      }
+    }catch(_){}
+
     console.log('[AUDITSIG-MERGE][ERR]', String(e && (e.stack || e)));
   }
   // === [AUDITSIG-MERGE v1] ここまで ===
