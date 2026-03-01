@@ -899,11 +899,11 @@ function pickSubPageCandidatesVNext_(origin){
 
   // “まずはこれだけ”固定（存在しなければ後段で勝手に落ちる）
   const candidates = [
-    o + '/about/',
-    o + '/company/',
-    o + '/service/',
-    o + '/business/',
-    o + '/contact/',
+    o + '/about',
+    o + '/business',
+    o + '/service',
+    o + '/company',
+    o + '/contact',
   ];
 
   // 重複除去して返す（最大5）
@@ -1029,8 +1029,10 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   for (const url of candidates){
     if (out.length >= SUBPAGES_VNEXT_MAX) break;
     try{
+      console.log('[M3][SUBPAGES][TRY]', url);
       await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
       const lite = await extractLiteFromPageVNext_(browserPage, url, origin);
+      console.log('[M3][SUBPAGES][OK]', url, { hasTitle: !!(lite && lite.title), hasH1: !!(lite && lite.h1), h2: lite && lite.h2 ? lite.h2.length : 0, jsonld: lite && lite.jsonldTypes ? lite.jsonldTypes.length : 0 });
       // “空っぽ”は捨てる（事故防止）
       const hasAny =
         (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
