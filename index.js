@@ -3387,7 +3387,7 @@ async function scrapeOnce(req, res) {
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
     auditSig,
 
-    subPages_vNext: await buildSubPagesVNext_V1_(page, origin),
+    subPages_vNext: await buildSubPagesVNext_V1_(page, (()=>{ try{ return (new URL(url)).origin; }catch(_){ return ''; } })()),
 
     // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
     jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
