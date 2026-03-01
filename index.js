@@ -1496,6 +1496,161 @@ async function scrapeForScoring(url) {
     console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
   }
 
+  // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
+  const ENABLE_SUBPAGES_VNEXT = true;
+  const SUBPAGES_VNEXT_MAX = 5;
+
+  // URL候補を最大5つ作る（軽量・決定論）
+  function pickSubPageCandidatesVNext_(origin){
+    const o = String(origin || '').trim().replace(/\/+$/,'');
+    if (!o) return [];
+
+    // “まずはこれだけ”固定（存在しなければ後段で勝手に落ちる）
+    const candidates = [
+      o + '/about/',
+      o + '/company/',
+      o + '/service/',
+      o + '/business/',
+      o + '/contact/',
+    ];
+
+    // 重複除去して返す（最大5）
+    const seen = new Set();
+    const out = [];
+    for (const u of candidates){
+      const k = String(u).replace(/\/+$/,'');
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(u);
+      if (out.length >= SUBPAGES_VNEXT_MAX) break;
+    }
+    return out;
+  }
+
+  // 1ページから“軽量な観測”だけ抜く（全文は保持しない）
+  async function extractLiteFromPageVNext_(page, url, origin){
+    const o = String(origin || '').trim().replace(/\/+$/,'');
+    const u = String(url || '').trim();
+
+    return await page.evaluate(({ u, o }) => {
+      function textOf(el){ try{ return (el && el.textContent || '').trim(); }catch(_){ return ''; } }
+      function attrOf(sel, name){
+        try{ const el = document.querySelector(sel); return el ? String(el.getAttribute(name) || '').trim() : ''; }catch(_){ return ''; }
+      }
+
+      const title = (document.title || '').trim();
+      const metaDescription = attrOf('meta[name="description"]', 'content');
+
+      const h1 = (() => {
+        try{
+          const el = document.querySelector('h1');
+          return el ? textOf(el) : '';
+        }catch(_){ return ''; }
+      })();
+
+      const h2 = (() => {
+        try{
+          const els = Array.from(document.querySelectorAll('h2')).slice(0, 10);
+          return els.map(e => textOf(e)).filter(Boolean);
+        }catch(_){ return []; }
+      })();
+
+      // JSON-LD type 抽出（雑に型だけ）
+      const jsonldTypes = (() => {
+        try{
+          const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20);
+          const types = [];
+          for (const s of scripts){
+            const raw = String(s.textContent || '').trim();
+            if (!raw) continue;
+            let obj = null;
+            try{ obj = JSON.parse(raw); }catch(_){ obj = null; }
+            const pushType = (t) => { if (t && !types.includes(t)) types.push(String(t)); };
+
+            const walk = (x) => {
+              if (!x) return;
+              if (Array.isArray(x)){ x.forEach(walk); return; }
+              if (typeof x !== 'object') return;
+              const t = x['@type'];
+              if (Array.isArray(t)) t.forEach(pushType);
+              else pushType(t);
+              // @graph
+              if (Array.isArray(x['@graph'])) x['@graph'].forEach(walk);
+            };
+            walk(obj);
+          }
+          return types.slice(0, 30);
+        }catch(_){ return []; }
+      })();
+
+      // 内部リンク数（同一origin）
+      const internalLinkCount = (() => {
+        try{
+          const links = Array.from(document.links || []);
+          let c = 0;
+          for (const a of links){
+            const href = a && a.href;
+            if (!href) continue;
+            try{
+              const uu = new URL(href, location.href);
+              if (uu.origin === o) c++;
+            }catch(_){}
+          }
+          return c;
+        }catch(_){ return 0; }
+      })();
+
+      // 更新日っぽい表記（ページ全体テキストから軽く拾う：最大1つ）
+      const updatedDate = (() => {
+        try{
+          const txt = (document.body && document.body.innerText || '').slice(0, 30000);
+          // 例: 2026-03-01 / 2026/03/01 / 2026.03.01
+          const m = txt.match(/(20\d{2})[\/\.\-](\d{1,2})[\/\.\-](\d{1,2})/);
+          if (!m) return '';
+          const y = m[1];
+          const mm = String(m[2]).padStart(2,'0');
+          const dd = String(m[3]).padStart(2,'0');
+          return `${y}-${mm}-${dd}`;
+        }catch(_){ return ''; }
+      })();
+
+      return {
+        url: u,
+        title,
+        metaDescription,
+        h1,
+        h2,
+        jsonldTypes,
+        updatedDate,
+        internalLinkCount,
+      };
+    }, { u, o });
+  }
+
+  // subPages_vNext を作る（最大5、失敗は握る）
+  async function buildSubPagesVNext_V1_(browserPage, origin){
+    if (!ENABLE_SUBPAGES_VNEXT) return [];
+    const candidates = pickSubPageCandidatesVNext_(origin);
+    if (!candidates.length) return [];
+
+    const out = [];
+    for (const url of candidates){
+      if (out.length >= SUBPAGES_VNEXT_MAX) break;
+      try{
+        await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        const lite = await extractLiteFromPageVNext_(browserPage, url, origin);
+        // “空っぽ”は捨てる（事故防止）
+        const hasAny =
+          (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
+        if (hasAny) out.push(lite);
+      }catch(_){
+        // 失敗は握る（v2を壊さない）
+      }
+    }
+    return out;
+  }
+  // ===== [M3][SUBPAGES_VNEXT v1] ここまで =====
+
   // === [SITE-FACTS-LITE v1] 汎用の “存在事実” を抽出して auditSig に保存 ===
   // 目的: LLMの推測で「採用がない/OGPがない/更新日がない/実績がない」等の嘘カードが出るのを恒久的に防ぐ
   let __siteFactsLite = null;
@@ -3231,6 +3386,8 @@ async function scrapeOnce(req, res) {
 
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
     auditSig,
+
+    subPages_vNext: await buildSubPagesVNext_V1_(page, origin),
 
     // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
     jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
