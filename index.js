@@ -1022,29 +1022,33 @@ async function extractLiteFromPageVNext_(page, url, origin){
 // subPages_vNext を作る（最大5、失敗は握る）
 async function buildSubPagesVNext_V1_(browserPage, origin){
   if (!ENABLE_SUBPAGES_VNEXT) return [];
-  const candidates = pickSubPageCandidatesVNext_(origin);
+
+  // ★ origin が空で来るケースを救済（最重要）
+  let o = String(origin || '').trim().replace(/\/+$/,'');
+  if (!o){
+    try{ o = (new URL(browserPage.url())).origin; }catch(_){ o = ''; }
+  }
+  if (!o) return []; // ここで止める（変なURL生成を防ぐ）
+
+  const candidates = pickSubPageCandidatesVNext_(o);
   if (!candidates.length) return [];
 
   const out = [];
   for (const url of candidates){
     if (out.length >= SUBPAGES_VNEXT_MAX) break;
     try{
-      console.log('[M3][SUBPAGES][TRY]', url);
-      await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // ★ SPA保険（軽く）
+      try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){}
 
-      // ★ 追加：SPA/遅延描画の最低限の待ち（失敗は握る）
-      try{ await browserPage.waitForLoadState('networkidle', { timeout: 8000 }); }catch(_){}
-      try{ await browserPage.waitForFunction(() => (document.title || '').trim().length > 0, { timeout: 8000 }); }catch(_){}
+      const lite = await extractLiteFromPageVNext_(browserPage, url, o);
 
-      const lite = await extractLiteFromPageVNext_(browserPage, url, origin);
-      console.log('[M3][SUBPAGES][OK]', url, { hasTitle: !!(lite && lite.title), hasH1: !!(lite && lite.h1), h2: lite && lite.h2 ? lite.h2.length : 0, jsonld: lite && lite.jsonldTypes ? lite.jsonldTypes.length : 0 });
-      // “空っぽ”は捨てる（事故防止）
+      // （ここは今のままでOK：捨てる/捨てないはあなたの今の実装に従う）
       const hasAny =
         (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
-      out.push(lite);
-    }catch(_){
-      // 失敗は握る（v2を壊さない）
-    }
+      if (hasAny) out.push(lite);
+
+    }catch(_){}
   }
   return out;
 }
