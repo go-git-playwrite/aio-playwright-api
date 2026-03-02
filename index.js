@@ -1003,6 +1003,15 @@ async function extractLiteFromPageVNext_(page, url, origin){
       }catch(_){ return ''; }
     })();
 
+    // --- 404っぽいページは捨てる（候補URLが存在しないケースを除外） ---
+    const is404 =
+      (/^404\b/i.test(title)) ||
+      (/not\s*found/i.test(title)) ||
+      (metaDescription && /not\s*found/i.test(metaDescription)) ||
+      ((document.body && document.body.innerText || '').slice(0, 400).match(/404|not\s*found/i));
+
+    if (is404) return null;
+
     return {
       url: u,
       title,
@@ -1047,6 +1056,9 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){}
 
       const lite = await extractLiteFromPageVNext_(browserPage, url, o);
+
+      // ★ ここを追加（nullは即スキップ）
+      if (!lite) continue;
 
       // （ここは今のままでOK：捨てる/捨てないはあなたの今の実装に従う）
       const hasAny =
