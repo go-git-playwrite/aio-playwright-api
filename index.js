@@ -1041,7 +1041,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       // “空っぽ”は捨てる（事故防止）
       const hasAny =
         (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
-      if (hasAny) out.push(lite);
+      out.push(lite);
     }catch(_){
       // 失敗は握る（v2を壊さない）
     }
