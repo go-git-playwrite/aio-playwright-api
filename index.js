@@ -1047,7 +1047,15 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   }
   if (!o) return []; // ここで止める（変なURL生成を防ぐ）
 
-  const candidates = await pickSubPageCandidatesVNext_(browserPage, o);
+  // --- M3: 候補抽出前にトップページのナビが描画されるまで少し待つ（SPA対策） ---
+  try{
+    await browserPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    try{ await browserPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){}
+    try{ await browserPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){}
+    try{ await browserPage.waitForTimeout(300); }catch(_){}
+  }catch(_){}
+
+  const candidates = await pickSubPageCandidatesVNext_(browserPage, String(origin || '').trim().replace(/\/+$/,''));
   if (!candidates.length) return [];
 
   const out = [];
