@@ -1031,6 +1031,11 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
     try{
       console.log('[M3][SUBPAGES][TRY]', url);
       await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 12000 });
+
+      // ★ 追加：SPA/遅延描画の最低限の待ち（失敗は握る）
+      try{ await browserPage.waitForLoadState('networkidle', { timeout: 8000 }); }catch(_){}
+      try{ await browserPage.waitForFunction(() => (document.title || '').trim().length > 0, { timeout: 8000 }); }catch(_){}
+
       const lite = await extractLiteFromPageVNext_(browserPage, url, origin);
       console.log('[M3][SUBPAGES][OK]', url, { hasTitle: !!(lite && lite.title), hasH1: !!(lite && lite.h1), h2: lite && lite.h2 ? lite.h2.length : 0, jsonld: lite && lite.jsonldTypes ? lite.jsonldTypes.length : 0 });
       // “空っぽ”は捨てる（事故防止）
