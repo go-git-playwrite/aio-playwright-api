@@ -892,31 +892,48 @@ async function extractHeadMetaV1(page) {
 const ENABLE_SUBPAGES_VNEXT = true;
 const SUBPAGES_VNEXT_MAX = 5;
 
-// URL候補を最大5つ作る（軽量・決定論）
-function pickSubPageCandidatesVNext_(origin){
+async function pickSubPageCandidatesVNext_(browserPage, origin){
   const o = String(origin || '').trim().replace(/\/+$/,'');
   if (!o) return [];
 
-  // “まずはこれだけ”固定（存在しなければ後段で勝手に落ちる）
-  const candidates = [
-    o + '/about',
-    o + '/business',
-    o + '/service',
-    o + '/company',
-    o + '/contact',
-  ];
+  const KW = /(会社|企業|法人|概要|about|company|事業|business|サービス|service|contact|お問い合わせ|問合せ|faq|よくある質問)/i;
 
-  // 重複除去して返す（最大5）
+  let hrefs = [];
+  try{
+    hrefs = await browserPage.evaluate((kwSrc) => {
+      const kw = new RegExp(kwSrc, 'i');
+      const as = Array.from(document.querySelectorAll('a[href]')).slice(0, 400);
+      const out = [];
+      for (const a of as){
+        const href = String(a.getAttribute('href') || '').trim();
+        if (!href) continue;
+        const txt = String(a.textContent || '').replace(/\s+/g,' ').trim();
+        if (!kw.test(txt) && !kw.test(href)) continue;
+        out.push(href);
+      }
+      return out;
+    }, KW.source);
+  }catch(_){
+    hrefs = [];
+  }
+
   const seen = new Set();
   const out = [];
-  for (const u of candidates){
-    const k = String(u).replace(/\/+$/,'');
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(u);
+  for (const h of hrefs){
     if (out.length >= SUBPAGES_VNEXT_MAX) break;
+    try{
+      const u = new URL(h, o + '/');
+      if (u.origin !== (new URL(o)).origin) continue;
+
+      const key = u.href.replace(/\/+$/,'');
+      if (!key || seen.has(key)) continue;
+
+      seen.add(key);
+      out.push(key);
+    }catch(_){}
   }
-  return out;
+
+  return out.slice(0, SUBPAGES_VNEXT_MAX);
 }
 
 // 1ページから“軽量な観測”だけ抜く（全文は保持しない）
@@ -1030,7 +1047,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   }
   if (!o) return []; // ここで止める（変なURL生成を防ぐ）
 
-  const candidates = pickSubPageCandidatesVNext_(o);
+  const candidates = await pickSubPageCandidatesVNext_(browserPage, o);
   if (!candidates.length) return [];
 
   const out = [];
