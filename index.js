@@ -2535,17 +2535,31 @@ async function scrapeOnce(req, res) {
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
 
-    // --- HTTP headers ---
+    // --- HTTP headers (main document only) ---
     try{
-      const h = (resp && resp.headers) ? resp.headers() : {};
+      const h = (resp && typeof resp.allHeaders === 'function')
+        ? await resp.allHeaders()
+        : ((resp && typeof resp.headers === 'function') ? resp.headers() : {});
+
+      const responseHeaders = {
+        'strict-transport-security': h['strict-transport-security'] ?? null,
+        'content-security-policy':   h['content-security-policy']   ?? null,
+        'x-frame-options':           h['x-frame-options']           ?? null,
+        'x-content-type-options':    h['x-content-type-options']    ?? null,
+        'referrer-policy':           h['referrer-policy']           ?? null
+      };
+
       obs.http = {
         ok: !!resp,
         status: resp ? resp.status() : null,
+        url: resp ? resp.url() : null,
         // Playwrightは小文字キーのことが多い
-        hsts: !!h['strict-transport-security'],
-        xfo:  !!h['x-frame-options'],
-        nosniff: !!h['x-content-type-options'],
-        csp:  !!h['content-security-policy'],
+        hsts: !!responseHeaders['strict-transport-security'],
+        xfo:  !!responseHeaders['x-frame-options'],
+        nosniff: !!responseHeaders['x-content-type-options'],
+        csp:  !!responseHeaders['content-security-policy'],
+        referrerPolicy: !!responseHeaders['referrer-policy'],
+        responseHeaders,
         // 監査用に生ヘッダも残す（必要なら後で削る）
         headers: h
       };
@@ -3307,6 +3321,13 @@ async function scrapeOnce(req, res) {
 
   const responsePayload = {
     url: urlToFetch,
+    responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
+      'strict-transport-security': null,
+      'content-security-policy': null,
+      'x-frame-options': null,
+      'x-content-type-options': null,
+      'referrer-policy': null
+    },
     bodyText,
     html: htmlSource,
 
