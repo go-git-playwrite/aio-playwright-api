@@ -3200,6 +3200,10 @@ async function scrapeOnce(req, res) {
     structured.jsonld = await page.evaluate(() => {
       var nodes = [];
 
+      function qa(root, sel) {
+        try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+      }
+
       function pushNode(n){
         if (!n || typeof n !== 'object') return;
         nodes.push(n);
@@ -3224,10 +3228,34 @@ async function scrapeOnce(req, res) {
         }
       }
 
-      var scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+      var hosts = Array.from(document.querySelectorAll('*'));
+      var openRoots = [];
+      for (var i = 0; i < hosts.length; i++) {
+        var el = hosts[i];
+        if (el && el.shadowRoot) openRoots.push(el.shadowRoot);
+        if (openRoots.length >= 8) break;
+      }
+
+      var allScriptsLight = qa(document, 'script');
+      var allScriptsShadow = openRoots.flatMap(function(root){ return qa(root, 'script'); });
+      var allScripts = allScriptsLight.concat(allScriptsShadow);
+
+      var scripts = allScripts.filter(function(el){
+        var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+        return t.includes('ld+json');
+      });
+
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(function(el){
+          var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
+          var txt = String(el && el.textContent || '').trim();
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }
 
       scripts.forEach(function(el){
-        var raw = (el.textContent || '').trim();
+        var raw = String(el && el.textContent || '').trim();
         if (!raw) return;
 
         try {
