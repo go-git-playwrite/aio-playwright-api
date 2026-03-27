@@ -3197,6 +3197,48 @@ async function scrapeOnce(req, res) {
       sameAs: sameAsClean
     };
 
+    structured.jsonld = await page.evaluate(() => {
+      var nodes = [];
+
+      function pushNode(n){
+        if (!n || typeof n !== 'object') return;
+        nodes.push(n);
+      }
+
+      function walk(input){
+        if (!input) return;
+
+        if (Array.isArray(input)) {
+          input.forEach(walk);
+          return;
+        }
+
+        if (typeof input !== 'object') return;
+
+        pushNode(input);
+
+        if (Array.isArray(input['@graph'])) {
+          input['@graph'].forEach(function(n){
+            if (n && typeof n === 'object') nodes.push(n);
+          });
+        }
+      }
+
+      var scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+
+      scripts.forEach(function(el){
+        var raw = (el.textContent || '').trim();
+        if (!raw) return;
+
+        try {
+          var parsed = JSON.parse(raw);
+          walk(parsed);
+        } catch (_) {}
+      });
+
+      return nodes;
+    }).catch(() => []);
+
     const jsonldSynth = [{
       "@context": "https://schema.org",
       "@type": "Organization",
