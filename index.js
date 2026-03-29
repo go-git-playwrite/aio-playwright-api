@@ -174,6 +174,98 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
   await page.evaluate(() => window.scrollTo(0, 0));
 }
 
+async function collectEnrichedObservations(page, url) {
+  const result = {
+    sitemap: null,
+    subpageMainlandmark: null,
+    metaDetail: null,
+    policyLinks: null
+  };
+
+  // =========================
+  // 1. sitemap_scan
+  // =========================
+  try {
+    const base = new URL(url).origin;
+    const sitemapUrl = base.replace(/\/$/, '') + '/sitemap.xml';
+
+    const res = await page.request.get(sitemapUrl, { timeout: 5000 });
+    if (res.ok()) {
+      result.sitemap = {
+        found: true,
+        url: sitemapUrl
+      };
+    } else {
+      result.sitemap = { found: false };
+    }
+  } catch (e) {
+    result.sitemap = { found: false };
+  }
+
+  // =========================
+  // 2. subpage_mainlandmark_scan
+  // =========================
+  try {
+    const mainCount = await page.$$eval('main', els => els.length);
+    const landmarkCount = await page.$$eval('[role="main"]', els => els.length);
+
+    result.subpageMainlandmark = {
+      mainCount,
+      mainLandmarkCount: landmarkCount
+    };
+  } catch (e) {
+    result.subpageMainlandmark = {};
+  }
+
+  // =========================
+  // 3. meta_detail_scan
+  // =========================
+  try {
+    const meta = await page.$eval(
+      'meta[name="description"]',
+      el => el.getAttribute('content') || ''
+    ).catch(() => '');
+
+    result.metaDetail = {
+      hasMetaDescription: !!meta,
+      metaDescriptionLength: meta ? meta.length : 0
+    };
+  } catch (e) {
+    result.metaDetail = {};
+  }
+
+  // =========================
+  // 4. policy_link_scan
+  // =========================
+  try {
+    const links = await page.$$eval('a', els =>
+      els.map(a => ({
+        href: a.href,
+        text: (a.innerText || '').toLowerCase()
+      }))
+    );
+
+    function hasMatch(keywords) {
+      return links.some(l =>
+        keywords.some(k =>
+          (l.href || '').toLowerCase().includes(k) ||
+          (l.text || '').includes(k)
+        )
+      );
+    }
+
+    result.policyLinks = {
+      hasPrivacyLink: hasMatch(['privacy', 'プライバシー']),
+      hasPolicyLink: hasMatch(['policy', 'ポリシー']),
+      hasTermsLink: hasMatch(['terms', '利用規約'])
+    };
+  } catch (e) {
+    result.policyLinks = {};
+  }
+
+  return result;
+}
+
 // === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
 // 目的：SPA でも「一瞬でも出た main/header/footer/nav/h1」をラッチして取りこぼさない。
 // 戻り値は probe 側(snake_case)で統一：buildAuditSigFromPage 側で header_present→headerPresent に合流する想定。
@@ -2532,6 +2624,8 @@ async function scrapeOnce(req, res) {
       return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
     }, { timeout: 8000 }).catch(()=>{});
 
+    const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
+
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
 
@@ -3391,6 +3485,7 @@ async function scrapeOnce(req, res) {
 
   const responsePayload = {
     url: urlToFetch,
+    enrichedObservations,
     responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
       'strict-transport-security': null,
       'content-security-policy': null,
