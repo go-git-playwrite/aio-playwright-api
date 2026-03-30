@@ -179,7 +179,9 @@ async function collectEnrichedObservations(page, url) {
     sitemap: null,
     subpageMainlandmark: null,
     metaDetail: null,
-    policyLinks: null
+    policyLinks: null,
+    contentClarity: null,
+    subpageHeading: null
   };
 
   // =========================
@@ -261,6 +263,68 @@ async function collectEnrichedObservations(page, url) {
     };
   } catch (e) {
     result.policyLinks = {};
+  }
+
+  // =========================
+  // 5. content_clarity_scan
+  // =========================
+  try {
+    result.contentClarity = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const headingEl = document.querySelector('main h1, h1, main h2, h2');
+      const headingText = norm(headingEl ? headingEl.textContent : '');
+
+      const anchors = Array.from(document.querySelectorAll('main a[href], a[href]'));
+      const anchorTexts = anchors
+        .map(a => norm(a.textContent || a.getAttribute('aria-label') || a.title || ''))
+        .filter(Boolean);
+
+      const genericRe = /^(more|read more|learn more|click here|view more|詳しく|こちら|詳細|もっと見る|続きを読む)$/i;
+      const specificAnchorCount = anchorTexts.filter(t => t.length >= 8 && !genericRe.test(t)).length;
+      const specificAnchorRatio = anchorTexts.length ? (specificAnchorCount / anchorTexts.length) : null;
+
+      const images = Array.from(document.querySelectorAll('main img, img'));
+      const altCoveredCount = images.filter(img => norm(img.getAttribute('alt')).length > 0).length;
+      const imgAltRatio = images.length ? (altCoveredCount / images.length) : null;
+
+      return {
+        checked: true,
+        headingTextLength: headingText.length || 0,
+        anchorCount: anchorTexts.length,
+        specificAnchorCount,
+        specificAnchorRatio,
+        imageCount: images.length,
+        altCoveredCount,
+        imgAltRatio
+      };
+    });
+  } catch (e) {
+    result.contentClarity = {};
+  }
+
+  // =========================
+  // 6. subpage_heading_scan
+  // =========================
+  try {
+    result.subpageHeading = await page.evaluate(() => {
+      const headingEls = Array.from(document.querySelectorAll('main h1, main h2, main h3, h1, h2, h3'));
+      const levels = headingEls.map(el => Number(String(el.tagName || '').replace(/[^1-6]/g, ''))).filter(Boolean);
+      let headingSequenceBroken = false;
+      for (let i = 1; i < levels.length; i++) {
+        if (levels[i] - levels[i - 1] > 1) {
+          headingSequenceBroken = true;
+          break;
+        }
+      }
+      return {
+        checked: true,
+        h1Count: levels.filter(n => n === 1).length,
+        h2Count: levels.filter(n => n === 2).length,
+        headingSequenceBroken
+      };
+    });
+  } catch (e) {
+    result.subpageHeading = {};
   }
 
   return result;
