@@ -1046,7 +1046,7 @@ async function extractHeadMetaV1(page) {
 
 // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
 const ENABLE_SUBPAGES_VNEXT = true;
-const SUBPAGES_VNEXT_MAX = 5;
+const SUBPAGES_VNEXT_MAX = 8;
 
 function pickSubPageCandidatesVNext_(origin){
   const o = String(origin || '').trim().replace(/\/+$/,'');
@@ -1054,10 +1054,15 @@ function pickSubPageCandidatesVNext_(origin){
 
   const candidates = [
     o + '/about',
-    o + '/business',
-    o + '/service',
     o + '/company',
+    o + '/service',
     o + '/contact',
+    o + '/faq',
+    o + '/policy',
+    o + '/privacy',
+    o + '/inquiry',
+    o + '/business',
+    o + '/support',
   ];
 
   const seen = new Set();
@@ -1072,35 +1077,85 @@ function pickSubPageCandidatesVNext_(origin){
   return out;
 }
 
+function firstMeaningfulStringVNext_(values){
+  for (const v of (Array.isArray(values) ? values : [])) {
+    const s = String(v || '').trim();
+    if (s) return s;
+  }
+  return null;
+}
+
+function buildPublisherInfoFromSubPagesVNext_(subpages, structured, origin){
+  const arr = Array.isArray(subpages) ? subpages : [];
+  const companyPages = arr.filter(p => Array.isArray(p && p.companyLikeSignals) && p.companyLikeSignals.length > 0);
+  const pool = companyPages.length ? companyPages : arr;
+
+  function pickField(field){
+    for (const page of pool) {
+      const val = page && page.publisherCandidate && page.publisherCandidate[field];
+      if (val != null && String(val).trim()) return String(val).trim();
+    }
+    return null;
+  }
+
+  const companyName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.companyName).concat(pool.map(p => p && p.h1)).concat(pool.map(p => p && p.title)));
+  const organizationName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.organizationName).concat([companyName]));
+
+  return {
+    checked: true,
+    companyName: companyName,
+    organizationName: organizationName,
+    address: pickField('address') || (structured && structured.address ? [structured.address.postalCode, structured.address.addressRegion, structured.address.addressLocality, structured.address.streetAddress].filter(Boolean).join(' ') : null),
+    telephone: pickField('telephone') || (structured && structured.telephone ? structured.telephone : null),
+    contactEmail: pickField('contactEmail'),
+    representative: pickField('representative'),
+    corporateNumber: pickField('corporateNumber'),
+    sourceUrl: firstMeaningfulStringVNext_(pool.map(p => p && p.url)) || String(origin || '').trim() || null
+  };
+}
+
+function summarizeSecurityHeaders_(responseHeaders){
+  const h = responseHeaders && typeof responseHeaders === 'object' ? responseHeaders : {};
+  return {
+    checked: true,
+    strictTransportSecurity: h['strict-transport-security'] ?? null,
+    contentSecurityPolicy: h['content-security-policy'] ?? null,
+    xFrameOptions: h['x-frame-options'] ?? null,
+    xContentTypeOptions: h['x-content-type-options'] ?? null,
+    referrerPolicy: h['referrer-policy'] ?? null,
+    permissionsPolicy: h['permissions-policy'] ?? null
+  };
+}
+
 // 1ページから“軽量な観測”だけ抜く（全文は保持しない）
-async function extractLiteFromPageVNext_(page, url, origin){
+async function extractLiteFromPageVNext_(page, url, origin, statusCode){
   const o = String(origin || '').trim().replace(/\/+$/,'');
   const u = String(url || '').trim();
 
-  return await page.evaluate(({ u, o }) => {
-    function textOf(el){ try{ return (el && el.textContent || '').trim(); }catch(_){ return ''; } }
+  return await page.evaluate(({ u, o, statusCode }) => {
+    function norm(s){ return String(s || '').replace(/\s+/g, ' ').trim(); }
+    function textOf(el){ try{ return norm(el && el.textContent || ''); }catch(_){ return ''; } }
     function attrOf(sel, name){
-      try{ const el = document.querySelector(sel); return el ? String(el.getAttribute(name) || '').trim() : ''; }catch(_){ return ''; }
+      try{ const el = document.querySelector(sel); return el ? norm(el.getAttribute(name) || '') : ''; }catch(_){ return ''; }
+    }
+    function collectSignalHits(combined, defs){
+      const hits = [];
+      for (const def of defs) {
+        if (def.re.test(combined)) hits.push(def.label);
+      }
+      return hits;
     }
 
-    const title = (document.title || '').trim();
-    const metaDescription = attrOf('meta[name="description"]', 'content');
+    const title = norm(document.title || '');
+    const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
+    const bodyText = norm(document.body && document.body.innerText || '');
 
-    const h1 = (() => {
-      try{
-        const el = document.querySelector('h1');
-        return el ? textOf(el) : '';
-      }catch(_){ return ''; }
-    })();
+    const h1Texts = Array.from(document.querySelectorAll('main h1, h1')).map(textOf).filter(Boolean);
+    const h2Texts = Array.from(document.querySelectorAll('main h2, h2')).map(textOf).filter(Boolean);
+    const headingTexts = h1Texts.concat(h2Texts).filter(Boolean).slice(0, 5);
+    const h1 = h1Texts[0] || '';
+    const h2 = h2Texts.slice(0, 10);
 
-    const h2 = (() => {
-      try{
-        const els = Array.from(document.querySelectorAll('h2')).slice(0, 10);
-        return els.map(e => textOf(e)).filter(Boolean);
-      }catch(_){ return []; }
-    })();
-
-    // JSON-LD type 抽出（雑に型だけ）
     const jsonldTypes = (() => {
       try{
         const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20);
@@ -1111,7 +1166,6 @@ async function extractLiteFromPageVNext_(page, url, origin){
           let obj = null;
           try{ obj = JSON.parse(raw); }catch(_){ obj = null; }
           const pushType = (t) => { if (t && !types.includes(t)) types.push(String(t)); };
-
           const walk = (x) => {
             if (!x) return;
             if (Array.isArray(x)){ x.forEach(walk); return; }
@@ -1119,7 +1173,6 @@ async function extractLiteFromPageVNext_(page, url, origin){
             const t = x['@type'];
             if (Array.isArray(t)) t.forEach(pushType);
             else pushType(t);
-            // @graph
             if (Array.isArray(x['@graph'])) x['@graph'].forEach(walk);
           };
           walk(obj);
@@ -1128,28 +1181,24 @@ async function extractLiteFromPageVNext_(page, url, origin){
       }catch(_){ return []; }
     })();
 
-    // 内部リンク数（同一origin）
-    const internalLinkCount = (() => {
-      try{
-        const links = Array.from(document.links || []);
-        let c = 0;
-        for (const a of links){
-          const href = a && a.href;
-          if (!href) continue;
-          try{
-            const uu = new URL(href, location.href);
-            if (uu.origin === o) c++;
-          }catch(_){}
-        }
-        return c;
-      }catch(_){ return 0; }
-    })();
+    const links = Array.from(document.querySelectorAll('a[href]'));
+    const internalLinkCount = links.filter(a => {
+      try {
+        const uu = new URL(a.href, location.href);
+        return uu.origin === o;
+      } catch (_) {
+        return false;
+      }
+    }).length;
+    const contactLinkCount = links.filter(a => {
+      const href = norm(a.getAttribute('href') || a.href || '').toLowerCase();
+      const txt = norm(a.textContent || '').toLowerCase();
+      return /contact|inquiry|お問い合わせ|お問合せ|問い合わせ/.test(href + ' ' + txt);
+    }).length;
 
-    // 更新日っぽい表記（ページ全体テキストから軽く拾う：最大1つ）
     const updatedDate = (() => {
       try{
-        const txt = (document.body && document.body.innerText || '').slice(0, 30000);
-        // 例: 2026-03-01 / 2026/03/01 / 2026.03.01
+        const txt = bodyText.slice(0, 30000);
         const m = txt.match(/(20\d{2})[\/\.\-](\d{1,2})[\/\.\-](\d{1,2})/);
         if (!m) return '';
         const y = m[1];
@@ -1159,17 +1208,58 @@ async function extractLiteFromPageVNext_(page, url, origin){
       }catch(_){ return ''; }
     })();
 
-    // --- 404っぽいページは捨てる（候補URLが存在しないケースを除外） ---
     const is404 =
       (/^404\b/i.test(title)) ||
       (/not\s*found/i.test(title)) ||
       (metaDescription && /not\s*found/i.test(metaDescription)) ||
-      ((document.body && document.body.innerText || '').slice(0, 400).match(/404|not\s*found/i));
-
+      (bodyText.slice(0, 400).match(/404|not\s*found/i));
     if (is404) return null;
+
+    const combined = [u, title].concat(headingTexts).join(' | ');
+    const combinedLower = combined.toLowerCase();
+
+    const companyLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'about', re: /\/about\b|about\s+us|about\s+company/ },
+      { label: 'company', re: /\/company\b|company|corporate|企業情報|会社概要|会社情報/ }
+    ]);
+    const serviceLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'service', re: /\/service\b|service|services|サービス|事業/ },
+      { label: 'solution', re: /solution|solutions|ソリューション/ },
+      { label: 'product', re: /product|products|プロダクト|製品/ }
+    ]);
+    const contactLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'contact', re: /\/contact\b|contact|お問い合わせ|お問合せ|問い合わせ/ },
+      { label: 'inquiry', re: /inquiry|inquire/ }
+    ]);
+    const faqLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'faq', re: /\/faq\b|\bfaq\b|よくある質問|q&a|q & a/ }
+    ]);
+
+    const breadcrumbEl = document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="breadcrumb" i], .breadcrumb, [class*="breadcrumb"], ol.breadcrumb, ul.breadcrumb, [data-breadcrumb]');
+    const words = bodyText.match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
+
+    const publisherCandidate = (() => {
+      const addressMatch = bodyText.match(/(?:〒?\d{3}-?\d{4}[\s\S]{0,80}?(?:都|道|府|県)[\s\S]{0,120})/);
+      const telMatch = bodyText.match(/(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/);
+      const emailMatch = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      const representativeMatch = bodyText.match(/(?:代表取締役|代表者|代表)\s*[:：]?\s*([^\n]{1,40})/);
+      const corporateNumberMatch = bodyText.match(/法人番号\s*[:：]?\s*(\d{13})/);
+      return {
+        checked: true,
+        companyName: h1 || title || null,
+        organizationName: h1 || title || null,
+        address: addressMatch ? norm(addressMatch[0]) : null,
+        telephone: telMatch ? norm(telMatch[0]) : null,
+        contactEmail: emailMatch ? norm(emailMatch[0]) : null,
+        representative: representativeMatch ? norm(representativeMatch[1]) : null,
+        corporateNumber: corporateNumberMatch ? norm(corporateNumberMatch[1]) : null,
+        sourceUrl: u
+      };
+    })();
 
     return {
       url: u,
+      status: typeof statusCode === 'number' ? statusCode : null,
       title,
       metaDescription,
       h1,
@@ -1177,52 +1267,86 @@ async function extractLiteFromPageVNext_(page, url, origin){
       jsonldTypes,
       updatedDate,
       internalLinkCount,
+      h1Count: h1Texts.length,
+      h2Count: h2Texts.length,
+      headingTexts,
+      mainCount: document.querySelectorAll('main').length,
+      navCount: document.querySelectorAll('nav').length,
+      headerCount: document.querySelectorAll('header').length,
+      footerCount: document.querySelectorAll('footer').length,
+      hasBreadcrumb: !!breadcrumbEl,
+      wordCount: words.length,
+      contactLinkCount,
+      companyLikeSignals,
+      serviceLikeSignals,
+      faqLikeSignals,
+      contactLikeSignals,
+      publisherCandidate
     };
-  }, { u, o });
+  }, { u, o, statusCode });
 }
 
-// subPages_vNext を作る（最大5、失敗は握る）
+// subPages_vNext を作る（最大8、失敗は握る）
 async function buildSubPagesVNext_V1_(browserPage, origin){
   if (!ENABLE_SUBPAGES_VNEXT) return [];
 
-  // ★ origin が空で来るケースを救済（最重要）
   let o = String(origin || '').trim().replace(/\/+$/,'');
   if (!o){
     try{ o = (new URL(browserPage.url())).origin; }catch(_){ o = ''; }
   }
-  if (!o) return []; // ここで止める（変なURL生成を防ぐ）
+  if (!o) return [];
 
-  // --- M3: 候補抽出前にトップページのナビが描画されるまで少し待つ（SPA対策） ---
   try{
     await browserPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
-    try{ await browserPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){}
-    try{ await browserPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){}
-    try{ await browserPage.waitForTimeout(300); }catch(_){}
-  }catch(_){}
+    try{ await browserPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){ }
+    try{ await browserPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){ }
+    try{ await browserPage.waitForTimeout(300); }catch(_){ }
+  }catch(_){ }
 
   const candidates = pickSubPageCandidatesVNext_(o);
+  console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
   if (!candidates.length) return [];
 
   const out = [];
   for (const url of candidates){
     if (out.length >= SUBPAGES_VNEXT_MAX) break;
     try{
-      await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      // ★ SPA保険（軽く）
-      try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){}
+      const resp = await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
 
-      const lite = await extractLiteFromPageVNext_(browserPage, url, o);
-
-      // ★ ここを追加（nullは即スキップ）
+      const status = resp ? resp.status() : null;
+      const lite = await extractLiteFromPageVNext_(browserPage, url, o, status);
       if (!lite) continue;
 
-      // （ここは今のままでOK：捨てる/捨てないはあなたの今の実装に従う）
-      const hasAny =
-        (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
-      if (hasAny) out.push(lite);
+      const hasAny = !!(lite && (lite.title || (lite.headingTexts && lite.headingTexts.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
+      if (!hasAny) continue;
 
-    }catch(_){}
+      out.push(lite);
+      console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
+        url: lite.url,
+        status: lite.status,
+        title: lite.title,
+        h1Count: lite.h1Count,
+        h2Count: lite.h2Count,
+        mainCount: lite.mainCount,
+        navCount: lite.navCount,
+        headerCount: lite.headerCount,
+        footerCount: lite.footerCount,
+        hasBreadcrumb: lite.hasBreadcrumb,
+        companyLikeSignals: lite.companyLikeSignals,
+        serviceLikeSignals: lite.serviceLikeSignals,
+        contactLikeSignals: lite.contactLikeSignals,
+        faqLikeSignals: lite.faqLikeSignals
+      }));
+    }catch(e){
+      console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
+    }
   }
+
+  console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
+    count: out.length,
+    sample: out.slice(0, 1)
+  }));
   return out;
 }
 // ===== [M3][SUBPAGES_VNEXT v1] ここまで =====
@@ -2704,7 +2828,8 @@ async function scrapeOnce(req, res) {
         'content-security-policy':   h['content-security-policy']   ?? null,
         'x-frame-options':           h['x-frame-options']           ?? null,
         'x-content-type-options':    h['x-content-type-options']    ?? null,
-        'referrer-policy':           h['referrer-policy']           ?? null
+        'referrer-policy':           h['referrer-policy']           ?? null,
+        'permissions-policy':        h['permissions-policy']        ?? null
       };
 
       obs.http = {
@@ -2717,6 +2842,7 @@ async function scrapeOnce(req, res) {
         nosniff: !!responseHeaders['x-content-type-options'],
         csp:  !!responseHeaders['content-security-policy'],
         referrerPolicy: !!responseHeaders['referrer-policy'],
+        permissionsPolicy: !!responseHeaders['permissions-policy'],
         responseHeaders,
         // 監査用に生ヘッダも残す（必要なら後で削る）
         headers: h
@@ -3355,6 +3481,40 @@ async function scrapeOnce(req, res) {
       sameAs: sameAsClean
     };
 
+    const responseOrigin = (() => { try { return new URL(urlToFetch).origin; } catch (_) { return ''; } })();
+    const subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
+    const publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+    const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
+
+    if (enrichedObservations && typeof enrichedObservations === 'object') {
+      enrichedObservations.subpages = subPagesVNext;
+      enrichedObservations.subpageDetails = subPagesVNext;
+      enrichedObservations.pageDetails = subPagesVNext;
+      enrichedObservations.publisherInfo = publisherInfo;
+      enrichedObservations.securityHeaders = securityHeaders;
+    }
+
+    console.log('[PUBLISHER_INFO][SUMMARY]', JSON.stringify({
+      checked: !!publisherInfo,
+      sourceUrl: publisherInfo && publisherInfo.sourceUrl,
+      companyName: publisherInfo && publisherInfo.companyName,
+      organizationName: publisherInfo && publisherInfo.organizationName,
+      hasAddress: !!(publisherInfo && publisherInfo.address),
+      hasTelephone: !!(publisherInfo && publisherInfo.telephone),
+      hasContactEmail: !!(publisherInfo && publisherInfo.contactEmail),
+      hasRepresentative: !!(publisherInfo && publisherInfo.representative),
+      hasCorporateNumber: !!(publisherInfo && publisherInfo.corporateNumber)
+    }));
+    console.log('[SECURITY_HEADERS][SUMMARY]', JSON.stringify({
+      checked: !!securityHeaders,
+      strictTransportSecurity: !!(securityHeaders && securityHeaders.strictTransportSecurity),
+      contentSecurityPolicy: !!(securityHeaders && securityHeaders.contentSecurityPolicy),
+      xFrameOptions: !!(securityHeaders && securityHeaders.xFrameOptions),
+      xContentTypeOptions: !!(securityHeaders && securityHeaders.xContentTypeOptions),
+      referrerPolicy: !!(securityHeaders && securityHeaders.referrerPolicy),
+      permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
+    }));
+
     structured.jsonld = await page.evaluate(() => {
       var nodes = [];
 
@@ -3555,7 +3715,8 @@ async function scrapeOnce(req, res) {
       'content-security-policy': null,
       'x-frame-options': null,
       'x-content-type-options': null,
-      'referrer-policy': null
+      'referrer-policy': null,
+      'permissions-policy': null
     },
     bodyText,
     html: htmlSource,
@@ -3665,7 +3826,12 @@ async function scrapeOnce(req, res) {
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
     auditSig,
 
-    subPages_vNext: await buildSubPagesVNext_V1_(page, (()=>{ try{ return (new URL(url)).origin; }catch(_){ return ''; } })()),
+    subPages_vNext: subPagesVNext,
+    subpages: subPagesVNext,
+    subpageDetails: subPagesVNext,
+    pageDetails: subPagesVNext,
+    publisherInfo,
+    securityHeaders,
 
     // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
     jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
