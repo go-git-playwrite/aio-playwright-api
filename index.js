@@ -160,6 +160,14 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+console.log('[BOOT][START]', JSON.stringify({
+  build: BUILD_TAG,
+  pid: process.pid,
+  node: process.version,
+  port: PORT,
+  ts: new Date().toISOString()
+}));
+
 // === helper: lazyload対応の自動スクロール ===
 async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } = {}) {
   let total = 0;
@@ -2248,6 +2256,23 @@ const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 
 const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
 const scrapeCache = new Map(); // key=url, val={ ts, json }
 
+console.log('[BOOT][MEMO]', JSON.stringify({
+  initialized: [
+    'express-app',
+    'weights-config',
+    'helper-functions',
+    'pqueue-instance',
+    'empty-scrape-cache'
+  ],
+  browserAtBoot: false,
+  contextAtBoot: false,
+  pageAtBoot: false,
+  queueConcurrency: CONCURRENCY,
+  cacheMaxEntries: CACHE_MAX_ENTRIES,
+  cacheTtlMs: CACHE_TTL_MS,
+  rss: process.memoryUsage().rss
+}));
+
 // LRU風に古いものを落とす
 function cacheSet(url, json) {
   if (!url) return;
@@ -4331,4 +4356,13 @@ app.get('/api/score', async (req, res) => {
   res.json(payload);
 });
 
-app.listen(PORT, () => console.log(`[${BUILD_TAG}] running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log('[BOOT][LISTENING]', JSON.stringify({
+    build: BUILD_TAG,
+    port: PORT,
+    pid: process.pid,
+    rss: process.memoryUsage().rss,
+    ts: new Date().toISOString()
+  }));
+  console.log(`[${BUILD_TAG}] running on ${PORT}`);
+});
