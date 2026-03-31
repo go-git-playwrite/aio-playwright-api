@@ -1361,6 +1361,70 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       const resp = await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
       try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
       try {
+        const contentType = resp && typeof resp.headerValue === 'function'
+          ? await resp.headerValue('content-type')
+          : ((resp && typeof resp.headers === 'function') ? (resp.headers()['content-type'] || null) : null);
+        const finalUrl = (() => {
+          try { return resp && typeof resp.url === 'function' ? resp.url() : browserPage.url(); } catch (_) { return url; }
+        })();
+        const userAgent = await browserPage.evaluate(() => navigator.userAgent).catch(() => null);
+        const htmlText = await browserPage.content().catch(() => '');
+        const htmlHead = String(htmlText || '').slice(0, 200);
+        const domMeta = await browserPage.evaluate(() => {
+          const bodyInnerHtml = String(document.body && document.body.innerHTML || '');
+          const outerHtml = String(document.documentElement && document.documentElement.outerHTML || '');
+          const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+            index: i,
+            src: f.getAttribute('src') || '',
+            id: f.id || null,
+            className: f.className || null
+          }));
+          return {
+            readyState: document.readyState,
+            bodyInnerHTMLLen: bodyInnerHtml.length,
+            outerHTMLLen: outerHtml.length,
+            bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
+            iframeCount: iframes.length,
+            iframeSrcs: iframes.slice(0, 10),
+            scriptCount: document.querySelectorAll('script').length
+          };
+        }).catch(() => ({
+          readyState: null,
+          bodyInnerHTMLLen: 0,
+          outerHTMLLen: 0,
+          bodyInnerTextLen: 0,
+          iframeCount: 0,
+          iframeSrcs: [],
+          scriptCount: 0
+        }));
+
+        console.log('[SUBPAGE_FETCH_DEBUG][META]', JSON.stringify({
+          candidateUrl: url,
+          finalUrl,
+          status: resp ? resp.status() : null,
+          title: await browserPage.title().catch(() => ''),
+          userAgent,
+          contentType
+        }));
+        console.log('[SUBPAGE_FETCH_DEBUG][HTML]', JSON.stringify({
+          candidateUrl: url,
+          finalUrl,
+          contentLength: String(htmlText || '').length,
+          bodyInnerHTMLLen: domMeta.bodyInnerHTMLLen,
+          outerHTMLLen: domMeta.outerHTMLLen,
+          htmlHead
+        }));
+        console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+          candidateUrl: url,
+          finalUrl,
+          readyState: domMeta.readyState,
+          bodyInnerTextLen: domMeta.bodyInnerTextLen,
+          iframeCount: domMeta.iframeCount,
+          iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
+          scriptCount: domMeta.scriptCount
+        }));
+      } catch (_) { }
+      try {
         await browserPage.waitForFunction(() => {
           const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
           const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
