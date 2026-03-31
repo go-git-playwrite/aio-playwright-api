@@ -1343,160 +1343,195 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   }
   if (!o) return [];
 
+  const parentContext = browserPage.context();
+  const browser = parentContext && typeof parentContext.browser === 'function'
+    ? parentContext.browser()
+    : null;
+  if (!browser) return [];
+
+  let subContext = null;
+  let subPage = null;
+
   try{
-    await browserPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
-    try{ await browserPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){ }
-    try{ await browserPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){ }
-    try{ await browserPage.waitForTimeout(300); }catch(_){ }
+    subContext = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 800, height: 600 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
+    });
+    subPage = await subContext.newPage();
+    await subPage.setViewportSize({ width: 800, height: 600 }).catch(() => {});
+    await subPage.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
+      return route.continue();
+    });
+  }catch(_){
+    try { if (subPage) await subPage.close(); } catch(_e) {}
+    try { if (subContext) await subContext.close(); } catch(_e) {}
+    return [];
+  }
+
+  try{
+    await subPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    try{ await subPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){ }
+    try{ await subPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){ }
+    try{ await subPage.waitForTimeout(300); }catch(_){ }
   }catch(_){ }
 
-  const candidates = pickSubPageCandidatesVNext_(o);
+  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 2);
   console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
   if (!candidates.length) return [];
 
   const out = [];
-  for (const url of candidates){
-    if (out.length >= SUBPAGES_VNEXT_MAX) break;
-    try{
-      const resp = await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
-      try {
-        const contentType = resp && typeof resp.headerValue === 'function'
-          ? await resp.headerValue('content-type')
-          : ((resp && typeof resp.headers === 'function') ? (resp.headers()['content-type'] || null) : null);
-        const finalUrl = (() => {
-          try { return resp && typeof resp.url === 'function' ? resp.url() : browserPage.url(); } catch (_) { return url; }
-        })();
-        const userAgent = await browserPage.evaluate(() => navigator.userAgent).catch(() => null);
-        const htmlText = await browserPage.content().catch(() => '');
-        const htmlHead = String(htmlText || '').slice(0, 200);
-        const domMeta = await browserPage.evaluate(() => {
-          const bodyInnerHtml = String(document.body && document.body.innerHTML || '');
-          const outerHtml = String(document.documentElement && document.documentElement.outerHTML || '');
-          const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
-            index: i,
-            src: f.getAttribute('src') || '',
-            id: f.id || null,
-            className: f.className || null
-          }));
-          return {
-            readyState: document.readyState,
-            bodyInnerHTMLLen: bodyInnerHtml.length,
-            outerHTMLLen: outerHtml.length,
-            bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
-            iframeCount: iframes.length,
-            iframeSrcs: iframes.slice(0, 10),
-            scriptCount: document.querySelectorAll('script').length
-          };
-        }).catch(() => ({
-          readyState: null,
-          bodyInnerHTMLLen: 0,
-          outerHTMLLen: 0,
-          bodyInnerTextLen: 0,
-          iframeCount: 0,
-          iframeSrcs: [],
-          scriptCount: 0
-        }));
-
-        console.log('[SUBPAGE_FETCH_DEBUG][META]', JSON.stringify({
-          candidateUrl: url,
-          finalUrl,
-          status: resp ? resp.status() : null,
-          title: await browserPage.title().catch(() => ''),
-          userAgent,
-          contentType
-        }));
-        console.log('[SUBPAGE_FETCH_DEBUG][HTML]', JSON.stringify({
-          candidateUrl: url,
-          finalUrl,
-          contentLength: String(htmlText || '').length,
-          bodyInnerHTMLLen: domMeta.bodyInnerHTMLLen,
-          outerHTMLLen: domMeta.outerHTMLLen,
-          htmlHead
-        }));
-        console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
-          candidateUrl: url,
-          finalUrl,
-          readyState: domMeta.readyState,
-          bodyInnerTextLen: domMeta.bodyInnerTextLen,
-          iframeCount: domMeta.iframeCount,
-          iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
-          scriptCount: domMeta.scriptCount
-        }));
-      } catch (_) { }
-      try {
-        await browserPage.waitForFunction(() => {
-          const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
-          const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
-          const mainLen = (() => {
-            const el = document.querySelector('main,[role="main"]');
-            return el && el.innerText ? el.innerText.length : 0;
+  try {
+    for (const url of candidates){
+      if (out.length >= 2) break;
+      try{
+        const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        try{ await subPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
+        try {
+          const contentType = resp && typeof resp.headerValue === 'function'
+            ? await resp.headerValue('content-type')
+            : ((resp && typeof resp.headers === 'function') ? (resp.headers()['content-type'] || null) : null);
+          const finalUrl = (() => {
+            try { return resp && typeof resp.url === 'function' ? resp.url() : subPage.url(); } catch (_) { return url; }
           })();
-          return bodyLen > 0 || docLen > 0 || mainLen > 0;
-        }, { timeout: 2500 }).catch(()=>{});
-      } catch (_) { }
-      try{ await browserPage.waitForTimeout(250); }catch(_){ }
+          const userAgent = await subPage.evaluate(() => navigator.userAgent).catch(() => null);
+          const htmlText = await subPage.content().catch(() => '');
+          const htmlHead = String(htmlText || '').slice(0, 200);
+          const domMeta = await subPage.evaluate(() => {
+            const bodyInnerHtml = String(document.body && document.body.innerHTML || '');
+            const outerHtml = String(document.documentElement && document.documentElement.outerHTML || '');
+            const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+              index: i,
+              src: f.getAttribute('src') || '',
+              id: f.id || null,
+              className: f.className || null
+            }));
+            return {
+              readyState: document.readyState,
+              bodyInnerHTMLLen: bodyInnerHtml.length,
+              outerHTMLLen: outerHtml.length,
+              bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
+              iframeCount: iframes.length,
+              iframeSrcs: iframes.slice(0, 10),
+              scriptCount: document.querySelectorAll('script').length
+            };
+          }).catch(() => ({
+            readyState: null,
+            bodyInnerHTMLLen: 0,
+            outerHTMLLen: 0,
+            bodyInnerTextLen: 0,
+            iframeCount: 0,
+            iframeSrcs: [],
+            scriptCount: 0
+          }));
 
-      const status = resp ? resp.status() : null;
-      const lite = await extractLiteFromPageVNext_(browserPage, url, o, status);
-      if (!lite) continue;
+          console.log('[SUBPAGE_FETCH_DEBUG][META]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            status: resp ? resp.status() : null,
+            title: await subPage.title().catch(() => ''),
+            userAgent,
+            contentType
+          }));
+          console.log('[SUBPAGE_FETCH_DEBUG][HTML]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            contentLength: String(htmlText || '').length,
+            bodyInnerHTMLLen: domMeta.bodyInnerHTMLLen,
+            outerHTMLLen: domMeta.outerHTMLLen,
+            htmlHead
+          }));
+          console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            readyState: domMeta.readyState,
+            bodyInnerTextLen: domMeta.bodyInnerTextLen,
+            iframeCount: domMeta.iframeCount,
+            iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
+            scriptCount: domMeta.scriptCount
+          }));
+        } catch (_) { }
+        try {
+          await subPage.waitForFunction(() => {
+            const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
+            const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
+            const mainLen = (() => {
+              const el = document.querySelector('main,[role="main"]');
+              return el && el.innerText ? el.innerText.length : 0;
+            })();
+            return bodyLen > 0 || docLen > 0 || mainLen > 0;
+          }, { timeout: 2500 }).catch(()=>{});
+        } catch (_) { }
+        try{ await subPage.waitForTimeout(250); }catch(_){ }
 
-      const hasAny = !!(lite && (lite.title || (lite.headingTexts && lite.headingTexts.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
-      if (!hasAny) continue;
+        const status = resp ? resp.status() : null;
+        const lite = await extractLiteFromPageVNext_(subPage, url, o, status);
+        if (!lite) continue;
 
-      out.push(lite);
-      console.log('[SUBPAGE_BODY_DEBUG][PAGE]', JSON.stringify({
-        candidateUrl: url,
-        locationHref: lite.locationHref,
-        status: lite.status,
-        title: lite.title,
-        mainCount: lite.mainCount,
-        bodyTextLen: lite.bodyTextLen,
-        bodyInnerTextLen: lite.bodyInnerTextLen,
-        mainInnerTextLen: lite.mainInnerTextLen,
-        wordCount: lite.wordCount
-      }));
-      console.log('[SUBPAGE_BODY_DEBUG][TEXT]', JSON.stringify({
-        url: lite.url,
-        locationHref: lite.locationHref,
-        mainTextSample: lite.mainTextSample,
-        bodyTextSample: lite.bodyTextSample
-      }));
-      console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
-        candidateUrl: url,
-        locationHref: lite.locationHref,
-        title: lite.title,
-        h1Count: lite.h1Count,
-        h2Count: lite.h2Count,
-        roleHeadingCount: lite.roleHeadingCount,
-        fallbackHeadingCount: lite.fallbackHeadingCount,
-        headingTexts: lite.headingTexts,
-        headingCandidateTexts: lite.headingCandidateTexts
-      }));
-      console.log('[SUBPAGE_HEADING_DEBUG][TEXT_SAMPLE]', JSON.stringify({
-        url: lite.url,
-        locationHref: lite.locationHref,
-        mainTextSample: lite.mainTextSample
-      }));
-      console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
-        url: lite.url,
-        status: lite.status,
-        title: lite.title,
-        h1Count: lite.h1Count,
-        h2Count: lite.h2Count,
-        mainCount: lite.mainCount,
-        navCount: lite.navCount,
-        headerCount: lite.headerCount,
-        footerCount: lite.footerCount,
-        hasBreadcrumb: lite.hasBreadcrumb,
-        companyLikeSignals: lite.companyLikeSignals,
-        serviceLikeSignals: lite.serviceLikeSignals,
-        contactLikeSignals: lite.contactLikeSignals,
-        faqLikeSignals: lite.faqLikeSignals
-      }));
-    }catch(e){
-      console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
+        const hasAny = !!(lite && (lite.title || (lite.headingTexts && lite.headingTexts.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
+        if (!hasAny) continue;
+
+        out.push(lite);
+        console.log('[SUBPAGE_BODY_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          status: lite.status,
+          title: lite.title,
+          mainCount: lite.mainCount,
+          bodyTextLen: lite.bodyTextLen,
+          bodyInnerTextLen: lite.bodyInnerTextLen,
+          mainInnerTextLen: lite.mainInnerTextLen,
+          wordCount: lite.wordCount
+        }));
+        console.log('[SUBPAGE_BODY_DEBUG][TEXT]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample,
+          bodyTextSample: lite.bodyTextSample
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          roleHeadingCount: lite.roleHeadingCount,
+          fallbackHeadingCount: lite.fallbackHeadingCount,
+          headingTexts: lite.headingTexts,
+          headingCandidateTexts: lite.headingCandidateTexts
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][TEXT_SAMPLE]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample
+        }));
+        console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
+          url: lite.url,
+          status: lite.status,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          mainCount: lite.mainCount,
+          navCount: lite.navCount,
+          headerCount: lite.headerCount,
+          footerCount: lite.footerCount,
+          hasBreadcrumb: lite.hasBreadcrumb,
+          companyLikeSignals: lite.companyLikeSignals,
+          serviceLikeSignals: lite.serviceLikeSignals,
+          contactLikeSignals: lite.contactLikeSignals,
+          faqLikeSignals: lite.faqLikeSignals
+        }));
+      }catch(e){
+        console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
+      }
     }
+  } finally {
+    try { if (subPage) await subPage.close(); } catch(_) {}
+    try { if (subContext) await subContext.close(); } catch(_) {}
   }
 
   console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
