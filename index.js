@@ -1159,8 +1159,11 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
 
     const title = norm(document.title || '');
     const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
-    const bodyText = norm(document.body && document.body.innerText || '');
-    const mainInnerText = norm((document.querySelector('main,[role="main"]') && document.querySelector('main,[role="main"]').innerText) || '');
+    const bodyInnerText = norm(document.body && document.body.innerText || '');
+    const mainEl = document.querySelector('main,[role="main"]');
+    const mainInnerText = norm((mainEl && mainEl.innerText) || '');
+    const bodyText = bodyInnerText || norm(document.documentElement && document.documentElement.innerText || '');
+    const bodyTextSample = bodyText.slice(0, 240);
 
     const h1Texts = uniqTexts(Array.from(document.querySelectorAll('main h1, h1')).map(textOf));
     const h2Texts = uniqTexts(Array.from(document.querySelectorAll('main h2, h2')).map(textOf));
@@ -1180,7 +1183,7 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
         .concat(roleHeadingTexts)
         .concat(fallbackHeadingTexts)
     ).slice(0, 10);
-    const fallbackMainHeading = mainInnerText.slice(0, 80);
+    const fallbackMainHeading = (mainInnerText || bodyText).slice(0, 80);
     if (!headingTexts.length && fallbackMainHeading) {
       headingTexts = [fallbackMainHeading];
     }
@@ -1271,7 +1274,7 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
     ]);
 
     const breadcrumbEl = document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="breadcrumb" i], .breadcrumb, [class*="breadcrumb"], ol.breadcrumb, ul.breadcrumb, [data-breadcrumb]');
-    const words = bodyText.match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
+    const words = String(mainInnerText || bodyText || '').match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
 
     const publisherCandidate = (() => {
       const addressMatch = bodyText.match(/(?:〒?\d{3}-?\d{4}[\s\S]{0,80}?(?:都|道|府|県)[\s\S]{0,120})/);
@@ -1310,6 +1313,10 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
       headingCandidateTexts: uniqTexts(roleHeadingTexts.concat(fallbackHeadingTexts)).slice(0, 10),
       locationHref: String(location.href || u || ''),
       mainTextSample: (mainInnerText || bodyText).slice(0, 240),
+      bodyTextSample,
+      bodyTextLen: bodyText.length,
+      bodyInnerTextLen: bodyInnerText.length,
+      mainInnerTextLen: mainInnerText.length,
       mainCount: document.querySelectorAll('main').length,
       navCount: document.querySelectorAll('nav').length,
       headerCount: document.querySelectorAll('header').length,
@@ -1353,6 +1360,18 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
     try{
       const resp = await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
       try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
+      try {
+        await browserPage.waitForFunction(() => {
+          const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
+          const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
+          const mainLen = (() => {
+            const el = document.querySelector('main,[role="main"]');
+            return el && el.innerText ? el.innerText.length : 0;
+          })();
+          return bodyLen > 0 || docLen > 0 || mainLen > 0;
+        }, { timeout: 2500 }).catch(()=>{});
+      } catch (_) { }
+      try{ await browserPage.waitForTimeout(250); }catch(_){ }
 
       const status = resp ? resp.status() : null;
       const lite = await extractLiteFromPageVNext_(browserPage, url, o, status);
@@ -1362,6 +1381,23 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       if (!hasAny) continue;
 
       out.push(lite);
+      console.log('[SUBPAGE_BODY_DEBUG][PAGE]', JSON.stringify({
+        candidateUrl: url,
+        locationHref: lite.locationHref,
+        status: lite.status,
+        title: lite.title,
+        mainCount: lite.mainCount,
+        bodyTextLen: lite.bodyTextLen,
+        bodyInnerTextLen: lite.bodyInnerTextLen,
+        mainInnerTextLen: lite.mainInnerTextLen,
+        wordCount: lite.wordCount
+      }));
+      console.log('[SUBPAGE_BODY_DEBUG][TEXT]', JSON.stringify({
+        url: lite.url,
+        locationHref: lite.locationHref,
+        mainTextSample: lite.mainTextSample,
+        bodyTextSample: lite.bodyTextSample
+      }));
       console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
         candidateUrl: url,
         locationHref: lite.locationHref,
