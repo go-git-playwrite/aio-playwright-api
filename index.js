@@ -1174,12 +1174,16 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
         .map(textOf)
         .filter(Boolean)
     );
-    const headingTexts = uniqTexts(
+    let headingTexts = uniqTexts(
       h1Texts
         .concat(h2Texts)
         .concat(roleHeadingTexts)
         .concat(fallbackHeadingTexts)
     ).slice(0, 10);
+    const fallbackMainHeading = mainInnerText.slice(0, 80);
+    if (!headingTexts.length && fallbackMainHeading) {
+      headingTexts = [fallbackMainHeading];
+    }
     const h1 = h1Texts[0] || roleHeadingTexts[0] || fallbackHeadingTexts[0] || '';
     const h2 = uniqTexts(
       h2Texts.length
