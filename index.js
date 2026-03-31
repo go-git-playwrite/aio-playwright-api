@@ -2256,23 +2256,6 @@ const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 
 const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
 const scrapeCache = new Map(); // key=url, val={ ts, json }
 
-console.log('[BOOT][MEMO]', JSON.stringify({
-  initialized: [
-    'express-app',
-    'weights-config',
-    'helper-functions',
-    'pqueue-instance',
-    'empty-scrape-cache'
-  ],
-  browserAtBoot: false,
-  contextAtBoot: false,
-  pageAtBoot: false,
-  queueConcurrency: CONCURRENCY,
-  cacheMaxEntries: CACHE_MAX_ENTRIES,
-  cacheTtlMs: CACHE_TTL_MS,
-  rss: process.memoryUsage().rss
-}));
-
 // LRU風に古いものを落とす
 function cacheSet(url, json) {
   if (!url) return;
@@ -2901,6 +2884,23 @@ function buildScoresFromScrape(scraped) {
 // 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
 const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
 const queue = new PQueue({ concurrency: CONCURRENCY });
+
+console.log('[BOOT][MEMO]', JSON.stringify({
+  initialized: [
+    'express-app',
+    'weights-config',
+    'helper-functions',
+    'pqueue-instance',
+    'empty-scrape-cache'
+  ],
+  browserAtBoot: false,
+  contextAtBoot: false,
+  pageAtBoot: false,
+  queueConcurrency: CONCURRENCY,
+  cacheMaxEntries: CACHE_MAX_ENTRIES,
+  cacheTtlMs: CACHE_TTL_MS,
+  rss: process.memoryUsage().rss
+}));
 
 app.get('/scrape', async (req, res) => {
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
