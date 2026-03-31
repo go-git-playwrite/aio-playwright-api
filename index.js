@@ -1435,15 +1435,74 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
             userAgent,
             contentType
           }));
-        console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
-          candidateUrl: url,
-          finalUrl,
-          readyState: domMeta.readyState,
-          bodyInnerTextLen: domMeta.bodyInnerTextLen,
+          console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            readyState: domMeta.readyState,
+            bodyInnerTextLen: domMeta.bodyInnerTextLen,
             iframeCount: domMeta.iframeCount,
             iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
             scriptCount: domMeta.scriptCount
           }));
+          if (/^https?:\/\/www\.fork\.co\.jp\/about\/?$/i.test(String(finalUrl || url || ''))) {
+            const domShape = await subPage.evaluate(() => {
+              const body = document.body;
+              const html = document.documentElement;
+              const bodyInnerHTML = String(body && body.innerHTML || '');
+              const docInnerHTML = String(html && html.innerHTML || '');
+              const bodyTextContent = String(body && body.textContent || '');
+              const bodyInnerText = String(body && body.innerText || '');
+
+              const hiddenSelectors = [
+                'main',
+                '#app',
+                '#__next',
+                '#__nuxt',
+                'app-index',
+                'body > *:first-child'
+              ];
+
+              const hiddenSignals = hiddenSelectors.map(sel => {
+                try {
+                  const el = document.querySelector(sel);
+                  if (!el) return { selector: sel, exists: false };
+                  const style = window.getComputedStyle(el);
+                  return {
+                    selector: sel,
+                    exists: true,
+                    displayNone: style.display === 'none',
+                    visibilityHidden: style.visibility === 'hidden'
+                  };
+                } catch (_) {
+                  return { selector: sel, exists: false };
+                }
+              });
+
+              return {
+                bodyChildElementCount: body ? body.childElementCount : 0,
+                bodyInnerHTMLHead: bodyInnerHTML.slice(0, 200),
+                documentInnerHTMLHead: docInnerHTML.slice(0, 200),
+                textContentLength: bodyTextContent.length,
+                innerTextLength: bodyInnerText.length,
+                hiddenSignals
+              };
+            }).catch(() => null);
+
+            console.log('[SUBPAGE_DOM_SHAPE][BODY]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyChildElementCount: domShape && domShape.bodyChildElementCount,
+              textContentLength: domShape && domShape.textContentLength,
+              innerTextLength: domShape && domShape.innerTextLength,
+              hiddenSignals: domShape && domShape.hiddenSignals
+            }));
+            console.log('[SUBPAGE_DOM_SHAPE][HTML]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyInnerHTMLHead: domShape && domShape.bodyInnerHTMLHead,
+              documentInnerHTMLHead: domShape && domShape.documentInnerHTMLHead
+            }));
+          }
         } catch (_) { }
         try {
           await subPage.waitForFunction(() => {
