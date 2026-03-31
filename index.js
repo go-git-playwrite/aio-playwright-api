@@ -1135,6 +1135,17 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
   return await page.evaluate(({ u, o, statusCode }) => {
     function norm(s){ return String(s || '').replace(/\s+/g, ' ').trim(); }
     function textOf(el){ try{ return norm(el && el.textContent || ''); }catch(_){ return ''; } }
+    function uniqTexts(arr){
+      const out = [];
+      const seen = new Set();
+      for (const v of (Array.isArray(arr) ? arr : [])) {
+        const s = norm(v);
+        if (!s || seen.has(s)) continue;
+        seen.add(s);
+        out.push(s);
+      }
+      return out;
+    }
     function attrOf(sel, name){
       try{ const el = document.querySelector(sel); return el ? norm(el.getAttribute(name) || '') : ''; }catch(_){ return ''; }
     }
@@ -1149,12 +1160,32 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
     const title = norm(document.title || '');
     const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
     const bodyText = norm(document.body && document.body.innerText || '');
+    const mainInnerText = norm((document.querySelector('main,[role="main"]') && document.querySelector('main,[role="main"]').innerText) || '');
 
-    const h1Texts = Array.from(document.querySelectorAll('main h1, h1')).map(textOf).filter(Boolean);
-    const h2Texts = Array.from(document.querySelectorAll('main h2, h2')).map(textOf).filter(Boolean);
-    const headingTexts = h1Texts.concat(h2Texts).filter(Boolean).slice(0, 5);
-    const h1 = h1Texts[0] || '';
-    const h2 = h2Texts.slice(0, 10);
+    const h1Texts = uniqTexts(Array.from(document.querySelectorAll('main h1, h1')).map(textOf));
+    const h2Texts = uniqTexts(Array.from(document.querySelectorAll('main h2, h2')).map(textOf));
+    const roleHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('[role="heading"]'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    const fallbackHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('main .title, .page-title, .headline, .hero-title, .title'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    const headingTexts = uniqTexts(
+      h1Texts
+        .concat(h2Texts)
+        .concat(roleHeadingTexts)
+        .concat(fallbackHeadingTexts)
+    ).slice(0, 10);
+    const h1 = h1Texts[0] || roleHeadingTexts[0] || fallbackHeadingTexts[0] || '';
+    const h2 = uniqTexts(
+      h2Texts.length
+        ? h2Texts
+        : roleHeadingTexts.slice(h1 ? 1 : 0).concat(fallbackHeadingTexts.slice(h1 ? 1 : 0))
+    ).slice(0, 10);
 
     const jsonldTypes = (() => {
       try{
@@ -1269,7 +1300,12 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
       internalLinkCount,
       h1Count: h1Texts.length,
       h2Count: h2Texts.length,
+      roleHeadingCount: roleHeadingTexts.length,
+      fallbackHeadingCount: fallbackHeadingTexts.length,
       headingTexts,
+      headingCandidateTexts: uniqTexts(roleHeadingTexts.concat(fallbackHeadingTexts)).slice(0, 10),
+      locationHref: String(location.href || u || ''),
+      mainTextSample: (mainInnerText || bodyText).slice(0, 240),
       mainCount: document.querySelectorAll('main').length,
       navCount: document.querySelectorAll('nav').length,
       headerCount: document.querySelectorAll('header').length,
@@ -1322,6 +1358,22 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       if (!hasAny) continue;
 
       out.push(lite);
+      console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
+        candidateUrl: url,
+        locationHref: lite.locationHref,
+        title: lite.title,
+        h1Count: lite.h1Count,
+        h2Count: lite.h2Count,
+        roleHeadingCount: lite.roleHeadingCount,
+        fallbackHeadingCount: lite.fallbackHeadingCount,
+        headingTexts: lite.headingTexts,
+        headingCandidateTexts: lite.headingCandidateTexts
+      }));
+      console.log('[SUBPAGE_HEADING_DEBUG][TEXT_SAMPLE]', JSON.stringify({
+        url: lite.url,
+        locationHref: lite.locationHref,
+        mainTextSample: lite.mainTextSample
+      }));
       console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
         url: lite.url,
         status: lite.status,
@@ -1346,6 +1398,10 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
     count: out.length,
     sample: out.slice(0, 1)
+  }));
+  console.log('[SUBPAGE_HEADING_DEBUG][SUMMARY]', JSON.stringify({
+    adoptedCount: out.length,
+    adoptedUrls: out.map(p => p && p.url).filter(Boolean)
   }));
   return out;
 }
