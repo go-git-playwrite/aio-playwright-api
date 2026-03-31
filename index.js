@@ -1375,22 +1375,20 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
 
   try{
     await subPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
-    try{ await subPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){ }
-    try{ await subPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){ }
-    try{ await subPage.waitForTimeout(300); }catch(_){ }
+    try{ await subPage.waitForTimeout(150); }catch(_){ }
   }catch(_){ }
 
-  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 2);
+  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 1);
   console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
   if (!candidates.length) return [];
 
   const out = [];
   try {
     for (const url of candidates){
-      if (out.length >= 2) break;
+      if (out.length >= 1) break;
       try{
         const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        try{ await subPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){ }
+        try{ await subPage.waitForTimeout(150); }catch(_){ }
         try {
           const contentType = resp && typeof resp.headerValue === 'function'
             ? await resp.headerValue('content-type')
@@ -1399,11 +1397,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
             try { return resp && typeof resp.url === 'function' ? resp.url() : subPage.url(); } catch (_) { return url; }
           })();
           const userAgent = await subPage.evaluate(() => navigator.userAgent).catch(() => null);
-          const htmlText = await subPage.content().catch(() => '');
-          const htmlHead = String(htmlText || '').slice(0, 200);
           const domMeta = await subPage.evaluate(() => {
-            const bodyInnerHtml = String(document.body && document.body.innerHTML || '');
-            const outerHtml = String(document.documentElement && document.documentElement.outerHTML || '');
             const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
               index: i,
               src: f.getAttribute('src') || '',
@@ -1412,8 +1406,6 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
             }));
             return {
               readyState: document.readyState,
-              bodyInnerHTMLLen: bodyInnerHtml.length,
-              outerHTMLLen: outerHtml.length,
               bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
               iframeCount: iframes.length,
               iframeSrcs: iframes.slice(0, 10),
@@ -1421,8 +1413,6 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
             };
           }).catch(() => ({
             readyState: null,
-            bodyInnerHTMLLen: 0,
-            outerHTMLLen: 0,
             bodyInnerTextLen: 0,
             iframeCount: 0,
             iframeSrcs: [],
@@ -1437,19 +1427,11 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
             userAgent,
             contentType
           }));
-          console.log('[SUBPAGE_FETCH_DEBUG][HTML]', JSON.stringify({
-            candidateUrl: url,
-            finalUrl,
-            contentLength: String(htmlText || '').length,
-            bodyInnerHTMLLen: domMeta.bodyInnerHTMLLen,
-            outerHTMLLen: domMeta.outerHTMLLen,
-            htmlHead
-          }));
-          console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
-            candidateUrl: url,
-            finalUrl,
-            readyState: domMeta.readyState,
-            bodyInnerTextLen: domMeta.bodyInnerTextLen,
+        console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+          candidateUrl: url,
+          finalUrl,
+          readyState: domMeta.readyState,
+          bodyInnerTextLen: domMeta.bodyInnerTextLen,
             iframeCount: domMeta.iframeCount,
             iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
             scriptCount: domMeta.scriptCount
@@ -1464,9 +1446,9 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
               return el && el.innerText ? el.innerText.length : 0;
             })();
             return bodyLen > 0 || docLen > 0 || mainLen > 0;
-          }, { timeout: 2500 }).catch(()=>{});
+          }, { timeout: 1200 }).catch(()=>{});
         } catch (_) { }
-        try{ await subPage.waitForTimeout(250); }catch(_){ }
+        try{ await subPage.waitForTimeout(120); }catch(_){ }
 
         const status = resp ? resp.status() : null;
         const lite = await extractLiteFromPageVNext_(subPage, url, o, status);
@@ -1525,6 +1507,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
           contactLikeSignals: lite.contactLikeSignals,
           faqLikeSignals: lite.faqLikeSignals
         }));
+        break;
       }catch(e){
         console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
       }
