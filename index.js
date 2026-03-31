@@ -1167,11 +1167,15 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
 
     const title = norm(document.title || '');
     const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
-    const bodyInnerText = norm(document.body && document.body.innerText || '');
     const mainEl = document.querySelector('main,[role="main"]');
     const mainInnerText = norm((mainEl && mainEl.innerText) || '');
-    const bodyText = bodyInnerText || norm(document.documentElement && document.documentElement.innerText || '');
-    const bodyTextSample = bodyText.slice(0, 240);
+    const bodyInnerText = norm(document.body && document.body.innerText || '');
+    const mainTextContent = norm((mainEl && mainEl.textContent) || '');
+    const bodyTextContent = norm(document.body && document.body.textContent || '');
+    const docTextContent = norm(document.documentElement && document.documentElement.textContent || '');
+    const bodyText = mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent;
+    const mainTextSample = (mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent).slice(0, 240);
+    const bodyTextSample = (bodyInnerText || bodyTextContent || docTextContent || mainInnerText || mainTextContent).slice(0, 240);
 
     const h1Texts = uniqTexts(Array.from(document.querySelectorAll('main h1, h1')).map(textOf));
     const h2Texts = uniqTexts(Array.from(document.querySelectorAll('main h2, h2')).map(textOf));
@@ -1191,7 +1195,7 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
         .concat(roleHeadingTexts)
         .concat(fallbackHeadingTexts)
     ).slice(0, 10);
-    const fallbackMainHeading = (mainInnerText || bodyText).slice(0, 80);
+    const fallbackMainHeading = bodyText.slice(0, 80);
     if (!headingTexts.length && fallbackMainHeading) {
       headingTexts = [fallbackMainHeading];
     }
@@ -1282,7 +1286,7 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
     ]);
 
     const breadcrumbEl = document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="breadcrumb" i], .breadcrumb, [class*="breadcrumb"], ol.breadcrumb, ul.breadcrumb, [data-breadcrumb]');
-    const words = String(mainInnerText || bodyText || '').match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
+    const words = String(bodyText || '').match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
 
     const publisherCandidate = (() => {
       const addressMatch = bodyText.match(/(?:〒?\d{3}-?\d{4}[\s\S]{0,80}?(?:都|道|府|県)[\s\S]{0,120})/);
@@ -1320,7 +1324,7 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
       headingTexts,
       headingCandidateTexts: uniqTexts(roleHeadingTexts.concat(fallbackHeadingTexts)).slice(0, 10),
       locationHref: String(location.href || u || ''),
-      mainTextSample: (mainInnerText || bodyText).slice(0, 240),
+      mainTextSample,
       bodyTextSample,
       bodyTextLen: bodyText.length,
       bodyInnerTextLen: bodyInnerText.length,
