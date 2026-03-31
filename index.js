@@ -1053,7 +1053,7 @@ async function extractHeadMetaV1(page) {
 }
 
 // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
-const ENABLE_SUBPAGES_VNEXT = true;
+const ENABLE_SUBPAGES_VNEXT = process.env.ENABLE_SUBPAGES_VNEXT !== '0';
 const SUBPAGES_VNEXT_MAX = 8;
 
 function pickSubPageCandidatesVNext_(origin){
@@ -3748,8 +3748,17 @@ async function scrapeOnce(req, res) {
     };
 
     const responseOrigin = (() => { try { return new URL(urlToFetch).origin; } catch (_) { return ''; } })();
-    const subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
-    const publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+    let subPagesVNext = [];
+    let publisherInfo = null;
+    if (ENABLE_SUBPAGES_VNEXT) {
+      subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
+      publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+    } else {
+      console.log('[SUBPAGE_ENRICH][DISABLED]', JSON.stringify({
+        url: urlToFetch,
+        reason: 'ENABLE_SUBPAGES_VNEXT=0'
+      }));
+    }
     const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
 
     if (enrichedObservations && typeof enrichedObservations === 'object') {
