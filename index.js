@@ -2307,6 +2307,7 @@ app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); n
 // -------------------- ヘルス --------------------
 app.get('/', (_, res) => res.status(200).json({ ok: true }));
 app.get('/__version', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
+app.get('/health', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
 
 // 軽量ヘルスチェック（RSS を見るとメモリ傾向を掴みやすい）
 app.get('/healthz', (_, res) => {
