@@ -3313,7 +3313,46 @@ async function scrapeOnce(req, res) {
   // 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
 
     // ---- HTMLソース（タグあり）----
+    // === ここから追加 ===
     const htmlSource = await page.content().catch(() => '');
+
+    const shadowNavHtml = await page.evaluate(() => {
+      const out = [];
+      const seenHtml = new Set();
+
+      const pushIfMatch = (el) => {
+        if (!el || !el.tagName) return;
+        const tag = el.tagName.toLowerCase();
+        if (tag !== 'header' && tag !== 'nav') return;
+
+        const html = String(el.outerHTML || '').trim();
+        if (!html) return;
+        if (seenHtml.has(html)) return;
+
+        seenHtml.add(html);
+        out.push(html);
+      };
+
+      const walk = (root) => {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = Array.from(root.querySelectorAll('*'));
+        for (const el of nodes) {
+          pushIfMatch(el);
+          if (el.shadowRoot) {
+            walk(el.shadowRoot);
+          }
+        }
+      };
+
+      walk(document);
+      return out.join('\n');
+    }).catch(() => '');
+
+    const payloadHtml = shadowNavHtml
+      ? htmlSource + '\n<!-- shadow-nav-fragments -->\n' + shadowNavHtml
+      : htmlSource;
+    // === ここまで追加 ===
 
     // ---- 設立（STRICT: DOM/HTML 構造のみ）----
     let foundFoundingDate = '';
@@ -3642,7 +3681,7 @@ async function scrapeOnce(req, res) {
     ));
 
     // === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
-    const scoringHtml  = (aboutHtml || topHtml || htmlSource || '');
+    const scoringHtml  = (aboutHtml || topHtml || payloadHtml || '');
     const scoringBodyA = renderedText || '';
     const scoringBodyB = stripTags(scoringHtml);
     const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
@@ -3994,7 +4033,7 @@ async function scrapeOnce(req, res) {
       'permissions-policy': null
     },
     bodyText,
-    html: htmlSource,
+    html: payloadHtml,
 
     confirmed: {
       has_hsts: !!(obs.http && obs.http.ok && obs.http.hsts),
