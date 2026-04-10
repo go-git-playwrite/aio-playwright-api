@@ -4041,6 +4041,8 @@ async function scrapeOnce(req, res) {
     }
   }).catch(() => []);
 
+  const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
+
   const responsePayload = {
     url: urlToFetch,
     enrichedObservations,
@@ -4159,7 +4161,10 @@ async function scrapeOnce(req, res) {
     })(),
 
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
-    auditSig,
+    auditSig: {
+      ...(existingAuditSig || {}),
+      headingTexts
+    },
 
     subPages_vNext: subPagesVNext,
     subpages: subPagesVNext,
