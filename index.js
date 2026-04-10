@@ -4022,6 +4022,25 @@ async function scrapeOnce(req, res) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
   }
 
+  const headingTexts = await page.evaluate(() => {
+    try {
+      const nodes = Array.from(document.querySelectorAll('h1, h2, h3'));
+      const seen = new Set();
+      const out = [];
+      for (const el of nodes) {
+        const t = String((el.innerText || el.textContent || '')).trim();
+        if (!t) continue;
+        if (seen.has(t)) continue;
+        seen.add(t);
+        out.push(t);
+        if (out.length >= 20) break;
+      }
+      return out;
+    } catch (_) {
+      return [];
+    }
+  }).catch(() => []);
+
   const responsePayload = {
     url: urlToFetch,
     enrichedObservations,
@@ -4051,11 +4070,12 @@ async function scrapeOnce(req, res) {
     // ★ 追加：レンダリング後のテキスト（deepText 優先）
     //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
     renderedText,
+    headingTexts,
 
     jsonld,
     structured,
     jsonldSynth,
-    scoring: { html: scoringHtml, bodyText: scoringBody },
+    scoring: { html: scoringHtml, bodyText: scoringBody, headingTexts },
     metaDescription,
 
     // ★ ADD: HTTPS 判定（GAS facts 用）
