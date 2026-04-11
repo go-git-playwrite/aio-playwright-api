@@ -2967,6 +2967,7 @@ console.log('[BOOT][MEMO]', JSON.stringify({
 }));
 
 app.get('/scrape', async (req, res) => {
+  console.log('[TEST][SCRAPE_ENTRY] entered /scrape');
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
   return queue.add(() => scrapeOnce(req, res)).catch(err => {
     if (!res.headersSent) {
@@ -4527,6 +4528,12 @@ async function scrapeOnce(req, res) {
   }catch(e){
     console.log('[COVNAV][SCRAPE][OUT v1][ERR]', String(e && (e.stack||e)));
   }
+
+  console.log('[TEST][RESPONSE_PATH_HIT] bodyText debug marker');
+  console.log('[TEST][RESPONSE_PAYLOAD_KEYS]', JSON.stringify({
+    hasPayload: !!out,
+    keys: out && typeof out === 'object' ? Object.keys(out).slice(0, 50) : []
+  }));
 
   // 正常終了
   return res.status(200).json(out);
