@@ -4342,6 +4342,7 @@ async function scrapeOnce(req, res) {
     //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
     renderedText,
     headingTexts,
+    bodyTextCandidates,
 
     jsonld,
     structured,
@@ -4761,6 +4762,11 @@ app.get('/api/score', async (req, res) => {
     console.log('[AUDITSIG][COVNAV][FINAL v2][ERR]', String(e && (e.stack || e)));
   }
   // ===== /ADD =====
+
+  console.log('[TEST][BODYTEXT][RESPONSE_PAYLOAD]', JSON.stringify({
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  }));
 
   res.json(payload);
 });
