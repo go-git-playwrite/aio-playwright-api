@@ -4114,54 +4114,84 @@ async function scrapeOnce(req, res) {
     length: primaryHeadingText ? primaryHeadingText.length : 0
   });
 
-  const primaryMessageText = await page.evaluate(() => {
-    function textOf(el) {
-      return String((el && (el.innerText || el.textContent)) || '')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
+  async function getPrimaryMessageText(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
 
-    function isBadContainer(el) {
-      if (!el || !el.closest) return false;
-      return !!el.closest('header, nav, footer, aside, [role="navigation"], .breadcrumb, .breadcrumbs, .global-nav, .header, .footer');
-    }
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
 
-    function isVisible(el) {
-      if (!el || !el.getBoundingClientRect) return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
-    }
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
 
-    const root =
-      document.querySelector('main') ||
-      document.querySelector('[role="main"]') ||
-      document.querySelector('article') ||
-      document.body;
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
 
-    const candidates = Array.from(root.querySelectorAll('h1,h2,h3,p,div,span'))
-      .filter(el => !isBadContainer(el))
-      .filter(isVisible)
-      .map(el => {
-        const text = textOf(el);
-        const rect = el.getBoundingClientRect();
-        return {
-          el,
-          text,
-          top: rect.top,
-          len: text.length
-        };
-      })
-      .filter(x =>
-        x.text &&
-        x.len >= 12 &&
-        x.len <= 120 &&
-        x.top >= 0 &&
-        x.top <= 900
-      )
-      .sort((a, b) => a.top - b.top);
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
 
-    return candidates.length ? candidates[0].text : '';
-  }).catch(() => '');
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      for (const root of roots) {
+        const out = [];
+        collectCandidates(root, out);
+        if (out.length) return out[0];
+      }
+
+      return null;
+    });
+  }
+
+  const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
 
   console.log('[PW][PRIMARY_MESSAGE]', {
     text: primaryMessageText || '',
