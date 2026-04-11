@@ -4023,22 +4023,27 @@ async function scrapeOnce(req, res) {
   }
 
   const headingTexts = await page.evaluate(() => {
-    try {
-      const nodes = Array.from(document.querySelectorAll('h1, h2, h3'));
-      const seen = new Set();
+    function collect(root) {
       const out = [];
-      for (const el of nodes) {
-        const t = String((el.innerText || el.textContent || '')).trim();
-        if (!t) continue;
-        if (seen.has(t)) continue;
-        seen.add(t);
-        out.push(t);
-        if (out.length >= 20) break;
+
+      // 通常DOM
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      // shadow DOM 再帰
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collect(el.shadowRoot));
+        }
       }
       return out;
-    } catch (_) {
-      return [];
     }
+
+    const nodes = collect(document);
+
+    return nodes
+      .map(n => (n.innerText || '').trim())
+      .filter(t => t.length > 0);
   }).catch(() => []);
 
   console.log('[PW][HEADINGS_RAW]', {
