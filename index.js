@@ -4051,10 +4051,53 @@ async function scrapeOnce(req, res) {
     sample: Array.isArray(headingTexts) ? headingTexts.slice(0, 5) : null
   });
 
+  const primaryHeadingText = await page.evaluate(() => {
+    function collect(root) {
+      const out = [];
+
+      const direct = Array.from(root.querySelectorAll('h1,h2,h3'));
+      out.push(...direct);
+
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) out.push(...collect(el.shadowRoot));
+      }
+      return out;
+    }
+
+    const nodes = collect(document)
+      .map(n => ({
+        tag: String((n.tagName || '')).toLowerCase(),
+        text: String(n.innerText || '').trim()
+      }))
+      .filter(x => x.text);
+
+    const h1 = nodes.find(x => x.tag === 'h1');
+    if (h1) return h1.text;
+
+    const h2 = nodes.find(x => x.tag === 'h2');
+    if (h2) return h2.text;
+
+    const h3 = nodes.find(x => x.tag === 'h3');
+    if (h3) return h3.text;
+
+    return '';
+  }).catch(() => '');
+
+  console.log('[PW][PRIMARY_HEADING]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
   const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
 
   console.log('[PW][HEADINGS_TO_AUDITSIG]', {
     count: headingTexts ? headingTexts.length : null
+  });
+
+  console.log('[PW][PRIMARY_HEADING_TO_AUDITSIG]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
   });
 
   const responsePayload = {
@@ -4177,7 +4220,8 @@ async function scrapeOnce(req, res) {
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
     auditSig: {
       ...(existingAuditSig || {}),
-      headingTexts
+      headingTexts,
+      primaryHeadingText: primaryHeadingText
     },
 
     subPages_vNext: subPagesVNext,
