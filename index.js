@@ -4114,6 +4114,60 @@ async function scrapeOnce(req, res) {
     length: primaryHeadingText ? primaryHeadingText.length : 0
   });
 
+  const primaryMessageText = await page.evaluate(() => {
+    function textOf(el) {
+      return String((el && (el.innerText || el.textContent)) || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function isBadContainer(el) {
+      if (!el || !el.closest) return false;
+      return !!el.closest('header, nav, footer, aside, [role="navigation"], .breadcrumb, .breadcrumbs, .global-nav, .header, .footer');
+    }
+
+    function isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }
+
+    const root =
+      document.querySelector('main') ||
+      document.querySelector('[role="main"]') ||
+      document.querySelector('article') ||
+      document.body;
+
+    const candidates = Array.from(root.querySelectorAll('h1,h2,h3,p,div,span'))
+      .filter(el => !isBadContainer(el))
+      .filter(isVisible)
+      .map(el => {
+        const text = textOf(el);
+        const rect = el.getBoundingClientRect();
+        return {
+          el,
+          text,
+          top: rect.top,
+          len: text.length
+        };
+      })
+      .filter(x =>
+        x.text &&
+        x.len >= 12 &&
+        x.len <= 120 &&
+        x.top >= 0 &&
+        x.top <= 900
+      )
+      .sort((a, b) => a.top - b.top);
+
+    return candidates.length ? candidates[0].text : '';
+  }).catch(() => '');
+
+  console.log('[PW][PRIMARY_MESSAGE]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
   const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
 
   console.log('[PW][HEADINGS_TO_AUDITSIG]', {
@@ -4123,6 +4177,11 @@ async function scrapeOnce(req, res) {
   console.log('[PW][PRIMARY_HEADING_TO_AUDITSIG]', {
     text: primaryHeadingText || '',
     length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
+  console.log('[PW][PRIMARY_MESSAGE_TO_AUDITSIG]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
   });
 
   const responsePayload = {
@@ -4246,7 +4305,8 @@ async function scrapeOnce(req, res) {
     auditSig: {
       ...(existingAuditSig || {}),
       headingTexts,
-      primaryHeadingText: primaryHeadingText
+      primaryHeadingText: primaryHeadingText,
+      primaryMessageText: primaryMessageText
     },
 
     subPages_vNext: subPagesVNext,
