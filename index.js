@@ -4281,10 +4281,10 @@ async function scrapeOnce(req, res) {
   const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
 
-  console.log('[PW][BODY_TEXT_CANDIDATES]', {
+  console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
     count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
-  });
+  }));
 
   console.log('[PW][PRIMARY_MESSAGE]', {
     text: primaryMessageText || '',
@@ -4307,10 +4307,10 @@ async function scrapeOnce(req, res) {
     length: primaryMessageText ? primaryMessageText.length : 0
   });
 
-  console.log('[PW][BODY_TEXT_CANDIDATES_TO_AUDITSIG]', {
+  console.log('[PW][BODY_TEXT_CANDIDATES_TO_AUDITSIG]', JSON.stringify({
     count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
-  });
+  }));
 
   const responsePayload = {
     url: urlToFetch,
