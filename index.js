@@ -4114,6 +4114,93 @@ async function scrapeOnce(req, res) {
     length: primaryHeadingText ? primaryHeadingText.length : 0
   });
 
+  async function getBodyTextCandidates(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
+
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
+
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
+
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      const out = [];
+      for (const root of roots) {
+        collectCandidates(root, out);
+        if (out.length >= 5) break;
+      }
+
+      const uniq = [];
+      const seen = Object.create(null);
+      for (const t of out) {
+        if (!seen[t]) {
+          seen[t] = true;
+          uniq.push(t);
+        }
+        if (uniq.length >= 5) break;
+      }
+
+      return uniq;
+    });
+  }
+
   async function getPrimaryMessageText(page) {
     await page.waitForFunction(() => {
       const roots = [
@@ -4191,7 +4278,13 @@ async function scrapeOnce(req, res) {
     });
   }
 
+  const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
+
+  console.log('[PW][BODY_TEXT_CANDIDATES]', {
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  });
 
   console.log('[PW][PRIMARY_MESSAGE]', {
     text: primaryMessageText || '',
@@ -4212,6 +4305,11 @@ async function scrapeOnce(req, res) {
   console.log('[PW][PRIMARY_MESSAGE_TO_AUDITSIG]', {
     text: primaryMessageText || '',
     length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
+  console.log('[PW][BODY_TEXT_CANDIDATES_TO_AUDITSIG]', {
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
   });
 
   const responsePayload = {
@@ -4336,7 +4434,8 @@ async function scrapeOnce(req, res) {
       ...(existingAuditSig || {}),
       headingTexts,
       primaryHeadingText: primaryHeadingText,
-      primaryMessageText: primaryMessageText
+      primaryMessageText: primaryMessageText,
+      bodyTextCandidates: bodyTextCandidates
     },
 
     subPages_vNext: subPagesVNext,
