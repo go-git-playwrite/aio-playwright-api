@@ -4056,20 +4056,38 @@ async function scrapeOnce(req, res) {
       return String((el && (el.innerText || el.textContent)) || '').trim();
     }
 
-    function firstHeading(root) {
-      if (!root || !root.querySelectorAll) return '';
-      const nodes = Array.from(root.querySelectorAll('h1,h2,h3'))
+    function collectHeadings(root) {
+      const out = [];
+      if (!root || !root.querySelectorAll) return out;
+
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collectHeadings(el.shadowRoot));
+        }
+      }
+      return out;
+    }
+
+    function pickHeading(root) {
+      const nodes = collectHeadings(root)
         .map(el => ({
           tag: String((el.tagName || '')).toLowerCase(),
           text: textOf(el)
         }))
         .filter(x => x.text);
+
       const h1 = nodes.find(x => x.tag === 'h1');
       if (h1) return h1.text;
+
       const h2 = nodes.find(x => x.tag === 'h2');
       if (h2) return h2.text;
+
       const h3 = nodes.find(x => x.tag === 'h3');
       if (h3) return h3.text;
+
       return '';
     }
 
@@ -4084,11 +4102,11 @@ async function scrapeOnce(req, res) {
     ].filter(Boolean);
 
     for (const root of scopedRoots) {
-      const t = firstHeading(root);
+      const t = pickHeading(root);
       if (t) return t;
     }
 
-    return firstHeading(document);
+    return pickHeading(document);
   }).catch(() => '');
 
   console.log('[PW][PRIMARY_HEADING]', {
