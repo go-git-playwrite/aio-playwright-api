@@ -4041,7 +4041,16 @@ async function scrapeOnce(req, res) {
     }
   }).catch(() => []);
 
+  console.log('[PW][HEADINGS_RAW]', {
+    count: headingTexts ? headingTexts.length : null,
+    sample: Array.isArray(headingTexts) ? headingTexts.slice(0, 5) : null
+  });
+
   const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
+
+  console.log('[PW][HEADINGS_TO_AUDITSIG]', {
+    count: headingTexts ? headingTexts.length : null
+  });
 
   const responsePayload = {
     url: urlToFetch,
