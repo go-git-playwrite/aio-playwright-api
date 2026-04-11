@@ -4052,36 +4052,43 @@ async function scrapeOnce(req, res) {
   });
 
   const primaryHeadingText = await page.evaluate(() => {
-    function collect(root) {
-      const out = [];
-
-      const direct = Array.from(root.querySelectorAll('h1,h2,h3'));
-      out.push(...direct);
-
-      const all = root.querySelectorAll('*');
-      for (const el of all) {
-        if (el.shadowRoot) out.push(...collect(el.shadowRoot));
-      }
-      return out;
+    function textOf(el) {
+      return String((el && (el.innerText || el.textContent)) || '').trim();
     }
 
-    const nodes = collect(document)
-      .map(n => ({
-        tag: String((n.tagName || '')).toLowerCase(),
-        text: String(n.innerText || '').trim()
-      }))
-      .filter(x => x.text);
+    function firstHeading(root) {
+      if (!root || !root.querySelectorAll) return '';
+      const nodes = Array.from(root.querySelectorAll('h1,h2,h3'))
+        .map(el => ({
+          tag: String((el.tagName || '')).toLowerCase(),
+          text: textOf(el)
+        }))
+        .filter(x => x.text);
+      const h1 = nodes.find(x => x.tag === 'h1');
+      if (h1) return h1.text;
+      const h2 = nodes.find(x => x.tag === 'h2');
+      if (h2) return h2.text;
+      const h3 = nodes.find(x => x.tag === 'h3');
+      if (h3) return h3.text;
+      return '';
+    }
 
-    const h1 = nodes.find(x => x.tag === 'h1');
-    if (h1) return h1.text;
+    const scopedRoots = [
+      document.querySelector('main'),
+      document.querySelector('[role="main"]'),
+      document.querySelector('article'),
+      document.querySelector('#content'),
+      document.querySelector('.content'),
+      document.querySelector('.main'),
+      document.querySelector('.page')
+    ].filter(Boolean);
 
-    const h2 = nodes.find(x => x.tag === 'h2');
-    if (h2) return h2.text;
+    for (const root of scopedRoots) {
+      const t = firstHeading(root);
+      if (t) return t;
+    }
 
-    const h3 = nodes.find(x => x.tag === 'h3');
-    if (h3) return h3.text;
-
-    return '';
+    return firstHeading(document);
   }).catch(() => '');
 
   console.log('[PW][PRIMARY_HEADING]', {
