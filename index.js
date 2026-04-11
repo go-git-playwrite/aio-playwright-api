@@ -4764,8 +4764,10 @@ app.get('/api/score', async (req, res) => {
   // ===== /ADD =====
 
   console.log('[TEST][BODYTEXT][RESPONSE_PAYLOAD]', JSON.stringify({
-    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
-    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+    hasBodyTextCandidates: Array.isArray(payload && payload.bodyTextCandidates),
+    count: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.length : 0,
+    sample: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.slice(0, 5) : [],
+    responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 50) : []
   }));
 
   res.json(payload);
