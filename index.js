@@ -160,6 +160,14 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+console.log('[BOOT][START]', JSON.stringify({
+  build: BUILD_TAG,
+  pid: process.pid,
+  node: process.version,
+  port: PORT,
+  ts: new Date().toISOString()
+}));
+
 // === helper: lazyload対応の自動スクロール ===
 async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } = {}) {
   let total = 0;
@@ -172,6 +180,162 @@ async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } =
   }
   // 先頭に戻す（見出し抽出が安定）
   await page.evaluate(() => window.scrollTo(0, 0));
+}
+
+async function collectEnrichedObservations(page, url) {
+  const result = {
+    sitemap: null,
+    subpageMainlandmark: null,
+    metaDetail: null,
+    policyLinks: null,
+    contentClarity: null,
+    subpageHeading: null
+  };
+
+  // =========================
+  // 1. sitemap_scan
+  // =========================
+  try {
+    const base = new URL(url).origin;
+    const sitemapUrl = base.replace(/\/$/, '') + '/sitemap.xml';
+
+    const res = await page.request.get(sitemapUrl, { timeout: 5000 });
+    if (res.ok()) {
+      result.sitemap = {
+        found: true,
+        url: sitemapUrl
+      };
+    } else {
+      result.sitemap = { found: false };
+    }
+  } catch (e) {
+    result.sitemap = { found: false };
+  }
+
+  // =========================
+  // 2. subpage_mainlandmark_scan
+  // =========================
+  try {
+    const mainCount = await page.$$eval('main', els => els.length);
+    const landmarkCount = await page.$$eval('[role="main"]', els => els.length);
+
+    result.subpageMainlandmark = {
+      mainCount,
+      mainLandmarkCount: landmarkCount
+    };
+  } catch (e) {
+    result.subpageMainlandmark = {};
+  }
+
+  // =========================
+  // 3. meta_detail_scan
+  // =========================
+  try {
+    const meta = await page.$eval(
+      'meta[name="description"]',
+      el => el.getAttribute('content') || ''
+    ).catch(() => '');
+
+    result.metaDetail = {
+      hasMetaDescription: !!meta,
+      metaDescriptionLength: meta ? meta.length : 0
+    };
+  } catch (e) {
+    result.metaDetail = {};
+  }
+
+  // =========================
+  // 4. policy_link_scan
+  // =========================
+  try {
+    const links = await page.$$eval('a', els =>
+      els.map(a => ({
+        href: a.href,
+        text: (a.innerText || '').toLowerCase()
+      }))
+    );
+
+    function hasMatch(keywords) {
+      return links.some(l =>
+        keywords.some(k =>
+          (l.href || '').toLowerCase().includes(k) ||
+          (l.text || '').includes(k)
+        )
+      );
+    }
+
+    result.policyLinks = {
+      hasPrivacyLink: hasMatch(['privacy', 'プライバシー']),
+      hasPolicyLink: hasMatch(['policy', 'ポリシー']),
+      hasTermsLink: hasMatch(['terms', '利用規約'])
+    };
+  } catch (e) {
+    result.policyLinks = {};
+  }
+
+  // =========================
+  // 5. content_clarity_scan
+  // =========================
+  try {
+    result.contentClarity = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const headingEl = document.querySelector('main h1, h1, main h2, h2');
+      const headingText = norm(headingEl ? headingEl.textContent : '');
+
+      const anchors = Array.from(document.querySelectorAll('main a[href], a[href]'));
+      const anchorTexts = anchors
+        .map(a => norm(a.textContent || a.getAttribute('aria-label') || a.title || ''))
+        .filter(Boolean);
+
+      const genericRe = /^(more|read more|learn more|click here|view more|詳しく|こちら|詳細|もっと見る|続きを読む)$/i;
+      const specificAnchorCount = anchorTexts.filter(t => t.length >= 8 && !genericRe.test(t)).length;
+      const specificAnchorRatio = anchorTexts.length ? (specificAnchorCount / anchorTexts.length) : null;
+
+      const images = Array.from(document.querySelectorAll('main img, img'));
+      const altCoveredCount = images.filter(img => norm(img.getAttribute('alt')).length > 0).length;
+      const imgAltRatio = images.length ? (altCoveredCount / images.length) : null;
+
+      return {
+        checked: true,
+        headingTextLength: headingText.length || 0,
+        anchorCount: anchorTexts.length,
+        specificAnchorCount,
+        specificAnchorRatio,
+        imageCount: images.length,
+        altCoveredCount,
+        imgAltRatio
+      };
+    });
+  } catch (e) {
+    result.contentClarity = {};
+  }
+
+  // =========================
+  // 6. subpage_heading_scan
+  // =========================
+  try {
+    result.subpageHeading = await page.evaluate(() => {
+      const headingEls = Array.from(document.querySelectorAll('main h1, main h2, main h3, h1, h2, h3'));
+      const levels = headingEls.map(el => Number(String(el.tagName || '').replace(/[^1-6]/g, ''))).filter(Boolean);
+      let headingSequenceBroken = false;
+      for (let i = 1; i < levels.length; i++) {
+        if (levels[i] - levels[i - 1] > 1) {
+          headingSequenceBroken = true;
+          break;
+        }
+      }
+      return {
+        checked: true,
+        h1Count: levels.filter(n => n === 1).length,
+        h2Count: levels.filter(n => n === 2).length,
+        headingSequenceBroken
+      };
+    });
+  } catch (e) {
+    result.subpageHeading = {};
+  }
+
+  return result;
 }
 
 // === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
@@ -889,8 +1053,8 @@ async function extractHeadMetaV1(page) {
 }
 
 // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
-const ENABLE_SUBPAGES_VNEXT = true;
-const SUBPAGES_VNEXT_MAX = 5;
+const ENABLE_SUBPAGES_VNEXT = process.env.ENABLE_SUBPAGES_VNEXT !== '0';
+const SUBPAGES_VNEXT_MAX = 8;
 
 function pickSubPageCandidatesVNext_(origin){
   const o = String(origin || '').trim().replace(/\/+$/,'');
@@ -898,10 +1062,15 @@ function pickSubPageCandidatesVNext_(origin){
 
   const candidates = [
     o + '/about',
-    o + '/business',
-    o + '/service',
     o + '/company',
+    o + '/service',
     o + '/contact',
+    o + '/faq',
+    o + '/policy',
+    o + '/privacy',
+    o + '/inquiry',
+    o + '/business',
+    o + '/support',
   ];
 
   const seen = new Set();
@@ -916,35 +1085,127 @@ function pickSubPageCandidatesVNext_(origin){
   return out;
 }
 
+function firstMeaningfulStringVNext_(values){
+  for (const v of (Array.isArray(values) ? values : [])) {
+    const s = String(v || '').trim();
+    if (s) return s;
+  }
+  return null;
+}
+
+function buildPublisherInfoFromSubPagesVNext_(subpages, structured, origin){
+  const arr = Array.isArray(subpages) ? subpages : [];
+  const companyPages = arr.filter(p => Array.isArray(p && p.companyLikeSignals) && p.companyLikeSignals.length > 0);
+  const pool = companyPages.length ? companyPages : arr;
+
+  function pickField(field){
+    for (const page of pool) {
+      const val = page && page.publisherCandidate && page.publisherCandidate[field];
+      if (val != null && String(val).trim()) return String(val).trim();
+    }
+    return null;
+  }
+
+  const companyName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.companyName).concat(pool.map(p => p && p.h1)).concat(pool.map(p => p && p.title)));
+  const organizationName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.organizationName).concat([companyName]));
+
+  return {
+    checked: true,
+    companyName: companyName,
+    organizationName: organizationName,
+    address: pickField('address') || (structured && structured.address ? [structured.address.postalCode, structured.address.addressRegion, structured.address.addressLocality, structured.address.streetAddress].filter(Boolean).join(' ') : null),
+    telephone: pickField('telephone') || (structured && structured.telephone ? structured.telephone : null),
+    contactEmail: pickField('contactEmail'),
+    representative: pickField('representative'),
+    corporateNumber: pickField('corporateNumber'),
+    sourceUrl: firstMeaningfulStringVNext_(pool.map(p => p && p.url)) || String(origin || '').trim() || null
+  };
+}
+
+function summarizeSecurityHeaders_(responseHeaders){
+  const h = responseHeaders && typeof responseHeaders === 'object' ? responseHeaders : {};
+  return {
+    checked: true,
+    strictTransportSecurity: h['strict-transport-security'] ?? null,
+    contentSecurityPolicy: h['content-security-policy'] ?? null,
+    xFrameOptions: h['x-frame-options'] ?? null,
+    xContentTypeOptions: h['x-content-type-options'] ?? null,
+    referrerPolicy: h['referrer-policy'] ?? null,
+    permissionsPolicy: h['permissions-policy'] ?? null
+  };
+}
+
 // 1ページから“軽量な観測”だけ抜く（全文は保持しない）
-async function extractLiteFromPageVNext_(page, url, origin){
+async function extractLiteFromPageVNext_(page, url, origin, statusCode){
   const o = String(origin || '').trim().replace(/\/+$/,'');
   const u = String(url || '').trim();
 
-  return await page.evaluate(({ u, o }) => {
-    function textOf(el){ try{ return (el && el.textContent || '').trim(); }catch(_){ return ''; } }
+  return await page.evaluate(({ u, o, statusCode }) => {
+    function norm(s){ return String(s || '').replace(/\s+/g, ' ').trim(); }
+    function textOf(el){ try{ return norm(el && el.textContent || ''); }catch(_){ return ''; } }
+    function uniqTexts(arr){
+      const out = [];
+      const seen = new Set();
+      for (const v of (Array.isArray(arr) ? arr : [])) {
+        const s = norm(v);
+        if (!s || seen.has(s)) continue;
+        seen.add(s);
+        out.push(s);
+      }
+      return out;
+    }
     function attrOf(sel, name){
-      try{ const el = document.querySelector(sel); return el ? String(el.getAttribute(name) || '').trim() : ''; }catch(_){ return ''; }
+      try{ const el = document.querySelector(sel); return el ? norm(el.getAttribute(name) || '') : ''; }catch(_){ return ''; }
+    }
+    function collectSignalHits(combined, defs){
+      const hits = [];
+      for (const def of defs) {
+        if (def.re.test(combined)) hits.push(def.label);
+      }
+      return hits;
     }
 
-    const title = (document.title || '').trim();
-    const metaDescription = attrOf('meta[name="description"]', 'content');
+    const title = norm(document.title || '');
+    const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
+    const mainEl = document.querySelector('main,[role="main"]');
+    const mainInnerText = norm((mainEl && mainEl.innerText) || '');
+    const bodyInnerText = norm(document.body && document.body.innerText || '');
+    const mainTextContent = norm((mainEl && mainEl.textContent) || '');
+    const bodyTextContent = norm(document.body && document.body.textContent || '');
+    const docTextContent = norm(document.documentElement && document.documentElement.textContent || '');
+    const bodyText = mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent;
+    const mainTextSample = (mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent).slice(0, 240);
+    const bodyTextSample = (bodyInnerText || bodyTextContent || docTextContent || mainInnerText || mainTextContent).slice(0, 240);
 
-    const h1 = (() => {
-      try{
-        const el = document.querySelector('h1');
-        return el ? textOf(el) : '';
-      }catch(_){ return ''; }
-    })();
+    const h1Texts = uniqTexts(Array.from(document.querySelectorAll('main h1, h1')).map(textOf));
+    const h2Texts = uniqTexts(Array.from(document.querySelectorAll('main h2, h2')).map(textOf));
+    const roleHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('[role="heading"]'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    const fallbackHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('main .title, .page-title, .headline, .hero-title, .title'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    let headingTexts = uniqTexts(
+      h1Texts
+        .concat(h2Texts)
+        .concat(roleHeadingTexts)
+        .concat(fallbackHeadingTexts)
+    ).slice(0, 10);
+    const fallbackMainHeading = bodyText.slice(0, 80);
+    if (!headingTexts.length && fallbackMainHeading) {
+      headingTexts = [fallbackMainHeading];
+    }
+    const h1 = h1Texts[0] || roleHeadingTexts[0] || fallbackHeadingTexts[0] || '';
+    const h2 = uniqTexts(
+      h2Texts.length
+        ? h2Texts
+        : roleHeadingTexts.slice(h1 ? 1 : 0).concat(fallbackHeadingTexts.slice(h1 ? 1 : 0))
+    ).slice(0, 10);
 
-    const h2 = (() => {
-      try{
-        const els = Array.from(document.querySelectorAll('h2')).slice(0, 10);
-        return els.map(e => textOf(e)).filter(Boolean);
-      }catch(_){ return []; }
-    })();
-
-    // JSON-LD type 抽出（雑に型だけ）
     const jsonldTypes = (() => {
       try{
         const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20);
@@ -955,7 +1216,6 @@ async function extractLiteFromPageVNext_(page, url, origin){
           let obj = null;
           try{ obj = JSON.parse(raw); }catch(_){ obj = null; }
           const pushType = (t) => { if (t && !types.includes(t)) types.push(String(t)); };
-
           const walk = (x) => {
             if (!x) return;
             if (Array.isArray(x)){ x.forEach(walk); return; }
@@ -963,7 +1223,6 @@ async function extractLiteFromPageVNext_(page, url, origin){
             const t = x['@type'];
             if (Array.isArray(t)) t.forEach(pushType);
             else pushType(t);
-            // @graph
             if (Array.isArray(x['@graph'])) x['@graph'].forEach(walk);
           };
           walk(obj);
@@ -972,28 +1231,24 @@ async function extractLiteFromPageVNext_(page, url, origin){
       }catch(_){ return []; }
     })();
 
-    // 内部リンク数（同一origin）
-    const internalLinkCount = (() => {
-      try{
-        const links = Array.from(document.links || []);
-        let c = 0;
-        for (const a of links){
-          const href = a && a.href;
-          if (!href) continue;
-          try{
-            const uu = new URL(href, location.href);
-            if (uu.origin === o) c++;
-          }catch(_){}
-        }
-        return c;
-      }catch(_){ return 0; }
-    })();
+    const links = Array.from(document.querySelectorAll('a[href]'));
+    const internalLinkCount = links.filter(a => {
+      try {
+        const uu = new URL(a.href, location.href);
+        return uu.origin === o;
+      } catch (_) {
+        return false;
+      }
+    }).length;
+    const contactLinkCount = links.filter(a => {
+      const href = norm(a.getAttribute('href') || a.href || '').toLowerCase();
+      const txt = norm(a.textContent || '').toLowerCase();
+      return /contact|inquiry|お問い合わせ|お問合せ|問い合わせ/.test(href + ' ' + txt);
+    }).length;
 
-    // 更新日っぽい表記（ページ全体テキストから軽く拾う：最大1つ）
     const updatedDate = (() => {
       try{
-        const txt = (document.body && document.body.innerText || '').slice(0, 30000);
-        // 例: 2026-03-01 / 2026/03/01 / 2026.03.01
+        const txt = bodyText.slice(0, 30000);
         const m = txt.match(/(20\d{2})[\/\.\-](\d{1,2})[\/\.\-](\d{1,2})/);
         if (!m) return '';
         const y = m[1];
@@ -1003,17 +1258,58 @@ async function extractLiteFromPageVNext_(page, url, origin){
       }catch(_){ return ''; }
     })();
 
-    // --- 404っぽいページは捨てる（候補URLが存在しないケースを除外） ---
     const is404 =
       (/^404\b/i.test(title)) ||
       (/not\s*found/i.test(title)) ||
       (metaDescription && /not\s*found/i.test(metaDescription)) ||
-      ((document.body && document.body.innerText || '').slice(0, 400).match(/404|not\s*found/i));
-
+      (bodyText.slice(0, 400).match(/404|not\s*found/i));
     if (is404) return null;
+
+    const combined = [u, title].concat(headingTexts).join(' | ');
+    const combinedLower = combined.toLowerCase();
+
+    const companyLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'about', re: /\/about\b|about\s+us|about\s+company/ },
+      { label: 'company', re: /\/company\b|company|corporate|企業情報|会社概要|会社情報/ }
+    ]);
+    const serviceLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'service', re: /\/service\b|service|services|サービス|事業/ },
+      { label: 'solution', re: /solution|solutions|ソリューション/ },
+      { label: 'product', re: /product|products|プロダクト|製品/ }
+    ]);
+    const contactLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'contact', re: /\/contact\b|contact|お問い合わせ|お問合せ|問い合わせ/ },
+      { label: 'inquiry', re: /inquiry|inquire/ }
+    ]);
+    const faqLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'faq', re: /\/faq\b|\bfaq\b|よくある質問|q&a|q & a/ }
+    ]);
+
+    const breadcrumbEl = document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="breadcrumb" i], .breadcrumb, [class*="breadcrumb"], ol.breadcrumb, ul.breadcrumb, [data-breadcrumb]');
+    const words = String(bodyText || '').match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
+
+    const publisherCandidate = (() => {
+      const addressMatch = bodyText.match(/(?:〒?\d{3}-?\d{4}[\s\S]{0,80}?(?:都|道|府|県)[\s\S]{0,120})/);
+      const telMatch = bodyText.match(/(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/);
+      const emailMatch = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      const representativeMatch = bodyText.match(/(?:代表取締役|代表者|代表)\s*[:：]?\s*([^\n]{1,40})/);
+      const corporateNumberMatch = bodyText.match(/法人番号\s*[:：]?\s*(\d{13})/);
+      return {
+        checked: true,
+        companyName: h1 || title || null,
+        organizationName: h1 || title || null,
+        address: addressMatch ? norm(addressMatch[0]) : null,
+        telephone: telMatch ? norm(telMatch[0]) : null,
+        contactEmail: emailMatch ? norm(emailMatch[0]) : null,
+        representative: representativeMatch ? norm(representativeMatch[1]) : null,
+        corporateNumber: corporateNumberMatch ? norm(corporateNumberMatch[1]) : null,
+        sourceUrl: u
+      };
+    })();
 
     return {
       url: u,
+      status: typeof statusCode === 'number' ? statusCode : null,
       title,
       metaDescription,
       h1,
@@ -1021,52 +1317,285 @@ async function extractLiteFromPageVNext_(page, url, origin){
       jsonldTypes,
       updatedDate,
       internalLinkCount,
+      h1Count: h1Texts.length,
+      h2Count: h2Texts.length,
+      roleHeadingCount: roleHeadingTexts.length,
+      fallbackHeadingCount: fallbackHeadingTexts.length,
+      headingTexts,
+      headingCandidateTexts: uniqTexts(roleHeadingTexts.concat(fallbackHeadingTexts)).slice(0, 10),
+      locationHref: String(location.href || u || ''),
+      mainTextSample,
+      bodyTextSample,
+      bodyTextLen: bodyText.length,
+      bodyInnerTextLen: bodyInnerText.length,
+      mainInnerTextLen: mainInnerText.length,
+      mainCount: document.querySelectorAll('main').length,
+      navCount: document.querySelectorAll('nav').length,
+      headerCount: document.querySelectorAll('header').length,
+      footerCount: document.querySelectorAll('footer').length,
+      hasBreadcrumb: !!breadcrumbEl,
+      wordCount: words.length,
+      contactLinkCount,
+      companyLikeSignals,
+      serviceLikeSignals,
+      faqLikeSignals,
+      contactLikeSignals,
+      publisherCandidate
     };
-  }, { u, o });
+  }, { u, o, statusCode });
 }
 
-// subPages_vNext を作る（最大5、失敗は握る）
+// subPages_vNext を作る（最大8、失敗は握る）
 async function buildSubPagesVNext_V1_(browserPage, origin){
   if (!ENABLE_SUBPAGES_VNEXT) return [];
 
-  // ★ origin が空で来るケースを救済（最重要）
   let o = String(origin || '').trim().replace(/\/+$/,'');
   if (!o){
     try{ o = (new URL(browserPage.url())).origin; }catch(_){ o = ''; }
   }
-  if (!o) return []; // ここで止める（変なURL生成を防ぐ）
+  if (!o) return [];
 
-  // --- M3: 候補抽出前にトップページのナビが描画されるまで少し待つ（SPA対策） ---
+  const parentContext = browserPage.context();
+  const browser = parentContext && typeof parentContext.browser === 'function'
+    ? parentContext.browser()
+    : null;
+  if (!browser) return [];
+
+  let subContext = null;
+  let subPage = null;
+
   try{
-    await browserPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
-    try{ await browserPage.waitForLoadState('networkidle', { timeout: 6000 }); }catch(_){}
-    try{ await browserPage.waitForSelector('a[href]', { timeout: 6000 }); }catch(_){}
-    try{ await browserPage.waitForTimeout(300); }catch(_){}
-  }catch(_){}
+    subContext = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 800, height: 600 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
+    });
+    subPage = await subContext.newPage();
+    await subPage.setViewportSize({ width: 800, height: 600 }).catch(() => {});
+    await subPage.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
+      return route.continue();
+    });
+  }catch(_){
+    try { if (subPage) await subPage.close(); } catch(_e) {}
+    try { if (subContext) await subContext.close(); } catch(_e) {}
+    return [];
+  }
 
-  const candidates = pickSubPageCandidatesVNext_(o);
+  try{
+    await subPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    try{ await subPage.waitForTimeout(150); }catch(_){ }
+  }catch(_){ }
+
+  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 1);
+  console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
   if (!candidates.length) return [];
 
   const out = [];
-  for (const url of candidates){
-    if (out.length >= SUBPAGES_VNEXT_MAX) break;
-    try{
-      await browserPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      // ★ SPA保険（軽く）
-      try{ await browserPage.waitForLoadState('networkidle', { timeout: 3000 }); }catch(_){}
+  try {
+    for (const url of candidates){
+      if (out.length >= 1) break;
+      try{
+        const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        try{ await subPage.waitForTimeout(150); }catch(_){ }
+        try {
+          const contentType = resp && typeof resp.headerValue === 'function'
+            ? await resp.headerValue('content-type')
+            : ((resp && typeof resp.headers === 'function') ? (resp.headers()['content-type'] || null) : null);
+          const finalUrl = (() => {
+            try { return resp && typeof resp.url === 'function' ? resp.url() : subPage.url(); } catch (_) { return url; }
+          })();
+          const userAgent = await subPage.evaluate(() => navigator.userAgent).catch(() => null);
+          const domMeta = await subPage.evaluate(() => {
+            const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+              index: i,
+              src: f.getAttribute('src') || '',
+              id: f.id || null,
+              className: f.className || null
+            }));
+            return {
+              readyState: document.readyState,
+              bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
+              iframeCount: iframes.length,
+              iframeSrcs: iframes.slice(0, 10),
+              scriptCount: document.querySelectorAll('script').length
+            };
+          }).catch(() => ({
+            readyState: null,
+            bodyInnerTextLen: 0,
+            iframeCount: 0,
+            iframeSrcs: [],
+            scriptCount: 0
+          }));
 
-      const lite = await extractLiteFromPageVNext_(browserPage, url, o);
+          console.log('[SUBPAGE_FETCH_DEBUG][META]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            status: resp ? resp.status() : null,
+            title: await subPage.title().catch(() => ''),
+            userAgent,
+            contentType
+          }));
+          console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            readyState: domMeta.readyState,
+            bodyInnerTextLen: domMeta.bodyInnerTextLen,
+            iframeCount: domMeta.iframeCount,
+            iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
+            scriptCount: domMeta.scriptCount
+          }));
+          if (/^https?:\/\/www\.fork\.co\.jp\/about\/?$/i.test(String(finalUrl || url || ''))) {
+            const domShape = await subPage.evaluate(() => {
+              const body = document.body;
+              const html = document.documentElement;
+              const bodyInnerHTML = String(body && body.innerHTML || '');
+              const docInnerHTML = String(html && html.innerHTML || '');
+              const bodyTextContent = String(body && body.textContent || '');
+              const bodyInnerText = String(body && body.innerText || '');
 
-      // ★ ここを追加（nullは即スキップ）
-      if (!lite) continue;
+              const hiddenSelectors = [
+                'main',
+                '#app',
+                '#__next',
+                '#__nuxt',
+                'app-index',
+                'body > *:first-child'
+              ];
 
-      // （ここは今のままでOK：捨てる/捨てないはあなたの今の実装に従う）
-      const hasAny =
-        (lite && (lite.title || lite.h1 || (lite.h2 && lite.h2.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
-      if (hasAny) out.push(lite);
+              const hiddenSignals = hiddenSelectors.map(sel => {
+                try {
+                  const el = document.querySelector(sel);
+                  if (!el) return { selector: sel, exists: false };
+                  const style = window.getComputedStyle(el);
+                  return {
+                    selector: sel,
+                    exists: true,
+                    displayNone: style.display === 'none',
+                    visibilityHidden: style.visibility === 'hidden'
+                  };
+                } catch (_) {
+                  return { selector: sel, exists: false };
+                }
+              });
 
-    }catch(_){}
+              return {
+                bodyChildElementCount: body ? body.childElementCount : 0,
+                bodyInnerHTMLHead: bodyInnerHTML.slice(0, 200),
+                documentInnerHTMLHead: docInnerHTML.slice(0, 200),
+                textContentLength: bodyTextContent.length,
+                innerTextLength: bodyInnerText.length,
+                hiddenSignals
+              };
+            }).catch(() => null);
+
+            console.log('[SUBPAGE_DOM_SHAPE][BODY]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyChildElementCount: domShape && domShape.bodyChildElementCount,
+              textContentLength: domShape && domShape.textContentLength,
+              innerTextLength: domShape && domShape.innerTextLength,
+              hiddenSignals: domShape && domShape.hiddenSignals
+            }));
+            console.log('[SUBPAGE_DOM_SHAPE][HTML]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyInnerHTMLHead: domShape && domShape.bodyInnerHTMLHead,
+              documentInnerHTMLHead: domShape && domShape.documentInnerHTMLHead
+            }));
+          }
+        } catch (_) { }
+        try {
+          await subPage.waitForFunction(() => {
+            const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
+            const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
+            const mainLen = (() => {
+              const el = document.querySelector('main,[role="main"]');
+              return el && el.innerText ? el.innerText.length : 0;
+            })();
+            return bodyLen > 0 || docLen > 0 || mainLen > 0;
+          }, { timeout: 1200 }).catch(()=>{});
+        } catch (_) { }
+        try{ await subPage.waitForTimeout(120); }catch(_){ }
+
+        const status = resp ? resp.status() : null;
+        const lite = await extractLiteFromPageVNext_(subPage, url, o, status);
+        if (!lite) continue;
+
+        const hasAny = !!(lite && (lite.title || (lite.headingTexts && lite.headingTexts.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
+        if (!hasAny) continue;
+
+        out.push(lite);
+        console.log('[SUBPAGE_BODY_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          status: lite.status,
+          title: lite.title,
+          mainCount: lite.mainCount,
+          bodyTextLen: lite.bodyTextLen,
+          bodyInnerTextLen: lite.bodyInnerTextLen,
+          mainInnerTextLen: lite.mainInnerTextLen,
+          wordCount: lite.wordCount
+        }));
+        console.log('[SUBPAGE_BODY_DEBUG][TEXT]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample,
+          bodyTextSample: lite.bodyTextSample
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          roleHeadingCount: lite.roleHeadingCount,
+          fallbackHeadingCount: lite.fallbackHeadingCount,
+          headingTexts: lite.headingTexts,
+          headingCandidateTexts: lite.headingCandidateTexts
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][TEXT_SAMPLE]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample
+        }));
+        console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
+          url: lite.url,
+          status: lite.status,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          mainCount: lite.mainCount,
+          navCount: lite.navCount,
+          headerCount: lite.headerCount,
+          footerCount: lite.footerCount,
+          hasBreadcrumb: lite.hasBreadcrumb,
+          companyLikeSignals: lite.companyLikeSignals,
+          serviceLikeSignals: lite.serviceLikeSignals,
+          contactLikeSignals: lite.contactLikeSignals,
+          faqLikeSignals: lite.faqLikeSignals
+        }));
+        break;
+      }catch(e){
+        console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
+      }
+    }
+  } finally {
+    try { if (subPage) await subPage.close(); } catch(_) {}
+    try { if (subContext) await subContext.close(); } catch(_) {}
   }
+
+  console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
+    count: out.length,
+    sample: out.slice(0, 1)
+  }));
+  console.log('[SUBPAGE_HEADING_DEBUG][SUMMARY]', JSON.stringify({
+    adoptedCount: out.length,
+    adoptedUrls: out.map(p => p && p.url).filter(Boolean)
+  }));
   return out;
 }
 // ===== [M3][SUBPAGES_VNEXT v1] ここまで =====
@@ -1778,6 +2307,7 @@ app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); n
 // -------------------- ヘルス --------------------
 app.get('/', (_, res) => res.status(200).json({ ok: true }));
 app.get('/__version', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
+app.get('/health', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
 
 // 軽量ヘルスチェック（RSS を見るとメモリ傾向を掴みやすい）
 app.get('/healthz', (_, res) => {
@@ -1948,7 +2478,7 @@ function hasGtmOrExternal(html) {
   return /googletagmanager\.com|googletagservices\.com|gtm\.js|google-analytics\.com/i.test(html);
 }
 
-// トップと /about の JSON-LD を比較して “/about 優先” で返す
+// トップと /about の JSON-LD を比較して “/about 優先” の Organization 候補を返す
 function preferAboutJsonLd(topArr, aboutArr) {
   const topOrg = pickOrgNodes(topArr);
   const aboutOrg = pickOrgNodes(aboutArr);
@@ -2419,7 +2949,25 @@ function buildScoresFromScrape(scraped) {
 const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
 const queue = new PQueue({ concurrency: CONCURRENCY });
 
+console.log('[BOOT][MEMO]', JSON.stringify({
+  initialized: [
+    'express-app',
+    'weights-config',
+    'helper-functions',
+    'pqueue-instance',
+    'empty-scrape-cache'
+  ],
+  browserAtBoot: false,
+  contextAtBoot: false,
+  pageAtBoot: false,
+  queueConcurrency: CONCURRENCY,
+  cacheMaxEntries: CACHE_MAX_ENTRIES,
+  cacheTtlMs: CACHE_TTL_MS,
+  rss: process.memoryUsage().rss
+}));
+
 app.get('/scrape', async (req, res) => {
+  console.log('[TEST][SCRAPE_ENTRY] entered /scrape');
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
   return queue.add(() => scrapeOnce(req, res)).catch(err => {
     if (!res.headersSent) {
@@ -2532,20 +3080,38 @@ async function scrapeOnce(req, res) {
       return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
     }, { timeout: 8000 }).catch(()=>{});
 
+    const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
+
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
 
-    // --- HTTP headers ---
+    // --- HTTP headers (main document only) ---
     try{
-      const h = (resp && resp.headers) ? resp.headers() : {};
+      const h = (resp && typeof resp.allHeaders === 'function')
+        ? await resp.allHeaders()
+        : ((resp && typeof resp.headers === 'function') ? resp.headers() : {});
+
+      const responseHeaders = {
+        'strict-transport-security': h['strict-transport-security'] ?? null,
+        'content-security-policy':   h['content-security-policy']   ?? null,
+        'x-frame-options':           h['x-frame-options']           ?? null,
+        'x-content-type-options':    h['x-content-type-options']    ?? null,
+        'referrer-policy':           h['referrer-policy']           ?? null,
+        'permissions-policy':        h['permissions-policy']        ?? null
+      };
+
       obs.http = {
         ok: !!resp,
         status: resp ? resp.status() : null,
+        url: resp ? resp.url() : null,
         // Playwrightは小文字キーのことが多い
-        hsts: !!h['strict-transport-security'],
-        xfo:  !!h['x-frame-options'],
-        nosniff: !!h['x-content-type-options'],
-        csp:  !!h['content-security-policy'],
+        hsts: !!responseHeaders['strict-transport-security'],
+        xfo:  !!responseHeaders['x-frame-options'],
+        nosniff: !!responseHeaders['x-content-type-options'],
+        csp:  !!responseHeaders['content-security-policy'],
+        referrerPolicy: !!responseHeaders['referrer-policy'],
+        permissionsPolicy: !!responseHeaders['permissions-policy'],
+        responseHeaders,
         // 監査用に生ヘッダも残す（必要なら後で削る）
         headers: h
       };
@@ -2742,6 +3308,9 @@ async function scrapeOnce(req, res) {
   const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
   const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
   const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
+  const jsonldTopAboutAll = []
+    .concat(Array.isArray(jsonldTopAll) ? jsonldTopAll : [])
+    .concat(Array.isArray(jsonldAboutAll) ? jsonldAboutAll : []);
 
   const gtmTop   = hasGtmOrExternal(topHtml);
   const gtmAbout = hasGtmOrExternal(aboutHtml);
@@ -2749,7 +3318,46 @@ async function scrapeOnce(req, res) {
   // 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
 
     // ---- HTMLソース（タグあり）----
+    // === ここから追加 ===
     const htmlSource = await page.content().catch(() => '');
+
+    const shadowNavHtml = await page.evaluate(() => {
+      const out = [];
+      const seenHtml = new Set();
+
+      const pushIfMatch = (el) => {
+        if (!el || !el.tagName) return;
+        const tag = el.tagName.toLowerCase();
+        if (tag !== 'header' && tag !== 'nav') return;
+
+        const html = String(el.outerHTML || '').trim();
+        if (!html) return;
+        if (seenHtml.has(html)) return;
+
+        seenHtml.add(html);
+        out.push(html);
+      };
+
+      const walk = (root) => {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = Array.from(root.querySelectorAll('*'));
+        for (const el of nodes) {
+          pushIfMatch(el);
+          if (el.shadowRoot) {
+            walk(el.shadowRoot);
+          }
+        }
+      };
+
+      walk(document);
+      return out.join('\n');
+    }).catch(() => '');
+
+    const payloadHtml = shadowNavHtml
+      ? htmlSource + '\n<!-- shadow-nav-fragments -->\n' + shadowNavHtml
+      : htmlSource;
+    // === ここまで追加 ===
 
     // ---- 設立（STRICT: DOM/HTML 構造のみ）----
     let foundFoundingDate = '';
@@ -2799,10 +3407,10 @@ async function scrapeOnce(req, res) {
     }).catch(()=>[]);
 
     // === [JSONLD][ORG-WEBSITE-FLAGS v1] Org / WebSite 用フラグを算出 ===
-    // /about 優先の JSON-LD（jsonldPref）があればそれを SSOT として採用し、
-    // 無ければ DOM から拾った jsonld を使う。
-    const jsonldForFlags = (Array.isArray(jsonldPref) && jsonldPref.length)
-      ? jsonldPref
+    // flags 判定では Org-only の jsonldPref を使わず、
+    // top + about の全 JSON-LD を優先し、無ければ DOM 由来へフォールバックする。
+    const jsonldForFlags = (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length)
+      ? jsonldTopAboutAll
       : (Array.isArray(jsonld) ? jsonld : []);
 
     const jsonldTypesAll = flatTypesFromJsonLd(jsonldForFlags);
@@ -3078,7 +3686,7 @@ async function scrapeOnce(req, res) {
     ));
 
     // === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
-    const scoringHtml  = (aboutHtml || topHtml || htmlSource || '');
+    const scoringHtml  = (aboutHtml || topHtml || payloadHtml || '');
     const scoringBodyA = renderedText || '';
     const scoringBodyB = stripTags(scoringHtml);
     const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
@@ -3183,6 +3791,119 @@ async function scrapeOnce(req, res) {
       sameAs: sameAsClean
     };
 
+    const responseOrigin = (() => { try { return new URL(urlToFetch).origin; } catch (_) { return ''; } })();
+    let subPagesVNext = [];
+    let publisherInfo = null;
+    if (ENABLE_SUBPAGES_VNEXT) {
+      subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
+      publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+    } else {
+      console.log('[SUBPAGE_ENRICH][DISABLED]', JSON.stringify({
+        url: urlToFetch,
+        reason: 'ENABLE_SUBPAGES_VNEXT=0'
+      }));
+    }
+    const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
+
+    if (enrichedObservations && typeof enrichedObservations === 'object') {
+      enrichedObservations.subpages = subPagesVNext;
+      enrichedObservations.subpageDetails = subPagesVNext;
+      enrichedObservations.pageDetails = subPagesVNext;
+      enrichedObservations.publisherInfo = publisherInfo;
+      enrichedObservations.securityHeaders = securityHeaders;
+    }
+
+    console.log('[PUBLISHER_INFO][SUMMARY]', JSON.stringify({
+      checked: !!publisherInfo,
+      sourceUrl: publisherInfo && publisherInfo.sourceUrl,
+      companyName: publisherInfo && publisherInfo.companyName,
+      organizationName: publisherInfo && publisherInfo.organizationName,
+      hasAddress: !!(publisherInfo && publisherInfo.address),
+      hasTelephone: !!(publisherInfo && publisherInfo.telephone),
+      hasContactEmail: !!(publisherInfo && publisherInfo.contactEmail),
+      hasRepresentative: !!(publisherInfo && publisherInfo.representative),
+      hasCorporateNumber: !!(publisherInfo && publisherInfo.corporateNumber)
+    }));
+    console.log('[SECURITY_HEADERS][SUMMARY]', JSON.stringify({
+      checked: !!securityHeaders,
+      strictTransportSecurity: !!(securityHeaders && securityHeaders.strictTransportSecurity),
+      contentSecurityPolicy: !!(securityHeaders && securityHeaders.contentSecurityPolicy),
+      xFrameOptions: !!(securityHeaders && securityHeaders.xFrameOptions),
+      xContentTypeOptions: !!(securityHeaders && securityHeaders.xContentTypeOptions),
+      referrerPolicy: !!(securityHeaders && securityHeaders.referrerPolicy),
+      permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
+    }));
+
+    structured.jsonld = await page.evaluate(() => {
+      var nodes = [];
+
+      function qa(root, sel) {
+        try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+      }
+
+      function pushNode(n){
+        if (!n || typeof n !== 'object') return;
+        nodes.push(n);
+      }
+
+      function walk(input){
+        if (!input) return;
+
+        if (Array.isArray(input)) {
+          input.forEach(walk);
+          return;
+        }
+
+        if (typeof input !== 'object') return;
+
+        pushNode(input);
+
+        if (Array.isArray(input['@graph'])) {
+          input['@graph'].forEach(function(n){
+            if (n && typeof n === 'object') nodes.push(n);
+          });
+        }
+      }
+
+      var hosts = Array.from(document.querySelectorAll('*'));
+      var openRoots = [];
+      for (var i = 0; i < hosts.length; i++) {
+        var el = hosts[i];
+        if (el && el.shadowRoot) openRoots.push(el.shadowRoot);
+        if (openRoots.length >= 8) break;
+      }
+
+      var allScriptsLight = qa(document, 'script');
+      var allScriptsShadow = openRoots.flatMap(function(root){ return qa(root, 'script'); });
+      var allScripts = allScriptsLight.concat(allScriptsShadow);
+
+      var scripts = allScripts.filter(function(el){
+        var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+        return t.includes('ld+json');
+      });
+
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(function(el){
+          var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
+          var txt = String(el && el.textContent || '').trim();
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }
+
+      scripts.forEach(function(el){
+        var raw = String(el && el.textContent || '').trim();
+        if (!raw) return;
+
+        try {
+          var parsed = JSON.parse(raw);
+          walk(parsed);
+        } catch (_) {}
+      });
+
+      return nodes;
+    }).catch(() => []);
+
     const jsonldSynth = [{
       "@context": "https://schema.org",
       "@type": "Organization",
@@ -3202,9 +3923,9 @@ async function scrapeOnce(req, res) {
     let hasWebsiteJsonLdFlag = false;
 
     try {
-      // /about 側を優先して JSON-LD を見る（なければトップ or DOM 由来）
-      const baseJsonLd = Array.isArray(jsonldPref) && jsonldPref.length
-        ? jsonldPref
+      // flags 判定では Org-only の jsonldPref を使わず、top + about 全体を優先する
+      const baseJsonLd = Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length
+        ? jsonldTopAboutAll
         : jsonld;
 
       const flatTypes = flatTypesFromJsonLd(baseJsonLd || []);
@@ -3305,10 +4026,309 @@ async function scrapeOnce(req, res) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
   }
 
+  const headingTexts = await page.evaluate(() => {
+    function collect(root) {
+      const out = [];
+
+      // 通常DOM
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      // shadow DOM 再帰
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collect(el.shadowRoot));
+        }
+      }
+      return out;
+    }
+
+    const nodes = collect(document);
+
+    return nodes
+      .map(n => (n.innerText || '').trim())
+      .filter(t => t.length > 0);
+  }).catch(() => []);
+
+  console.log('[PW][HEADINGS_RAW]', {
+    count: headingTexts ? headingTexts.length : null,
+    sample: Array.isArray(headingTexts) ? headingTexts.slice(0, 5) : null
+  });
+
+  const primaryHeadingText = await page.evaluate(() => {
+    function textOf(el) {
+      return String((el && (el.innerText || el.textContent)) || '').trim();
+    }
+
+    function collectHeadings(root) {
+      const out = [];
+      if (!root || !root.querySelectorAll) return out;
+
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collectHeadings(el.shadowRoot));
+        }
+      }
+      return out;
+    }
+
+    function pickHeading(root) {
+      const nodes = collectHeadings(root)
+        .map(el => ({
+          tag: String((el.tagName || '')).toLowerCase(),
+          text: textOf(el)
+        }))
+        .filter(x => x.text);
+
+      const h1 = nodes.find(x => x.tag === 'h1');
+      if (h1) return h1.text;
+
+      const h2 = nodes.find(x => x.tag === 'h2');
+      if (h2) return h2.text;
+
+      const h3 = nodes.find(x => x.tag === 'h3');
+      if (h3) return h3.text;
+
+      return '';
+    }
+
+    const scopedRoots = [
+      document.querySelector('main'),
+      document.querySelector('[role="main"]'),
+      document.querySelector('article'),
+      document.querySelector('#content'),
+      document.querySelector('.content'),
+      document.querySelector('.main'),
+      document.querySelector('.page')
+    ].filter(Boolean);
+
+    for (const root of scopedRoots) {
+      const t = pickHeading(root);
+      if (t) return t;
+    }
+
+    return pickHeading(document);
+  }).catch(() => '');
+
+  console.log('[PW][PRIMARY_HEADING]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
+  async function getBodyTextCandidates(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
+
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
+
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
+
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      const out = [];
+      for (const root of roots) {
+        collectCandidates(root, out);
+        if (out.length >= 5) break;
+      }
+
+      const uniq = [];
+      const seen = Object.create(null);
+      for (const t of out) {
+        if (!seen[t]) {
+          seen[t] = true;
+          uniq.push(t);
+        }
+        if (uniq.length >= 5) break;
+      }
+
+      return uniq;
+    });
+  }
+
+  async function getPrimaryMessageText(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
+
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
+
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
+
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      for (const root of roots) {
+        const out = [];
+        collectCandidates(root, out);
+        if (out.length) return out[0];
+      }
+
+      return null;
+    });
+  }
+
+  const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
+  const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
+
+  console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  }));
+
+  console.log('[PW][PRIMARY_MESSAGE]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
+  const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
+
+  console.log('[PW][HEADINGS_TO_AUDITSIG]', {
+    count: headingTexts ? headingTexts.length : null
+  });
+
+  console.log('[PW][PRIMARY_HEADING_TO_AUDITSIG]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
+  console.log('[PW][PRIMARY_MESSAGE_TO_AUDITSIG]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
+  console.log('[PW][BODY_TEXT_CANDIDATES_TO_AUDITSIG]', JSON.stringify({
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  }));
+
   const responsePayload = {
     url: urlToFetch,
+    enrichedObservations,
+    responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
+      'strict-transport-security': null,
+      'content-security-policy': null,
+      'x-frame-options': null,
+      'x-content-type-options': null,
+      'referrer-policy': null,
+      'permissions-policy': null
+    },
     bodyText,
-    html: htmlSource,
+    html: payloadHtml,
 
     confirmed: {
       has_hsts: !!(obs.http && obs.http.ok && obs.http.hsts),
@@ -3325,11 +4345,13 @@ async function scrapeOnce(req, res) {
     // ★ 追加：レンダリング後のテキスト（deepText 優先）
     //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
     renderedText,
+    headingTexts,
+    bodyTextCandidates,
 
     jsonld,
     structured,
     jsonldSynth,
-    scoring: { html: scoringHtml, bodyText: scoringBody },
+    scoring: { html: scoringHtml, bodyText: scoringBody, headingTexts },
     metaDescription,
 
     // ★ ADD: HTTPS 判定（GAS facts 用）
@@ -3358,13 +4380,12 @@ async function scrapeOnce(req, res) {
       try {
         if (!auditSig || typeof auditSig !== 'object') return {};
 
-        // JSON-LD ノード集合（優先: jsonldPref → なければ top+about）
+        // JSON-LD ノード集合（flags 用と同じく top+about 全体を優先）
         var nodes = [];
-        if (Array.isArray(jsonldPref) && jsonldPref.length) {
-          nodes = jsonldPref.slice();
+        if (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length) {
+          nodes = jsonldTopAboutAll.slice();
         } else {
-          if (Array.isArray(jsonldTopAll))   nodes = nodes.concat(jsonldTopAll);
-          if (Array.isArray(jsonldAboutAll)) nodes = nodes.concat(jsonldAboutAll);
+          if (Array.isArray(jsonld)) nodes = nodes.concat(jsonld);
         }
 
         var hasOrg  = false;
@@ -3413,9 +4434,20 @@ async function scrapeOnce(req, res) {
     })(),
 
     // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
-    auditSig,
+    auditSig: {
+      ...(existingAuditSig || {}),
+      headingTexts,
+      primaryHeadingText: primaryHeadingText,
+      primaryMessageText: primaryMessageText,
+      bodyTextCandidates: bodyTextCandidates
+    },
 
-    subPages_vNext: await buildSubPagesVNext_V1_(page, (()=>{ try{ return (new URL(url)).origin; }catch(_){ return ''; } })()),
+    subPages_vNext: subPagesVNext,
+    subpages: subPagesVNext,
+    subpageDetails: subPagesVNext,
+    pageDetails: subPagesVNext,
+    publisherInfo,
+    securityHeaders,
 
     // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
     jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
@@ -3498,6 +4530,12 @@ async function scrapeOnce(req, res) {
   }catch(e){
     console.log('[COVNAV][SCRAPE][OUT v1][ERR]', String(e && (e.stack||e)));
   }
+
+  console.log('[TEST][RESPONSE_PATH_HIT] bodyText debug marker');
+  console.log('[TEST][RESPONSE_PAYLOAD_KEYS]', JSON.stringify({
+    hasPayload: !!out,
+    keys: out && typeof out === 'object' ? Object.keys(out).slice(0, 50) : []
+  }));
 
   // 正常終了
   return res.status(200).json(out);
@@ -3734,7 +4772,23 @@ app.get('/api/score', async (req, res) => {
   }
   // ===== /ADD =====
 
+  console.log('[TEST][BODYTEXT][RESPONSE_PAYLOAD]', JSON.stringify({
+    hasBodyTextCandidates: Array.isArray(payload && payload.bodyTextCandidates),
+    count: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.length : 0,
+    sample: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.slice(0, 5) : [],
+    responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 50) : []
+  }));
+
   res.json(payload);
 });
 
-app.listen(PORT, () => console.log(`[${BUILD_TAG}] running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log('[BOOT][LISTENING]', JSON.stringify({
+    build: BUILD_TAG,
+    port: PORT,
+    pid: process.pid,
+    rss: process.memoryUsage().rss,
+    ts: new Date().toISOString()
+  }));
+  console.log(`[${BUILD_TAG}] running on ${PORT}`);
+});
