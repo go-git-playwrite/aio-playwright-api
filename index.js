@@ -2478,7 +2478,7 @@ function hasGtmOrExternal(html) {
   return /googletagmanager\.com|googletagservices\.com|gtm\.js|google-analytics\.com/i.test(html);
 }
 
-// トップと /about の JSON-LD を比較して “/about 優先” で返す
+// トップと /about の JSON-LD を比較して “/about 優先” の Organization 候補を返す
 function preferAboutJsonLd(topArr, aboutArr) {
   const topOrg = pickOrgNodes(topArr);
   const aboutOrg = pickOrgNodes(aboutArr);
@@ -3308,6 +3308,9 @@ async function scrapeOnce(req, res) {
   const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
   const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
   const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
+  const jsonldTopAboutAll = []
+    .concat(Array.isArray(jsonldTopAll) ? jsonldTopAll : [])
+    .concat(Array.isArray(jsonldAboutAll) ? jsonldAboutAll : []);
 
   const gtmTop   = hasGtmOrExternal(topHtml);
   const gtmAbout = hasGtmOrExternal(aboutHtml);
@@ -3404,10 +3407,10 @@ async function scrapeOnce(req, res) {
     }).catch(()=>[]);
 
     // === [JSONLD][ORG-WEBSITE-FLAGS v1] Org / WebSite 用フラグを算出 ===
-    // /about 優先の JSON-LD（jsonldPref）があればそれを SSOT として採用し、
-    // 無ければ DOM から拾った jsonld を使う。
-    const jsonldForFlags = (Array.isArray(jsonldPref) && jsonldPref.length)
-      ? jsonldPref
+    // flags 判定では Org-only の jsonldPref を使わず、
+    // top + about の全 JSON-LD を優先し、無ければ DOM 由来へフォールバックする。
+    const jsonldForFlags = (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length)
+      ? jsonldTopAboutAll
       : (Array.isArray(jsonld) ? jsonld : []);
 
     const jsonldTypesAll = flatTypesFromJsonLd(jsonldForFlags);
@@ -3920,9 +3923,9 @@ async function scrapeOnce(req, res) {
     let hasWebsiteJsonLdFlag = false;
 
     try {
-      // /about 側を優先して JSON-LD を見る（なければトップ or DOM 由来）
-      const baseJsonLd = Array.isArray(jsonldPref) && jsonldPref.length
-        ? jsonldPref
+      // flags 判定では Org-only の jsonldPref を使わず、top + about 全体を優先する
+      const baseJsonLd = Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length
+        ? jsonldTopAboutAll
         : jsonld;
 
       const flatTypes = flatTypesFromJsonLd(baseJsonLd || []);
@@ -4377,13 +4380,12 @@ async function scrapeOnce(req, res) {
       try {
         if (!auditSig || typeof auditSig !== 'object') return {};
 
-        // JSON-LD ノード集合（優先: jsonldPref → なければ top+about）
+        // JSON-LD ノード集合（flags 用と同じく top+about 全体を優先）
         var nodes = [];
-        if (Array.isArray(jsonldPref) && jsonldPref.length) {
-          nodes = jsonldPref.slice();
+        if (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length) {
+          nodes = jsonldTopAboutAll.slice();
         } else {
-          if (Array.isArray(jsonldTopAll))   nodes = nodes.concat(jsonldTopAll);
-          if (Array.isArray(jsonldAboutAll)) nodes = nodes.concat(jsonldAboutAll);
+          if (Array.isArray(jsonld)) nodes = nodes.concat(jsonld);
         }
 
         var hasOrg  = false;
