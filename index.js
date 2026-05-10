@@ -1623,6 +1623,27 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     const t = node && node['@type'];
     return (Array.isArray(t) ? t : (t ? [t] : [])).map(v => String(v || ''));
   }
+  function emitTrace(data) {
+    try {
+      console.log('[PW][PRODUCT_SPEC_COLLECT_TRACE]', JSON.stringify({
+        tableCount: data && data.tableCount,
+        dlCount: data && data.dlCount,
+        headingCount: data && data.headingCount,
+        specLikeTablesCount: data && data.specLikeTablesCount,
+        comparisonLikeTablesCount: data && data.comparisonLikeTablesCount,
+        specCueCount: data && data.specCueCount,
+        comparisonCueCount: data && data.comparisonCueCount,
+        productJsonLdCount: data && data.productJsonLdCount,
+        serviceJsonLdCount: data && data.serviceJsonLdCount,
+        structuredSpecScore: data && data.structuredSpecScore,
+        comparisonReadinessLevel: data && data.comparisonReadinessLevel,
+        hasStructuredProductInfo: data && data.hasStructuredProductInfo,
+        hasComparisonReadyShape: data && data.hasComparisonReadyShape,
+        attached: !!(data && data.attached),
+        reason: data && data.reason
+      }));
+    } catch (_) {}
+  }
 
   const dom = await page.evaluate(() => {
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -1705,6 +1726,7 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     return {
       tableCount: tables.length,
       dlCount: dls.length,
+      headingCount: headingTexts.length,
       specLikeTablesCount,
       comparisonLikeTablesCount,
       specDlCount,
@@ -1714,9 +1736,21 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     };
   }).catch(() => null);
 
-  if (!dom || typeof dom !== 'object') return null;
+  if (!dom || typeof dom !== 'object') {
+    emitTrace({
+      attached: false,
+      reason: 'extraction_error'
+    });
+    return null;
+  }
 
   const jsonldNodes = flattenJsonLd(jsonldForFlags || [], []);
+  const productJsonLdCount = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^Product$/i.test(t))
+  ).length;
+  const serviceJsonLdCount = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^Service$/i.test(t))
+  ).length;
   const productLikeNodes = jsonldNodes.filter(node =>
     jsonLdTypeList(node).some(t => /^(Product|Service|Offer|AggregateOffer)$/i.test(t))
   );
@@ -1747,7 +1781,27 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     dom.specDlCount > 0 ||
     hasProductLikeJsonLd
   );
-  if (!hasRealObservationMaterial) return null;
+  if (!hasRealObservationMaterial) {
+    const hasCueOnly = Number(dom.specCueCount || 0) > 0 || Number(dom.comparisonCueCount || 0) > 0;
+    emitTrace({
+      tableCount: Number(dom.tableCount || 0),
+      dlCount: Number(dom.dlCount || 0),
+      headingCount: Number(dom.headingCount || 0),
+      specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+      comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+      specCueCount: Number(dom.specCueCount || 0),
+      comparisonCueCount: Number(dom.comparisonCueCount || 0),
+      productJsonLdCount,
+      serviceJsonLdCount,
+      structuredSpecScore: null,
+      comparisonReadinessLevel: null,
+      hasStructuredProductInfo,
+      hasComparisonReadyShape,
+      attached: false,
+      reason: hasCueOnly ? 'cue_only_guard' : 'no_structured_signal'
+    });
+    return null;
+  }
 
   let structuredSpecScore = 0;
   if (dom.specLikeTablesCount > 0) structuredSpecScore += 35;
@@ -1766,6 +1820,24 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     .concat(dom.evidenceSources || [])
     .concat(hasProductLikeJsonLd ? ['jsonld: Product/Service/Offer nodes=' + productLikeNodes.length] : [])
   ).slice(0, 8);
+
+  emitTrace({
+    tableCount: Number(dom.tableCount || 0),
+    dlCount: Number(dom.dlCount || 0),
+    headingCount: Number(dom.headingCount || 0),
+    specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+    comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+    specCueCount: Number(dom.specCueCount || 0),
+    comparisonCueCount: Number(dom.comparisonCueCount || 0),
+    productJsonLdCount,
+    serviceJsonLdCount,
+    structuredSpecScore,
+    comparisonReadinessLevel,
+    hasStructuredProductInfo,
+    hasComparisonReadyShape,
+    attached: true,
+    reason: 'attached'
+  });
 
   return {
     hasStructuredProductInfo,
