@@ -1600,6 +1600,186 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
 }
 // ===== [M3][SUBPAGES_VNEXT v1] ここまで =====
 
+async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
+  function uniq(arr) {
+    return Array.from(new Set((arr || []).map(v => String(v || '').trim()).filter(Boolean)));
+  }
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+  function flattenJsonLd(input, out) {
+    out = out || [];
+    if (!input) return out;
+    if (Array.isArray(input)) {
+      input.forEach(v => flattenJsonLd(v, out));
+      return out;
+    }
+    if (typeof input !== 'object') return out;
+    out.push(input);
+    if (Array.isArray(input['@graph'])) input['@graph'].forEach(v => flattenJsonLd(v, out));
+    return out;
+  }
+  function jsonLdTypeList(node) {
+    const t = node && node['@type'];
+    return (Array.isArray(t) ? t : (t ? [t] : [])).map(v => String(v || ''));
+  }
+
+  const dom = await page.evaluate(() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const head = (s, n) => norm(s).slice(0, n || 80);
+    const SPEC_RE = /(仕様|スペック|サイズ|重量|重さ|価格|料金|材質|素材|対応|型番|品番|SKU|容量|寸法|幅|高さ|奥行|カラー|色|spec|specification|size|weight|price|material|model|sku|capacity|dimension|color)/i;
+    const COMP_RE = /(比較|違い|選び方|おすすめ|一覧|ラインアップ|性能差|compare|comparison|versus|vs\.?|difference|choose|ranking)/i;
+
+    function qa(root, sel) {
+      try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+    }
+    function openRoots() {
+      const roots = [];
+      try {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) roots.push(el.shadowRoot);
+          if (roots.length >= 8) break;
+        }
+      } catch (_) {}
+      return roots;
+    }
+    const roots = [document].concat(openRoots());
+    const all = (sel) => roots.flatMap(root => qa(root, sel));
+
+    let specLikeTablesCount = 0;
+    let comparisonLikeTablesCount = 0;
+    let specCueCount = 0;
+    let comparisonCueCount = 0;
+    let specDlCount = 0;
+    const evidenceSources = [];
+
+    const tables = all('table').slice(0, 24);
+    tables.forEach((table) => {
+      const caption = head((table.querySelector('caption') || {}).innerText || '', 60);
+      const thTexts = qa(table, 'th').slice(0, 24).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const tdTexts = qa(table, 'td').slice(0, 80).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const rowCount = qa(table, 'tr').length;
+      const firstRowCells = qa(table, 'tr:first-child th, tr:first-child td').length;
+      const colCount = Math.max(firstRowCells, thTexts.length ? Math.min(thTexts.length, 8) : 0);
+      const text = [caption].concat(thTexts, tdTexts.slice(0, 24)).join(' ');
+      const hasSpecCue = SPEC_RE.test(text);
+      const hasComparisonCue = COMP_RE.test(text);
+      if (hasSpecCue) {
+        specLikeTablesCount++;
+        specCueCount++;
+        if (evidenceSources.length < 8) {
+          evidenceSources.push('table: ' + head(caption || thTexts.join(' / ') || tdTexts.join(' / '), 80));
+        }
+      }
+      if (hasComparisonCue || (hasSpecCue && rowCount >= 3 && colCount >= 3)) {
+        comparisonLikeTablesCount++;
+        comparisonCueCount++;
+        if (evidenceSources.length < 8) {
+          evidenceSources.push('comparison-table: rows=' + rowCount + ', cols=' + colCount);
+        }
+      }
+    });
+
+    const dls = all('dl').slice(0, 24);
+    dls.forEach((dl) => {
+      const labels = qa(dl, 'dt').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const values = qa(dl, 'dd').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const text = labels.concat(values.slice(0, 10)).join(' ');
+      if (labels.length >= 3 && SPEC_RE.test(text)) {
+        specDlCount++;
+        specCueCount++;
+        if (evidenceSources.length < 8) evidenceSources.push('dl: ' + head(labels.join(' / '), 80));
+      }
+      if (COMP_RE.test(text)) comparisonCueCount++;
+    });
+
+    const headingTexts = all('h1,h2,h3,h4,[role="heading"]').slice(0, 80)
+      .map(el => norm(el.innerText || el.textContent))
+      .filter(Boolean);
+    headingTexts.forEach((txt) => {
+      if (SPEC_RE.test(txt)) specCueCount++;
+      if (COMP_RE.test(txt)) comparisonCueCount++;
+    });
+
+    return {
+      tableCount: tables.length,
+      dlCount: dls.length,
+      specLikeTablesCount,
+      comparisonLikeTablesCount,
+      specDlCount,
+      specCueCount,
+      comparisonCueCount,
+      evidenceSources: evidenceSources.slice(0, 8)
+    };
+  }).catch(() => null);
+
+  if (!dom || typeof dom !== 'object') return null;
+
+  const jsonldNodes = flattenJsonLd(jsonldForFlags || [], []);
+  const productLikeNodes = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^(Product|Service|Offer|AggregateOffer)$/i.test(t))
+  );
+  const propertyKeys = [
+    'name', 'description', 'sku', 'mpn', 'model', 'brand', 'offers',
+    'additionalProperty', 'category', 'url', 'provider', 'serviceType',
+    'areaServed', 'itemOffered'
+  ];
+  const jsonLdPropertyHits = productLikeNodes.map(node =>
+    propertyKeys.filter(k => node && Object.prototype.hasOwnProperty.call(node, k)).length
+  );
+  const maxJsonLdPropertyCount = jsonLdPropertyHits.length ? Math.max(...jsonLdPropertyHits) : 0;
+  const hasProductLikeJsonLd = productLikeNodes.length > 0;
+
+  const hasStructuredProductInfo = !!(
+    dom.specLikeTablesCount > 0 ||
+    dom.specDlCount > 0 ||
+    (hasProductLikeJsonLd && maxJsonLdPropertyCount >= 4)
+  );
+  const hasComparisonReadyShape = !!(
+    dom.comparisonLikeTablesCount > 0 ||
+    (dom.specLikeTablesCount > 0 && dom.comparisonCueCount > 0)
+  );
+
+  const hasRealObservationMaterial = !!(
+    dom.specLikeTablesCount > 0 ||
+    dom.comparisonLikeTablesCount > 0 ||
+    dom.specDlCount > 0 ||
+    hasProductLikeJsonLd
+  );
+  if (!hasRealObservationMaterial) return null;
+
+  let structuredSpecScore = 0;
+  if (dom.specLikeTablesCount > 0) structuredSpecScore += 35;
+  if (dom.specDlCount > 0) structuredSpecScore += 20;
+  if (hasProductLikeJsonLd) structuredSpecScore += clamp(maxJsonLdPropertyCount * 6, 10, 30);
+  if (dom.comparisonLikeTablesCount > 0) structuredSpecScore += 25;
+  if (hasComparisonReadyShape) structuredSpecScore += 10;
+  structuredSpecScore = clamp(Math.round(structuredSpecScore), 0, 100);
+
+  const comparisonReadinessLevel =
+    structuredSpecScore >= 70 ? 'strong' :
+    structuredSpecScore >= 40 ? 'medium' :
+    structuredSpecScore > 0 ? 'weak' : 'none';
+
+  const evidenceSources = uniq([]
+    .concat(dom.evidenceSources || [])
+    .concat(hasProductLikeJsonLd ? ['jsonld: Product/Service/Offer nodes=' + productLikeNodes.length] : [])
+  ).slice(0, 8);
+
+  return {
+    hasStructuredProductInfo,
+    hasComparisonReadyShape,
+    structuredSpecScore,
+    comparisonReadinessLevel,
+    specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+    comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+    specCueCount: Number(dom.specCueCount || 0),
+    comparisonCueCount: Number(dom.comparisonCueCount || 0),
+    evidenceSources
+  };
+}
+
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
   // === [AIO][JSONLD_WAIT v1] JSON-LDの出現待ち＋状態を付けて probe をラップ ===
@@ -3954,6 +4134,30 @@ async function scrapeOnce(req, res) {
       auditSig = null;  // 失敗しても全体は止めない
     }
 
+    let productSpecComparisonSignals = null;
+    try {
+      console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
+        phase: 'before_collect',
+        hasAuditSig: !!auditSig,
+        auditSigKeys: Object.keys(auditSig || {}).slice(0, 20)
+      }));
+      productSpecComparisonSignals = await collectProductSpecComparisonSignals(page, jsonldForFlags);
+      if (auditSig && typeof auditSig === 'object' && productSpecComparisonSignals) {
+        auditSig.productSpecComparisonSignals = productSpecComparisonSignals;
+      }
+      console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS]', JSON.stringify({
+        attached: !!productSpecComparisonSignals,
+        comparisonReadinessLevel: productSpecComparisonSignals && productSpecComparisonSignals.comparisonReadinessLevel,
+        structuredSpecScore: productSpecComparisonSignals && productSpecComparisonSignals.structuredSpecScore,
+        hasStructuredProductInfo: productSpecComparisonSignals && productSpecComparisonSignals.hasStructuredProductInfo,
+        hasComparisonReadyShape: productSpecComparisonSignals && productSpecComparisonSignals.hasComparisonReadyShape,
+        evidenceSources: productSpecComparisonSignals && productSpecComparisonSignals.evidenceSources
+      }));
+    } catch (e) {
+      productSpecComparisonSignals = null;
+      console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
+    }
+
     // ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
     try {
       if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
@@ -4364,6 +4568,7 @@ async function scrapeOnce(req, res) {
     hasJsonLd: hasJsonLdFlag,
     hasOrgJsonLd: hasOrgJsonLdFlag,
     hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
+    ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
 
     // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
     // Playwright 側の auditSig をそのまま噛ませる
@@ -4439,7 +4644,8 @@ async function scrapeOnce(req, res) {
       headingTexts,
       primaryHeadingText: primaryHeadingText,
       primaryMessageText: primaryMessageText,
-      bodyTextCandidates: bodyTextCandidates
+      bodyTextCandidates: bodyTextCandidates,
+      ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {})
     },
 
     subPages_vNext: subPagesVNext,
@@ -4500,6 +4706,14 @@ async function scrapeOnce(req, res) {
       obs: { http: obs.http ? { ok:obs.http.ok, status:obs.http.status, hsts:obs.http.hsts, xfo:obs.http.xfo, nosniff:obs.http.nosniff, csp:obs.http.csp } : null, dom: obs.dom || null },
     }
   }; // ← ここで必ず閉じる！
+
+  console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
+    phase: 'after_responsePayload',
+    hasTopLevel: Object.prototype.hasOwnProperty.call(responsePayload, 'productSpecComparisonSignals'),
+    hasAuditSigSignal: !!(responsePayload.auditSig && responsePayload.auditSig.productSpecComparisonSignals),
+    topLevelType: typeof responsePayload.productSpecComparisonSignals,
+    auditSigSignalType: typeof (responsePayload.auditSig && responsePayload.auditSig.productSpecComparisonSignals)
+  }));
 
   // --- 追加: /scrape で採点も実施して返す ---
   const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
