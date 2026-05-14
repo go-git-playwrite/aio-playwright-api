@@ -3267,8 +3267,34 @@ async function scrapeOnce(req, res) {
   let context = null;
   let page = null;
   const t0 = Date.now();
+  const scrapeTiming = {
+    spans: {
+      browser_launch_context: 0,
+      initial_goto_and_waits: 0,
+      collectEnrichedObservations: 0,
+      dom_shadow_text_extract: 0,
+      top_about_same_fetch: 0,
+      resource_json_tap: 0,
+      resource_js_tap: 0,
+      chunk_tap: 0,
+      jsonld_wait_probe: 0,
+      subpages_vnext: 0,
+      response_payload_build: 0
+    }
+  };
+  let hydratedForTiming = null;
+  const addScrapeSpan = (name, start) => {
+    try {
+      if (!Object.prototype.hasOwnProperty.call(scrapeTiming.spans, name)) scrapeTiming.spans[name] = 0;
+      scrapeTiming.spans[name] += Math.max(0, Date.now() - Number(start || Date.now()));
+    } catch (_) {}
+  };
+  const safeTimingUrl = () => {
+    try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return String(urlToFetch || '').slice(0, 120); }
+  };
 
   try {
+    const __timingBrowserStart = Date.now();
     browser = await chromium.launch({
       headless: true,
       // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
@@ -3304,8 +3330,10 @@ async function scrapeOnce(req, res) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    addScrapeSpan('browser_launch_context', __timingBrowserStart);
 
     // ---- 主要待機（軽め） ----
+    const __timingInitialWaitStart = Date.now();
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await Promise.race([
       page.waitForResponse(r => {
@@ -3331,13 +3359,17 @@ async function scrapeOnce(req, res) {
       const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
       return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
     }, { timeout: 8000 }).catch(()=>{});
+    addScrapeSpan('initial_goto_and_waits', __timingInitialWaitStart);
 
+    const __timingEnrichedStart = Date.now();
     const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
+    addScrapeSpan('collectEnrichedObservations', __timingEnrichedStart);
 
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
 
     // --- HTTP headers (main document only) ---
+    const __timingDomTextStart = Date.now();
     try{
       const h = (resp && typeof resp.allHeaders === 'function')
         ? await resp.allHeaders()
@@ -3501,6 +3533,7 @@ async function scrapeOnce(req, res) {
       page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
     ]);
     const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
+    hydratedForTiming = hydrated;
 
   // === ここから追記（Shadow DOMも含めて深くテキストを収集）===
   const deepText = await page.evaluate(() => {
@@ -3538,8 +3571,10 @@ async function scrapeOnce(req, res) {
   const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
     ? deepText
     : (innerText || docText || '');
+  addScrapeSpan('dom_shadow_text_extract', __timingDomTextStart);
 
   // --- トップと /about の JSON-LD を比較 ---
+  const __timingTopAboutSameStart = Date.now();
   const targetUrl = normalizeUrl(urlToFetch);
   const u = new URL(targetUrl);
   const topUrl   = u.origin + '/';
@@ -3699,6 +3734,7 @@ async function scrapeOnce(req, res) {
       /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(u)
     ));
     const jsonToTap = extraJsonUrls.filter(u => !jsUrls.includes(u));
+    addScrapeSpan('top_about_same_fetch', __timingTopAboutSameStart);
 
     // ---- 正規表現（電話/郵便のみ）----
     const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
@@ -3723,6 +3759,7 @@ async function scrapeOnce(req, res) {
     ).catch(()=>[]);
 
     // --- リソース由来の JSON（電話/住所/同社SNSのみに使用）---
+    const __timingJsonTapStart = Date.now();
     for (const u of jsonToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 10000 });
@@ -3762,6 +3799,7 @@ async function scrapeOnce(req, res) {
         }
       } catch {}
     }
+    addScrapeSpan('resource_json_tap', __timingJsonTapStart);
 
     // ページが教えてくれたJS候補 + 典型的なエントリ
     const jsToTap = uniq([
@@ -3770,6 +3808,7 @@ async function scrapeOnce(req, res) {
     ]);
 
     // ---- JS/JSON 本文を取得して抽出（※設立は見ない）----
+    const __timingJsTapStart = Date.now();
     for (const u of jsToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 20_000 });
@@ -3836,8 +3875,10 @@ async function scrapeOnce(req, res) {
         }
       } catch(_) {}
     }
+    addScrapeSpan('resource_js_tap', __timingJsTapStart);
 
     // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃（※設立は見ない）--------
+    const __timingChunkTapStart = Date.now();
     try {
       const extraChunkUrls = new Set();
       for (const t of tappedAppIndexBodies) {
@@ -3897,6 +3938,7 @@ async function scrapeOnce(req, res) {
       }
     } catch {}
     // -------- 2nd pass end --------
+    addScrapeSpan('chunk_tap', __timingChunkTapStart);
 
     // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
@@ -3944,6 +3986,7 @@ async function scrapeOnce(req, res) {
     const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
 
     // === JSON-LD の実出現をピンポイント待機（最大 20 秒に延長） ===
+    const __timingJsonLdProbeStart = Date.now();
     await page.waitForFunction(() => {
       return !!document.querySelector('script[type="application/ld+json" i]');
     }, { timeout: 20000 }).catch(()=>{}); // ← 12s→20s に延長
@@ -3992,6 +4035,7 @@ async function scrapeOnce(req, res) {
         }
       }
     } catch (_) {}
+    addScrapeSpan('jsonld_wait_probe', __timingJsonLdProbeStart);
 
     // === Fallback（コピーライト）：CSR前でも静的/レンダ済みから検知 ===
     try {
@@ -4046,6 +4090,7 @@ async function scrapeOnce(req, res) {
     const responseOrigin = (() => { try { return new URL(urlToFetch).origin; } catch (_) { return ''; } })();
     let subPagesVNext = [];
     let publisherInfo = null;
+    const __timingSubpagesStart = Date.now();
     if (ENABLE_SUBPAGES_VNEXT) {
       subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
       publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
@@ -4055,6 +4100,7 @@ async function scrapeOnce(req, res) {
         reason: 'ENABLE_SUBPAGES_VNEXT=0'
       }));
     }
+    addScrapeSpan('subpages_vnext', __timingSubpagesStart);
     const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
 
     if (enrichedObservations && typeof enrichedObservations === 'object') {
@@ -4200,11 +4246,13 @@ async function scrapeOnce(req, res) {
 
     // ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
     let auditSig = null;
+    const __timingAuditSigProbeStart = Date.now();
     try {
       auditSig = await buildAuditSigFromPage(page);
     } catch (_) {
       auditSig = null;  // 失敗しても全体は止めない
     }
+    addScrapeSpan('jsonld_wait_probe', __timingAuditSigProbeStart);
 
     let productSpecComparisonSignals = null;
     try {
@@ -4302,6 +4350,7 @@ async function scrapeOnce(req, res) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
   }
 
+  const __timingResponsePayloadStart = Date.now();
   const headingTexts = await page.evaluate(() => {
     function collect(root) {
       const out = [];
@@ -4790,6 +4839,7 @@ async function scrapeOnce(req, res) {
   // --- 追加: /scrape で採点も実施して返す ---
   const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
   const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
+  addScrapeSpan('response_payload_build', __timingResponsePayloadStart);
 
   // --- CACHE SET（成功時のみ保存）
   try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
@@ -4835,6 +4885,15 @@ async function scrapeOnce(req, res) {
       elapsedMs
     });
   } finally {
+    try {
+      console.log('[PW][SCRAPE_TIMING]', JSON.stringify({
+        url: safeTimingUrl(),
+        hydrated: hydratedForTiming,
+        nocache: noCache,
+        totalMs: Math.max(0, Date.now() - t0),
+        spans: scrapeTiming.spans
+      }));
+    } catch (_) {}
     // 終了順：page → context → browser（全て握りつぶし）
     try { if (page)    await page.close(); } catch(_) {}
     try { if (context) await context.close(); } catch(_) {}
