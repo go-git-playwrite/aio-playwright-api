@@ -1346,20 +1346,43 @@ async function extractLiteFromPageVNext_(page, url, origin, statusCode){
 }
 
 // subPages_vNext を作る（最大8、失敗は握る）
-async function buildSubPagesVNext_V1_(browserPage, origin){
-  if (!ENABLE_SUBPAGES_VNEXT) return [];
+async function buildSubPagesVNext_V1_(browserPage, origin, decision){
+  const dec = decision && typeof decision === 'object' ? decision : null;
+  const startedAt = Date.now();
+  const setDecision = (patch) => {
+    if (!dec || !patch || typeof patch !== 'object') return;
+    try { Object.assign(dec, patch); } catch (_) {}
+  };
+  setDecision({
+    enabled: !!ENABLE_SUBPAGES_VNEXT,
+    envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+    origin: String(origin || '').trim().replace(/\/+$/,''),
+    limit: 1,
+    skipReason: 'not_reached'
+  });
+  if (!ENABLE_SUBPAGES_VNEXT) {
+    setDecision({ skipReason: 'disabled_by_env', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
 
   let o = String(origin || '').trim().replace(/\/+$/,'');
   if (!o){
     try{ o = (new URL(browserPage.url())).origin; }catch(_){ o = ''; }
   }
-  if (!o) return [];
+  if (!o) {
+    setDecision({ skipReason: 'no_candidates', errorMessage: 'origin_missing', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
+  setDecision({ origin: o });
 
-  const parentContext = browserPage.context();
+  const parentContext = browserPage && typeof browserPage.context === 'function' ? browserPage.context() : null;
   const browser = parentContext && typeof parentContext.browser === 'function'
     ? parentContext.browser()
     : null;
-  if (!browser) return [];
+  if (!browser) {
+    setDecision({ skipReason: 'browser_or_context_missing', errorMessage: 'browser_unavailable', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
 
   let subContext = null;
   let subPage = null;
@@ -1379,7 +1402,12 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
       if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
       return route.continue();
     });
-  }catch(_){
+  }catch(e){
+    setDecision({
+      skipReason: 'browser_or_context_missing',
+      errorMessage: String(e && (e.message || e) || ''),
+      elapsedMs: Math.max(0, Date.now() - startedAt)
+    });
     try { if (subPage) await subPage.close(); } catch(_e) {}
     try { if (subContext) await subContext.close(); } catch(_e) {}
     return [];
@@ -1391,13 +1419,22 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
   }catch(_){ }
 
   const candidates = pickSubPageCandidatesVNext_(o).slice(0, 1);
+  setDecision({
+    candidateCount: candidates.length,
+    candidateSample: candidates.slice(0, 5),
+    limit: 1
+  });
   console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
-  if (!candidates.length) return [];
+  if (!candidates.length) {
+    setDecision({ skipReason: 'no_candidates', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
 
   const out = [];
   try {
     for (const url of candidates){
       if (out.length >= 1) break;
+      setDecision({ attemptedCount: (dec && Number(dec.attemptedCount || 0) || 0) + 1 });
       try{
         const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
         try{ await subPage.waitForTimeout(150); }catch(_){ }
@@ -1580,6 +1617,10 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
         }));
         break;
       }catch(e){
+        setDecision({
+          skipReason: out.length ? 'ok' : 'fetch_failed',
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
         console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
       }
     }
@@ -1588,6 +1629,11 @@ async function buildSubPagesVNext_V1_(browserPage, origin){
     try { if (subContext) await subContext.close(); } catch(_) {}
   }
 
+  setDecision({
+    adoptedCount: out.length,
+    skipReason: out.length ? 'ok' : (dec && dec.skipReason && dec.skipReason !== 'not_reached' ? dec.skipReason : 'adopted_zero'),
+    elapsedMs: Math.max(0, Date.now() - startedAt)
+  });
   console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
     count: out.length,
     sample: out.slice(0, 1)
@@ -3291,7 +3337,20 @@ async function scrapeOnce(req, res) {
       build_scores_from_scrape: 0,
       output_object_assembly: 0
     },
-    payload_size_summary: null
+    payload_size_summary: null,
+    subpagesVNextDecision: {
+      enabled: !!ENABLE_SUBPAGES_VNEXT,
+      envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+      origin: null,
+      candidateCount: 0,
+      candidateSample: [],
+      attemptedCount: 0,
+      adoptedCount: 0,
+      skipReason: 'not_reached',
+      errorMessage: '',
+      limit: 1,
+      elapsedMs: 0
+    }
   };
   let hydratedForTiming = null;
   const addScrapeSpan = (name, start) => {
@@ -4117,15 +4176,42 @@ async function scrapeOnce(req, res) {
     let publisherInfo = null;
     const __timingSubpagesStart = Date.now();
     if (ENABLE_SUBPAGES_VNEXT) {
-      subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin);
-      publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+      if (typeof buildSubPagesVNext_V1_ === 'function') {
+        subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin, scrapeTiming.subpagesVNextDecision);
+        publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+      } else {
+        try {
+          Object.assign(scrapeTiming.subpagesVNextDecision, {
+            enabled: true,
+            envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+            origin: responseOrigin,
+            skipReason: 'build_function_missing',
+            errorMessage: 'buildSubPagesVNext_V1_ is not defined',
+            elapsedMs: Math.max(0, Date.now() - __timingSubpagesStart)
+          });
+        } catch (_) {}
+      }
     } else {
+      try {
+        Object.assign(scrapeTiming.subpagesVNextDecision, {
+          enabled: false,
+          envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+          origin: responseOrigin,
+          skipReason: 'disabled_by_env',
+          elapsedMs: Math.max(0, Date.now() - __timingSubpagesStart)
+        });
+      } catch (_) {}
       console.log('[SUBPAGE_ENRICH][DISABLED]', JSON.stringify({
         url: urlToFetch,
         reason: 'ENABLE_SUBPAGES_VNEXT=0'
       }));
     }
     addScrapeSpan('subpages_vnext', __timingSubpagesStart);
+    try {
+      if (scrapeTiming.subpagesVNextDecision && !scrapeTiming.subpagesVNextDecision.elapsedMs) {
+        scrapeTiming.subpagesVNextDecision.elapsedMs = Math.max(0, Date.now() - __timingSubpagesStart);
+      }
+    } catch (_) {}
     const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
 
     if (enrichedObservations && typeof enrichedObservations === 'object') {
@@ -4953,7 +5039,8 @@ async function scrapeOnce(req, res) {
         totalMs: Math.max(0, Date.now() - t0),
         spans: scrapeTiming.spans,
         responsePayloadSubspans: scrapeTiming.responsePayloadSubspans,
-        payload_size_summary: scrapeTiming.payload_size_summary
+        payload_size_summary: scrapeTiming.payload_size_summary,
+        subpagesVNextDecision: scrapeTiming.subpagesVNextDecision
       }));
     } catch (_) {}
     // 終了順：page → context → browser（全て握りつぶし）
