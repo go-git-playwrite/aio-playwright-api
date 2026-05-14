@@ -3280,7 +3280,18 @@ async function scrapeOnce(req, res) {
       jsonld_wait_probe: 0,
       subpages_vnext: 0,
       response_payload_build: 0
-    }
+    },
+    responsePayloadSubspans: {
+      heading_extract: 0,
+      primary_heading_extract: 0,
+      body_text_candidates_extract: 0,
+      primary_message_extract: 0,
+      response_object_assembly: 0,
+      jsonld_flags_patch: 0,
+      build_scores_from_scrape: 0,
+      output_object_assembly: 0
+    },
+    payload_size_summary: null
   };
   let hydratedForTiming = null;
   const addScrapeSpan = (name, start) => {
@@ -3291,6 +3302,20 @@ async function scrapeOnce(req, res) {
   };
   const safeTimingUrl = () => {
     try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return String(urlToFetch || '').slice(0, 120); }
+  };
+  const addResponsePayloadSpan = (name, start) => {
+    try {
+      const spans = scrapeTiming.responsePayloadSubspans || {};
+      if (!Object.prototype.hasOwnProperty.call(spans, name)) spans[name] = 0;
+      spans[name] += Math.max(0, Date.now() - Number(start || Date.now()));
+      scrapeTiming.responsePayloadSubspans = spans;
+    } catch (_) {}
+  };
+  const safeLength = (v) => {
+    try { return typeof v === 'string' ? v.length : 0; } catch (_) { return 0; }
+  };
+  const safeArrayLength = (v) => {
+    try { return Array.isArray(v) ? v.length : 0; } catch (_) { return 0; }
   };
 
   try {
@@ -4351,6 +4376,7 @@ async function scrapeOnce(req, res) {
   }
 
   const __timingResponsePayloadStart = Date.now();
+  const __timingHeadingExtractStart = Date.now();
   const headingTexts = await page.evaluate(() => {
     function collect(root) {
       const out = [];
@@ -4374,12 +4400,14 @@ async function scrapeOnce(req, res) {
       .map(n => (n.innerText || '').trim())
       .filter(t => t.length > 0);
   }).catch(() => []);
+  addResponsePayloadSpan('heading_extract', __timingHeadingExtractStart);
 
   console.log('[PW][HEADINGS_RAW]', {
     count: headingTexts ? headingTexts.length : null,
     sample: Array.isArray(headingTexts) ? headingTexts.slice(0, 5) : null
   });
 
+  const __timingPrimaryHeadingExtractStart = Date.now();
   const primaryHeadingText = await page.evaluate(() => {
     function textOf(el) {
       return String((el && (el.innerText || el.textContent)) || '').trim();
@@ -4437,6 +4465,7 @@ async function scrapeOnce(req, res) {
 
     return pickHeading(document);
   }).catch(() => '');
+  addResponsePayloadSpan('primary_heading_extract', __timingPrimaryHeadingExtractStart);
 
   console.log('[PW][PRIMARY_HEADING]', {
     text: primaryHeadingText || '',
@@ -4607,8 +4636,12 @@ async function scrapeOnce(req, res) {
     });
   }
 
+  const __timingBodyTextCandidatesExtractStart = Date.now();
   const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
+  addResponsePayloadSpan('body_text_candidates_extract', __timingBodyTextCandidatesExtractStart);
+  const __timingPrimaryMessageExtractStart = Date.now();
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
+  addResponsePayloadSpan('primary_message_extract', __timingPrimaryMessageExtractStart);
 
   console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
     count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
@@ -4641,6 +4674,7 @@ async function scrapeOnce(req, res) {
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
   }));
 
+  const __timingResponseObjectAssemblyStart = Date.now();
   const responsePayload = {
     url: urlToFetch,
     enrichedObservations,
@@ -4703,6 +4737,7 @@ async function scrapeOnce(req, res) {
 
     // ★ NEW: JSON-LD 種別フラグ（Organization / WebSite）を計算して auditSig ＋トップレベルに載せる
     ...(function () {
+      const __timingJsonLdFlagsPatchStart = Date.now();
       try {
         if (!auditSig || typeof auditSig !== 'object') return {};
 
@@ -4756,6 +4791,8 @@ async function scrapeOnce(req, res) {
           console.log('[PW][JSONLD-FLAGS][ERR]', String(e && e.stack || e));
         } catch (_) {}
         return {};
+      } finally {
+        addResponsePayloadSpan('jsonld_flags_patch', __timingJsonLdFlagsPatchStart);
       }
     })(),
 
@@ -4827,6 +4864,25 @@ async function scrapeOnce(req, res) {
       obs: { http: obs.http ? { ok:obs.http.ok, status:obs.http.status, hsts:obs.http.hsts, xfo:obs.http.xfo, nosniff:obs.http.nosniff, csp:obs.http.csp } : null, dom: obs.dom || null },
     }
   }; // ← ここで必ず閉じる！
+  addResponsePayloadSpan('response_object_assembly', __timingResponseObjectAssemblyStart);
+  try {
+    scrapeTiming.payload_size_summary = {
+      htmlLength: safeLength(responsePayload.html),
+      bodyTextLength: safeLength(responsePayload.bodyText),
+      renderedTextLength: safeLength(responsePayload.renderedText),
+      scoringHtmlLength: safeLength(responsePayload.scoring && responsePayload.scoring.html),
+      scoringBodyTextLength: safeLength(responsePayload.scoring && responsePayload.scoring.bodyText),
+      enrichedObservationsCount: responsePayload.enrichedObservations && typeof responsePayload.enrichedObservations === 'object'
+        ? Object.keys(responsePayload.enrichedObservations).length
+        : 0,
+      subpagesCount: safeArrayLength(responsePayload.subpages),
+      subpageDetailsCount: safeArrayLength(responsePayload.subpageDetails),
+      pageDetailsCount: safeArrayLength(responsePayload.pageDetails),
+      jsonldCount: safeArrayLength(responsePayload.jsonld),
+      headingTextsCount: safeArrayLength(responsePayload.headingTexts),
+      bodyTextCandidatesCount: safeArrayLength(responsePayload.bodyTextCandidates)
+    };
+  } catch (_) {}
 
   console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
     phase: 'after_responsePayload',
@@ -4837,8 +4893,12 @@ async function scrapeOnce(req, res) {
   }));
 
   // --- 追加: /scrape で採点も実施して返す ---
+  const __timingBuildScoresStart = Date.now();
   const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
+  addResponsePayloadSpan('build_scores_from_scrape', __timingBuildScoresStart);
+  const __timingOutputObjectAssemblyStart = Date.now();
   const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
+  addResponsePayloadSpan('output_object_assembly', __timingOutputObjectAssemblyStart);
   addScrapeSpan('response_payload_build', __timingResponsePayloadStart);
 
   // --- CACHE SET（成功時のみ保存）
@@ -4891,7 +4951,9 @@ async function scrapeOnce(req, res) {
         hydrated: hydratedForTiming,
         nocache: noCache,
         totalMs: Math.max(0, Date.now() - t0),
-        spans: scrapeTiming.spans
+        spans: scrapeTiming.spans,
+        responsePayloadSubspans: scrapeTiming.responsePayloadSubspans,
+        payload_size_summary: scrapeTiming.payload_size_summary
       }));
     } catch (_) {}
     // 終了順：page → context → browser（全て握りつぶし）
