@@ -1615,7 +1615,6 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
           contactLikeSignals: lite.contactLikeSignals,
           faqLikeSignals: lite.faqLikeSignals
         }));
-        break;
       }catch(e){
         setDecision({
           skipReason: out.length ? 'ok' : 'fetch_failed',
