@@ -1053,7 +1053,7 @@ async function extractHeadMetaV1(page) {
 }
 
 // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
-const ENABLE_SUBPAGES_VNEXT = process.env.ENABLE_SUBPAGES_VNEXT !== '0';
+const ENABLE_SUBPAGES_VNEXT = true;
 const SUBPAGES_VNEXT_MAX = 8;
 
 function pickSubPageCandidatesVNext_(origin){
