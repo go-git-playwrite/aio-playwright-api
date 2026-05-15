@@ -1898,6 +1898,272 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
   };
 }
 
+async function collectMultimodalSignals(page, jsonldForFlags) {
+  function compactUrl(v) {
+    return String(v || '').trim();
+  }
+  function uniq(arr) {
+    return Array.from(new Set((arr || []).map(v => compactUrl(v)).filter(Boolean)));
+  }
+  function take(arr, n) {
+    return (arr || []).filter(Boolean).slice(0, n || 5);
+  }
+  function flattenJsonLd(input, out) {
+    out = out || [];
+    if (!input) return out;
+    if (Array.isArray(input)) {
+      input.forEach(v => flattenJsonLd(v, out));
+      return out;
+    }
+    if (typeof input !== 'object') return out;
+    out.push(input);
+    if (Array.isArray(input['@graph'])) input['@graph'].forEach(v => flattenJsonLd(v, out));
+    return out;
+  }
+  function typeList(node) {
+    const t = node && node['@type'];
+    return (Array.isArray(t) ? t : (t ? [t] : [])).map(v => String(v || '').trim()).filter(Boolean);
+  }
+  function firstTextValue(v) {
+    if (!v) return '';
+    if (typeof v === 'string') return compactUrl(v);
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        const s = firstTextValue(item);
+        if (s) return s;
+      }
+      return '';
+    }
+    if (typeof v === 'object') {
+      return firstTextValue(v.url || v.contentUrl || v.thumbnailUrl || v['@id'] || v.image);
+    }
+    return '';
+  }
+
+  try {
+    const dom = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const abs = (u) => {
+        try { return u ? new URL(u, document.baseURI).toString() : ''; } catch (_) { return String(u || '').trim(); }
+      };
+      const firstMeta = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const v = el && el.getAttribute('content');
+          if (norm(v)) return norm(v);
+        }
+        return '';
+      };
+      const firstLink = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const v = el && el.getAttribute('href');
+          if (norm(v)) return abs(v);
+        }
+        return '';
+      };
+      const collect = (sel) => Array.from(document.querySelectorAll(sel));
+      const openRoots = [];
+      try {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) openRoots.push(el.shadowRoot);
+          if (openRoots.length >= 8) break;
+        }
+      } catch (_) {}
+      const queryAll = (sel) => {
+        const out = collect(sel);
+        for (const root of openRoots) {
+          try { out.push(...Array.from(root.querySelectorAll(sel))); } catch (_) {}
+        }
+        return out;
+      };
+
+      const ogImageUrl = abs(firstMeta([
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[property="og:image:secure_url"]'
+      ]));
+      const twitterImageUrl = abs(firstMeta([
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]'
+      ]));
+      const faviconUrl = firstLink([
+        'link[rel~="icon"][href]',
+        'link[rel="shortcut icon"][href]'
+      ]);
+      const appleTouchIconUrl = firstLink([
+        'link[rel~="apple-touch-icon"][href]',
+        'link[rel="apple-touch-icon-precomposed"][href]'
+      ]);
+
+      const images = queryAll('img').slice(0, 500);
+      const imageUrls = [];
+      let altMissingCount = 0;
+      images.forEach((img) => {
+        const alt = norm(img.getAttribute('alt'));
+        if (!alt) altMissingCount++;
+        const src = abs(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original'));
+        if (src && imageUrls.length < 5) imageUrls.push(src);
+      });
+      const imageCount = images.length;
+      const altTotal = imageCount;
+      const imgAltRatio = imageCount ? ((imageCount - altMissingCount) / imageCount) : null;
+
+      const iframes = queryAll('iframe');
+      const iframeSrcs = iframes.map(el => abs(el.getAttribute('src'))).filter(Boolean);
+      const youtubeIframes = iframeSrcs.filter(src => /(^|\/\/)(www\.)?(youtube\.com|youtu\.be)|youtube-nocookie\.com/i.test(src));
+      const vimeoIframes = iframeSrcs.filter(src => /(^|\/\/)(player\.)?vimeo\.com/i.test(src));
+      const audioEmbedIframes = iframeSrcs.filter(src => /(spotify\.com|soundcloud\.com|podcasts\.apple\.com|anchor\.fm|podbean\.com)/i.test(src));
+
+      const videoTags = queryAll('video');
+      const audioTags = queryAll('audio');
+      const tracks = queryAll('track');
+      const captionTracks = tracks.filter(t => /^(captions|subtitles)$/i.test(norm(t.getAttribute('kind'))));
+      const transcriptLinks = queryAll('a[href]').filter(a => {
+        const txt = norm((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('href') || ''));
+        return /(transcript|caption|subtitles?|文字起こし|字幕|書き起こし)/i.test(txt);
+      });
+
+      const figures = queryAll('figure');
+      const figcaptions = queryAll('figcaption');
+      const mediaAriaNodes = queryAll('img,video,audio,iframe,figure').filter(el =>
+        norm(el.getAttribute('aria-label') || el.getAttribute('title'))
+      );
+      const mediaCaptionSamples = [];
+      figcaptions.forEach(el => {
+        const t = norm(el.innerText || el.textContent);
+        if (t && mediaCaptionSamples.length < 5) mediaCaptionSamples.push(t.slice(0, 120));
+      });
+      mediaAriaNodes.forEach(el => {
+        const t = norm(el.getAttribute('aria-label') || el.getAttribute('title'));
+        if (t && mediaCaptionSamples.length < 5) mediaCaptionSamples.push(t.slice(0, 120));
+      });
+
+      return {
+        ogImageUrl,
+        twitterImageUrl,
+        faviconUrl,
+        appleTouchIconUrl,
+        imageCount,
+        altTotal,
+        altMissingCount,
+        imgAltRatio,
+        imageUrlsSample: imageUrls.slice(0, 5),
+        videoTagCount: videoTags.length,
+        hasYoutubeIframe: youtubeIframes.length > 0,
+        hasVimeoIframe: vimeoIframes.length > 0,
+        videoIframeCount: youtubeIframes.length + vimeoIframes.length,
+        audioTagCount: audioTags.length,
+        audioEmbedCount: audioEmbedIframes.length,
+        trackCount: tracks.length,
+        captionTrackCount: captionTracks.length,
+        transcriptLinkCount: transcriptLinks.length,
+        figureCount: figures.length,
+        figcaptionCount: figcaptions.length,
+        mediaAriaLabelCount: mediaAriaNodes.length,
+        mediaCaptionSamples: mediaCaptionSamples.slice(0, 5)
+      };
+    });
+
+    const nodes = flattenJsonLd(jsonldForFlags || [], []);
+    const structuredImageTypes = [];
+    let structuredLogoUrl = '';
+    let structuredImageCount = 0;
+    let imageObjectCount = 0;
+    let primaryImageOfPage = '';
+    let thumbnailUrlCount = 0;
+    let videoObjectCount = 0;
+    let videoThumbnailUrlCount = 0;
+    let audioObjectCount = 0;
+
+    nodes.forEach((node) => {
+      if (!node || typeof node !== 'object') return;
+      const types = typeList(node);
+      const hasImage = !!firstTextValue(node.image);
+      const hasLogo = !!firstTextValue(node.logo);
+      const primaryImage = firstTextValue(node.primaryImageOfPage);
+      const thumb = firstTextValue(node.thumbnailUrl);
+
+      if (hasLogo && !structuredLogoUrl) structuredLogoUrl = firstTextValue(node.logo);
+      if (hasImage || hasLogo || primaryImage || thumb) {
+        structuredImageCount++;
+        types.forEach(t => structuredImageTypes.push(t));
+      }
+      if (types.some(t => /^ImageObject$/i.test(t))) imageObjectCount++;
+      if (primaryImage && !primaryImageOfPage) primaryImageOfPage = primaryImage;
+      if (thumb) thumbnailUrlCount++;
+      if (types.some(t => /^VideoObject$/i.test(t))) {
+        videoObjectCount++;
+        if (thumb) videoThumbnailUrlCount++;
+      }
+      if (types.some(t => /^AudioObject$/i.test(t))) audioObjectCount++;
+    });
+
+    return {
+      checked: true,
+      source: 'top_dom_head_meta_jsonld',
+      image: {
+        hasOgImage: !!(dom && dom.ogImageUrl),
+        ogImageUrl: (dom && dom.ogImageUrl) || '',
+        hasTwitterImage: !!(dom && dom.twitterImageUrl),
+        twitterImageUrl: (dom && dom.twitterImageUrl) || '',
+        hasFavicon: !!(dom && dom.faviconUrl),
+        faviconUrl: (dom && dom.faviconUrl) || '',
+        hasAppleTouchIcon: !!(dom && dom.appleTouchIconUrl),
+        appleTouchIconUrl: (dom && dom.appleTouchIconUrl) || '',
+        imageCount: Number((dom && dom.imageCount) || 0),
+        altTotal: Number((dom && dom.altTotal) || 0),
+        altMissingCount: Number((dom && dom.altMissingCount) || 0),
+        imgAltRatio: (dom && typeof dom.imgAltRatio === 'number') ? dom.imgAltRatio : null,
+        imageUrlsSample: take(dom && dom.imageUrlsSample, 5)
+      },
+      structured: {
+        hasStructuredLogo: !!structuredLogoUrl,
+        structuredLogoUrl: structuredLogoUrl || '',
+        structuredImageCount,
+        imageObjectCount,
+        structuredImageTypes: take(uniq(structuredImageTypes), 12),
+        primaryImageOfPage: primaryImageOfPage || '',
+        thumbnailUrlCount
+      },
+      video: {
+        hasVideoTag: Number((dom && dom.videoTagCount) || 0) > 0,
+        videoTagCount: Number((dom && dom.videoTagCount) || 0),
+        hasYoutubeIframe: !!(dom && dom.hasYoutubeIframe),
+        hasVimeoIframe: !!(dom && dom.hasVimeoIframe),
+        videoIframeCount: Number((dom && dom.videoIframeCount) || 0),
+        hasVideoObject: videoObjectCount > 0,
+        videoObjectCount,
+        videoThumbnailUrlCount,
+        trackCount: Number((dom && dom.trackCount) || 0),
+        captionTrackCount: Number((dom && dom.captionTrackCount) || 0),
+        transcriptLinkCount: Number((dom && dom.transcriptLinkCount) || 0)
+      },
+      audio: {
+        hasAudioTag: Number((dom && dom.audioTagCount) || 0) > 0,
+        audioTagCount: Number((dom && dom.audioTagCount) || 0),
+        hasAudioObject: audioObjectCount > 0,
+        audioObjectCount,
+        audioEmbedCount: Number((dom && dom.audioEmbedCount) || 0),
+        audioTranscriptLinkCount: Number((dom && dom.transcriptLinkCount) || 0)
+      },
+      general: {
+        figureCount: Number((dom && dom.figureCount) || 0),
+        figcaptionCount: Number((dom && dom.figcaptionCount) || 0),
+        mediaAriaLabelCount: Number((dom && dom.mediaAriaLabelCount) || 0),
+        mediaCaptionSamples: take(dom && dom.mediaCaptionSamples, 5)
+      }
+    };
+  } catch (e) {
+    return {
+      checked: false,
+      source: 'top_dom_head_meta_jsonld',
+      errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+    };
+  }
+}
+
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
   // === [AIO][JSONLD_WAIT v1] JSON-LDの出現待ち＋状態を付けて probe をラップ ===
@@ -4389,6 +4655,31 @@ async function scrapeOnce(req, res) {
       console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
     }
 
+    let multimodalSignals = null;
+    const __timingMultimodalSignalStart = Date.now();
+    try {
+      multimodalSignals = await collectMultimodalSignals(page, jsonldForFlags);
+      if (auditSig && typeof auditSig === 'object') {
+        auditSig.multimodalSignals = multimodalSignals;
+      }
+      if (enrichedObservations && typeof enrichedObservations === 'object') {
+        enrichedObservations.multimodalSignals = multimodalSignals;
+      }
+    } catch (e) {
+      multimodalSignals = {
+        checked: false,
+        source: 'top_dom_head_meta_jsonld',
+        errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+      };
+      if (auditSig && typeof auditSig === 'object') {
+        auditSig.multimodalSignals = multimodalSignals;
+      }
+      if (enrichedObservations && typeof enrichedObservations === 'object') {
+        enrichedObservations.multimodalSignals = multimodalSignals;
+      }
+    }
+    addScrapeSpan('multimodal_signal_collect', __timingMultimodalSignalStart);
+
     // ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
     try {
       if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
@@ -4810,6 +5101,7 @@ async function scrapeOnce(req, res) {
     hasOrgJsonLd: hasOrgJsonLdFlag,
     hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
     ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
+    ...(multimodalSignals ? { multimodalSignals } : {}),
 
     // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
     // Playwright 側の auditSig をそのまま噛ませる
@@ -4889,7 +5181,8 @@ async function scrapeOnce(req, res) {
       primaryHeadingText: primaryHeadingText,
       primaryMessageText: primaryMessageText,
       bodyTextCandidates: bodyTextCandidates,
-      ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {})
+      ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
+      ...(multimodalSignals ? { multimodalSignals } : {})
     },
 
     subPages_vNext: subPagesVNext,
