@@ -1,5690 +1,5858 @@
-<!-- =========================
-  pdf.html (NEW)
-  - PDF export v1 skeleton
-  - Public API: window.runPdfExportV1()
-  ========================= -->
-<script>
-(function(){
-  'use strict';
+// index.js — scrape-v5-bundle+cache (phones/addresses + sameAs, foundingDate=STRICT DOM/HTML)
+// 目的: DOMが空でも JS/JSON から電話・住所・sameAs を抽出。
+//       設立日は「誤検出防止のため」DOM/HTML構造からのみ抽出（非必須）。
 
-  // Prevent double-install
-  if (window.__PDF_EXPORT_V1_INSTALLED__) return;
-  window.__PDF_EXPORT_V1_INSTALLED__ = true;
+// === scoring config (ADD) ===
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const WEIGHTS5 = {
+  dataStructure: 35,       // データ構造
+  expressionClarity: 20,   // 表現の明確さ
+  coverage: 20,            // 情報網羅性
+  documentStructure: 15,   // 文書構造
+  trust: 10                // 信頼性
+};
+const USE_REAL_SCORE = process.env.USE_REAL_SCORE !== 'false';
 
-  // -------------------------
-  // Config (adjust if needed)
-  // -------------------------
-  const SEL = {
-    // Root pages
-    dashboardRoot: '#page-dashboard-v2',
-    diagnosisRoot:  '#page-diagnosis-v2',
-    compareRoot:    '#page-compare',        // if exists
+function clamp100(n){ const x = Number(n); return Math.max(0, Math.min(100, isFinite(x)?Math.round(x):0)); }
+function weightedOverall5(ax){
+  const sum = (WEIGHTS5.dataStructure    * clamp100(ax.dataStructure))
+            + (WEIGHTS5.expressionClarity* clamp100(ax.expressionClarity))
+            + (WEIGHTS5.coverage         * clamp100(ax.coverage))
+            + (WEIGHTS5.documentStructure* clamp100(ax.documentStructure))
+            + (WEIGHTS5.trust            * clamp100(ax.trust));
+  return Math.round(sum / 100);
+}
 
-    // Diagnosis subroots (order fixed)
-    diagCharts:     '#dv2-diagnosis-charts',
-    diagSummary:    '#dv2-diagnosis-summary',
-    diagScoreTable: '#dv2-score-table',
-    diagCards:      '#dv2-improve-cards',
+// === scorer (FIX v2: structured prompt + rationales + confidence) ===
+async function scoreWithGemini5axes({ url, scrape }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
 
-    // AI recognition log (on dashboard)
-    aiRecognition:  '#dv2-ai-recognition'
+  // 安全ガード
+  const ix = Number(scrape.innerTextLen || 0);
+  const jc = Array.isArray(scrape.jsonld) ? scrape.jsonld.length : 0;
+  const sig = scrape.signals || {};
+  const s = {
+    h1: sig.h1 || 0,
+    h2: sig.h2 || 0,
+    lists: sig.lists || 0,
+    tables: sig.tables || 0,
+    links: sig.links || 0,
+    hasTel: !!sig.hasTel,
+    hasAddress: !!sig.hasAddress,
+    jsonldTypes: Array.isArray(sig.jsonldTypes) ? sig.jsonldTypes : []
   };
 
-  const PRINT_ROOT_ID = 'pdf-print-root';
-  const MODAL_ID = 'pdf-export-modal-v1';
+  // モデルへの厳密プロンプト
+  const prompt = `
+You are an auditor scoring a website's AI-readiness across 5 axes. 
+Use ONLY the provided numeric/boolean signals; do not invent missing data.
+Return STRICT JSON matching this schema:
 
-  // -------------------------
-  // Public entry
-  // -------------------------
-  window.runPdfExportV1 = async function runPdfExportV1(){
-    window.__PDF_EXPORT_INFLIGHT__ = true;
+{
+ "axes5": {
+   "dataStructure": 0-100,
+   "expressionClarity": 0-100,
+   "coverage": 0-100,
+   "documentStructure": 0-100,
+   "trust": 0-100
+ },
+ "rationales": {
+   "dataStructure": [ "<<=50 chars each" ],
+   "expressionClarity": [ "<=50" ],
+   "coverage": [ "<=50" ],
+   "documentStructure": [ "<=50" ],
+   "trust": [ "<=50" ]
+ }
+}
 
-    try{
-      // 1) Open modal and get user inputs
-      const job = await openPdfModal_();
-      if (!job) return; // cancelled
-      attachVisibleCompareSummaryToJob_(job);
+Scoring policy (Japanese site):
+- dataStructure (35): JSON-LD presence/types, machine-identifiable facts (tel/address).
+- expressionClarity (20): clear nouns, concise content (use innerTextLen proxy and lists).
+- coverage (20): breadth/depth proxies (innerTextLen, links).
+- documentStructure (15): h1/h2 counts, lists, tables.
+- trust (10): tel/address presence, policy/contact hints.
 
-      // 2) Show global loader if available (or no-op)
-      loaderOn_('PDFを生成しています…');
+Signals:
+- hydrated: ${scrape.hydrated}
+- innerTextLen: ${ix}
+- jsonldCount: ${jc}
+- jsonldTypes: ${JSON.stringify(s.jsonldTypes)}
+- h1: ${s.h1}, h2: ${s.h2}, lists: ${s.lists}, tables: ${s.tables}, links: ${s.links}
+- hasTel: ${s.hasTel}, hasAddress: ${s.hasAddress}
 
-      // 3) Build print root (cover/conditions/sections/notes)
-      const ctx = buildContext_(job);
+Rules:
+- Output integers 0–100 only.
+- Provide at most 2 rationale bullets per axis, each <= 50 chars.
+- No prose outside JSON.
+`.trim();
 
-      // ★ 追加：表紙用の「レポート作成日（納品日）」
-      // モーダルで指定があればそれを優先、なければ従来どおり診断日へフォールバック
-      ctx.reportDateText = (job && job.reportDateText) ? job.reportDateText : '';
-
-      // ★ 追加：非表示ページも“PDF収集時だけ”見えるようにする
-      try { if (typeof window.markAllPagesForPrint === 'function') window.markAllPagesForPrint(true); } catch(_){}
-
-      let sections = null;
-      try{
-        sections = collectDomSections_(job);
-      }catch(e){
-        console.error('[PDF][SECTIONS][EXC]', e);
-        throw e;
-      }
-
-      // ★ Chart.js / レイアウト安定待ち（診断直後PDFが白紙になる対策）
-      await new Promise(resolve => {
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      });
-
-      let printRoot = null;
-
-      // === [PDF][DASH-FORCE-VIS v1] 診断直後のdashboard非可視/未resizeで白紙になるのを防ぐ（必ず復元） ===
-      let __pdfDash = null;
-      let __pdfDashUndo = null;
-
-      function __raf2(){
-        return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-      }
-
-      try{
-        // 0) dashboard を“PDF中だけ”強制可視化
-        try{
-          __pdfDash = document.querySelector('#page-dashboard-v2');
-          if (__pdfDash){
-            const prev = {
-              className: __pdfDash.className,
-              hidden: __pdfDash.hasAttribute('hidden'),
-              ariaHidden: __pdfDash.getAttribute('aria-hidden'),
-              styleText: __pdfDash.getAttribute('style') || ''
-            };
-
-            __pdfDashUndo = function(){
-              try{
-                __pdfDash.className = prev.className;
-                if (prev.hidden) __pdfDash.setAttribute('hidden','');
-                else __pdfDash.removeAttribute('hidden');
-
-                if (prev.ariaHidden === null) __pdfDash.removeAttribute('aria-hidden');
-                else __pdfDash.setAttribute('aria-hidden', prev.ariaHidden);
-
-                if (prev.styleText) __pdfDash.setAttribute('style', prev.styleText);
-                else __pdfDash.removeAttribute('style');
-              }catch(_){}
-            };
-
-            __pdfDash.classList.add('active');
-            __pdfDash.removeAttribute('hidden');
-            __pdfDash.removeAttribute('aria-hidden');
-
-            __pdfDash.style.setProperty('display','block','important');
-            __pdfDash.style.setProperty('visibility','visible','important');
-            __pdfDash.style.setProperty('opacity','1','important');
-            __pdfDash.style.setProperty('pointer-events','none','important');
-
-            // ★ ここ（ダッシュボード側で確実に出る）
-            console.warn('[PDF][DASH-SNAP][AFTER-STYLE]', {
-              found: true,
-              w: __pdfDash.getBoundingClientRect ? Math.round(__pdfDash.getBoundingClientRect().width) : null,
-              display: getComputedStyle(__pdfDash).display,
-              vis: getComputedStyle(__pdfDash).visibility,
-              op: getComputedStyle(__pdfDash).opacity
-            });
-          } else {
-            console.warn('[PDF][DASH-SNAP][AFTER-STYLE]', { found: false });
-          }
-        }catch(_){}
-
-        // ★ PDF中だけ：ダッシュボードの KPI/チャート見た目を固定（画面全体には漏らさない：__pdfDash直下だけ触る）
-        try{
-          if (__pdfDash){
-
-            // 1) KPIは常に3列横並び（縦積み禁止）
-            const kpi = __pdfDash.querySelector('section.kpi-row');
-            if (kpi){
-              kpi.style.setProperty('display','grid','important');
-              kpi.style.setProperty('grid-template-columns','repeat(3, minmax(0, 1fr))','important');
-              kpi.style.setProperty('gap','12px','important');
-              kpi.style.setProperty('width','100%','important');
-              kpi.style.setProperty('max-width','100%','important');
-              kpi.style.setProperty('box-sizing','border-box','important');
-
-              // 子の最小幅だけ止血（折り返し事故防止）
-              Array.from(kpi.children || []).forEach(ch=>{
-                try{ ch.style.setProperty('min-width','0','important'); }catch(_){}
-              });
-            }
-
-            // 2) チャート枠は高さ固定（PC幅PDFでも高さが変わるのを止める）
-            __pdfDash.querySelectorAll('.chart-wrap').forEach(w=>{
-              w.style.setProperty('height','320px','important');
-              w.style.setProperty('max-height','320px','important');
-              w.style.setProperty('overflow','hidden','important');
-              w.style.setProperty('box-sizing','border-box','important');
-            });
-
-            // 3) canvas が display:none だと Chart.js が計算崩すので、PDF中だけ必ず表示
-            ['#dv2-chart-score', '#dv2-chart-clicks'].forEach(sel=>{
-              const cv = __pdfDash.querySelector(sel);
-              if (!cv) return;
-              cv.style.setProperty('display','block','important');
-              cv.style.setProperty('visibility','visible','important');
-              cv.style.setProperty('opacity','1','important');
-              cv.style.setProperty('max-width','100%','important');
-
-              // 画面DOMに合わせた “CSS高さ” の止血（必要なら値はあなたの正に合わせる）
-              cv.style.setProperty('height','294px','important');
-            });
-
-            console.warn('[PDF][DASH-SNAP][FIXSTYLE-APPLIED]', {
-              kpi: !!__pdfDash.querySelector('section.kpi-row'),
-              scoreCv: !!__pdfDash.querySelector('#dv2-chart-score'),
-              clicksCv: !!__pdfDash.querySelector('#dv2-chart-clicks')
-            });
-          }
-        }catch(_){}
-
-        // 1) 可視化が layout に反映されるのを待つ
-        await __raf2();
-
-        // 2) Chart.js を “可視状態” で一度だけ resize/update（canvasが0x0のままを防ぐ）
-        try{
-          if (__pdfDash && window.Chart){
-            const cvs = Array.from(__pdfDash.querySelectorAll('canvas[id]')) || [];
-            cvs.forEach(cv=>{
-              try{
-                const ch = (Chart.getChart ? Chart.getChart(cv) : (cv.__chart || cv.chart || null));
-                if (!ch) return;
-                try{ ch.resize && ch.resize(); }catch(_){}
-                try{
-                  if (ch.options) { ch.options.animation = false; ch.options.animations = false; }
-                }catch(_){}
-                try{ ch.update && ch.update('none'); }catch(_){}
-
-                // === [PDF][DASH-SNAP][PNG-CAPTURE v2] “画面canvas”ではなく offscreen で描き直してPNG化（サイズ固定） ===
-                try{
-                  const id = String(cv && cv.id || '');
-                  if (id === 'dv2-chart-score' || id === 'dv2-chart-clicks'){
-                    window.__PDF_DASH_PNG__ = window.__PDF_DASH_PNG__ || {};
-
-                    // ✅ 固定サイズ（あなたのDOM: canvas style height 294px / width 628px に合わせる）
-                    const Wcss = 628;
-                    const Hcss = 294;
-                    const DPR  = window.devicePixelRatio || 1;
-
-                    // offscreen canvas
-                    const off = document.createElement('canvas');
-                    off.width  = Math.round(Wcss * DPR);
-                    off.height = Math.round(Hcss * DPR);
-
-                    const ctx2 = off.getContext('2d');
-
-                    // --- データ/オプションを“壊れない範囲で”クローン（関数が混ざるので structuredClone 優先） ---
-                    function cloneObj_(o){
-                      try{
-                        if (typeof structuredClone === 'function') return structuredClone(o);
-                      }catch(_){}
-                      try{
-                        return JSON.parse(JSON.stringify(o));
-                      }catch(_){
-                        // 最後の逃げ（浅い）
-                        const x = {};
-                        try{ for (const k in (o||{})) x[k] = o[k]; }catch(_){}
-                        return x;
-                      }
-                    }
-
-                    const type = (ch && ch.config && ch.config.type) ? ch.config.type : 'line';
-                    const data = cloneObj_(ch.data || {});
-                    const opt  = cloneObj_(ch.options || {});
-
-                    // ✅ PDF用：必ず固定描画
-                    opt.responsive = false;
-                    opt.maintainAspectRatio = false;
-                    opt.animation = false;
-                    opt.animations = false;
-                    opt.devicePixelRatio = DPR;
-
-                    // ✅ 一時Chartを生成 → PNG化 → destroy
-                    const tmp = new Chart(ctx2, { type, data, options: opt });
-                    try{ tmp.resize(Wcss, Hcss); }catch(_){}
-                    try{ tmp.update('none'); }catch(_){}
-                    try{ tmp.draw(); }catch(_){}
-
-                    window.__PDF_DASH_PNG__[id] = off.toDataURL('image/png');
-
-                    try{ tmp.destroy(); }catch(_){}
-
-                    console.warn('[PDF][DASH-PNG][CAPTURED]', { id, Wcss, Hcss, DPR });
-                  }
-                }catch(_){}
-              }catch(_){}
-            });
-          }
-        }catch(_){}
-
-        // 3) 念のためもう1フレ
-        await __raf2();
-
-        // 4) build
-        console.warn('[PDF][PRINT_ROOT][CALL] about to build');
-        printRoot = buildPrintRoot_C_(job, ctx, sections);
-        console.warn('[PDF][PRINT_ROOT][OK]', {
-          id: printRoot && printRoot.id,
-          children: (printRoot && printRoot.children) ? printRoot.children.length : null
-        });
-
-        // === [PDF][PRI][COPY-UI-LABEL v1] 画面の「優先度：中（…）」をPDFバッジに反映 ===
-        try{
-          const ui = Array.from(document.querySelectorAll('.priority-badge'))
-            .map(el => String(el.textContent || '').trim())
-            .filter(t => /^優先度：/.test(t));
-
-          const pdf = printRoot ? Array.from(printRoot.querySelectorAll('.pdf-pri')) : [];
-
-          // 件数が合う前提（いまのログでは 22枚で揃っている）
-          const n = Math.min(ui.length, pdf.length);
-
-          for (let i = 0; i < n; i++){
-            const t = ui[i];               // 例: "優先度：中（品質向上）"
-            const m = t.match(/^優先度：\s*([高中低])/);
-            const jp = m ? m[1] : '';
-
-            // 表示をそのままコピー
-            pdf[i].textContent = t;
-
-            // 色は jp(高/中/低) で確実に当てる（middle 等の混入を潰す）
-            if (jp){
-              pdf[i].className = pdf[i].className
-                .split(/\s+/).filter(c => c && !/^pdf-pri-/.test(c))
-                .concat(['pdf-pri', 'pdf-pri-' + jp])
-                .join(' ')
-                .trim();
-            }
-          }
-
-          console.warn('[PDF][PRI][COPY-UI-LABEL][OK]', { ui: ui.length, pdf: pdf.length, applied: n });
-        }catch(e){
-          console.warn('[PDF][PRI][COPY-UI-LABEL][SKIP]', e);
-        }
-        // === [/PDF][PRI][COPY-UI-LABEL v1] ===
-
-      }catch(e){
-        console.error('[PDF][PRINT_ROOT][EXC]', e);
-        throw e;
-
-      } finally {
-        // === [PDF][DASH-SNAP][UNDO v1] KPI/Chart 固定スタイルを元に戻す ===
-        try{ __pdfDashStyleUndo && __pdfDashStyleUndo(); }catch(_){}
-
-        // 5) 必ず復元（画面状態は壊さない）
-        try{ __pdfDashUndo && __pdfDashUndo(); }catch(_){}
-      }
-
-      // 4) Render to PDF + download
-      console.warn('[PDF][RENDER][ROOT-CHECK]', {
-        printRootId: printRoot && printRoot.id,
-        priCount: printRoot ? printRoot.querySelectorAll('.pdf-pri').length : -1,
-        priHigh: printRoot ? printRoot.querySelectorAll('.pdf-pri-高').length : -1,
-        priMid:  printRoot ? printRoot.querySelectorAll('.pdf-pri-中').length : -1,
-        priLow:  printRoot ? printRoot.querySelectorAll('.pdf-pri-低').length : -1,
-      });
-
-      await renderPdfAndDownload_(job, printRoot);
-
-      // 5) Done
-      toast_('PDFを生成しました');
-    }catch(err){
-      console.error('[PDF][v1] FAILED', err);
-      toast_('PDF生成に失敗しました');
-    } finally {
-      window.__PDF_EXPORT_INFLIGHT__ = false;
-      cleanup_();
-      loaderOff_();
-    }
+  let axes5;
+  let rationales = {
+    dataStructure: [], expressionClarity: [], coverage: [], documentStructure: [], trust: []
   };
 
-  // =========================================================
-  // 0) Minimal CSS injection (no pdf_styles.html)
-  // =========================================================
-  injectCssOnce_();
-
-  function injectCssOnce_(){
-    if (document.getElementById('pdf-v1-style')) return;
-    const style = document.createElement('style');
-    style.id = 'pdf-v1-style';
-    style.textContent = `
-      /* --- PDF print root (offscreen) --- */
-      #${PRINT_ROOT_ID}{
-        position: fixed;
-        left: -99999px;
-        top: 0;
-        width: 794px; /* A4 portrait @ 96dpi-ish */
-        background: #fff;
-        color: #111;
-        z-index: -1;
-      }
-      #${PRINT_ROOT_ID} .pdf-page{
-        box-sizing: border-box;
-        padding: 32px;
-        page-break-after: always;
-      }
-      #${PRINT_ROOT_ID} .pdf-page:last-child{
-        page-break-after: auto;
-      }
-      #${PRINT_ROOT_ID} h1{
-        margin: 0 0 12px 0;
-        font-size: 22px;
-      }
-      #${PRINT_ROOT_ID} h2{
-        margin: 0 0 10px 0;
-        font-size: 16px;
-      }
-      #${PRINT_ROOT_ID} .pdf-kv{
-        margin-top: 14px;
-        font-size: 13px;
-        line-height: 1.6;
-      }
-      #${PRINT_ROOT_ID} .pdf-kv dt{ font-weight: 700; }
-      #${PRINT_ROOT_ID} .pdf-kv dd{ margin: 0 0 10px 0; }
-      #${PRINT_ROOT_ID} .pdf-divider{
-        height: 1px; background: #ddd; margin: 18px 0;
-      }
-      /* Avoid modals/toasts etc inside cloned DOM */
-      #${PRINT_ROOT_ID} .no-print,
-      #${PRINT_ROOT_ID} [data-no-print="1"]{
-        display: none !important;
-      }
-    `;
-    document.head.appendChild(style);
+  try {
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    const parsed = JSON.parse(text);
+    axes5 = parsed.axes5;
+    rationales = parsed.rationales || rationales;
+  } catch (_) {
+    // フォールバック：信号に基づく簡易ルール
+    const ds = (jc > 0 || s.hasTel || s.hasAddress) ? 70 : 40;
+    const dc = Math.min(90, 30 + s.h1*10 + s.h2*5 + s.lists*5 + s.tables*5);
+    const ec = Math.min(90, 40 + Math.floor(ix/100) + s.lists*3);
+    const cov = Math.min(90, 40 + Math.floor(ix/80) + Math.floor(s.links/10));
+    const tr  = (s.hasTel || s.hasAddress) ? 75 : 50;
+    axes5 = {
+      dataStructure: clamp100(ds),
+      expressionClarity: clamp100(ec),
+      coverage: clamp100(cov),
+      documentStructure: clamp100(dc),
+      trust: clamp100(tr)
+    };
+    rationales = {
+      dataStructure: jc>0 ? ["JSON-LDあり"] : ["JSON-LD無し","本文に電話/住所="+(s.hasTel||s.hasAddress)],
+      expressionClarity: [ "本文長:"+ix, "箇条書き:"+s.lists ],
+      coverage: [ "本文長:"+ix, "リンク数:"+s.links ],
+      documentStructure: [ "h1:"+s.h1+" h2:"+s.h2, "リスト/表:"+s.lists+"/"+s.tables ],
+      trust: [ "電話:"+s.hasTel, "住所:"+s.hasAddress ]
+    };
   }
 
-  function attachVisibleCompareSummaryToJob_(job){
-    try{
-      if (!job || !job.includeCompare) return;
+  // overall（重み 35/20/20/15/10）
+  const overall = weightedOverall5(axes5);
 
-      const cmpSummaryEl = document.getElementById('cmp-summary');
-      const visibleCompareSummaryText = cmpSummaryEl
-        ? String(cmpSummaryEl.innerText || cmpSummaryEl.textContent || '').trim()
-        : '';
-      const visibleCompareSummaryHtml = cmpSummaryEl
-        ? String(cmpSummaryEl.innerHTML || '').trim()
-        : '';
+  // 簡易 confidence（0-1）：材料が多い & JSON-LD あり & hydrated で上がる
+  const confBase = Math.max(0, Math.min(1, (ix/1500)));
+  const confBoost = (scrape.hydrated ? 0.1 : 0) + (jc>0 ? 0.15 : 0);
+  const confidence = Math.max(0.3, Math.min(0.98, confBase + confBoost));
 
-      let compareRes = null;
-      try{
-        compareRes = JSON.parse(Storage.prototype.getItem.call(localStorage, 'aio:lastCompare') || 'null');
-      }catch(_){
-        compareRes = null;
-      }
-      if (!compareRes || typeof compareRes !== 'object') compareRes = {};
+  return {
+    overall,
+    axes5: {
+      dataStructure: clamp100(axes5.dataStructure),
+      expressionClarity: clamp100(axes5.expressionClarity),
+      coverage: clamp100(axes5.coverage),
+      documentStructure: clamp100(axes5.documentStructure),
+      trust: clamp100(axes5.trust)
+    },
+    weights5: WEIGHTS5,
+    rationales,
+    evidence: {
+      innerTextLen: ix, jsonldCount: jc, jsonldTypes: s.jsonldTypes,
+      h1: s.h1, h2: s.h2, lists: s.lists, tables: s.tables, links: s.links,
+      hasTel: s.hasTel, hasAddress: s.hasAddress
+    },
+    confidence,
+    source: 'GEMINI_VIA_SCRAPE'
+  };
+}
 
-      if (visibleCompareSummaryText) {
-        compareRes.summaryText = visibleCompareSummaryText;
-      }
-      if (visibleCompareSummaryHtml) {
-        compareRes.summaryHtml = visibleCompareSummaryHtml;
-      }
+const express = require('express');
+const { chromium } = require('playwright');
+const PQueue = require('p-queue').default;
 
-      try{
-        const tbl = document.querySelector('#compareScores');
-        if (tbl) {
-          const rows = Array.from(tbl.querySelectorAll('tbody tr'));
-          const parsed = rows.map(tr => {
-            const tds = Array.from(tr.querySelectorAll('td')).map(td => String(td.innerText || td.textContent || '').trim());
-            const label = tds[0] || '';
-            const nums = tds.slice(1).map(n => Number(String(n || '').replace(/[^\d.-]/g, '')) || 0);
+const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
+const app = express();
+const PORT = process.env.PORT || 8080;
 
-            return {
-              label: label,
-              values: nums.slice(0, 5),
-              axes: {
-                data: nums[0],
-                doc: nums[1],
-                clarity: nums[2],
-                coverage: nums[3],
-                trust: nums[4]
-              },
-              avg: nums[5],
-              sum: nums[5]
-            };
-          }).filter(r => r.label);
+console.log('[BOOT][START]', JSON.stringify({
+  build: BUILD_TAG,
+  pid: process.pid,
+  node: process.version,
+  port: PORT,
+  ts: new Date().toISOString()
+}));
 
-          if (parsed.length === 4) {
-            compareRes.table = parsed;
-            console.warn('[PDF][COMPARE][TABLE_FROM_DOM]', { rows: parsed.length });
-          }
-        }
-      }catch(e){
-        console.warn('[PDF][COMPARE][TABLE_FROM_DOM][ERR]', e);
-      }
+// === helper: lazyload対応の自動スクロール ===
+async function autoScroll(page, { step = 1000, pauseMs = 250, maxScrolls = 6 } = {}) {
+  let total = 0;
+  for (let i = 0; i < maxScrolls; i++) {
+    total = await page.evaluate((s) => {
+      window.scrollBy(0, s);
+      return window.scrollY || document.documentElement.scrollTop || 0;
+    }, step);
+    await page.waitForTimeout(pauseMs);
+  }
+  // 先頭に戻す（見出し抽出が安定）
+  await page.evaluate(() => window.scrollTo(0, 0));
+}
 
-      if (!Array.isArray(compareRes.table) || !compareRes.table.length) {
-        try{
-          const rawTable = Storage.prototype.getItem.call(localStorage, 'aio:lastCompareTable');
-          const parsedTable = rawTable ? JSON.parse(rawTable) : null;
-          if (Array.isArray(parsedTable) && parsedTable.length) compareRes.table = parsedTable;
-        }catch(_){}
-      }
+async function collectEnrichedObservations(page, url) {
+  const result = {
+    sitemap: null,
+    subpageMainlandmark: null,
+    metaDetail: null,
+    policyLinks: null,
+    contentClarity: null,
+    subpageHeading: null
+  };
 
-      try{
-        const a = String(Storage.prototype.getItem.call(localStorage, 'aio:lastCompareTargetA') || '').trim();
-        const b = String(Storage.prototype.getItem.call(localStorage, 'aio:lastCompareTargetB') || '').trim();
-        if (a && !compareRes.aUrl) compareRes.aUrl = a;
-        if (b && !compareRes.bUrl) compareRes.bUrl = b;
-      }catch(_){}
+  // =========================
+  // 1. sitemap_scan
+  // =========================
+  try {
+    const base = new URL(url).origin;
+    const sitemapUrl = base.replace(/\/$/, '') + '/sitemap.xml';
 
-      job.compareRes = compareRes;
-      console.warn('[PDF][COMPARE][SUMMARY_FROM_DOM]', {
-        textLen: visibleCompareSummaryText.length,
-        htmlLen: visibleCompareSummaryHtml.length
-      });
-    }catch(e){
-      console.warn('[PDF][COMPARE][SUMMARY_FROM_DOM][ERR]', e);
+    const res = await page.request.get(sitemapUrl, { timeout: 5000 });
+    if (res.ok()) {
+      result.sitemap = {
+        found: true,
+        url: sitemapUrl
+      };
+    } else {
+      result.sitemap = { found: false };
     }
+  } catch (e) {
+    result.sitemap = { found: false };
   }
 
-  // =========================================================
-  // 1) UI modal (clientName + includeCompare)
-  // =========================================================
-  function openPdfModal_(){
-    return new Promise((resolve) => {
-      // If already open, close first
-      const prev = document.getElementById(MODAL_ID);
-      if (prev) prev.remove();
+  // =========================
+  // 2. subpage_mainlandmark_scan
+  // =========================
+  try {
+    const mainCount = await page.$$eval('main', els => els.length);
+    const landmarkCount = await page.$$eval('[role="main"]', els => els.length);
 
-      const overlay = document.createElement('div');
-      overlay.id = MODAL_ID;
-      overlay.style.cssText = [
-        'position:fixed','inset:0','background:rgba(0,0,0,.35)',
-        'z-index:99999','display:flex','align-items:center','justify-content:center',
-        'padding:16px'
-      ].join(';');
+    result.subpageMainlandmark = {
+      mainCount,
+      mainLandmarkCount: landmarkCount
+    };
+  } catch (e) {
+    result.subpageMainlandmark = {};
+  }
 
-      const dialog = document.createElement('div');
-      dialog.style.cssText = [
-        'width:min(560px, 100%)','background:#fff','border-radius:12px',
-        'box-shadow:0 10px 30px rgba(0,0,0,.25)','padding:16px 16px 12px 16px',
-        'text-align:left','display:block','box-sizing:border-box','overflow:hidden'
-      ].join(';');
+  // =========================
+  // 3. meta_detail_scan
+  // =========================
+  try {
+    const meta = await page.$eval(
+      'meta[name="description"]',
+      el => el.getAttribute('content') || ''
+    ).catch(() => '');
 
-      const hasCompare = !!document.querySelector(SEL.compareRoot);
+    result.metaDetail = {
+      hasMetaDescription: !!meta,
+      metaDescriptionLength: meta ? meta.length : 0
+    };
+  } catch (e) {
+    result.metaDetail = {};
+  }
 
-      dialog.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-          <div style="font-weight:700;font-size:16px;">PDF生成</div>
-          <button type="button" data-act="close" style="border:none;background:transparent;font-size:18px;cursor:pointer;">×</button>
-        </div>
-        <div style="margin-top:12px;font-size:13px;opacity:.85;">
-          表紙・検査条件・診断結果等を出力します。<br>競合比較もレポートに含める場合はPDF生成前に実施してください。
-        </div>
+  // =========================
+  // 4. policy_link_scan
+  // =========================
+  try {
+    const links = await page.$$eval('a', els =>
+      els.map(a => ({
+        href: a.href,
+        text: (a.innerText || '').toLowerCase()
+      }))
+    );
 
-        <div style="margin-top:14px;">
-          <label style="display:block;font-size:13px;font-weight:700;margin-bottom:6px;">クライアント名</label>
-          <input type="text" data-k="clientName" placeholder="例）株式会社〇〇"
-                 style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:10px;font-size:14px;">
-        </div>
+    function hasMatch(keywords) {
+      return links.some(l =>
+        keywords.some(k =>
+          (l.href || '').toLowerCase().includes(k) ||
+          (l.text || '').includes(k)
+        )
+      );
+    }
 
-        <div style="margin-top:14px;">
-          <label style="display:block;font-size:13px;font-weight:700;margin-bottom:6px;">レポート作成日（納品日）</label>
-          <input type="date" data-k="reportDate"
-                 style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:10px;font-size:14px;">
-          <div style="margin-top:6px;font-size:12px;opacity:.75;">
-            ※ 表紙の「作成日」に反映されます（診断日とは別）
-          </div>
-        </div>
+    result.policyLinks = {
+      hasPrivacyLink: hasMatch(['privacy', 'プライバシー']),
+      hasPolicyLink: hasMatch(['policy', 'ポリシー']),
+      hasTermsLink: hasMatch(['terms', '利用規約'])
+    };
+  } catch (e) {
+    result.policyLinks = {};
+  }
 
-        <div style="margin-top:14px;text-align:left;">
-          <div style="font-size:13px;font-weight:700;margin-bottom:8px;">生成対象</div>
+  // =========================
+  // 5. content_clarity_scan
+  // =========================
+  try {
+    result.contentClarity = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const headingEl = document.querySelector('main h1, h1, main h2, h2');
+      const headingText = norm(headingEl ? headingEl.textContent : '');
 
-          <div style="display:grid;grid-template-columns:18px 1fr;column-gap:8px;row-gap:8px;align-items:start;width:100%;">
+      const anchors = Array.from(document.querySelectorAll('main a[href], a[href]'));
+      const anchorTexts = anchors
+        .map(a => norm(a.textContent || a.getAttribute('aria-label') || a.title || ''))
+        .filter(Boolean);
 
-            <!-- ダッシュボード（固定） -->
-            <input type="checkbox" checked disabled style="margin:2px 0 0 0;" />
-            <div style="min-width:0;max-width:100%;overflow-wrap:anywhere;white-space:normal;font-size:13px;">
-              ダッシュボード（固定）
-            </div>
+      const genericRe = /^(more|read more|learn more|click here|view more|詳しく|こちら|詳細|もっと見る|続きを読む)$/i;
+      const specificAnchorCount = anchorTexts.filter(t => t.length >= 8 && !genericRe.test(t)).length;
+      const specificAnchorRatio = anchorTexts.length ? (specificAnchorCount / anchorTexts.length) : null;
 
-            <!-- GEO診断（固定） -->
-            <input type="checkbox" checked disabled style="margin:2px 0 0 0;" />
-            <div style="min-width:0;max-width:100%;overflow-wrap:anywhere;white-space:normal;font-size:13px;">
-              GEO診断（固定）
-            </div>
+      const images = Array.from(document.querySelectorAll('main img, img'));
+      const altCoveredCount = images.filter(img => norm(img.getAttribute('alt')).length > 0).length;
+      const imgAltRatio = images.length ? (altCoveredCount / images.length) : null;
 
-            <!-- 競合比較（任意） -->
-            <input type="checkbox" data-k="includeCompare" ${hasCompare ? '' : 'disabled'}
-              style="margin:2px 0 0 0;${hasCompare ? '' : 'opacity:.6;'}" />
-            <div style="min-width:0;max-width:100%;overflow-wrap:anywhere;white-space:normal;font-size:13px;${hasCompare ? '' : 'opacity:.6;'}">
-              競合比較（任意） ${hasCompare ? '' : '（比較ページがないため無効）'}
-            </div>
-
-          </div>
-        </div>
-
-        <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:10px;">
-          <button type="button" data-act="cancel"
-            style="padding:10px 14px;border:1px solid #ddd;border-radius:10px;background:#fff;color:#111;cursor:pointer;">
-            キャンセル
-          </button>
-          <button type="button" data-act="run"
-            style="padding:10px 14px;border:1px solid #111;border-radius:10px;background:#111;color:#fff;cursor:pointer;">
-            PDFを生成
-          </button>
-        </div>
-      `;
-
-      overlay.appendChild(dialog);
-      document.body.appendChild(overlay);
-
-      // default: today (yyyy-mm-dd)
-      try{
-        const el = dialog.querySelector('[data-k="reportDate"]');
-        if (el && !el.value){
-          const d = new Date();
-          const y = d.getFullYear();
-          const m = String(d.getMonth() + 1).padStart(2,'0');
-          const day = String(d.getDate()).padStart(2,'0');
-          el.value = `${y}-${m}-${day}`;
-        }
-      }catch(_){}
-
-      function close(result){
-        overlay.remove();
-        resolve(result);
-      }
-
-      overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) close(null);
-      });
-
-      dialog.querySelector('[data-act="close"]').addEventListener('click', () => close(null));
-      dialog.querySelector('[data-act="cancel"]').addEventListener('click', () => close(null));
-
-      dialog.querySelector('[data-act="run"]').addEventListener('click', () => {
-        const clientName = String(dialog.querySelector('[data-k="clientName"]').value || '').trim();
-        const includeCompare = !!(dialog.querySelector('[data-k="includeCompare"]').checked);
-
-        // report date (yyyy-mm-dd -> yyyy/mm/dd)
-        let reportDateText = '';
-        try{
-          const v = String((dialog.querySelector('[data-k="reportDate"]')||{}).value || '').trim();
-          if (v) reportDateText = v.replace(/-/g,'/');
-        }catch(_){}
-
-        close({
-          clientName: clientName || '(未入力)',
-          includeCompare: includeCompare && hasCompare,
-          reportDateText: reportDateText // 表紙用（未入力なら空）
-        });
-      });
+      return {
+        checked: true,
+        headingTextLength: headingText.length || 0,
+        anchorCount: anchorTexts.length,
+        specificAnchorCount,
+        specificAnchorRatio,
+        imageCount: images.length,
+        altCoveredCount,
+        imgAltRatio
+      };
     });
+  } catch (e) {
+    result.contentClarity = {};
   }
 
-  // =========================================================
-  // 2) Context builder for "検査条件" (v1 fixed text + runtime values)
-  // =========================================================
-  function buildContext_(job){
-    const origin = getActiveOrigin_();
-    const siteTypeLabel = (function(){
-      function map(v){
-        switch(String(v||'').trim()){
-          case 'corporate': return 'コーポレート';
-          case 'saas':      return 'サービス';
-          case 'ec':        return 'EC';
-          case 'media':     return 'メディア';
-          default:          return '';
+  // =========================
+  // 6. subpage_heading_scan
+  // =========================
+  try {
+    result.subpageHeading = await page.evaluate(() => {
+      const headingEls = Array.from(document.querySelectorAll('main h1, main h2, main h3, h1, h2, h3'));
+      const levels = headingEls.map(el => Number(String(el.tagName || '').replace(/[^1-6]/g, ''))).filter(Boolean);
+      let headingSequenceBroken = false;
+      for (let i = 1; i < levels.length; i++) {
+        if (levels[i] - levels[i - 1] > 1) {
+          headingSequenceBroken = true;
+          break;
+        }
+      }
+      return {
+        checked: true,
+        h1Count: levels.filter(n => n === 1).length,
+        h2Count: levels.filter(n => n === 2).length,
+        headingSequenceBroken
+      };
+    });
+  } catch (e) {
+    result.subpageHeading = {};
+  }
+
+  return result;
+}
+
+// === ADD: JSON-LD 待機＋コピーライト抽出（収集ペイロード） ==================
+// 目的：SPA でも「一瞬でも出た main/header/footer/nav/h1」をラッチして取りこぼさない。
+// 戻り値は probe 側(snake_case)で統一：buildAuditSigFromPage 側で header_present→headerPresent に合流する想定。
+async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 } = {}) {
+  const t0 = Date.now();
+
+  // Playwright のロード状態は「補助」。これだけでは SPA の DOM 出現を保証できない。
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+
+  console.log('[DBG][DOM-TOPOLOGY][ENTER]', { url: await page.url(), t: Date.now() });
+  try { console.log('[DBG][DOM-TOPOLOGY][FRAMECOUNT]', page.frames().length); } catch(_){}
+
+  // === [DBG][DOM-TOPOLOGY v1] 1回で「観測対象ズレ」を潰す ===
+  try {
+    const topo = await page.evaluate(() => {
+      const out = {};
+
+      // ---- 基本カウント（現ドキュメント）----
+      out.url = location.href;
+      out.readyState = document.readyState;
+      out.title = document.title || '';
+      out.bodyChildCount = document.body ? document.body.childElementCount : -1;
+
+      out.counts = {
+        header: document.querySelectorAll('header,[role="banner"]').length,
+        footer: document.querySelectorAll('footer,[role="contentinfo"]').length,
+        main:   document.querySelectorAll('main,[role="main"]').length,
+        nav:    document.querySelectorAll('nav,[role="navigation"]').length,
+        h1:     document.querySelectorAll('h1').length,
+        ldjson:  document.querySelectorAll('script[type*="ld+json" i]').length,
+        module:  document.querySelectorAll('script[type="module"][src]').length,
+        iframe:  document.querySelectorAll('iframe').length
+      };
+
+      // ---- 画面に実体があるか（超ざっくり）----
+      out.metrics = {
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen:  (document.body?.innerText || '').length,
+      };
+
+      // ---- JS進行の目安（1回で「JSが動いてるか」を見る）----
+      out.runtime = {
+        perfNow: (typeof performance !== 'undefined' && performance.now) ? Math.floor(performance.now()) : null,
+        hasHydrationMarks: !!document.querySelector('script[type="module"], link[rel="modulepreload"]'),
+        rafCallable: false
+      };
+
+      try {
+        // requestAnimationFrame が存在して呼べる＝JSの実行環境としては動いている目安
+        out.runtime.rafCallable = (typeof requestAnimationFrame === 'function');
+      } catch (_) {
+        out.runtime.rafCallable = false;
+      }
+
+      // ---- iframe: 同一オリジンだけ覗ける範囲で「中にmain等があるか」----
+      const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12);
+      out.iframes = iframes.map((f, idx) => {
+        let ok = false, counts = null, src = '';
+        try {
+          src = f.getAttribute('src') || '';
+          const d = f.contentDocument; // cross-origin だと例外/ null
+          if (d) {
+            ok = true;
+            counts = {
+              header: d.querySelectorAll('header,[role="banner"]').length,
+              footer: d.querySelectorAll('footer,[role="contentinfo"]').length,
+              main:   d.querySelectorAll('main,[role="main"]').length,
+              nav:    d.querySelectorAll('nav,[role="navigation"]').length,
+              h1:     d.querySelectorAll('h1').length,
+              ldjson: d.querySelectorAll('script[type*="ld+json" i]').length
+            };
+          }
+        } catch (e) {
+          ok = false;
+        }
+        return { idx, src: src.slice(0, 160), sameOriginReadable: ok, counts };
+      });
+
+      // ---- Shadow DOM: open root の有無だけ（closed は“推定”もできないので存在確認はここまで）----
+      const nodes = Array.from(document.querySelectorAll('*'));
+      let openRoots = 0;
+      for (const el of nodes) if (el.shadowRoot) openRoots++;
+
+      // ---- Shadow DOM(open) の中に main/header/footer/nav/h1 が居ないかをスキャン ----
+      try {
+        // open shadowRoot だけ辿る（closed は辿れない）
+        const roots = [];
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) roots.push(el.shadowRoot);
+        }
+
+        const shadowCounts = {
+          roots: roots.length,
+          header: 0,
+          footer: 0,
+          main: 0,
+          nav: 0,
+          h1: 0
+        };
+
+        // ルートごとにカウント（重複は許容：まず “居る/居ない” を確定したい）
+        for (const r of roots) {
+          try {
+            shadowCounts.header += r.querySelectorAll('header,[role="banner"]').length;
+            shadowCounts.footer += r.querySelectorAll('footer,[role="contentinfo"]').length;
+            shadowCounts.main   += r.querySelectorAll('main,[role="main"]').length;
+            shadowCounts.nav    += r.querySelectorAll('nav,[role="navigation"]').length;
+            shadowCounts.h1     += r.querySelectorAll('h1').length;
+          } catch (_) {}
+        }
+
+        out.shadowCounts = shadowCounts;
+
+        // “main が Shadow 内にある” をフラグで返す
+        out.shadowHasMain = shadowCounts.main > 0;
+
+        // ついでに「Shadow の最上位タグ」を少しだけサンプル（観測用）
+        out.shadowTopology = {
+          samples: roots.slice(0, 3).map((r, i) => {
+            try {
+              const top = Array.from(r.children || []).slice(0, 8).map(el => ({
+                tag: (el.tagName || '').toLowerCase(),
+                id: el.id || '',
+                cls: (el.className && String(el.className).split(/\s+/).slice(0, 4).join(' ')) || '',
+                child: el.childElementCount
+              }));
+              return { i, top };
+            } catch (e) {
+              return { i, err: String(e && (e.message || e)) };
+            }
+          })
+        };
+      } catch (e) {
+        out.shadowCounts = { err: String(e && (e.message || e)) };
+      }
+
+      // ---- 代表的な SPA ルート候補（あれば名前を見る）----
+      const roots = ['#app', '#root', '#__next', '#svelte', '#nuxt', '#main', '#content'];
+      out.spaRoots = roots
+        .map(sel => ({ sel, hit: !!document.querySelector(sel) }))
+        .filter(x => x.hit);
+
+      return out;
+    });
+
+    // ---- Playwright frames: evaluateできる範囲で main 等を各frameで確認 ----
+    try {
+      const frames = page.frames();
+      const framesInfo = [];
+      for (const f of frames) {
+        try {
+          const r = await f.evaluate(() => ({
+            url: location.href,
+            hasMain: !!document.querySelector('main,[role="main"]'),
+            hasHeader: !!document.querySelector('header,[role="banner"]'),
+            hasFooter: !!document.querySelector('footer,[role="contentinfo"]'),
+            navCount: document.querySelectorAll('nav,[role="navigation"]').length,
+            h1Count: document.querySelectorAll('h1').length,
+            bodyTextLen: (document.body?.innerText || '').length
+          }));
+          framesInfo.push(r);
+        } catch (e) {
+          framesInfo.push({ url: String(f.url()), err: String(e && (e.message || e)) });
+        }
+      }
+      console.log('[DBG][DOM-TOPOLOGY][FRAMES]', { frameCount: frames.length, frames: framesInfo });
+    } catch (e) {
+      console.log('[DBG][DOM-TOPOLOGY][FRAMES][ERR]', String(e && (e.message || e)));
+    }
+
+    console.log('[DBG][DOM-TOPOLOGY]', topo);
+
+    try{
+      // 1) 展開できない問題を確実に潰す
+      console.log('[DBG][DOM-TOPOLOGY][JSON]', JSON.stringify(topo));
+    }catch(e){
+      console.log('[DBG][DOM-TOPOLOGY][JSON][ERR]', String(e && (e.message || e)));
+    }
+
+    try{
+      // 2) Shadow の “先頭だけ” を人間が読める形で抜く（JSONより見やすいことが多い）
+      const s = topo && topo.shadowTopology && topo.shadowTopology.samples;
+      console.log('[DBG][DOM-TOPOLOGY][SHADOW-SAMPLES]', Array.isArray(s) ? s : '(none)');
+    }catch(e){
+      console.log('[DBG][DOM-TOPOLOGY][SHADOW-SAMPLES][ERR]', String(e && (e.message || e)));
+    }
+
+    try{
+      // 3) 重要シグナルだけを短く1行で（ログ検索が楽）
+      console.log('[DBG][DOM-TOPOPOLOGY][SIG]', {
+        url: topo && topo.url,
+        module: topo && topo.counts && topo.counts.module,
+        bodyTextLen: topo && topo.metrics && topo.metrics.bodyTextLen,
+        openShadowRoots: topo && topo.shadowCounts && topo.shadowCounts.roots,
+        shadowHasMain: topo && topo.shadowHasMain
+      });
+    }catch(_){}
+
+    // === [DBG][DOM-ROOT-CHECK v1] 1回で「どこにDOMがあるか」を確定 ===
+    try {
+      // 1) 現在フレームの URL と、最終的に見てるページ URL のズレ
+      const pageUrl = await page.url();
+      const mainFrameUrl = page.mainFrame().url();
+      console.log('[DBG][DOM-ROOT-CHECK][URL]', { pageUrl, mainFrameUrl });
+
+      // 2) 画面が “真っ白” なのか / テキストはあるのか / body自体があるのか
+      const surface = await page.evaluate(() => ({
+        readyState: document.readyState,
+        hasBody: !!document.body,
+        bodyChildren: document.body ? document.body.childElementCount : -1,
+        docElChildren: document.documentElement ? document.documentElement.childElementCount : -1,
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen: (document.body?.innerText || '').length,
+        bodyHTMLLen: (document.body?.innerHTML || '').length,
+        title: document.title || '',
+        locationHref: location.href
+      }));
+      console.log('[DBG][DOM-ROOT-CHECK][SURFACE]', surface);
+
+      // 3) “mainが無い”のではなく「別のセレクタで main 相当がある」ケースを拾う
+      const altMain = await page.evaluate(() => {
+        const candidates = [
+          '#app', '#root', '#__next', '#nuxt', '#svelte',
+          '#content', '#contents', '#main', '.main', '.l-main', '.site-main',
+          '[data-testid="main"]', '[data-main]', '[role="document"]'
+        ];
+
+        const hits = [];
+        for (const sel of candidates) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const txtLen = (el.innerText || '').length;
+          const child = el.childElementCount;
+          hits.push({ sel, child, txtLen });
+        }
+
+        // body直下の代表タグを列挙（何で構成されてるか）
+        const bodyTop = Array.from(document.body ? document.body.children : [])
+          .slice(0, 20)
+          .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            id: el.id || '',
+            cls: (el.className && String(el.className).split(/\s+/).slice(0, 4).join(' ')) || '',
+            child: el.childElementCount
+          }));
+
+        return { altRoots: hits, bodyTop };
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][ALT_MAIN]', altMain);
+
+      // 4) “main等が0”の原因が Shadow DOM かを一発で判断（open rootsだけでも十分ヒントになる）
+      const shadow = await page.evaluate(() => {
+        const nodes = Array.from(document.querySelectorAll('*'));
+        let openRoots = 0;
+        let openRootTags = [];
+        for (const el of nodes) {
+          if (el.shadowRoot) {
+            openRoots++;
+            if (openRootTags.length < 12) openRootTags.push(el.tagName.toLowerCase());
+          }
+        }
+        return { openRoots, openRootTags };
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][SHADOW]', shadow);
+
+      // 5) iframe が “別ドキュメント本体” になっていないか（cross-originかどうかも見える）
+      const iframeInfo = await page.evaluate(() => {
+        const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 12);
+        return iframes.map((f, i) => ({
+          i,
+          src: (f.getAttribute('src') || '').slice(0, 180),
+          hasSrcdoc: !!f.getAttribute('srcdoc')
+        }));
+      });
+      console.log('[DBG][DOM-ROOT-CHECK][IFRAMES]', iframeInfo);
+
+    } catch (e) {
+      console.log('[DBG][DOM-ROOT-CHECK][ERR]', String(e && (e.stack || e)));
+    }
+
+  } catch (e) {
+    console.log('[DBG][DOM-TOPOLOGY][ERR]', String(e && (e.message || e)));
+  }
+
+  // --- DOM スナップショット（1回分） ---
+  const snapshot = async () => {
+    return await page.evaluate(() => {
+      // --------- helpers ----------
+      const q = (root, sel) => {
+        try { return root ? root.querySelector(sel) : null; } catch (_) { return null; }
+      };
+      const qa = (root, sel) => {
+        try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+      };
+      const textLen = (root) => {
+        try { return (root && root.innerText) ? root.innerText.length : 0; } catch (_) { return 0; }
+      };
+
+      // --------- shadow roots (open only) ----------
+      const hosts = Array.from(document.querySelectorAll('*'));
+      const openRoots = [];
+      for (const el of hosts) {
+        if (el && el.shadowRoot) openRoots.push({ tag: el.tagName.toLowerCase(), root: el.shadowRoot });
+        if (openRoots.length >= 8) break; // 多すぎると重いので上限
+      }
+
+      // Light DOM counts
+      const light = {
+        header: qa(document, 'header,[role="banner"]').length,
+        footer: qa(document, 'footer,[role="contentinfo"]').length,
+        main:   qa(document, 'main,[role="main"]').length,
+        nav:    qa(document, 'nav,[role="navigation"]').length,
+        h1:     qa(document, 'h1').length,
+        ldjson: qa(document, 'script[type*="ld+json" i]').length,
+        module: qa(document, 'script[type="module"][src]').length
+      };
+
+      // Shadow DOM counts（open root を合算）
+      const shadow = {
+        openRoots: openRoots.length,
+        counts: { header: 0, footer: 0, main: 0, nav: 0, h1: 0, ldjson: 0 },
+        textLenMax: 0,
+        samples: [] // どのhostに入ってるかのヒント
+      };
+
+      for (const it of openRoots) {
+        const r = it.root;
+        const c = {
+          header: qa(r, 'header,[role="banner"]').length,
+          footer: qa(r, 'footer,[role="contentinfo"]').length,
+          main:   qa(r, 'main,[role="main"]').length,
+          nav:    qa(r, 'nav,[role="navigation"]').length,
+          h1:     qa(r, 'h1').length,
+          ldjson: qa(r, 'script[type*="ld+json" i]').length
+        };
+        shadow.counts.header += c.header;
+        shadow.counts.footer += c.footer;
+        shadow.counts.main   += c.main;
+        shadow.counts.nav    += c.nav;
+        shadow.counts.h1     += c.h1;
+        shadow.counts.ldjson += c.ldjson;
+
+        const tl = textLen(r);
+        if (tl > shadow.textLenMax) shadow.textLenMax = tl;
+
+        if (shadow.samples.length < 6) {
+          shadow.samples.push({ host: it.tag, ...c, textLen: tl });
         }
       }
 
-      try{
-        // 1) まず既存関数
-        const v0 = (typeof getSiteTypeLabel_ === 'function') ? String(getSiteTypeLabel_()||'').trim() : '';
-        const v0Label = map(v0);
-        if (v0Label) return v0Label;
+      // --------- JSON-LD 検出（Light + Shadow） ----------
+      const allScriptsLight = qa(document, 'script');
+      const allScriptsShadow = openRoots.flatMap(it => qa(it.root, 'script'));
+      const allScripts = allScriptsLight.concat(allScriptsShadow);
 
-        // 2) 診断ページの radio から直取り（最優先の確実ルート）
-        const checked =
-          document.querySelector('input[name="siteType"]:checked') ||
-          document.querySelector('#page-diagnose input[name="siteType"]:checked') ||
-          document.querySelector('#page-diagnosis-v2 input[name="siteType"]:checked');
+      let scripts = allScripts.filter(el => {
+        const t = String(el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+        return t.includes('ld+json');
+      });
 
-        const v1 = map(checked && checked.value);
-        if (v1) return v1;
-
-        return '未判定';
-      }catch(_){
-        return '未判定';
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(el => {
+          const t = String(el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
+          const txt = String(el.textContent || '').trim();
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
       }
+
+      const jsonldCount = scripts.length;
+      const jsonldSampleHead = String(scripts[0]?.textContent || '').slice(0, 200);
+
+      // ★ 追加：jsonldTypesAll 抽出（最大5本・各テキスト最大50KB） + parseFailed
+      let jsonldParseFailed = false;
+      let jsonldTypesAll = [];
+      try{
+        const typeSet = new Set();
+
+        const take = scripts.slice(0, 5);
+        for (const sc of take){
+          let txt = '';
+          try{ txt = String(sc && sc.textContent || ''); }catch(_){ txt=''; }
+          txt = txt.trim();
+          if (!txt) continue;
+          if (txt.length > 50000) txt = txt.slice(0, 50000); // ★重さ対策
+
+          try{
+            const obj = JSON.parse(txt);
+
+            const nodes = Array.isArray(obj) ? obj : [obj];
+            for (const node of nodes){
+              if (!node || typeof node !== 'object') continue;
+              const t = node['@type'];
+              const types = Array.isArray(t) ? t : (t ? [t] : []);
+              for (const tt of types){
+                if (typeof tt === 'string' && tt) typeSet.add(tt);
+              }
+            }
+          }catch(_e){
+            // JSON-LD scriptがあるのにパースできない → “存在はするが確定不能”の重要シグナル
+            jsonldParseFailed = true;
+          }
+        }
+
+        jsonldTypesAll = Array.from(typeSet);
+      }catch(_){
+        jsonldParseFailed = true;
+      }
+
+      // --------- semantic DOM flags（Light OR Shadow） ----------
+      const headerPresent = (light.header > 0) || (shadow.counts.header > 0);
+      const footerPresent = (light.footer > 0) || (shadow.counts.footer > 0);
+      const hasMainLandmark = (light.main > 0) || (shadow.counts.main > 0);
+      const navCount = light.nav + shadow.counts.nav;
+      const h1Count  = light.h1  + shadow.counts.h1;
+
+      // --------- module script srcs（Lightのみで十分） ----------
+      const moduleScriptSrcs = qa(document, 'script[type="module"][src]')
+        .map(el => el.getAttribute('src') || '')
+        .filter(Boolean);
+
+      return {
+        // JSON-LD
+        jsonldCount,
+        jsonldSampleHead,
+        jsonldTypesAll,        // ★ 追加
+        jsonldParseFailed,     // ★ 追加
+
+        // SPA観測（Shadow込み）
+        headerPresent,
+        footerPresent,
+        hasMainLandmark,
+        navCount,
+        h1Count,
+
+        // デバッグ
+        moduleScriptSrcs,
+        shadowTopology: shadow,
+
+        // 参考：Light側テキスト長（shadowはshadowTopology.textLenMax）
+        innerTextLen: (document.documentElement?.innerText || '').length,
+        bodyTextLen:  (document.body?.innerText || '').length
+      };
+    });
+  };
+
+  // --- ラッチ（取りこぼし防止） ---
+  let headerSeen = false;
+  let footerSeen = false;
+  let mainSeen   = false;
+  let navMax     = 0;
+  let h1Max      = 0;
+
+  let lastSnap = null;
+
+  // まずは「JS描画で必要そうな要素が1つでも出る」まで軽く待つ（最大8秒）
+  try {
+    await page.waitForFunction(() => {
+      const hasMain   = !!document.querySelector('main,[role="main"]');
+      const hasHeader = !!document.querySelector('header,[role="banner"]');
+      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasLdJson = !!document.querySelector('script[type*="ld+json" i]');
+      const hasModule = !!document.querySelector('script[type="module"][src]');
+      return hasMain || hasHeader || hasFooter || hasLdJson || hasModule;
+    }, { timeout: 8000 });
+  } catch (_) {}
+
+  // ★★★★★ ここに「IFRAME-CHECK」を挿入（この1箇所だけ） ★★★★★
+  try {
+    const iframes = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+        index: i,
+        src: f.getAttribute('src'),
+        id: f.id || null,
+        class: f.className || null
+      }));
+    });
+    console.log('[DEBUG][IFRAME-CHECK]', iframes);
+  } catch (e) {
+    console.log('[DEBUG][IFRAME-CHECK][ERR]', e && e.message);
+  }
+
+  // ★★★★★ A11Y（アクセシビリティツリー）経由の landmark 検出 ★★★★★
+  let a11yMainSeen = false;
+
+  try {
+    // Playwright の role selector（closed shadow でも見える可能性あり）
+    const a11yMainCount = await page.getByRole('main').count().catch(() => 0);
+    const a11yBanner    = await page.getByRole('banner').count().catch(() => 0);
+    const a11yFooter    = await page.getByRole('contentinfo').count().catch(() => 0);
+
+    console.log('[DBG][A11Y-LANDMARKS]', {
+      main: a11yMainCount,
+      banner: a11yBanner,
+      footer: a11yFooter
+    });
+
+    if (a11yMainCount > 0) a11yMainSeen = true;
+  } catch (e) {
+    console.log('[DBG][A11Y-LANDMARKS][ERR]', String(e && (e.message || e)));
+  }
+
+  // --- ポーリング：JSON-LD or semantic DOM の出現を待ちつつ、最大値をラッチ ---
+  while (Date.now() - t0 < maxWaitMs) {
+    const r = await snapshot();
+    lastSnap = r;
+
+    if (!a11yMainSeen) {
+      const c = await page.getByRole('main').count().catch(() => 0);
+      if (c > 0) a11yMainSeen = true;
+    }
+
+    if (r.headerPresent) headerSeen = true;
+    if (r.footerPresent) footerSeen = true;
+    if (r.hasMainLandmark || a11yMainSeen) mainSeen = true;
+
+    if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+    if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
+
+    // JSON-LD が DOM で出たら即勝ち
+    if (Number(r.jsonldCount || 0) > 0) {
+      return {
+        jsonld_detected_once: true,
+        jsonld_detect_count: Number(r.jsonldCount || 0),
+        jsonld_types_all: Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [],
+        jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
+        jsonld_wait_ms:   Date.now() - t0,
+        jsonld_timed_out: false,
+
+        // ★ 追加：進捗状態（永続未判定の切り分け用）
+        jsonld_scan_started: true,
+        jsonld_scan_finished: true,
+        jsonld_parse_failed: !!(r && r.jsonldParseFailed),
+
+        // ★ 追加：同意壁の疑い（ここはDOM成功なので基本false）
+        consent_wall_suspected: false,
+
+        jsonld_sample_head: String(r.jsonldSampleHead || ''),
+
+        // ★ ラッチ結果（snake_case）
+        header_present: headerSeen,
+        footer_present: footerSeen,
+        nav_count: navMax,
+        h1_count: h1Max,
+        hasMainLandmark: mainSeen,
+
+        // copyright（snake_case）
+        copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+        copyright_hit: !!r.copyrightHit,
+        copyright_hit_token: String(r.copyrightHitToken || ''),
+        copyright_excerpt: String(r.copyrightExcerpt || '')
+      };
+    }
+
+    // JSON-LD は無くても、semantic DOM が一度でも出たら「観測値」は確保できる
+    // ただし JSON-LD をもう少し待ちたいので、ここでは抜けない（maxWaitMs まで続ける）
+
+    await page.waitForTimeout(pollMs);
+  }
+
+  // --- タイムアウト時：最後のスナップでラッチを更新 ---
+  const r = lastSnap || await snapshot();
+
+  if (r.headerPresent) headerSeen = true;
+  if (r.footerPresent) footerSeen = true;
+  if (r.hasMainLandmark || a11yMainSeen) mainSeen = true;
+
+  if (Number(r.navCount || 0) > navMax) navMax = Number(r.navCount || 0);
+  if (Number(r.h1Count  || 0) > h1Max)  h1Max  = Number(r.h1Count  || 0);
+
+  // --- フォールバック：DOMに JSON-LD が出ない SPA 用（module script から探索） ---
+  // module script を 1本だけ GET して "@context" & "@type" を探す（軽量）
+  try {
+    if (Number(r.jsonldCount || 0) === 0) {
+      // module src 候補（相対/絶対を正規化）
+      let moduleSrcs = Array.isArray(r.moduleScriptSrcs) ? r.moduleScriptSrcs : [];
+
+      // 相対パスを絶対化
+      const pageUrl = await page.url();
+      try {
+        moduleSrcs = moduleSrcs.map(s => {
+          try { return new URL(s, pageUrl).toString(); } catch(_) { return s; }
+        });
+      } catch(_) {}
+
+      if (moduleSrcs.length > 0) {
+        // app-index.js 優先、それ以外は先頭
+        const target =
+          moduleSrcs.find(u => String(u).includes('app-index.js')) ||
+          moduleSrcs[0];
+
+        if (target) {
+          const resp = await page.context().request.get(target).catch(() => null);
+          if (resp && resp.ok()) {
+            const jsText = await resp.text();
+            const idxContext = jsText.indexOf('"@context"');
+            const idxType    = jsText.indexOf('"@type"');
+
+            if (idxContext !== -1 && idxType !== -1) {
+              // "@type" を列挙
+              let typeNames = [];
+              try {
+                const mAll = jsText.matchAll(/"@type"\s*:\s*"([^"]+)"/g);
+                for (const m of mAll) if (m && m[1]) typeNames.push(m[1]);
+              } catch (_) {}
+
+              // sample head
+              const head = jsText.slice(Math.max(0, idxContext - 40), idxContext + 240);
+
+              // detect_count は type の出現数をざっくり採用（最低1）
+              const typeMatches = jsText.match(/"@type"\s*:/g);
+              const count = typeMatches ? Math.max(1, typeMatches.length) : 1;
+
+              return {
+                jsonld_detected_once: true,
+                jsonld_detect_count: count,
+                jsonld_types_all: typeNames,
+                jsonld_types:     typeNames, // 互換
+                jsonld_wait_ms:   Date.now() - t0,
+                jsonld_timed_out: false,
+
+                // ★ 追加：進捗状態
+                jsonld_scan_started: true,
+                jsonld_scan_finished: true,
+                jsonld_parse_failed: false,          // jsTextから拾えたのでparse失敗ではない
+
+                // ★ 追加：同意壁疑い（timeout経由なのであり得る）
+                consent_wall_suspected: false,       // ※ここは後で必要なら推定する（今は固定でOK）
+
+                jsonld_sample_head: String(head || ''),
+
+                header_present: headerSeen,
+                footer_present: footerSeen,
+                nav_count: navMax,
+                h1_count: h1Max,
+                hasMainLandmark: mainSeen,
+
+                copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+                copyright_hit: !!r.copyrightHit,
+                copyright_hit_token: String(r.copyrightHitToken || ''),
+                copyright_excerpt: String(r.copyrightExcerpt || '')
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // フォールバック失敗は無視して通常の timeout 結果へ
+  }
+
+  // --- ここまで来たら「見つからなかった」 ---
+  return {
+    jsonld_detected_once: false,
+    jsonld_detect_count: Number(r.jsonldCount || 0),
+    jsonld_types_all: Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [],
+    jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
+    jsonld_wait_ms:   Date.now() - t0,
+    jsonld_timed_out: true,
+    jsonld_sample_head: String(r.jsonldSampleHead || ''),
+
+    header_present: headerSeen,
+    footer_present: footerSeen,
+    nav_count: navMax,
+    h1_count: h1Max,
+    hasMainLandmark: mainSeen,
+
+    copyright_footer_present: !!(r.footerElementPresent || footerSeen),
+    copyright_hit: !!r.copyrightHit,
+    copyright_hit_token: String(r.copyrightHitToken || ''),
+    copyright_excerpt: String(r.copyrightExcerpt || '')
+  };
+}
+
+// === [AIO][HEAD_META v1] head/meta 情報を抽出するヘルパー ==================
+async function extractHeadMetaV1(page) {
+  // title
+  let titleText = '';
+  try {
+    // <title> が無い場合は空文字 or 例外になるので try/catch
+    titleText = (await page.title()) || '';
+  } catch (_) {
+    titleText = '';
+  }
+  const hasTitle = !!titleText.trim();
+
+  // meta description
+  let descText = '';
+  try {
+    // head 内の <meta name="description">（大文字小文字ゆらぎも吸収）
+    const handle = await page.$('head meta[name="description" i]');
+    if (handle) {
+      const content = await handle.getAttribute('content');
+      descText = (content || '').trim();
+      await handle.dispose();
+    }
+  } catch (_) {
+    descText = '';
+  }
+
+  const hasMetaDescription = !!descText;
+  const metaDescriptionLen = descText.length;
+
+  return {
+    hasTitle,
+    titleText,
+    hasMetaDescription,
+    metaDescriptionLen,
+    metaDescriptionText: descText
+  };
+}
+
+// ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
+const ENABLE_SUBPAGES_VNEXT = process.env.ENABLE_SUBPAGES_VNEXT !== '0';
+const SUBPAGES_VNEXT_MAX = 8;
+
+function pickSubPageCandidatesVNext_(origin){
+  const o = String(origin || '').trim().replace(/\/+$/,'');
+  if (!o) return [];
+
+  const candidates = [
+    o + '/about',
+    o + '/company',
+    o + '/service',
+    o + '/contact',
+    o + '/faq',
+    o + '/policy',
+    o + '/privacy',
+    o + '/inquiry',
+    o + '/business',
+    o + '/support',
+  ];
+
+  const seen = new Set();
+  const out = [];
+  for (const u of candidates){
+    const k = String(u).replace(/\/+$/,'');
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+    if (out.length >= SUBPAGES_VNEXT_MAX) break;
+  }
+  return out;
+}
+
+function firstMeaningfulStringVNext_(values){
+  for (const v of (Array.isArray(values) ? values : [])) {
+    const s = String(v || '').trim();
+    if (s) return s;
+  }
+  return null;
+}
+
+function buildPublisherInfoFromSubPagesVNext_(subpages, structured, origin){
+  const arr = Array.isArray(subpages) ? subpages : [];
+  const companyPages = arr.filter(p => Array.isArray(p && p.companyLikeSignals) && p.companyLikeSignals.length > 0);
+  const pool = companyPages.length ? companyPages : arr;
+
+  function pickField(field){
+    for (const page of pool) {
+      const val = page && page.publisherCandidate && page.publisherCandidate[field];
+      if (val != null && String(val).trim()) return String(val).trim();
+    }
+    return null;
+  }
+
+  const companyName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.companyName).concat(pool.map(p => p && p.h1)).concat(pool.map(p => p && p.title)));
+  const organizationName = firstMeaningfulStringVNext_(pool.map(p => p && p.publisherCandidate && p.publisherCandidate.organizationName).concat([companyName]));
+
+  return {
+    checked: true,
+    companyName: companyName,
+    organizationName: organizationName,
+    address: pickField('address') || (structured && structured.address ? [structured.address.postalCode, structured.address.addressRegion, structured.address.addressLocality, structured.address.streetAddress].filter(Boolean).join(' ') : null),
+    telephone: pickField('telephone') || (structured && structured.telephone ? structured.telephone : null),
+    contactEmail: pickField('contactEmail'),
+    representative: pickField('representative'),
+    corporateNumber: pickField('corporateNumber'),
+    sourceUrl: firstMeaningfulStringVNext_(pool.map(p => p && p.url)) || String(origin || '').trim() || null
+  };
+}
+
+function summarizeSecurityHeaders_(responseHeaders){
+  const h = responseHeaders && typeof responseHeaders === 'object' ? responseHeaders : {};
+  return {
+    checked: true,
+    strictTransportSecurity: h['strict-transport-security'] ?? null,
+    contentSecurityPolicy: h['content-security-policy'] ?? null,
+    xFrameOptions: h['x-frame-options'] ?? null,
+    xContentTypeOptions: h['x-content-type-options'] ?? null,
+    referrerPolicy: h['referrer-policy'] ?? null,
+    permissionsPolicy: h['permissions-policy'] ?? null
+  };
+}
+
+// 1ページから“軽量な観測”だけ抜く（全文は保持しない）
+async function extractLiteFromPageVNext_(page, url, origin, statusCode){
+  const o = String(origin || '').trim().replace(/\/+$/,'');
+  const u = String(url || '').trim();
+
+  return await page.evaluate(({ u, o, statusCode }) => {
+    function norm(s){ return String(s || '').replace(/\s+/g, ' ').trim(); }
+    function textOf(el){ try{ return norm(el && el.textContent || ''); }catch(_){ return ''; } }
+    function uniqTexts(arr){
+      const out = [];
+      const seen = new Set();
+      for (const v of (Array.isArray(arr) ? arr : [])) {
+        const s = norm(v);
+        if (!s || seen.has(s)) continue;
+        seen.add(s);
+        out.push(s);
+      }
+      return out;
+    }
+    function attrOf(sel, name){
+      try{ const el = document.querySelector(sel); return el ? norm(el.getAttribute(name) || '') : ''; }catch(_){ return ''; }
+    }
+    function collectSignalHits(combined, defs){
+      const hits = [];
+      for (const def of defs) {
+        if (def.re.test(combined)) hits.push(def.label);
+      }
+      return hits;
+    }
+
+    const title = norm(document.title || '');
+    const metaDescription = attrOf('meta[name="description"], meta[property="og:description"], meta[name="twitter:description"]', 'content');
+    const mainEl = document.querySelector('main,[role="main"]');
+    const mainInnerText = norm((mainEl && mainEl.innerText) || '');
+    const bodyInnerText = norm(document.body && document.body.innerText || '');
+    const mainTextContent = norm((mainEl && mainEl.textContent) || '');
+    const bodyTextContent = norm(document.body && document.body.textContent || '');
+    const docTextContent = norm(document.documentElement && document.documentElement.textContent || '');
+    const bodyText = mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent;
+    const mainTextSample = (mainInnerText || bodyInnerText || mainTextContent || bodyTextContent || docTextContent).slice(0, 240);
+    const bodyTextSample = (bodyInnerText || bodyTextContent || docTextContent || mainInnerText || mainTextContent).slice(0, 240);
+
+    const h1Texts = uniqTexts(Array.from(document.querySelectorAll('main h1, h1')).map(textOf));
+    const h2Texts = uniqTexts(Array.from(document.querySelectorAll('main h2, h2')).map(textOf));
+    const roleHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('[role="heading"]'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    const fallbackHeadingTexts = uniqTexts(
+      Array.from(document.querySelectorAll('main .title, .page-title, .headline, .hero-title, .title'))
+        .map(textOf)
+        .filter(Boolean)
+    );
+    let headingTexts = uniqTexts(
+      h1Texts
+        .concat(h2Texts)
+        .concat(roleHeadingTexts)
+        .concat(fallbackHeadingTexts)
+    ).slice(0, 10);
+    const fallbackMainHeading = bodyText.slice(0, 80);
+    if (!headingTexts.length && fallbackMainHeading) {
+      headingTexts = [fallbackMainHeading];
+    }
+    const h1 = h1Texts[0] || roleHeadingTexts[0] || fallbackHeadingTexts[0] || '';
+    const h2 = uniqTexts(
+      h2Texts.length
+        ? h2Texts
+        : roleHeadingTexts.slice(h1 ? 1 : 0).concat(fallbackHeadingTexts.slice(h1 ? 1 : 0))
+    ).slice(0, 10);
+
+    const jsonldTypes = (() => {
+      try{
+        const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20);
+        const types = [];
+        for (const s of scripts){
+          const raw = String(s.textContent || '').trim();
+          if (!raw) continue;
+          let obj = null;
+          try{ obj = JSON.parse(raw); }catch(_){ obj = null; }
+          const pushType = (t) => { if (t && !types.includes(t)) types.push(String(t)); };
+          const walk = (x) => {
+            if (!x) return;
+            if (Array.isArray(x)){ x.forEach(walk); return; }
+            if (typeof x !== 'object') return;
+            const t = x['@type'];
+            if (Array.isArray(t)) t.forEach(pushType);
+            else pushType(t);
+            if (Array.isArray(x['@graph'])) x['@graph'].forEach(walk);
+          };
+          walk(obj);
+        }
+        return types.slice(0, 30);
+      }catch(_){ return []; }
     })();
 
-    // v1 fixed / agreed texts
-    const scopeLines = [
-      'トップページ（HTML構造・主要コンテンツ）',
-      '主要ナビゲーション／フッターに表示されているリンク情報',
-      '構造化データ（JSON-LD：Organization / WebSite / WebPage 等）',
-      'サイト構造・宣言に関する補助情報（robots.txt / sitemap.xml 等）',
-      'AI可視性に関する参考情報（AI向け宣言・外部参照点 等）'
-    ];
+    const links = Array.from(document.querySelectorAll('a[href]'));
+    const internalLinkCount = links.filter(a => {
+      try {
+        const uu = new URL(a.href, location.href);
+        return uu.origin === o;
+      } catch (_) {
+        return false;
+      }
+    }).length;
+    const contactLinkCount = links.filter(a => {
+      const href = norm(a.getAttribute('href') || a.href || '').toLowerCase();
+      const txt = norm(a.textContent || '').toLowerCase();
+      return /contact|inquiry|お問い合わせ|お問合せ|問い合わせ/.test(href + ' ' + txt);
+    }).length;
 
-    const modelLines = [
-      'Gemini 2.5 Pro（テキスト生成・要約・評価）',
-      'Gemini 1.5 Pro（構造化出力・JSON生成）'
-    ];
+    const updatedDate = (() => {
+      try{
+        const txt = bodyText.slice(0, 30000);
+        const m = txt.match(/(20\d{2})[\/\.\-](\d{1,2})[\/\.\-](\d{1,2})/);
+        if (!m) return '';
+        const y = m[1];
+        const mm = String(m[2]).padStart(2,'0');
+        const dd = String(m[3]).padStart(2,'0');
+        return `${y}-${mm}-${dd}`;
+      }catch(_){ return ''; }
+    })();
 
-    // v1 assumption (you can later wire real used list)
-    const aiOverviewLines = [
-      'Google（AI Overviews）',
-      'ChatGPT（Web）',
-      'Perplexity',
-      'Copilot'
-    ];
+    const is404 =
+      (/^404\b/i.test(title)) ||
+      (/not\s*found/i.test(title)) ||
+      (metaDescription && /not\s*found/i.test(metaDescription)) ||
+      (bodyText.slice(0, 400).match(/404|not\s*found/i));
+    if (is404) return null;
 
-    // Diagnosis date: best-effort (v1)
-    const diagnosisDateText = getDiagnosisDateText_() || formatDateYmd_(new Date());
+    const combined = [u, title].concat(headingTexts).join(' | ');
+    const combinedLower = combined.toLowerCase();
 
-    // Author (your company): optional in v1 (leave blank if you want)
-    const authorName = getAuthorName_() || '';
+    const companyLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'about', re: /\/about\b|about\s+us|about\s+company/ },
+      { label: 'company', re: /\/company\b|company|corporate|企業情報|会社概要|会社情報/ }
+    ]);
+    const serviceLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'service', re: /\/service\b|service|services|サービス|事業/ },
+      { label: 'solution', re: /solution|solutions|ソリューション/ },
+      { label: 'product', re: /product|products|プロダクト|製品/ }
+    ]);
+    const contactLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'contact', re: /\/contact\b|contact|お問い合わせ|お問合せ|問い合わせ/ },
+      { label: 'inquiry', re: /inquiry|inquire/ }
+    ]);
+    const faqLikeSignals = collectSignalHits(combinedLower, [
+      { label: 'faq', re: /\/faq\b|\bfaq\b|よくある質問|q&a|q & a/ }
+    ]);
+
+    const breadcrumbEl = document.querySelector('nav[aria-label*="breadcrumb" i], [aria-label*="breadcrumb" i], .breadcrumb, [class*="breadcrumb"], ol.breadcrumb, ul.breadcrumb, [data-breadcrumb]');
+    const words = String(bodyText || '').match(/[一-龠ぁ-んァ-ンA-Za-z0-9]+/g) || [];
+
+    const publisherCandidate = (() => {
+      const addressMatch = bodyText.match(/(?:〒?\d{3}-?\d{4}[\s\S]{0,80}?(?:都|道|府|県)[\s\S]{0,120})/);
+      const telMatch = bodyText.match(/(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/);
+      const emailMatch = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      const representativeMatch = bodyText.match(/(?:代表取締役|代表者|代表)\s*[:：]?\s*([^\n]{1,40})/);
+      const corporateNumberMatch = bodyText.match(/法人番号\s*[:：]?\s*(\d{13})/);
+      return {
+        checked: true,
+        companyName: h1 || title || null,
+        organizationName: h1 || title || null,
+        address: addressMatch ? norm(addressMatch[0]) : null,
+        telephone: telMatch ? norm(telMatch[0]) : null,
+        contactEmail: emailMatch ? norm(emailMatch[0]) : null,
+        representative: representativeMatch ? norm(representativeMatch[1]) : null,
+        corporateNumber: corporateNumberMatch ? norm(corporateNumberMatch[1]) : null,
+        sourceUrl: u
+      };
+    })();
 
     return {
-      origin,
-      siteTypeLabel,
-      scopeLines,
-      modelLines,
-      aiOverviewLines,
-      diagnosisDateText,
-      authorName,
-      clientName: String(job && job.clientName || '').trim() || '(未入力)',
-      reportDateText: String(job && job.reportDateText || '').trim()
+      url: u,
+      status: typeof statusCode === 'number' ? statusCode : null,
+      title,
+      metaDescription,
+      h1,
+      h2,
+      jsonldTypes,
+      updatedDate,
+      internalLinkCount,
+      h1Count: h1Texts.length,
+      h2Count: h2Texts.length,
+      roleHeadingCount: roleHeadingTexts.length,
+      fallbackHeadingCount: fallbackHeadingTexts.length,
+      headingTexts,
+      headingCandidateTexts: uniqTexts(roleHeadingTexts.concat(fallbackHeadingTexts)).slice(0, 10),
+      locationHref: String(location.href || u || ''),
+      mainTextSample,
+      bodyTextSample,
+      bodyTextLen: bodyText.length,
+      bodyInnerTextLen: bodyInnerText.length,
+      mainInnerTextLen: mainInnerText.length,
+      mainCount: document.querySelectorAll('main').length,
+      navCount: document.querySelectorAll('nav').length,
+      headerCount: document.querySelectorAll('header').length,
+      footerCount: document.querySelectorAll('footer').length,
+      hasBreadcrumb: !!breadcrumbEl,
+      wordCount: words.length,
+      contactLinkCount,
+      companyLikeSignals,
+      serviceLikeSignals,
+      faqLikeSignals,
+      contactLikeSignals,
+      publisherCandidate
     };
+  }, { u, o, statusCode });
+}
+
+// subPages_vNext を作る（最大8、失敗は握る）
+async function buildSubPagesVNext_V1_(browserPage, origin, decision){
+  const dec = decision && typeof decision === 'object' ? decision : null;
+  const startedAt = Date.now();
+  const setDecision = (patch) => {
+    if (!dec || !patch || typeof patch !== 'object') return;
+    try { Object.assign(dec, patch); } catch (_) {}
+  };
+  setDecision({
+    enabled: !!ENABLE_SUBPAGES_VNEXT,
+    envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+    origin: String(origin || '').trim().replace(/\/+$/,''),
+    limit: 1,
+    skipReason: 'not_reached'
+  });
+  if (!ENABLE_SUBPAGES_VNEXT) {
+    setDecision({ skipReason: 'disabled_by_env', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
   }
 
-  // =========================================================
-  // 3) DOM collection (clone sources)
-  // =========================================================
-  function collectDomSections_(job){
-    const sections = {
-      dashboard: null,
-      diagnosisBlocks: [],
-      compare: null
-    };
+  let o = String(origin || '').trim().replace(/\/+$/,'');
+  if (!o){
+    try{ o = (new URL(browserPage.url())).origin; }catch(_){ o = ''; }
+  }
+  if (!o) {
+    setDecision({ skipReason: 'no_candidates', errorMessage: 'origin_missing', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
+  setDecision({ origin: o });
 
-    const dash = document.querySelector(SEL.dashboardRoot);
-    if (dash) sections.dashboard = dash;
-
-    // Diagnosis: v1はサブブロック積み上げをやめて、ページ全体を1つで取る（白紙対策）
-    const diagRoot =
-      document.querySelector('#page-diagnosis-v2') ||
-      document.querySelector('#page-diagnose');
-    sections.diagnosisRoot = diagRoot || null;
-
-    // 互換のため diagnosisBlocks は空にしておく
-    sections.diagnosisBlocks = [];
-
-    if (job.includeCompare){
-      const cmp = document.querySelector(SEL.compareRoot);
-      if (cmp) sections.compare = cmp;
-    }
-
-    return sections;
+  const parentContext = browserPage && typeof browserPage.context === 'function' ? browserPage.context() : null;
+  const browser = parentContext && typeof parentContext.browser === 'function'
+    ? parentContext.browser()
+    : null;
+  if (!browser) {
+    setDecision({ skipReason: 'browser_or_context_missing', errorMessage: 'browser_unavailable', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
   }
 
-  // =========================================================
-  // 4) Build #pdf-print-root with fixed page order
-  // =========================================================
-  function buildPrintRoot_C_(job, ctx, sections){
-    document.getElementById(PRINT_ROOT_ID)?.remove();
+  let subContext = null;
+  let subPage = null;
 
-    const root = document.createElement('div');
-    root.id = PRINT_ROOT_ID;
+  try{
+    subContext = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      viewport: { width: 800, height: 600 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
+    });
+    subPage = await subContext.newPage();
+    await subPage.setViewportSize({ width: 800, height: 600 }).catch(() => {});
+    await subPage.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'font', 'media', 'stylesheet'].includes(type)) return route.abort();
+      return route.continue();
+    });
+  }catch(e){
+    setDecision({
+      skipReason: 'browser_or_context_missing',
+      errorMessage: String(e && (e.message || e) || ''),
+      elapsedMs: Math.max(0, Date.now() - startedAt)
+    });
+    try { if (subPage) await subPage.close(); } catch(_e) {}
+    try { if (subContext) await subContext.close(); } catch(_e) {}
+    return [];
+  }
 
-    // PDF専用スタイル（改ページ・table・カード途中分割抑制）
-    const st = document.createElement('style');
-    st.textContent = `
-      #${PRINT_ROOT_ID}{ font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color:#111; }
+  try{
+    await subPage.goto(origin, { waitUntil: 'domcontentloaded', timeout: 12000 });
+    try{ await subPage.waitForTimeout(150); }catch(_){ }
+  }catch(_){ }
 
-      /* ★ 表紙だけ：absolute配置の基準を与える */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-cover{
-        position: relative;
-      }
+  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 1);
+  setDecision({
+    candidateCount: candidates.length,
+    candidateSample: candidates.slice(0, 5),
+    limit: 1
+  });
+  console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
+  if (!candidates.length) {
+    setDecision({ skipReason: 'no_candidates', elapsedMs: Math.max(0, Date.now() - startedAt) });
+    return [];
+  }
 
-      /* pages */
-      #${PRINT_ROOT_ID} .pdf-page{
-        page-break-after: always;
-        break-after: page;
-        padding: 22px 36px 26px;
-      }
-
-      /* screen-only: page boundary visibility */
-      @media screen{
-        #${PRINT_ROOT_ID} .pdf-page{
-          outline: 1px solid rgba(0,0,0,.08);
-          outline-offset: 6px;
-          background: #fff;
-        }
-      }
-
-      /* typography */
-      #${PRINT_ROOT_ID} .pdf-text{ font-size:13px; line-height:1.7; }
-      #${PRINT_ROOT_ID} .pdf-h1{ margin:0 0 10px; font-size:20px; font-weight:800; }
-      #${PRINT_ROOT_ID} .pdf-h2{ margin:12px 0 6px; font-size:16px; font-weight:800; }
-      #${PRINT_ROOT_ID} .pdf-sub{
-        margin:12px 0 6px;
-        font-size:14px;
-        font-weight:800;
-        color:#111;
-      }
-      #${PRINT_ROOT_ID} .pdf-note{ font-size:12px; color:#444; margin-top:8px; }
-
-      /* tables */
-      #${PRINT_ROOT_ID} .pdf-table{
-        width:100%;
-        border-collapse:collapse;
-        font-size:12px;
-        border:1px solid #e5e7eb;
-      }
-      #${PRINT_ROOT_ID} .pdf-table th{
-        text-align:left;
-        border-bottom:1px solid #d1d5db;
-        padding:7px 8px;
-        background:#f3f4f6;
-        font-weight:800;
-        vertical-align:bottom;
-      }
-      #${PRINT_ROOT_ID} .pdf-table td{
-        border-bottom:1px solid #e5e7eb;
-        padding:7px 8px;
-        vertical-align:top;
-      }
-      #${PRINT_ROOT_ID} .r{ text-align:right; }
-
-      /* cards (共通) */
-      #${PRINT_ROOT_ID} .pdf-card{
-        border:1px solid #d1d5db;
-        border-radius:0;              /* ★角丸やめる（共通でOKならここで） */
-        padding:12px;
-        margin:12px 0;
-        break-inside: avoid;
-        page-break-inside: avoid;
-        background:#fff;
-        box-sizing:border-box;
-      }
-
-      /* ★ 2枚目以降も「区切り線」が見えるように、カード間に1本線を追加 */
-      #${PRINT_ROOT_ID} .pdf-card + .pdf-card{
-        margin-top:14px;
-        border-top:1px solid #d1d5db; /* 連続して見える問題の止血 */
-      }
-
-      #${PRINT_ROOT_ID} .compare-section{
-        page-break-before:auto;
-        break-before:auto;
-        page-break-inside:avoid;
-        break-inside:avoid;
-        margin-top:0 !important;
-      }
-      #${PRINT_ROOT_ID} .compare-section .pdf-h2{
-        margin-top:0;
-        page-break-before:avoid;
-        break-before:avoid;
-      }
-      #${PRINT_ROOT_ID} .compare-section#card-compare-targets-text{
-        margin-top:0;
-        margin-bottom:8px;
-        padding-top:10px;
-        padding-bottom:10px;
-        page-break-inside:avoid;
-        break-inside:avoid;
-      }
-      #${PRINT_ROOT_ID} .compare-targets-title{
-        margin:0 0 6px 0 !important;
-        padding:0 !important;
-        line-height:1.2 !important;
-        page-break-before:avoid;
-        break-before:avoid;
-      }
-      #${PRINT_ROOT_ID} .compare-targets-body{
-        margin:0 !important;
-        padding:0 !important;
-        line-height:1.35 !important;
-      }
-      #${PRINT_ROOT_ID} .compare-target-line{
-        margin:0 !important;
-        padding:0 !important;
-        line-height:1.35 !important;
-      }
-
-      /* helpers */
-      #${PRINT_ROOT_ID} .pdf-muted{ color:#6b7280; font-size:12px; }
-
-      #${PRINT_ROOT_ID} .pdf-panel{
-        border:1px solid #e5e7eb;
-        background:#f9fafb;
-        border-radius:0;   /* ★サマリー側も角丸不要なら */
-        padding:12px;
-      }
-
-      #${PRINT_ROOT_ID} .pdf-axis-cover-frame{
-        border:1px solid #d1d5db;
-        background:#fff;
-        padding:12px;
-        box-sizing:border-box;
-      }
-      #${PRINT_ROOT_ID} .pdf-axis-cover-field + .pdf-axis-cover-field{
-        margin-top:12px;
-        padding-top:12px;
-        border-top:1px solid #e5e7eb;
-      }
-      #${PRINT_ROOT_ID} .pdf-axis-cover-label{
-        font-size:14px;
-        font-weight:800;
-        color:#111;
-        margin:12px 0 6px;
-      }
-      #${PRINT_ROOT_ID} .pdf-axis-cover-value{
-        font-size:13px;
-        line-height:1.7;
-        color:#111;
-      }
-      #${PRINT_ROOT_ID} .pdf-axis-cover-list{
-        margin:0;
-        padding-left:18px;
-      }
-      #${PRINT_ROOT_ID} .pdf-axis-cover-list li{
-        margin:0 0 4px;
-        font-size:13px;
-        line-height:1.7;
-      }
-
-      #${PRINT_ROOT_ID} .pdf-grid-2{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
-      #${PRINT_ROOT_ID} .pdf-grid-3{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; }
-
-      #${PRINT_ROOT_ID} .pdf-kpi-label{ font-size:11px; color:#6b7280; margin:0 0 4px; }
-      #${PRINT_ROOT_ID} .pdf-kpi-value{ font-size:28px; font-weight:900; margin:0; }
-      #${PRINT_ROOT_ID} .pdf-kpi-sub{ font-size:12px; color:#6b7280; margin-top:4px; }
-
-      /* bars */
-      #${PRINT_ROOT_ID} .pdf-bar-fill.before{ background: rgba(54, 162, 235, 1); }
-      #${PRINT_ROOT_ID} .pdf-bar-fill.after { background: rgba(255, 99, 132, 1); }
-      #${PRINT_ROOT_ID} .pdf-bar-fill{ -webkit-print-color-adjust: exact; print-color-adjust: exact; display:block; }
-
-      /* priority badge */
-      #${PRINT_ROOT_ID} .pdf-pri{
-        display:inline-block;
-        padding:2px 8px;
-        border-radius:999px;
-        font-size:12px;
-        font-weight:800;
-        line-height:1.2;
-        border:1px solid #ddd;
-      }
-      #${PRINT_ROOT_ID} .pdf-pri-高{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }
-      #${PRINT_ROOT_ID} .pdf-pri-中{ background:#fef3c7; color:#92400e; border-color:#fde68a; }
-      #${PRINT_ROOT_ID} .pdf-pri-低{ background:#e0f2fe; color:#075985; border-color:#bae6fd; }
-
-      /* === Improve（画像版でも見た目を揃える） === */
-
-      /* Improveカード：サマリーと同じ “薄グレー背景＋四角枠” */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve .pdf-card{
-        background:#f9fafb !important;
-        border-color:#e5e7eb !important;
-      }
-
-      /* Improve本文：改行を生かす（Markdownを段落っぽく） */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve .pdf-text{
-        white-space: pre-wrap;
-      }
-
-      /* ===== サマリー本文：色指定をすべて黒に上書き ===== */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-rank,
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-rank *{
-        color:#111 !important;
-      }
-
-      /* インライン `code`（最低限の見分け） */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve .pdf-text code{
-        background:#ffffff;
-        border:1px solid #e5e7eb;
-        padding:0 4px;
-        border-radius:0;
-      }
-
-      /* コードブロック：カードがグレーなので “中は白” にする + 変な細い箱を防ぐ */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve pre{
-        display:block;
-        width:100%;
-        box-sizing:border-box;
-        margin:10px 0 12px;
-        padding:12px;
-        background:#ffffff;
-        border:1px solid #e5e7eb;
-        border-radius:0;
-        white-space:pre-wrap;
-        word-break:break-word;
-        overflow-wrap:anywhere;
-      }
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve pre code{
-        background:transparent;
-        border:none;
-        padding:0;
-      }
-
-      /* ===== Improve: code block force-white (inline style に勝つ) ===== */
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve pre{
-        background: #ffffff !important;
-        background-color: #ffffff !important;
-        border: 1px solid #e5e7eb !important;
-        border-radius: 0 !important;
-        width: 100% !important;
-        max-width: 100% !important;
-        box-sizing: border-box !important;
-        display: block !important;
-        padding: 12px !important;
-        margin: 10px 0 12px !important;
-        white-space: pre-wrap !important;
-        word-break: break-word !important;
-        overflow-wrap: anywhere !important;
-      }
-      #${PRINT_ROOT_ID} .pdf-page.pdf-report-improve pre code{
-        background: transparent !important;
-        border: none !important;
-        padding: 0 !important;
-      }
-
-      /* continue note */
-      .pdf-continue-note{ display:none; }
-      .pdf-page[data-has-next="1"] .pdf-continue-note{ display:block; }
-
-      #${PRINT_ROOT_ID} .pdf-continue-note{
-        margin-top: 8px;
-        font-size: 12px;
-        color: #6b7280;
-        opacity: .9;
-        text-align: left;
-      }
-
-      /* PDF: 根拠の見出しは出さないが、見出し相当の間隔だけは残す */
-      #${PRINT_ROOT_ID} .pdf-sub-spacer{
-        height: 14px;
-      }
-
-      /* ※ “Improveカード継ぎ目の線を消す” ルールは一旦入れない（あなたの要望：線が欲しいため） */
-    `;
-    root.appendChild(st);
-
-    // 1) Cover
-    root.appendChild(makePage_('pdf-cover', buildCoverHtml_(ctx)));
-
-    // 2) Conditions
-    root.appendChild(makePage_('pdf-conditions', buildConditionsHtml_(ctx)));
-
-    function bakeStyles_(src, dst){
+  const out = [];
+  try {
+    for (const url of candidates){
+      if (out.length >= 1) break;
+      setDecision({ attemptedCount: (dec && Number(dec.attemptedCount || 0) || 0) + 1 });
       try{
-        const cs = getComputedStyle(src);
-        const PROPS = [
-          'display','position','boxSizing',
-          'width','height','minWidth','maxWidth','minHeight','maxHeight',
-          'marginTop','marginRight','marginBottom','marginLeft',
-          'paddingTop','paddingRight','paddingBottom','paddingLeft',
-          'borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
-          'borderTopStyle','borderRightStyle','borderBottomStyle','borderLeftStyle',
-          'borderTopColor','borderRightColor','borderBottomColor','borderLeftColor',
-          'borderTopLeftRadius','borderTopRightRadius',
-          'borderBottomRightRadius','borderBottomLeftRadius',
-          'backgroundColor',
-          'color','fontFamily','fontSize','fontWeight','lineHeight','letterSpacing',
-          'textAlign','whiteSpace',
-          'alignItems','justifyContent','gap',
-          'boxShadow'
-        ];
-        PROPS.forEach(p=>{
-          try{ dst.style[p] = cs[p]; }catch(_){}
-        });
-      }catch(_){}
-    }
-
-    function bakeTree_(srcRoot, dstRoot){
-      bakeStyles_(srcRoot, dstRoot);
-      const s = srcRoot.children ? Array.from(srcRoot.children) : [];
-      const d = dstRoot.children ? Array.from(dstRoot.children) : [];
-      const n = Math.min(s.length, d.length);
-      for (let i=0;i<n;i++){
-        bakeTree_(s[i], d[i]);
-      }
-    }
-
-    function appendAiRecognitionLogPages_(){
-    // AI recognition log（AIごと改ページ／UIは除去／重複させない／AI名はPDFに出さない）
-    try{
-      const aiSrc =
-        (sections?.dashboard && sections.dashboard.querySelector('#ai-rec-section')) ||
-        (sections?.diagnosisRoot && sections.diagnosisRoot.querySelector('#ai-rec-section')) ||
-        document.querySelector('#ai-rec-section');
-
-      if (!aiSrc){
-        root.appendChild(makePage_('pdf-report-ai', [
-          '<h1 class="pdf-h1">AI認識ログ</h1>',
-          '<div class="pdf-note">※ #ai-rec-section が見つかりませんでした</div>'
-        ].join('\n')));
-      } else {
-        // ★details（=AIごとのアコーディオン）を確実に拾う
-        const detailsList = Array.from(aiSrc.querySelectorAll('details[id^="ai-rec-"]'));
-
-        // 末尾の注意書き（1回だけ）を取る
-        let footerNote = '';
-        try{
-          const muted = aiSrc.querySelector(':scope > div.muted');
-          if (muted) footerNote = (muted.textContent || '').trim();
-        }catch(_){}
-
-        if (!detailsList.length){
-          // detailsが無い場合のフォールバック：見えるテキストだけ（UI除去は最小限）
-          const clean = aiSrc.cloneNode(true);
-          try{
-            clean.querySelectorAll('form, textarea, input, select, button, summary, a').forEach(n => n.remove());
-            clean.querySelectorAll('[role="button"], [tabindex]').forEach(n => n.remove());
-          }catch(_){}
-          const raw = (clean.textContent || '').trim();
-
-          root.appendChild(makePage_('pdf-report-ai', [
-            '<h1 class="pdf-h1">AI認識ログ</h1>',
-            raw
-              ? `<div style="white-space:pre-wrap;line-height:1.55;">${esc_(raw)}</div>`
-              : '<div class="pdf-note">※ AI認識ログの内容が空でした</div>',
-            footerNote ? `<div class="pdf-note" style="margin-top:10px;">${esc_(footerNote)}</div>` : ''
-          ].join('\n')));
-        } else {
-          // detailsごとにページ化（AI名は一切出さない）
-          // ★ 高さで分割して「table行のまま」複数ページ化する（切れ防止）
-          const A4_H_PX = 1123; // stage.width=794px 前提のA4高さ(約)
-          const PAD_T = 22;     // .pdf-page padding top（あなたのCSSと一致させる）
-          const PAD_B = 26;     // .pdf-page padding bottom
-          const SAFE_EXTRA = 30; // 余裕（ヘッダ/フッタ相当の安全分）
-          const MAX_PAGE_H = A4_H_PX - PAD_T - PAD_B - SAFE_EXTRA;
-
-          // 計測用ステージ（1回だけ作って使い回す）
-          const __measureStage = (function(){
-            try{
-              const d = document.createElement('div');
-              d.style.position = 'fixed';
-              d.style.left = '-100000px';
-              d.style.top  = '0';
-              d.style.width = '794px';
-              d.style.background = '#fff';
-              d.style.pointerEvents = 'none';
-              d.style.zIndex = '-1';
-              document.body.appendChild(d);
-              return d;
-            }catch(_){ return null; }
+        const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        try{ await subPage.waitForTimeout(150); }catch(_){ }
+        try {
+          const contentType = resp && typeof resp.headerValue === 'function'
+            ? await resp.headerValue('content-type')
+            : ((resp && typeof resp.headers === 'function') ? (resp.headers()['content-type'] || null) : null);
+          const finalUrl = (() => {
+            try { return resp && typeof resp.url === 'function' ? resp.url() : subPage.url(); } catch (_) { return url; }
           })();
-
-          function measureHtmlHeight_(html){
-            if (!__measureStage) return 999999;
-            __measureStage.innerHTML = '';
-            const page = document.createElement('section');
-            page.className = 'pdf-page pdf-report-ai';
-            // paddingはCSSが当たるのでここでは入れない
-            page.appendChild(htmlToEl_(html));
-            __measureStage.appendChild(page);
-            // scrollHeight の方が確実
-            const h = page.scrollHeight || page.getBoundingClientRect().height || 999999;
-            return Math.ceil(h);
-          }
-
-          // payload（全文）を「行」単位で分割し、A4に収まる最大量でページを切る
-          function splitPayloadByHeight_(baseHtmlBuilder, payloadText){
-            const src = String(payloadText || '').replace(/\r\n/g, '\n');
-            if (!src.trim()) return ['—'];
-
-            // まず改行で行配列
-            let lines = src.split('\n');
-
-            // 長すぎる1行（URL/コード等）は先に適当に折る（高さ測定の安定化）
-            const HARD_WRAP = 220; // 1行がこれ以上なら文字で折る
-            const fixed = [];
-            lines.forEach(l=>{
-              l = String(l || '');
-              if (l.length <= HARD_WRAP) { fixed.push(l); return; }
-              let s = l;
-              while (s.length){
-                fixed.push(s.slice(0, HARD_WRAP));
-                s = s.slice(HARD_WRAP);
-              }
-            });
-            lines = fixed;
-
-            const parts = [];
-            let idx = 0;
-
-            while (idx < lines.length){
-              // 二分探索で「収まる最大行数」を探す
-              let lo = 1;
-              let hi = Math.min(lines.length - idx, 600); // 念のため上限
-              let best = 1;
-
-              while (lo <= hi){
-                const mid = (lo + hi) >> 1;
-                const chunk = lines.slice(idx, idx + mid).join('\n') || '—';
-                const html = baseHtmlBuilder(chunk);
-                const h = measureHtmlHeight_(html);
-
-                if (h <= MAX_PAGE_H){
-                  best = mid;
-                  lo = mid + 1;
-                }else{
-                  hi = mid - 1;
-                }
-              }
-
-              const out = lines.slice(idx, idx + best).join('\n') || '—';
-              parts.push(out);
-              idx += best;
-
-              // それでも全然進まない（=1行でも溢れる）場合の保険：文字で強制切り
-              if (best === 1){
-                const one = String(lines[idx - 1] || '');
-                if (one.length > 80){
-                  const head = one.slice(0, 80);
-                  const tail = one.slice(80);
-                  parts[parts.length - 1] = head;
-                  lines.splice(idx, 0, tail);
-                }
-              }
-            }
-
-            return parts.length ? parts : ['—'];
-          }
-
-          detailsList.forEach((det, idx) => {
-            const aiTitle = (det.querySelector('summary')?.textContent || '').trim();
-            const metaEl    = det.querySelector('.muted[id$="Meta"]');
-            const queryEl   = det.querySelector('[id$="ViewQuery"]');
-            const payloadEl = det.querySelector('[id$="ViewPayload"]');
-
-            const meta    = (metaEl?.textContent || '').trim();
-            const query   = (queryEl?.textContent || '').trim();
-            const payload = (payloadEl?.textContent || '').trim();
-
-            // 1ページ目：従来の見た目（AI名/保存日時/検索語句/観測結果）
-            function buildAiHtml_First_(payloadChunk){
-              const hasMore = !!(payloadChunk && String(payloadChunk).trim()) && !!(payload && String(payload).trim()) && (String(payloadChunk).length < String(payload).length);
-              // ↑ hasMore は「続きページがあるときだけ出したい」なら使う（雑でもOK）
-
-              return [
-                '<h1 class="pdf-h1">AI認識ログ</h1>',
-                aiTitle ? `<h2 class="pdf-h2">${esc_(aiTitle)}</h2>` : '',
-
-                '<table class="pdf-table">',
-                  '<tr><th style="width:26%;">項目</th><th>内容</th></tr>',
-                  `<tr><td>検索語句</td><td style="white-space:pre-wrap;word-break:break-word;">${esc_(query || '—')}</td></tr>`,
-                  `<tr><td>観測結果（全文）</td><td style="white-space:pre-wrap;word-break:break-word;">${esc_(payloadChunk || '—')}</td></tr>`,
-
-                  // ★ 追加：表の末尾に「次ページへ続く…」を入れる（見た目はほぼ変えず、表の一部として出す）
-                  // (hasMore ? [
-                  //   '<tr>',
-                  //     '<td colspan="2" style="text-align:right;font-size:12px;color:#6b7280;padding-top:6px;">',
-                  //       '（次ページへ続く…）',
-                  //     '</td>',
-                  //   '</tr>',
-                  // ].join('') : ''),
-
-                '</table>',
-              ].filter(Boolean).join('\n');
-            }
-
-            // 2ページ目以降：続きだけ（AI名/検索語句は出さない）
-            // ※ 見た目を変えないため、table自体は維持するが行は「続き」だけにする
-            function buildAiHtml_Cont_(payloadChunk, partLabel){
-              return [
-                '<h1 class="pdf-h1">AI認識ログ</h1>',
-
-                // ★ 続きページは見出し（観測結果（続き）（2/2））を出さない
-                // 代わりに table の行ラベルだけで “続き” を表現する
-                '<table class="pdf-table">',
-                  '<tr><th style="width:26%;">項目</th><th>内容</th></tr>',
-                  `<tr><td>観測結果（続き）</td><td style="white-space:pre-wrap;word-break:break-word;">${esc_(payloadChunk || '—')}</td></tr>`,
-                '</table>',
-              ].join('\n');
-            }
-
-            // まず「高さで」payloadを分割
-            const parts = splitPayloadByHeight_(
-              (chunk) => buildAiHtml_First_(chunk), // 計測は1ページ目の骨格でOK（より厳しめ）
-              payload
-            );
-
-            const total = parts.length;
-
-            for (let pi=0; pi<total; pi++){
-              const label = (total > 1) ? `（${pi+1}/${total}）` : '';
-
-              if (pi === 0){
-                root.appendChild(makePage_('pdf-report-ai', buildAiHtml_First_(parts[pi])));
-              }else{
-                root.appendChild(makePage_('pdf-report-ai', buildAiHtml_Cont_(parts[pi], label)));
-              }
-            }
-
-            // 最後の注記は「最後のAIの最後の分割ページ」だけに付ける（仕様維持）
-            if (footerNote && idx === detailsList.length - 1 && total > 0){
-              // 最後に追加したページの末尾に注記を追記（簡単に：別ブロックとして追記）
-              // ※ここは“見た目を変えない”なら、注記は従来通り最終ページに出すだけでOK
-              // 既に上で抑制しているので、ここで1回だけ出す
-              const html = [
-                '<h1 class="pdf-h1">AI認識ログ</h1>',
-                '<div class="pdf-note">※</div>',
-                `<div class="pdf-note" style="margin-top:10px;">${esc_(footerNote)}</div>`
-              ].join('\n');
-              // 注記専用ページが嫌なら、この3行はコメントアウトしてOK
-              // root.appendChild(makePage_('pdf-report-ai', html));
-            }
-          });
-
-          try{ __measureStage && __measureStage.remove(); }catch(_){}
-        }
-      }
-    }catch(e){
-      root.appendChild(makePage_('pdf-report-ai', [
-        '<h1 class="pdf-h1">AI認識ログ</h1>',
-        '<div class="pdf-note">※ AI認識ログの取り込みで例外が発生しました</div>'
-      ].join('\n')));
-    }
-    }
-
-    // 5) AIO check（AI可視性に関する対応状況：1ページだけ・まずは枠だけ）
-    try{
-	      function buildAioCheckHtml_(rows, summary){
-	        rows = Array.isArray(rows) ? rows : [];
-	        summary = (summary && typeof summary === 'object') ? summary : {};
-	        // rows: [{label, statusText}]  statusText は「✔ 確認されました / ✖ 現時点では確認されていません / － このサイト種別では必須ではありません / —」など
-	        const trs = rows.map(r=>{
-          const label = esc_(String(r && r.label || '—'));
-
-	          // statusText は旧表記も受け取り、PDFでは色付きの丸印表示へ寄せる。
-	          const st = detailStatusMark_(r && r.statusText);
-
-	          // statusNote: ▲ のときだけ入れる「確認できた内容 / 推奨対応」（任意）
-	          const noteRaw = (r && r.statusNote) ? String(r.statusNote) : '';
-	          const note = noteRaw.trim()
-	            ? `<div class="pdf-text" style="margin-top:4px;font-size:12px;line-height:1.55;color:#333;">${hangingLinesHtml_(noteRaw)}</div>`
-	            : '';
-
-			          return `<tr><td>${label}</td><td>${st}${note}</td></tr>`;
-			        }).join('\n');
-
-	        function hangingLinesHtml_(text){
-	          return String(text || '').split(/\n/).map(line => {
-	            const raw = String(line || '');
-	            const isBullet = raw.trim().indexOf('・') === 0;
-	            const style = isBullet
-	              ? 'padding-left:1.15em;text-indent:-1.15em;'
-	              : '';
-	            return '<div style="' + style + '">' + esc_(raw) + '</div>';
-	          }).join('');
-	        }
-
-	        function bulletListHtml_(items){
-	          const bullets = Array.isArray(items) ? items.filter(Boolean).slice(0, 4) : [];
-	          if (!bullets.length) return '';
-	          return '<div style="margin-top:8px;font-size:11.5px;line-height:1.5;color:#333;">' +
-	            bullets.map(b => '<div style="padding-left:1.15em;text-indent:-1.15em;">・' + esc_(String(b)) + '</div>').join('') +
-	          '</div>';
-	        }
-
-		        function detailStatusLabel_(raw){
-		          const s = String(raw || '').trim();
-		          if (s.indexOf('一部') >= 0 || s.indexOf('△') >= 0 || s.indexOf('必須ではありません') >= 0) return '一部確認';
-		          if (s.indexOf('確認されました') >= 0 || s.indexOf('✔') >= 0 || s === '良好') return '確認されました';
-		          if (s.indexOf('未配置') >= 0) return '未配置';
-		          if (!s || s === '—' || s === 'ー') return '現時点では確認されていません';
-		          if (s.indexOf('確認できません') >= 0 || s.indexOf('未観測') >= 0 || s.indexOf('未確認') >= 0 || s.indexOf('✖') >= 0) return '現時点では確認されていません';
-		          return '現時点では確認されていません';
-		        }
-
-		        function detailStatusMark_(raw){
-		          const label = detailStatusLabel_(raw);
-		          const color = label === '確認されました'
-		            ? '#16934a'
-		            : label === '一部確認'
-		              ? '#c78500'
-		              : '#d12f2f';
-			          return '<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;line-height:1.45;color:#1f2937;white-space:nowrap;">' +
-		            '<span style="font-size:11px;color:' + color + ';">●</span>' +
-		            '<span>' + esc_(label) + '</span>' +
-		          '</span>';
-		        }
-
-	        function statusPill_(card){
-	          const bg = String(card && card.statusBg || '#eef2f7');
-	          const color = String(card && card.statusColor || '#333');
-	          const border = String(card && card.statusBorder || '#cbd5e1');
-	          return '<span style="display:inline-block;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700;background:' + bg + ';color:' + color + ';border:1px solid ' + border + ';white-space:nowrap;">' +
-	            esc_(String(card && card.status || '—')) +
-	          '</span>';
-	        }
-
-		        function summaryCard_(card){
-		          card = (card && typeof card === 'object') ? card : {};
-		          const bulletHtml = bulletListHtml_(card.bullets);
-		          return [
-	            '<div style="flex:1;min-width:0;border:1px solid #d8dee8;border-radius:12px;padding:13px 12px 12px;background:#ffffff;box-shadow:0 1px 3px rgba(15,23,42,0.04);">',
-	              '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">',
-	                '<div style="font-size:13.5px;font-weight:800;color:#111827;line-height:1.35;">' + esc_(String(card.title || '—')) + '</div>',
-	                statusPill_(card),
-	              '</div>',
-	              '<div class="pdf-text" style="margin-top:9px;font-size:12px;line-height:1.62;color:#1f2937;">' + esc_(String(card.body || '')).replace(/\n/g, '<br>') + '</div>',
-	              bulletHtml,
-	            '</div>'
-	          ].join('');
-	        }
-
-	        const cardsHtml = [
-	          summaryCard_(summary.policy),
-	          summaryCard_(summary.multimodal),
-	          summaryCard_(summary.structure)
-	        ].join('\n');
-
-	        return [
-	          // 章タイトル
-	          '<h1 class="pdf-h1">GEO診断</h1>',
-	          '<h2 class="pdf-h2">AI可視性に関する対応状況</h2>',
-
-	          '<div class="pdf-text" style="font-size:12.5px;line-height:1.6;margin-top:4px;color:#1f2937;">',
-	            'AIから見た公開設計を、方針・マルチモーダル情報・サイト構造の3つに分けて整理します。',
-	          '</div>',
-
-	          '<div style="display:flex;gap:10px;margin-top:12px;align-items:stretch;">',
-	            cardsHtml,
-	          '</div>',
-
-	          '<div style="margin-top:12px;font-size:12.5px;font-weight:800;color:#1f2937;">詳細チェック</div>',
-	          '<table class="pdf-table" style="margin-top:6px;font-size:11.5px;line-height:1.45;">',
-	            '<tr><th style="width:42%;">項目</th><th>状況</th></tr>',
-	            trs,
-	          '</table>',
-	        ].join('\n');
-	      }
-
-      // --- AIOチェック：実データが取れれば✔/✖/－にする（取れなければ — のまま） ---
-      function pickFactsForAioCheck_(){
-        // SSOT: 直近診断の結果（PDF生成時に参照できる）
-        try{
-          const r = (typeof window !== 'undefined' && window.__AIO_LAST_RES__) ? window.__AIO_LAST_RES__ : null;
-          if (r && typeof r === 'object'){
-            if (r.aioCheck && typeof r.aioCheck === 'object') return r.aioCheck;
-            if (r.facts && typeof r.facts === 'object') return r.facts;
-            // 念のため救済：facts が直置きされている形式
-            if (r.auditSig || r.trust || r.data) return r;
-          }
-        }catch(_){}
-        return null;
-      }
-
-	      function statusText_(v){
-	        // v: true/false/null/undefined
-	        if (v === true)  return '確認されました';
-	        if (v === null)  return '一部確認';
-	        if (v === false) return '現時点では確認されていません';
-	        // undefined は未判定
-	        return '現時点では確認されていません';
-	      }
-
-      // === [AIOCHECK][POLICY-TRI-STATE v1] AI向け利用方針だけ △ 表示を許可 ===
-      function statusTextPolicy_(aiPolicyBool, hasDecl){
-	        if (aiPolicyBool === true)  return '確認されました';
-	        if (aiPolicyBool === false) return '現時点では確認されていません';
-
-        // aiPolicy が未判定でも「宣言の示唆」が取れていれば △
-	        if (hasDecl === true) return '一部確認';
-
-	        return '現時点では確認されていません';
-	      }
-
-      function normalizeSiteTypeCode_(siteType){
-        // 4種だけ：corp / ec / media / saas
-        try{
-          if (!siteType) return '';
-
-          // 文字列ならそのまま正規化
-          if (typeof siteType === 'string'){
-            const s = siteType.trim().toLowerCase();
-            if (s === 'corp' || s === 'corporate') return 'corp';
-            if (s === 'ec'   || s === 'ecommerce') return 'ec';
-            if (s === 'media' || s === 'news') return 'media';
-            if (s === 'saas' || s === 'service') return 'saas'; // もし過去混在が残っててもsaasへ寄せる
-            return '';
-          }
-
-          // オブジェクト（snapshotJSON.siteType）を想定
-          if (typeof siteType === 'object'){
-            if (siteType.isSaaSOrService) return 'saas';
-            if (siteType.isEC)           return 'ec';
-            if (siteType.isMedia)        return 'media';
-            if (siteType.isCorporate)    return 'corp';
-            return '';
-          }
-        }catch(_){}
-        return '';
-      }
-
-      function statusTextMcp_(v, siteType){
-        // v: true/false/null/undefined
-        if (v === true)  return '✔ 確認されました';
-
-        if (v === false){
-          const st = normalizeSiteTypeCode_(siteType);
-
-          // siteType 不明でも「一般サイト寄り」扱い（あなたの方針維持）
-          if (!st) return '－ このサイト種別では必須ではありません';
-
-          // 「MCPが必須じゃない」＝ corp/ec/media
-          const isNotRequired = (st === 'corp' || st === 'ec' || st === 'media');
-
-          return isNotRequired ? '－ このサイト種別では必須ではありません'
-                              : '✖ 現時点では確認されていません'; // saas はここに落ちる
-        }
-
-        // null/undefined は未判定
-        return '—';
-      }
-
-      function boolFromFacts_(f, path){
-        // path: 'auditSig.hasSitemapXml' のようなドットパス
-        try{
-          const ps = String(path||'').split('.');
-          let cur = f;
-          for (let i=0;i<ps.length;i++){
-            if (!cur || typeof cur !== 'object') return undefined;
-            cur = cur[ps[i]];
-          }
-          return (typeof cur === 'boolean') ? cur : undefined;
-        }catch(_){ return undefined; }
-      }
-
-      function anyHrefIncludes_(needle){
-        try{
-          const n = String(needle||'').toLowerCase();
-          const as = Array.from(document.querySelectorAll('a[href]'));
-          for (const a of as){
-            const href = String(a.getAttribute('href')||'').toLowerCase();
-            if (href.includes(n)) return true;
-          }
-        }catch(_){}
-        return undefined; // 断定しない（リンクが無い＝存在しない、ではないので）
-      }
-
-      function hasExternalRefHint_(f){
-        // “外部評価情報への参照点”は、GBP/Maps などの「入口」があれば✔
-        // facts があれば sameAs / placeId 系から拾う。無ければ DOM の maps リンクだけ軽く拾う。
-        try{
-          // JSON-LD解析結果が facts に入っている想定の救済（ある場合だけ）
-          const sig = (f && typeof f.auditSig === 'object') ? f.auditSig : {};
-          // 例：sig.hasGoogleMapsLink / sig.hasPlaceId 等があるならそれを使う
-          const b1 = (typeof sig.hasGoogleMapsLink === 'boolean') ? sig.hasGoogleMapsLink : undefined;
-          if (b1 !== undefined) return b1;
-
-          const b2 = (typeof sig.hasPlaceId === 'boolean') ? sig.hasPlaceId : undefined;
-          if (b2 !== undefined) return b2;
-        }catch(_){}
-
-        // DOMベース（弱いが“入口がある”の事実としては十分）
-        try{
-          const as = Array.from(document.querySelectorAll('a[href]'));
-          for (const a of as){
-            const href = String(a.getAttribute('href')||'');
-            if (!href) continue;
-            const h = href.toLowerCase();
-            if (h.includes('google.com/maps') || h.includes('goo.gl/maps') || h.includes('maps.app.goo.gl')) return true;
-            if (h.includes('g.page/')) return true; // Googleビジネスプロフィール短縮
-          }
-        }catch(_){}
-        return null; // 見つからなければ「未判定」
-      }
-
-      // === [PDF][AIOCHECK][FACTS-SOURCE v1] pickFactsForAioCheck_ に依存せず、直近resから読む ===
-	      const f0 = (function(){
-	        try{
-	          // 1) いま実際に入っている場所（あなたの確認結果）
-	          if (window.__AIO_LAST_RES__ && typeof window.__AIO_LAST_RES__ === 'object') return window.__AIO_LAST_RES__;
-	          if (window.__AIO_LAST_SS_RES__ && typeof window.__AIO_LAST_SS_RES__ === 'object') return window.__AIO_LAST_SS_RES__;
-	          if (window.__AIO_DEBUG_LAST_SS_RESULT && typeof window.__AIO_DEBUG_LAST_SS_RESULT === 'object') return window.__AIO_DEBUG_LAST_SS_RESULT;
-	        }catch(_){}
-	        return null;
-	      })();
-
-	      const snapshot0 = (function(){
-	        try{
-	          return (f0 && f0.snapshot   && typeof f0.snapshot   === 'object') ? f0.snapshot :
-	            (f0 && f0.snapshotJSON && typeof f0.snapshotJSON === 'object') ? f0.snapshotJSON :
-	            (f0 && f0.snap       && typeof f0.snap       === 'object') ? f0.snap :
-	            null;
-	        }catch(_){}
-	        return null;
-	      })();
-
-	      // === [PDF][AIOCHECK-READ v1] snapshotJSON.aioCheck（永続）を最優先で読む ===
-	      const aioCheck0 = (function(){
-	        try{
-	          // 1) facts 直下に aioCheck がある（将来用）
-	          if (f0 && f0.aioCheck && typeof f0.aioCheck === 'object') return f0.aioCheck;
-
-	          // 2) SSから復元した snapshotJSON が facts にぶら下がっている場合（よくある）
-	          //    ここは実装揺れがあるので "snapshot" / "snapshotJSON" / "snap" を順に見る
-	          if (snapshot0 && snapshot0.aioCheck && typeof snapshot0.aioCheck === 'object') return snapshot0.aioCheck;
-	        }catch(_){}
-	        return null;
-	      })();
-
-	      const multimodal0 = (function(){
-	        try{
-	          const candidates = [
-	            f0 && f0.multimodalSignals,
-	            f0 && f0.auditSig && f0.auditSig.multimodalSignals,
-	            f0 && f0.enrichedObservations && f0.enrichedObservations.multimodalSignals,
-	            snapshot0 && snapshot0.multimodalSignals,
-	            snapshot0 && snapshot0.auditSig && snapshot0.auditSig.multimodalSignals,
-	            snapshot0 && snapshot0.enrichedObservations && snapshot0.enrichedObservations.multimodalSignals,
-	            snapshot0 && snapshot0.observations && snapshot0.observations.multimodalSignals
-	          ];
-	          for (let i = 0; i < candidates.length; i++) {
-	            const v = candidates[i];
-	            if (v && typeof v === 'object' && !Array.isArray(v)) return v;
-	          }
-	        }catch(_){}
-	        return null;
-	      })();
-
-      const siteType0 =
-        (aioCheck0 && (aioCheck0.siteType || aioCheck0.siteMode)) ||
-        (f0 && (
-          f0.siteType ||
-          f0.siteMode ||
-          (f0.meta && (f0.meta.siteType || f0.meta.siteMode))
-        )) ||
-        undefined;
-
-      function findBoolDeep_(obj, key){
-        // obj のどこかに { [key]: true/false } があればそれを返す
-        try{
-          const seen = new Set();
-          function walk(o, depth){
-            if (!o || typeof o !== 'object') return undefined;
-            if (seen.has(o)) return undefined;
-            seen.add(o);
-            if (depth > 12) return undefined; // 深掘りしすぎ防止
-
-            if (Object.prototype.hasOwnProperty.call(o, key)){
-              const v = o[key];
-              if (typeof v === 'boolean') return v;
-            }
-            for (const k in o){
-              if (!Object.prototype.hasOwnProperty.call(o, k)) continue;
-              const v = o[k];
-              if (v && typeof v === 'object'){
-                const hit = walk(v, depth + 1);
-                if (hit !== undefined) return hit;
-              }
-            }
-            return undefined;
-          }
-          return walk(obj, 0);
-        }catch(_){
-          return undefined;
-        }
-      }
-
-      // 1) AI向け利用方針（まず永続 aioCheck を最優先）
-      let hasAiPolicy =
-        (aioCheck0 && typeof aioCheck0.aiPolicy === 'boolean') ? aioCheck0.aiPolicy :
-        boolFromFacts_(f0, 'aiPolicy') ??
-        undefined;
-
-      // 2) robots.txt（aioCheck を最優先）
-      let hasRobots =
-        (aioCheck0 && typeof aioCheck0.hasRobotsTxt === 'boolean') ? aioCheck0.hasRobotsTxt :
-        boolFromFacts_(f0, 'hasRobotsTxt') ??
-        undefined;
-
-      // 3) sitemap.xml（aioCheck を最優先）
-      let hasSitemap =
-        (aioCheck0 && typeof (aioCheck0.hasSitemapXml ?? aioCheck0.sitemap) === 'boolean')
-          ? (aioCheck0.hasSitemapXml ?? aioCheck0.sitemap)
-          : (boolFromFacts_(f0, 'hasSitemapXml') ?? boolFromFacts_(f0, 'sitemap') ?? findBoolDeep_(f0, 'hasSitemapXml'));
-
-      // 4) 構造化宣言（aioCheck を最優先…ただし false は auditSig で救済）
-      const sig = (f0 && typeof f0.auditSig === 'object') ? f0.auditSig : {};
-
-      let hasStructuredDecl =
-        (aioCheck0 && typeof aioCheck0.hasStructuredDecl === 'boolean') ? aioCheck0.hasStructuredDecl :
-        (boolFromFacts_(f0, 'hasStructuredDecl') ?? undefined);
-
-      // ★救済：×(false) でも JSON-LD検出があるなら △(null) に引き上げ
-      try{
-        const hasAnyJsonld =
-          (sig.hasOrgJsonLd === true) ||
-          (sig.hasWebsiteJsonLd === true) ||
-          (sig.jsonldDetected === true) ||
-          (typeof sig.jsonldCount === 'number' && sig.jsonldCount > 0);
-
-        if (hasStructuredDecl === false && hasAnyJsonld) {
-          // 「自社宣言として確定はできないが、構造化データ自体はある」扱い
-          hasStructuredDecl = null;
-        }
-      }catch(_){}
-
-      // 5) MCP（aioCheck を最優先）
-      let hasMcp = (function(){
-        try{
-          // 1) SS保存済み aioCheck を最優先
-          if (aioCheck0 && typeof aioCheck0.hasMcpEndpoint === 'boolean') {
-            return aioCheck0.hasMcpEndpoint;
-          }
-          // 2) 次に facts（復元揺れ用）
-          const b = boolFromFacts_(f0, 'hasMcpEndpoint');
-          if (typeof b === 'boolean') return b;
-
-          // 3) それ以外は未判定
-          return undefined;
-        }catch(_){
-          return undefined;
-        }
-      })();
-
-      // 6) 外部評価情報への参照点（aioCheck を最優先）
-	      let hasExternalRef =
-	        (aioCheck0 && typeof aioCheck0.hasExternalRefHint === 'boolean') ? aioCheck0.hasExternalRefHint :
-	        boolFromFacts_(f0, 'hasExternalRefHint') ??
-	        boolFromFacts_(f0, 'externalRef') ??
-	        hasExternalRefHint_(f0);
-
-	      const mmImage0 = (multimodal0 && multimodal0.image && typeof multimodal0.image === 'object') ? multimodal0.image : {};
-	      const mmStructured0 = (multimodal0 && multimodal0.structured && typeof multimodal0.structured === 'object') ? multimodal0.structured : {};
-	      const mmVideo0 = (multimodal0 && multimodal0.video && typeof multimodal0.video === 'object') ? multimodal0.video : {};
-	      const mmAudio0 = (multimodal0 && multimodal0.audio && typeof multimodal0.audio === 'object') ? multimodal0.audio : {};
-	      const hasMultimodalChecked0 = !!(multimodal0 && multimodal0.checked === true);
-	      const hasOgImage0 = !!(mmImage0.hasOgImage === true || String(mmImage0.ogImageUrl || '').trim());
-	      const hasTwitterImage0 = !!(mmImage0.hasTwitterImage === true || String(mmImage0.twitterImageUrl || '').trim());
-	      const hasFavicon0 = !!(mmImage0.hasFavicon === true || String(mmImage0.faviconUrl || '').trim());
-	      const hasAppleTouchIcon0 = !!(mmImage0.hasAppleTouchIcon === true || String(mmImage0.appleTouchIconUrl || '').trim());
-	      const hasAnyBasicMediaMeta0 = hasOgImage0 || hasTwitterImage0 || hasFavicon0 || hasAppleTouchIcon0;
-	      const hasStructuredLogo0 = !!(mmStructured0.hasStructuredLogo === true || String(mmStructured0.structuredLogoUrl || '').trim());
-	      const hasImageObject0 = Number(mmStructured0.imageObjectCount || 0) > 0;
-	      const hasStructuredImage0 = Number(mmStructured0.structuredImageCount || 0) > 0;
-	      const hasPrimaryImage0 = !!String(mmStructured0.primaryImageOfPage || '').trim();
-	      const hasVideoObject0 = !!(mmVideo0.hasVideoObject === true || Number(mmVideo0.videoObjectCount || 0) > 0);
-		      const hasAudioObject0 = !!(mmAudio0.hasAudioObject === true || Number(mmAudio0.audioObjectCount || 0) > 0);
-		      const hasAnyStructuredMedia0 = hasStructuredLogo0 || hasImageObject0 || hasStructuredImage0 || hasPrimaryImage0 || hasVideoObject0 || hasAudioObject0;
-		      const structuredMediaStrong0 = hasStructuredLogo0 && (hasImageObject0 || hasStructuredImage0 || hasPrimaryImage0);
-
-		      const aioSummary0 = (function(){
-		        const okStyle = {
-		          statusBg: '#e8f7ee',
-		          statusColor: '#166534',
-		          statusBorder: '#9bd8ae'
-		        };
-		        const warnStyle = {
-		          statusBg: '#fff7db',
-		          statusColor: '#92400e',
-		          statusBorder: '#e6c36a'
-		        };
-		        const badStyle = {
-		          statusBg: '#fee2e2',
-		          statusColor: '#991b1b',
-		          statusBorder: '#f1a5a5'
-		        };
-
-		        const hasLlmsTxt0 = !!(aioCheck0 && (aioCheck0.hasLlmsTxt === true || String(aioCheck0.llmsTxtUrl || '').trim()));
-		        const hasLlmsFullTxt0 = !!(aioCheck0 && (aioCheck0.hasLlmsFullTxt === true || String(aioCheck0.llmsFullTxtUrl || '').trim()));
-		        const hasRobotsAiPolicy0 = !!(aioCheck0 && aioCheck0.robotsAiBotHints === true);
-		        const policyStrong0 = hasLlmsFullTxt0 || hasLlmsTxt0;
-		        const policyPartial0 = !policyStrong0 && hasRobotsAiPolicy0;
-			        const policyStatus0 = policyStrong0
-			          ? Object.assign({ status: '良好' }, okStyle)
-			          : policyPartial0
-			            ? Object.assign({ status: '一部対応' }, warnStyle)
-			            : Object.assign({ status: '要整備' }, badStyle);
-
-			        const multimodalStatus0 = (hasAnyBasicMediaMeta0 && structuredMediaStrong0)
-			          ? Object.assign({ status: '良好' }, okStyle)
-			          : hasAnyBasicMediaMeta0
-			            ? Object.assign({ status: '一部対応' }, warnStyle)
-			            : Object.assign({ status: '要整備' }, badStyle);
-
-		        const sameAsCnt0 = (typeof sig.sameAsCount === 'number' && sig.sameAsCount > 0) ? sig.sameAsCount : 0;
-		        const hasStructureBase0 = (hasSitemap === true) || (hasStructuredDecl === true) || (hasStructuredDecl === null) || sameAsCnt0 > 0;
-			        const structureStatus0 = hasStructureBase0
-			          ? Object.assign({ status: '良好' }, okStyle)
-			          : Object.assign({ status: '要整備' }, badStyle);
-
-		        return {
-		          policy: Object.assign({
-		            title: 'AI向け公開方針',
-		            body: policyStrong0
-		              ? 'AI向け公開情報ファイルを確認できます。robots.txt の方針と合わせて、AIが参照しやすい公開設計になっています。'
-		              : policyPartial0
-		                ? 'AIクローラー方針は robots.txt で確認できます。一方で、AI向け公開情報ファイル（llms.txt / llms-full.txt）は確認対象URLでは未配置です。'
-		                : 'AIクローラー向けの方針や、AI向け公開情報ファイルは観測範囲では確認できていません。',
-		            bullets: [
-		              'robots.txt AIクローラー方針: ' + (hasRobotsAiPolicy0 ? '確認' : '確認できず'),
-		              'llms.txt: ' + (hasLlmsTxt0 ? '確認' : '未配置'),
-		              'llms-full.txt: ' + (hasLlmsFullTxt0 ? '確認' : '未配置')
-		            ]
-		          }, policyStatus0),
-
-		          multimodal: Object.assign({
-		            title: 'AI向けマルチモーダル情報',
-		            body: hasAnyBasicMediaMeta0
-		              ? 'OGP画像やアイコン情報は確認できます。一方で、AIが画像やメディア情報を機械的に理解しやすくする構造化情報は限定的です。'
-		              : '画像やアイコンの基本メタ情報、構造化メディア情報ともに観測範囲では限定的です。',
-		            bullets: [
-		              'OGP / twitter:image: ' + ((hasOgImage0 || hasTwitterImage0) ? '確認' : '確認できず'),
-		              'favicon / apple-touch-icon: ' + ((hasFavicon0 || hasAppleTouchIcon0) ? '確認' : '確認できず'),
-		              '実装ヒント: structured logo / ImageObject',
-		              'VideoObject / AudioObject: ' + ((hasVideoObject0 || hasAudioObject0) ? '一部確認' : '必要時に整備')
-		            ]
-		          }, multimodalStatus0),
-
-			          structure: Object.assign({
-			            title: 'AI可読なサイト構造',
-			            body: hasStructureBase0
-			              ? 'サイト構造や運営主体に関する基本入口は成立しています。良好は改善余地ゼロではなく、AIにとって読めない状態ではないという意味です。'
-			              : 'サイト構造や運営主体に関する機械可読な情報は、観測範囲では限定的です。',
-		            bullets: [
-		              'sitemap.xml: ' + (hasSitemap === true ? '確認' : '確認できず'),
-		              'WebSite / Organization: ' + (hasStructuredDecl === true ? '確認' : hasStructuredDecl === null ? '一部確認' : '確認できず'),
-		              'sameAs: ' + (sameAsCnt0 > 0 ? String(sameAsCnt0) + '件' : '確認できず')
-		            ]
-		          }, structureStatus0),
-
-		        };
-		      })();
-
-		      const rows0 = [
-	        {
-		          label: 'AIクローラー方針（robots.txt）',
-          statusText: (function(){
-            try{
-              // decl は「宣言を確認できた時だけ true」それ以外は null 扱い（= 断定しない）
-              const decl =
-                (aioCheck0 && aioCheck0.hasAiPolicyDeclaration === true) ? true :
-                (boolFromFacts_(f0, 'hasAiPolicyDeclaration') === true) ? true :
-                null;
-
-              const v = hasAiPolicy; // true / false / null / undefined
-
-	              // 表示ルール（仕様は変えず、見せ方だけ明確化）
-	              if (decl === true) return '確認されました';
-	              if (v === true)    return '一部確認'; // 示唆はあるが「宣言」は確認できない
-	              return '現時点では確認されていません';
-	            }catch(_){
-	              return '現時点では確認されていません';
-	            }
-          })(),
-          statusNote: (function(){
-            try{
-              const decl =
-                (aioCheck0 && aioCheck0.hasAiPolicyDeclaration === true) ? true :
-                (boolFromFacts_(f0, 'hasAiPolicyDeclaration') === true) ? true :
-                false;
-
-              const v = hasAiPolicy; // true / false / null / undefined
-
-              // ○：明示宣言あり → 注記なし
-              if (decl === true) return '';
-
-	              // △：示唆あり（robots 等）
-	              if (v === true) {
-	                return 'robots.txt でAIクローラー方針を確認できます。一方で、AI向け公開情報ファイル（llms.txt / llms-full.txt）は確認対象URLでは未配置です';
-	              }
-
-	              // ×：取得できたが宣言なし
-	              if (v === false) {
-	                return 'AIクローラー方針やAI向け公開情報ファイルは、観測範囲では確認できませんでした';
-	              }
-
-              // ー：未観測・判定不能
-              return 'AI利用に関する方針や意図を示す記述は未観測、または判定できませんでした';
-
-            }catch(_){
-              return 'AI利用に関する方針や意図を示す記述は未観測、または判定できませんでした';
-            }
-          })()
-        },
-	        {
-	          label: 'llms.txt',
-	          statusText: aioCheck0 && typeof aioCheck0.hasLlmsTxt === 'boolean'
-	            ? (aioCheck0.llmsTxtUrl ? '確認されました' : '未配置')
-	            : '現時点では確認されていません',
-	          statusNote: aioCheck0 && aioCheck0.llmsTxtUrl ? '・検出URL: ' + String(aioCheck0.llmsTxtUrl) : ''
-	        },
-	        {
-	          label: 'llms-full.txt',
-	          statusText: aioCheck0 && typeof aioCheck0.hasLlmsFullTxt === 'boolean'
-	            ? (aioCheck0.llmsFullTxtUrl ? '確認されました' : '未配置')
-	            : '現時点では確認されていません',
-	          statusNote: aioCheck0 && aioCheck0.llmsFullTxtUrl ? '・検出URL: ' + String(aioCheck0.llmsFullTxtUrl) : ''
-	        },
-	        {
-	          label: 'AIクローラー対象トークン',
-	          statusText: statusText_(aioCheck0 && typeof aioCheck0.robotsAiBotHints === 'boolean' ? aioCheck0.robotsAiBotHints : undefined),
-	          statusNote: (function(){
-	            try{
-              const tokens = (aioCheck0 && Array.isArray(aioCheck0.robotsAiBotHintTokens))
-                ? aioCheck0.robotsAiBotHintTokens.filter(Boolean)
-                : [];
-              const source = aioCheck0 && aioCheck0.aiPolicyEvidenceSource
-                ? String(aioCheck0.aiPolicyEvidenceSource)
-	                : '';
-	              const lines = [];
-	              if (tokens.length) lines.push('・AIクローラー方針の対象: ' + tokens.slice(0, 12).join(', '));
-	              if (source) lines.push('・根拠: ' + source);
-	              return lines.join('\n');
-	            }catch(_){
-	              return '';
-	            }
-	          })()
-	        },
-	        {
-	          label: 'AI向けマルチモーダル情報（基本メタ）',
-	          statusText: hasMultimodalChecked0
-	            ? (hasAnyBasicMediaMeta0 ? '確認されました' : '現時点では確認されていません')
-	            : '現時点では確認されていません',
-	          statusNote: (function(){
-	            try{
-	              if (!hasMultimodalChecked0) return '';
-	              const bits = [];
-	              if (hasOgImage0) bits.push('og:image');
-	              if (hasTwitterImage0) bits.push('twitter:image');
-	              if (hasFavicon0) bits.push('favicon');
-	              if (hasAppleTouchIcon0) bits.push('apple-touch-icon');
-	              return bits.length ? '・確認項目: ' + bits.join(', ') : '';
-	            }catch(_){ return ''; }
-	          })()
-	        },
-	        {
-	          label: '構造化メディア情報（JSON-LD）',
-	          statusText: hasMultimodalChecked0
-	            ? (structuredMediaStrong0 ? '確認されました' : '一部確認')
-	            : '現時点では確認されていません',
-	          statusNote: (function(){
-	            try{
-	              if (!hasMultimodalChecked0) return '';
-	              const present = [];
-	              const missing = [];
-	              if (hasStructuredLogo0) present.push('structured logo'); else missing.push('structured logo');
-	              if (hasImageObject0) present.push('ImageObject'); else missing.push('ImageObject');
-	              if (hasPrimaryImage0) present.push('primaryImageOfPage'); else missing.push('primaryImageOfPage');
-	              if (hasVideoObject0) present.push('VideoObject');
-	              if (hasAudioObject0) present.push('AudioObject');
-		              const lines = [];
-		              if (present.length) lines.push('・確認項目: ' + present.join(', '));
-		              if (missing.length) lines.push('・AIが画像やメディア情報を機械的に理解しやすくする余地があります');
-		              if (missing.length) lines.push('・改善余地: ' + missing.join(', '));
-	              if (!hasVideoObject0 && !hasAudioObject0) lines.push('・動画・音声の未検出自体は不足扱いしません');
-	              return lines.join('\n');
-	            }catch(_){ return ''; }
-	          })()
-	        },
-	        { label: 'サイトマップ公開（sitemap.xml）',   statusText: statusText_(hasSitemap) },
-        {
-          label: 'サイト全体・運営主体の構造化データ（自社宣言）',
-          statusText: (function(){
-            try{
-	              // hasStructuredDecl: true=✔ / false=✖ / null=△ / undefined=—
-	              if (hasStructuredDecl === true)  return '確認されました';
-	              if (hasStructuredDecl === null)  return '一部確認';
-	              if (hasStructuredDecl === false) return '現時点では確認されていません';
-	              return '現時点では確認されていません';
-	            }catch(_){ return '現時点では確認されていません'; }
-          })(),
-          statusNote: (function(){
-            try{
-              const sig = (f0 && typeof f0.auditSig === 'object') ? f0.auditSig : {};
-
-              // ✔：強い根拠（Org / WebSite を確認）
-              if (hasStructuredDecl === true) {
-                const bits = [];
-                if (sig.hasOrgJsonLd === true)     bits.push('Organization');
-                if (sig.hasWebsiteJsonLd === true) bits.push('WebSite');
-                const types = bits.length ? bits.join(', ') : '（種別は未特定）';
-                return `・構造化データ（${types}）を確認`;
-              }
-
-              // △：弱い根拠（jsonldDetected/jsonldCount はある）
-              if (hasStructuredDecl === null) {
-                const cnt = (typeof sig.jsonldCount === 'number') ? sig.jsonldCount : 0;
-                if (cnt > 0) return `・構造化データは検出（件数: ${cnt}）しましたが、自社宣言（運営主体/サイト全体）として確定できません`;
-                if (sig.jsonldDetected === true) return '・構造化データは検出しましたが、自社宣言（運営主体/サイト全体）として確定できません';
-                return '・構造化データは一部確認できますが、自社宣言として確定できません';
-              }
-
-              // ✖：未検出
-              if (hasStructuredDecl === false) {
-                return '・サイト全体/運営主体を示す構造化データは確認できませんでした';
-              }
-
-              return '';
-            }catch(_){ return ''; }
-          })()
-        },
-        {
-          label: '外部プロフィール連携（sameAs）',
-          statusText: (function(){
-            try{
-              // 1) 構造化データの sameAs 件数（あれば ✔）
-              const sig = (f0 && typeof f0.auditSig === 'object') ? f0.auditSig : {};
-              const sameAsCnt = (typeof sig.sameAsCount === 'number' && sig.sameAsCount > 0) ? sig.sameAsCount : 0;
-
-	              if (sameAsCnt > 0) return '確認されました';
-
-              // 2) DOM上の外部参照（あれば △）
-              // ※ hasExternalRefHint_(f0) は “外部へつながる入口がある” の弱い証拠
-              const hasDomExternal = (hasExternalRefHint_(f0) === true);
-	              if (hasDomExternal) return '一部確認';
-
-	              // 3) 無ければ未検出
-	              return '現時点では確認されていません';
-	            }catch(_){ return '現時点では確認されていません'; }
-          })(),
-          statusNote: (function(){
-            try{
-              const sig = (f0 && typeof f0.auditSig === 'object') ? f0.auditSig : {};
-              const sameAsCnt = (typeof sig.sameAsCount === 'number' && sig.sameAsCount > 0)
-                ? sig.sameAsCount
-                : 0;
-
-              // 構造化データ sameAs がある場合
-              if (sameAsCnt > 0 && sig.hasJsonLd === true) {
-                return `・構造化データの sameAs を ${sameAsCnt} 件確認`;
-              }
-
-              // 構造化データとしては確定できないが、外部参照候補がある場合
-              if (sameAsCnt > 0 && sig.hasJsonLd !== true) {
-                return `・外部プロフィール候補: ${sameAsCnt} 件`;
-              }
-
-              // 何も無い
-              return '';
-            }catch(_){
-              return '';
-            }
-          })()
-        },
-	      ];
-
-	      root.appendChild(makePage_('pdf-report-aio', buildAioCheckHtml_(rows0, aioSummary0)));
-    }catch(e){
-      try{
-        console.error('[PDF][AIOCHECK][BUILD][ERR]', e && (e.stack || e));
-        window.__AIO_LAST_AIOCHECK_BUILD_ERR__ = String(e && (e.stack || e));
-      }catch(_){}
-
-      root.appendChild(makePage_('pdf-report-aio', [
-        '<h1 class="pdf-h1">GEO診断</h1>',
-        '<h2 class="pdf-h2">AI可視性に関する対応状況</h2>',
-        '<div class="pdf-note">※ AI可視性チェックページの生成で例外が発生しました</div>'
-      ].join('\n')));
-    }
-
-    // 3) Summary page（sections=画面DOMからKPIを抽出して埋める）
-    const kpi = extractKpiFromSections_(sections);
-    console.warn('[PDF][C][KPI]', kpi);
-
-    // 3.1) Summary page DOM（KPIは画面DOMをクローン→computed style焼き付けで“再現”）
-    {
-      const page = document.createElement('section');
-      page.className = 'pdf-page pdf-report-summary';
-
-      page.appendChild(htmlToEl_('<h1 class="pdf-h1">GEO診断</h1>'));
-      // page.appendChild(htmlToEl_('<h2 class="pdf-h2">ランク・総合スコア</h2>'));
-
-      try{
-        const kpiSrc =
-          (sections?.dashboard && sections.dashboard.querySelector('.kpi-row')) ||
-          document.querySelector('.kpi-row') ||
-          null;
-
-        if (kpiSrc){
-          const kpiClone = kpiSrc.cloneNode(true);
-          bakeTree_(kpiSrc, kpiClone);
-
-          // === [PDF][KPI][FILL+WIDTH-FIX v1] 値を“抽出結果”で確実に差し込み + 右詰まり/固定幅を止血 ===
-          try{
-            // 0) まず「どのIDが居るか」確認（次の切り分け用）
-            const ids = Array.from(kpiClone.querySelectorAll('[id]')).map(n=>n.id).filter(Boolean);
-            console.warn('[PDF][KPI][IDS]', ids);
-
-            // 1) 値を差し込む（dv2系IDが居ればそこへ。無ければ旧IDへフォールバック）
-            const scoreText = (kpi && (kpi.score != null)) ? String(kpi.score) : '';
-            const rankText  = (kpi && kpi.rank) ? String(kpi.rank) : '';
-            const diffText  = (kpi && kpi.diffText) ? String(kpi.diffText) : '';
-
-            function setTextByIds_(idList, text){
-              if (!text) return false;
-              for (const id of idList){
-                const el = kpiClone.querySelector('#' + id);
-                if (el){
-                  el.textContent = text;
-                  return true;
-                }
-              }
-              return false;
-            }
-
-            // rank
-            setTextByIds_(['dv2-kpi-rank','dv2-kpiRank','resultRank','dv2-kpi-rank'], rankText);
-
-            // score
-            setTextByIds_(['dv2-kpi-score','dv2-kpiScore','badgeAvg','resultScore','sumBefore'], scoreText);
-
-            // diff（文字列のまま： "+3" 等を維持）
-            setTextByIds_(['dv2-kpi-gap','dv2-kpiDiff','prevDiff','kpiDiff'], diffText);
-
-            // 2) “右端まで伸びる/右詰まり”の主因だけ止血（kpiClone配下限定）
-            //    - 固定px幅/transform/auto margin を最小限に解除
-            kpiClone.style.setProperty('width','100%','important');
-            kpiClone.style.setProperty('max-width','100%','important');
-            kpiClone.style.setProperty('box-sizing','border-box','important');
-
-            // gridの見た目は維持（縦積み禁止）
-            kpiClone.style.setProperty('display','grid','important');
-            kpiClone.style.setProperty('grid-template-columns','repeat(3, minmax(0, 1fr))','important');
-            kpiClone.style.setProperty('gap','12px','important');
-
-            // 子（カード）だけ“幅/位置”を正規化
-            Array.from(kpiClone.querySelectorAll(':scope .card')).forEach(card=>{
-              try{
-                card.style.setProperty('width','100%','important');
-                card.style.setProperty('max-width','100%','important');
-                card.style.setProperty('box-sizing','border-box','important');
-                card.style.setProperty('transform','none','important');
-                card.style.setProperty('left','0','important');
-                card.style.setProperty('right','0','important');
-                card.style.setProperty('margin-left','0','important');
-                card.style.setProperty('margin-right','0','important');
-                card.style.setProperty('min-width','0','important');
-              }catch(_){}
-            });
-
-            console.warn('[PDF][KPI][FILLED]', {rankText, scoreText, diffText});
-          }catch(e){
-            console.warn('[PDF][KPI][FILL+WIDTH-FIX][ERR]', e);
-          }
-
-          // ✅ KPIだけ：下の“余白（margin-bottom）”だけ潰す（paddingは触らない）
-          try{
-            // kpiClone 自体の下余白
-            kpiClone.style.marginBottom = '0';
-
-            // KPI内の最後のカードが下余白を持ってるケースを潰す
-            const cards = kpiClone.querySelectorAll('.card');
-            const last  = cards && cards.length ? cards[cards.length - 1] : null;
-            if (last) last.style.marginBottom = '0';
-
-            // 念のため：kpi-row直下の要素にも下余白が焼けてたら潰す（paddingは維持）
-            Array.from(kpiClone.children || []).forEach(ch=>{
-              try{ ch.style.marginBottom = '0'; }catch(_){}
-            });
-          }catch(_){}
-
-          // ★PDF用：KPIだけ「レイアウト系」を上書きして、見切れ/重なりを止める
-          try{
-            // 親（kpi-row）をPDF用の3カラムグリッドに固定
-            kpiClone.style.display = 'grid';
-            kpiClone.style.gridTemplateColumns = 'repeat(3, minmax(0, 1fr))';
-            kpiClone.style.gap = '12px';
-            kpiClone.style.alignItems = 'stretch';
-            kpiClone.style.width = '100%';
-            kpiClone.style.maxWidth = '100%';
-            kpiClone.style.boxSizing = 'border-box';
-
-            kpiClone.querySelectorAll('.title-wrap').forEach(tw=>{
-              try{
-                tw.style.display = 'block';      // 横並びflexを殺す
-                tw.style.width = '100%';
-              }catch(_){}
-            });
-            kpiClone.querySelectorAll('.title-wrap > *').forEach(ch=>{
-              try{
-                ch.style.display = 'block';      // 「項目名」「Before」を縦に
-              }catch(_){}
-            });
-
-            // 子孫の “固定幅” を解除（タイポは維持）
-            // ★ width:auto は「内容幅に縮む」原因になるので、px幅は 100% に寄せる
-            kpiClone.querySelectorAll('*').forEach(el=>{
-              try{
-                el.style.boxSizing = 'border-box';
-
-                const w  = String(el.style.width || '');
-                const mw = String(el.style.maxWidth || '');
-
-                // px固定幅が焼けているなら、原則 100% に寄せる（縮み防止）
-                if (/^\d+px$/.test(w))  el.style.width = '100%';
-
-                // maxWidth のpx固定も 100% に寄せる
-                if (/^\d+px$/.test(mw)) el.style.maxWidth = '100%';
-
-                // min/max系の安全化
-                if (el.style.minWidth)  el.style.minWidth = '0';
-                if (!el.style.maxWidth) el.style.maxWidth = '100%';
-
-                // transform/位置ズレの保険（右だけ崩れる系）
-                if (el.style.transform) el.style.transform = 'none';
-                if (el.style.left)  el.style.left  = '0';
-                if (el.style.right) el.style.right = '0';
-
-                // 長い文字/数字が重なりやすいので折返しを許可
-                if (el.style.whiteSpace) el.style.whiteSpace = 'normal';
-                // 行間が詰まりすぎると重なるので最低限だけ確保
-                if (!el.style.lineHeight) el.style.lineHeight = '1.25';
-              }catch(_){}
-            });
-          }catch(_){}
-
-          // ★PDF用：KPIブロックの「過剰な高さ」を締める（焼き付いたheight/min-height対策）
-          try{
-            // 親（kpi-row）自体が変に高いケース
-            kpiClone.style.height = 'auto';
-            kpiClone.style.minHeight = '0';
-
-            // KPIカード（.card）に焼き付いた min-height / height / padding が暴れてるケースが多い
-            kpiClone.querySelectorAll('.card').forEach(card=>{
-              try{
-                card.style.height = 'auto';
-                card.style.minHeight = '0';
-                // “上下paddingが過剰” で背が伸びるケース用（タイポは維持）
-                if (!card.style.paddingTop)    card.style.paddingTop = '12px';
-                if (!card.style.paddingBottom) card.style.paddingBottom = '12px';
-              }catch(_){}
-            });
-
-            // 子孫に焼き付いた height/min-height を解除（幅はもうやってるので高さだけ）
-            kpiClone.querySelectorAll('*').forEach(el=>{
-              try{
-                if (el.style.height)    el.style.height = 'auto';
-                if (el.style.minHeight) el.style.minHeight = '0';
-                // もしline-heightが異常にデカく焼けてたら最低限に戻す（未指定の時だけ）
-                if (!el.style.lineHeight) el.style.lineHeight = '1.25';
-              }catch(_){}
-            });
-          }catch(_){}
-
-          // === [PDF][KPI-VAL-JC-CENTER v1] dv2-kpi-{rank,score,gap} は justify-content を強制center（値要素だけ） ===
-          try{
-            ['dv2-kpi-rank','dv2-kpi-score','dv2-kpi-gap'].forEach(id=>{
-              const el = kpiClone.querySelector('#' + id);
-              if (!el || !el.style || !el.style.setProperty) return;
-
-              // 「normal」(=start扱い) を潰して、値だけ確実に中央へ
-              el.style.setProperty('display', 'flex', 'important');
-              el.style.setProperty('justify-content', 'center', 'important');
-              el.style.setProperty('align-items', 'center', 'important');
-              el.style.setProperty('text-align', 'center', 'important');
-              el.style.setProperty('width', '100%', 'important');
-              el.style.setProperty('box-sizing', 'border-box', 'important');
-            });
-          }catch(_){}
-
-          page.appendChild(kpiClone);
-
-          // ✅ KPIと下のチャートの間だけ空ける（KPIの高さ・レイアウトは触らない）
-          page.appendChild(htmlToEl_('<div style="height:12px"></div>'));
-
-          // ★ KPI直後：推移・件数チャート（同一ページ：KPIの下に出す）
-          try{
-            function buildChartBlock(canvasSel, title){
-              // 1) まず「PDF用に保存したPNG」を最優先で使う（画面幅/表示状態の影響を避ける）
-              try{
-                const id = String(canvasSel || '').replace(/^#/, '');
-                const stash = window.__PDF_DASH_PNG__ || {};
-                const png1 = stash[id];
-                if (png1){
-                  return [
-                    '<div class="card" style="margin:0 0 12px;">',
-                      `<h2 class="pdf-h2" style="margin:0 0 6px;">${esc_(title)}</h2>`,
-                      '<div style="background:#ffffff;padding:8px;">',
-                        `<img src="${png1}" style="width:100%;height:auto;display:block;">`,
-                      '</div>',
-                    '</div>'
-                  ].join('');
-                }
-              }catch(_){}
-
-              // 2) フォールバック：その場のDOM canvasから（従来どおり）
-              try{
-                const cv = document.querySelector(canvasSel);
-                if (!cv || !cv.toDataURL) return '';
-
-                const png2 = cv.toDataURL('image/png');
-                return [
-                  '<div class="card" style="margin:0 0 12px;">',
-                    `<h2 class="pdf-h2" style="margin:0 0 6px;">${esc_(title)}</h2>`,
-                    '<div style="background:#ffffff;padding:8px;">',
-                      `<img src="${png2}" style="width:100%;height:auto;display:block;">`,
-                    '</div>',
-                  '</div>'
-                ].join('');
-              }catch(_){}
-
-              return '';
-            }
-
-            const html = [
-              '<section style="break-inside:avoid;page-break-inside:avoid;">',
-                buildChartBlock('#dv2-chart-score',  '総合スコア推移'),
-                buildChartBlock('#dv2-chart-clicks', '改善ポイント件数'),
-              '</section>'
-            ].join('\n');
-
-            // ✅ 同一ページ：KPIページ（page）の末尾に追加
-            page.appendChild(htmlToEl_(html));
-
-          }catch(e){
-            // ✅ KPIページは壊さない（注記だけ出す）
-            page.appendChild(htmlToEl_('<div class="pdf-note">※ チャート生成失敗</div>'));
-          }
-
-        } else {
-          page.appendChild(htmlToEl_('<div class="pdf-note">※ KPI（.kpi-row）が見つかりませんでした</div>'));
-        }
-      }catch(e){
-        page.appendChild(htmlToEl_('<div class="pdf-note">※ KPIの取得に失敗しました</div>'));
-      }
-
-      page.appendChild(htmlToEl_([
-        '<div style="height:12px"></div>',
-        (kpi && kpi._note) ? `<div class="pdf-note" style="margin-top:10px;">${esc_(kpi._note)}</div>` : ''
-      ].join('\n')));
-
-      // === [PDF][SUMMARY-WIDTH-NORMALIZE v1] Summary内の“直下だけ”固定px幅を剥がす ===
-      try{
-        page.style.width = '794px';
-        page.style.maxWidth = '794px';
-        page.style.boxSizing = 'border-box';
-
-        Array.from(page.children || []).forEach(ch=>{
-          try{
-            if (!ch || !ch.style) return;
-
-            const w = String(ch.style.width || '');
-            if (/^\d+px$/.test(w)) ch.style.width = '100%';
-
-            const mw = String(ch.style.maxWidth || '');
-            if (/^\d+px$/.test(mw)) ch.style.maxWidth = '100%';
-
-            ch.style.boxSizing = 'border-box';
-            ch.style.transform = 'none';
-            ch.style.left = '0';
-            ch.style.right = '0';
-          }catch(_){}
-        });
-      }catch(_){}
-
-      root.appendChild(page);
-    }
-
-    // 6) Diagnosis radar + Axis scores（同一ページに収める）
-    try{
-      const radarCard =
-        (sections?.diagnosisRoot && sections.diagnosisRoot.querySelector('#dv2-card-result-radar')) ||
-        document.querySelector('#dv2-card-result-radar');
-
-      // ✅ レーダーは「canvas直取りでPNG化」し、見た目（グレー背景＋タイトル）は wrapper で作る
-      // （= await不要。ここで壊れない）
-      let png = '';
-      try{
-        if (radarCard){
-          const c = radarCard.querySelector('canvas');
-          if (c && c.toDataURL) png = c.toDataURL('image/png');
-        }
-      }catch(_){
-        png = '';
-      }
-
-      // ★ 画面のスコア詳細（これを“置換元”として使う）※ID両対応
-      const scoreSrc =
-        (sections?.diagnosisRoot &&
-          sections.diagnosisRoot.querySelector('#v2-card-score-table, #card-score-table')) ||
-        document.querySelector('#v2-card-score-table, #card-score-table');
-
-      // ===== ここから：makePage_ じゃなく “sectionを組む” =====
-      const page = document.createElement('section');
-      page.className = 'pdf-page pdf-report-radar-axis';
-
-      page.appendChild(htmlToEl_('<h1 class="pdf-h1">GEO診断</h1>'));
-
-      if (png){
-        try{
-          const radarSrc =
-            (sections?.diagnosisRoot && sections.diagnosisRoot.querySelector('#dv2-card-result-radar')) ||
-            document.querySelector('#dv2-card-result-radar') ||
-            null;
-
-          if (radarSrc){
-            // 1) 画面DOMを丸ごと clone
-            const radarClone = radarSrc.cloneNode(true);
-
-            // 2) computed style 焼き付け
-            bakeTree_(radarSrc, radarClone);
-
-            // 3) canvas → PNG 差し替え
-            const srcCanvas = radarSrc.querySelector('canvas');
-            const dstCanvas = radarClone.querySelector('canvas');
-
-            if (srcCanvas && dstCanvas && srcCanvas.toDataURL){
-              const img = document.createElement('img');
-              img.src = srcCanvas.toDataURL('image/png');
-              img.style.display = 'block';
-              img.style.maxWidth = '100%';
-              img.style.height = 'auto';
-              dstCanvas.replaceWith(img);
-            }
-
-            // 4) DOMとして追加（★ htmlToEl_ を使わない）
-            page.appendChild(radarClone);
-
-            // ✅ 余白（レーダー → スコア詳細の間隔を復元）
-            page.appendChild(htmlToEl_('<div style="height:12px"></div>'));
-
-          } else {
-            page.appendChild(htmlToEl_(
-              '<div class="pdf-note">※ レーダーが見つかりませんでした</div>'
-            ));
-          }
-
-        } catch(e){
-          page.appendChild(htmlToEl_(
-            '<div class="pdf-note">※ レーダーチャートの再現に失敗しました</div>'
-          ));
-        }
-
-      } else {
-        page.appendChild(htmlToEl_(
-          '<div class="pdf-note">※ レーダーが見つからないか、画像化できませんでした</div>'
-        ));
-      }
-
-      // スコア詳細：画面DOMをクローンしてそのまま載せる（=ここで“置換”完了）
-      if (scoreSrc){
-        const clone = scoreSrc.cloneNode(true);
-
-        // computed style 焼き付け（画面再現の肝）
-        try{ bakeTree_(scoreSrc, clone); }catch(_){}
-
-        // 指標の説明は常に非表示
-        try{
-          clone.querySelectorAll('#kpiHelpBlock, details').forEach(n => n.remove());
-        }catch(_){}
-
-        // はみ出し事故だけ止血
-        try{
-          clone.style.maxWidth = '100%';
-          clone.style.boxSizing = 'border-box';
-          clone.querySelectorAll('*').forEach(el=>{
-            try{
-              el.style.boxSizing = 'border-box';
-              if (el.style.maxWidth) el.style.maxWidth = '100%';
-            }catch(_){}
-          });
-        }catch(_){}
-
-        page.appendChild(clone);
-      }else{
-        page.appendChild(htmlToEl_('<div class="pdf-note">※ #v2-card-score-table が見つかりませんでした</div>'));
-      }
-
-      root.appendChild(page);
-
-    }catch(e){
-      root.appendChild(makePage_('pdf-report-radar-axis', [
-        '<h1 class="pdf-h1">レーダーチャート・スコア詳細</h1>',
-        '<div class="pdf-note">※ レーダー/スコア詳細の生成で例外が発生しました</div>'
-      ].join('\n')));
-    }
-
-    // 8) Summary card page（総合ランク：DOMクローン→computed style焼き付けで“再現”）
-    try{
-      const sumSrc =
-        (sections?.diagnosisRoot && sections.diagnosisRoot.querySelector('#v2-card-result-summary')) ||
-        document.querySelector('#v2-card-result-summary');
-
-      const page = document.createElement('section');
-      page.className = 'pdf-page pdf-report-rank';
-
-      // 章/節のフォーマット
-      page.appendChild(htmlToEl_('<h1 class="pdf-h1">GEO診断</h1>'));
-      page.appendChild(htmlToEl_('<h2 class="pdf-h2">概要</h2>'));
-
-      if (!sumSrc){
-        page.appendChild(htmlToEl_('<div class="pdf-note">※ #v2-card-result-summary が見つかりませんでした</div>'));
-      } else {
-        // ★ PDF専用クローンを作る（画面DOMは触らない）
-        const clone = sumSrc.cloneNode(true);
-
-        // ★ 最重要：画面の computed style をすべて焼き付ける
-        try{ bakeTree_(sumSrc, clone); }catch(_){}
-
-        // 1) 指標の説明はPDFでは不要（＋スコア詳細が紛れたら消す）
-        try{
-          clone.querySelectorAll('#kpiHelpBlock, details, #v2-card-score-table').forEach(n => n.remove());
-        }catch(_){}
-
-        // 2) はみ出し防止（事故防止・見た目は維持）
-        try{
-          clone.style.maxWidth = '100%';
-          clone.style.boxSizing = 'border-box';
-          clone.querySelectorAll('*').forEach(el=>{
-            el.style.boxSizing = 'border-box';
-            if (el.style.maxWidth) el.style.maxWidth = '100%';
-          });
-        }catch(_){}
-
-        // 3) pdf-page にそのまま載せる
-        page.appendChild(clone);
-      }
-
-      // === [PDF][RANK-WIDTH-NORMALIZE v1] GEO診断サマリー(pfd-report-rank)だけ “右詰まり” を止血 ===
-      try{
-        // ページ自体は固定幅（他と同条件に揃える）
-        page.style.width = '794px';
-        page.style.maxWidth = '794px';
-        page.style.boxSizing = 'border-box';
-
-        // 「直下の card だけ」安全に正規化（深い子孫は触らない）
-        const cards = Array.from(page.querySelectorAll(':scope .card'));
-        cards.forEach(card=>{
-          try{
-            if (!card || !card.style) return;
-
-            // 幅/位置/変形の焼き付きを無効化（右詰まりの主因）
-            card.style.boxSizing = 'border-box';
-            card.style.width = '100%';
-            card.style.maxWidth = '100%';
-
-            // left/right/transform が焼けてるケースがあるので潰す
-            card.style.left = '0';
-            card.style.right = '0';
-            card.style.transform = 'none';
-
-            // 余計な auto margin があると幅が詰まって見えるので固定
-            card.style.marginLeft = '0';
-            card.style.marginRight = '0';
-          }catch(_){}
-        });
-      }catch(_){}
-
-      // === [PDF][RANK-INNER-WIDTH-UNLOCK v2] rankページの「card配下」だけ px固定幅を解除 ===
-      try{
-        // ★ 絶対に rank ページ以外へ漏らさない
-        const isRankPage = !!(page && page.classList && page.classList.contains('pdf-report-rank'));
-        if (isRankPage) {
-          const MAX_PX = 760; // 794pxページの内側での上限目安
-
-          // ★ rankページ内の card の「中だけ」対象（kpi-row など他ページへの漏れを防ぐ）
-          const cards = Array.from(page.querySelectorAll('.card'));
-          cards.forEach(card=>{
-            const nodes = Array.from(card.querySelectorAll('[style]'));
-            nodes.forEach(el=>{
-              try{
-                const st = el.style;
-                if (!st) return;
-
-                const w  = String(st.width || '');
-                const mw = String(st.maxWidth || '');
-
-                if (/^\d+px$/.test(mw)) {
-                  const n = parseInt(mw, 10);
-                  if (!isNaN(n) && n > 0 && n < MAX_PX) st.maxWidth = '100%';
-                }
-                if (/^\d+px$/.test(w)) {
-                  const n = parseInt(w, 10);
-                  if (!isNaN(n) && n > 0 && n < MAX_PX) st.width = '100%';
-                }
-
-                // 位置ズレ要因だけ最小限に無効化（rank内だけ）
-                if (st.transform) st.transform = 'none';
-                if (st.left)      st.left = '0';
-                if (st.right)     st.right = '0';
-              }catch(_){}
-            });
-
-            // card自体は常に100%
-            try{
-              card.style.width = '100%';
-              card.style.maxWidth = '100%';
-              card.style.boxSizing = 'border-box';
-            }catch(_){}
-          });
-        }
-      }catch(_){}
-
-      root.appendChild(page);
-
-    }catch(e){
-      root.appendChild(makePage_('pdf-report-rank', [
-        '<h1 class="pdf-h1">GEO診断</h1>',
-        '<h2 class="pdf-h2">概要</h2>',
-        '<div>—</div>'
-      ].join('\n')));
-    }
-
-    // 9) Improve page（改善カード：カードごと改ページ / DOM再現）
-    try{
-      const rootDoc = sections?.diagnosisRoot || document;
-      const host =
-        (rootDoc && rootDoc.querySelector && rootDoc.querySelector('#v2-card-inline-improve')) ||
-        document.querySelector('#v2-card-inline-improve');
-
-      const cards = host ? Array.from(host.querySelectorAll('section.improve-card')) : [];
-      console.warn('[PDF][C][IMPROVE][DOM]', {hasHost: !!host, cards: cards.length});
-
-      if (!host || !cards.length){
-        root.appendChild(makePage_('pdf-report-improve', [
-          '<h1 class="pdf-h1">GEO診断</h1>',
-          '<h2 class="pdf-h2">改善ポイント</h2>',
-          '<div class="pdf-note">※ 改善カードが見つかりませんでした</div>'
-        ].join('\n')));
-      } else {
-        function pickText_(el, sel){
-          try{
-            const n = el.querySelector(sel);
-            return n ? (n.textContent || '').trim() : '';
-          }catch(_){ return ''; }
-        }
-        function pickAllText_(el, sel){
-          try{
-            return Array.from(el.querySelectorAll(sel)).map(n => (n.textContent||'').trim()).filter(Boolean);
-          }catch(_){ return []; }
-        }
-
-        const __domTitlesByAxis = { data:[], doc:[], clarity:[], coverage:[], trust:[] };
-        cards.forEach((srcCard) => {
-          const __title =
-            pickText_(srcCard, 'h3') ||
-            pickText_(srcCard, '.card-title') ||
-            pickText_(srcCard, '.improve-title') ||
-            '';
-          const __axisKey =
-            axisKeyFromTitleForPdf_(__title) ||
-            axisKeyOf_(
-              pickText_(srcCard, '.axis') ||
-              pickText_(srcCard, '.axis-badge') ||
-              ''
-            );
-          if (!__axisKey || !__title) return;
-          if (__domTitlesByAxis[__axisKey].indexOf(__title) < 0) {
-            __domTitlesByAxis[__axisKey].push(__title);
-          }
-        });
-
-        const __axisReportData = buildAxisReportData_(sections, __domTitlesByAxis);
-        const __seenAxisCover = {};
-        const __axisOrder = ['data', 'doc', 'clarity', 'coverage', 'trust'];
-
-        // ★カードごとにページ化（仕様：カード毎に改ページ）
-        // DOM再現をやめて「テキストをそのままPDF用HTMLにする」= 白紙を確実に潰す
-        cards.forEach((srcCard, i) => {
-          const __titleForCover =
-            pickText_(srcCard, 'h3') ||
-            pickText_(srcCard, '.card-title') ||
-            pickText_(srcCard, '.improve-title') ||
-            '';
-          const __axisKeyForCover =
-            axisKeyFromTitleForPdf_(__titleForCover) ||
-            axisKeyOf_(
-              pickText_(srcCard, '.axis') ||
-              pickText_(srcCard, '.axis-badge') ||
-              ''
-            );
-          console.log('[PDF][AXIS]', __axisKeyForCover);
-          if (__axisKeyForCover) {
-            const __targetIdx = __axisOrder.indexOf(__axisKeyForCover);
-            __axisOrder.forEach((ax, axIdx) => {
-              if (axIdx > __targetIdx) return;
-              if (__seenAxisCover[ax]) return;
-              if (!__axisReportData[ax]) return;
-              const __coverPage = buildAxisCoverPage_(ax, __axisReportData[ax]);
-              if (__coverPage) root.appendChild(__coverPage);
-              __seenAxisCover[ax] = true;
-            });
-          }
-
-          const page = document.createElement('section');
-          page.className = 'pdf-page pdf-report-improve';
-
-          const pri = (srcCard.getAttribute('data-priority') || '').trim(); // 高 / 中 / 低
-
-          page.appendChild(htmlToEl_('<h1 class="pdf-h1">GEO診断</h1>'));
-          page.appendChild(htmlToEl_('<h2 class="pdf-h2">改善ポイント</h2>'));
-
-          const title =
-            pickText_(srcCard, 'h3') ||
-            pickText_(srcCard, '.card-title') ||
-            pickText_(srcCard, '.improve-title') ||
-            '';
-
-          const axis =
-            pickText_(srcCard, '.axis') ||
-            pickText_(srcCard, '.axis-badge') ||
-            '';
-
-          // セクション見出し+本文を “見出しごと” 抜く（全文・Markdown保持）
-          let blocks = [];
-          try{
-            const heads = Array.from(srcCard.querySelectorAll('h4,h5'));
-            if (heads.length){
-              heads.forEach(h=>{
-                const key = (h.textContent || '').trim();
-
-                let bodyParts = [];
-                let cur = h.nextElementSibling;
-
-                while (cur){
-                  // 次の見出しに到達したら終了
-                  if (cur.matches && cur.matches('h4,h5')) break;
-
-                  try{
-                    // 1) まず「コードブロック」を優先的に拾う（UI側で ``` が消えて <pre><code> になっている想定）
-                    const pre = (cur.matches && cur.matches('pre')) ? cur : (cur.querySelector ? cur.querySelector('pre') : null);
-                    if (pre){
-                      const codeEl = (pre.querySelector && pre.querySelector('code')) ? pre.querySelector('code') : pre;
-
-                      // lang 推定（よくあるパターンを拾う）
-                      let lang = '';
-                      try{
-                        lang = String(
-                          pre.getAttribute('data-lang') ||
-                          codeEl.getAttribute('data-lang') ||
-                          pre.getAttribute('lang') ||
-                          codeEl.getAttribute('lang') ||
-                          ''
-                        ).trim();
-                      }catch(_){}
-
-                      if (!lang){
-                        try{
-                          const cls = String(pre.className || '') + ' ' + String(codeEl.className || '');
-                          const m1 = cls.match(/\blanguage-([a-zA-Z0-9_-]+)\b/);
-                          const m2 = cls.match(/\blang-([a-zA-Z0-9_-]+)\b/);
-                          lang = (m1 && m1[1]) ? m1[1] : (m2 && m2[1]) ? m2[1] : '';
-                        }catch(_){}
-                      }
-
-                      const codeText = String(codeEl.textContent || '').replace(/\s+$/,'');
-                      const fence = '```' + (lang ? lang : '') + '\n' + codeText + '\n```';
-                      if (codeText.trim()) bodyParts.push(fence);
-
-                      cur = cur.nextElementSibling;
-                      continue;
-                    }
-
-                    // 2) 通常テキスト（DOM構造を “改行つき/強調つき” に寄せる）
-                    let text = '';
-
-                    try{
-                      // ★ br/strong を含む “1つの<p>に全部入ってる型” を救う（今回の崩れ原因）
-                      const rawHtml = String(cur.innerHTML || '');
-                      const looksRich = /<br\s*\/?>/i.test(rawHtml) || /<(strong|b)\b/i.test(rawHtml);
-
-                      if (looksRich){
-                        // HTML → 最低限Markdown寄せ（renderBodyHtml_ に渡して整形させる）
-                        let md = rawHtml;
-
-                        // br は改行へ
-                        md = md.replace(/<br\s*\/?>/gi, '\n');
-
-                        // strong/b は ** ** へ（中のタグは落としてテキスト化）
-                        md = md.replace(/<(strong|b)>([\s\S]*?)<\/\1>/gi, function(_m,_t,inner){
-                          const t = String(inner || '').replace(/<[^>]+>/g,'').trim();
-                          return t ? ('**' + t + '**') : '';
-                        });
-
-                        // 残りタグは落とす（p/span 等）
-                        md = md.replace(/<[^>]+>/g, '');
-
-                        // 連続改行を詰める（段落境界は残す）
-                        md = md.replace(/\n{3,}/g, '\n\n').trim();
-
-                        if (md) {
-                          bodyParts.push(md);
-                          // ★ ここで終わり（下のinnerText経路に落ちない）
-                          //    → br/strong が “確実に” 残る
-                        } else {
-                          // 空なら従来経路へ落とす
-                          const fallback = (cur.innerText || cur.textContent || '').trim();
-                          if (fallback) bodyParts.push(fallback);
-                        }
-
-                      } else {
-                        // --- 従来経路（li優先→innerText） ---
-                        const lis = cur.querySelectorAll ? Array.from(cur.querySelectorAll('li')) : [];
-                        if (lis.length){
-                          text = lis.map(li => (li.innerText || li.textContent || '').trim()).filter(Boolean).join('\n');
-                        } else {
-                          text = (cur.innerText || '').trim();
-                          if (!text) text = (cur.textContent || '').trim();
-                        }
-                        if (text) bodyParts.push(text);
-                      }
-
-                    }catch(_){
-                      text = (cur.innerText || cur.textContent || '').trim();
-                      if (text) bodyParts.push(text);
-                    }
-
-                  }catch(_){
-                    // 例外時でも “改行/強調” をできるだけ潰さないため、innerHTML優先で拾う
-                    try{
-                      const html = String(cur.innerHTML || '').trim();
-                      if (html){
-                        const text = html
-                          .replace(/<br\s*\/?>/gi, '\n')
-                          .replace(/<(strong|b)>([\s\S]*?)<\/\1>/gi, function(_m,_t,inner){
-                            const t = String(inner || '').replace(/<[^>]+>/g,'').trim();
-                            return t ? ('**' + t + '**') : '';
-                          })
-                          .replace(/<[^>]+>/g, '')
-                          .trim();
-
-                        if (text) bodyParts.push(text);
-                      }else{
-                        const text = (cur.innerText || cur.textContent || '').trim();
-                        if (text) bodyParts.push(text);
-                      }
-                    }catch(__){
-                      const text = (cur.innerText || cur.textContent || '').trim();
-                      if (text) bodyParts.push(text);
-                    }
-                  }
-
-                  cur = cur.nextElementSibling;
-                }
-
-                // ✅ 連結は “1改行” に寄せる（bodyParts側に既に改行が含まれるため、\n\n だと空きすぎる）
-                let body = bodyParts.join('\n').trim();
-
-                if (body.length > 4000) body = body.slice(0, 4000);
-                if (key || body) blocks.push({ key, body });
-              });
-            }
-          }catch(_){}
-
-          // fallback：h4/h5 が取れないカードは全文を入れる（ただし上限）
-          if (!blocks.length){
-            const raw = (srcCard.innerText || srcCard.textContent || '').trim();
-            if (raw) blocks = [{key:'', body: raw.slice(0, 4000)}];
-          }
-
-          // blocks本文に紛れた「優先度：高/中/低」等の行を除去（重複表示対策）
-          blocks = blocks.map(b => {
-            const body = String(b.body || '')
-              .replace(/^[ \t　]*(優先度|Priority)\s*[:：]?\s*(高|中|低)\s*[\r\n]+/m, '')
-              .replace(/[\r\n]+[ \t　]*(優先度|Priority)\s*[:：]?\s*(高|中|低)\s*$/m, '');
-            return { key: b.key, body };
-          });
-
-          const html = [
-            '<div class="pdf-card" style="break-inside:avoid;page-break-inside:avoid;">',
-
-              (axis || pri)
-                ? `<div class="pdf-note" style="margin:0 0 6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                    ${axis ? `<span>${esc_(axis)}</span>` : ''}
-                    ${pri ? pdfPriBadge_(pri) : ''}
-                  </div>`
-                : '',
-
-              title ? `<div class="pdf-h2" style="margin:0 0 6px;">${esc_(title)}</div>` : '',
-
-              ...blocks.map(b=>{
-                const __k = String(b.key || '').replace(/[\s\u3000]+/g,'').trim();
-                const h = __k
-                  ? (__k === '根拠'
-                      ? `<div class="pdf-sub-spacer" style="height:14px;"></div>`
-                      : `<div class="pdf-sub">${esc_(b.key)}</div>`)
-                  : '';
-
-                // --- PDF用：Markdownのコードフェンス ```lang ... ``` と **bold** を最低限整形して出す ---
-                function decodeEntitiesForDisplay_(s){
-                  return String(s || '')
-                    .replace(/&lt;/g, '<')
-                    .replace(/&gt;/g, '>')
-                    .replace(/&amp;/g, '&')
-                    .replace(/&quot;/g, '"')
-                    .replace(/&#39;/g, "'")
-                    .replace(/&#x27;/g, "'");
-                }
-
-                function formatInlineMd_(escapedText){
-                  return String(escapedText || '')
-                    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, '<strong>$1</strong>');
-                }
-
-                // ★ 表示用：HTMLエンティティを “最大2回” 戻す（&amp;lt; → &lt; → <）
-                function decodeEntitiesTwice_(s){
-                  s = String(s || '');
-                  function once(x){
-                    try{
-                      const ta = document.createElement('textarea');
-                      ta.innerHTML = String(x || '');
-                      return ta.value;
-                    }catch(_){
-                      // DOMが使えない場合の最低限フォールバック
-                      return String(x || '')
-                        .replace(/&amp;/g, '&')
-                        .replace(/&lt;/g, '<')
-                        .replace(/&gt;/g, '>')
-                        .replace(/&quot;/g, '"')
-                        .replace(/&#39;/g, "'");
-                    }
-                  }
-                  const a = once(s);
-                  const b = once(a);
-                  return b;
-                }
-
-                // フェンスをプレースホルダに退避 → 本文全体を esc_ → 戻して ** も処理
-                function renderBodyHtml_(raw){
-                  raw = decodeEntitiesTwice_(String(raw || '')); // ★ &amp;lt; / &lt; を “表示用に” いったん戻す
-
-                  // reference は reference section 側だけで表示する。
-                  // evidence に旧形式の「参考情報」ブロックが混ざっていてもPDFでは根拠として出さない。
-                  try{
-                    const __isEvidenceBlock =
-                      __k === '根拠' ||
-                      String(b.key || '').trim().toLowerCase() === 'evidence' ||
-                      /観測事実（AI可視性ログ）/.test(String(raw || ''));
-                    if (__isEvidenceBlock) {
-                      raw = String(raw || '').replace(
-                        /(^|\n)[ \t　]*(?:\*\*)?参考情報(?:\*\*)?[ \t　]*[\s\S]*$/m,
-                        ''
-                      ).trim();
-                    }
-                  }catch(_){}
-
-                  // ★ evidence内ラベル行を「ブロック見出し」に固定（改行が潰れるのを防ぐ）
-                  try{
-                    raw = String(raw || '').replace(
-                      /(^|\n)[ \t　]*(観測事実（AI可視性ログ）|参考情報)[ \t　]*(?=\n|$)/g,
-                      function(_m, bol, t){
-                        // 後段でHTMLに差し替えるためのトークン
-                        return (bol || '\n') + '@@@PDF_EVID_TITLE:' + String(t || '').trim() + '@@@';
-                      }
-                    );
-                  }catch(_){}
-
-                  const blocks = [];
-                  let tokenized = raw.replace(
-                    /(^|\n)```([a-zA-Z0-9_-]+)?[ \t]*\r?\n([\s\S]*?)\r?\n```(?=\n|$)/g,
-                    function(_m, bol, lang, code){
-                      const i = blocks.length;
-                      blocks.push({ lang: (lang || ''), code });
-                      return (bol || '') + `@@@PDF_CODE_BLOCK_${i}@@@`;
-                    }
-                  );
-
-                  // ★ コードブロック直前/直後の “余計な空行” を1つに圧縮（これが「コード前だけ改行が入る」原因）
-                  try{
-                    // 直前の空行を詰める：\n\n@@@... → \n@@@...
-                    tokenized = tokenized.replace(/\n{2,}(@@@PDF_CODE_BLOCK_\d+@@@)/g, '\n$1');
-                    // 直後の空行を詰める：@@@...\n\n → @@@...\n
-                    tokenized = tokenized.replace(/(@@@PDF_CODE_BLOCK_\d+@@@)\n{2,}/g, '$1\n');
-                  }catch(_){}
-
-                  // 1) リスト記号が “段落途中に混ざって改行が消える” 系を、先に改行正規化する
-                  function normalizeListNewlines_(s){
-                    s = String(s || '');
-
-                    // 「…です。1. xxx」みたいに “行頭じゃない 1.” を段落扱いに寄せる
-                    // ※ 直前が改行でない 1. を見つけたら、前に \n\n を挿入
-                    s = s.replace(/([^\n])\s*(\d+)\.\s+/g, function(_m, pre, n){
-                      return pre + '\n' + n + '. ';
-                    });
-
-                    // 同様に “行頭じゃない * / - ” を改行扱いに寄せる
-                    s = s.replace(/([^\n])\s*([*-])\s+/g, function(_m, pre, m){
-                      return pre + '\n' + m + ' ';
-                    });
-
-                    return s;
-                  }
-
-                  // 2) 本文は esc_ して安全化 → 最低限のMarkdown整形
-                  let out = formatInlineMd_(esc_(normalizeListNewlines_(tokenized)));
-
-                  // ★ evidenceタイトルトークンをHTMLへ差し替え（divなので必ず改行される）
-                  try{
-                    out = String(out || '').replace(
-                      /@@@PDF_EVID_TITLE:([^@]+)@@@/g,
-                      function(_m, t){
-                        return `<div class="pdf-evidence-title" style="margin:16px 0 4px;font-weight:600;">${esc_(String(t||'').trim())}</div>`;
-                      }
-                    );
-                  }catch(_){}
-
-                  // 2.1) インラインコード `...`
-                  out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-
-                  // 2.2) 行頭の番号リスト / 箇条書きを “行” として整形（見た目と改行を安定させる）
-                  out = out
-                    // 1. xxx
-                    .replace(/(^|\n)[ \t]*(\d+)\.\s+([^\n]+)/g, function(_m, bol, n, body){
-                      body = String(body || '');
-
-                      // タイトル＝先頭〜最初の「:」or「：」まで（なければ先頭の塊）
-                      let head = body;
-                      let tail = '';
-                      const m = body.match(/^(.{1,120}?)([:：]\s*)([\s\S]*)$/); // 120は暴走防止
-                      if (m){
-                        head = m[1];
-                        tail = (m[2] || '') + (m[3] || '');
-                      }
-
-                      // 番号ではなく “項目タイトル” を太字に
-                      return bol + `<div style="margin:0 0 6px;">${n}. <strong>${head}</strong>${tail}</div>`;
-                    })
-                    // * xxx / - xxx
-                    .replace(/(^|\n)[ \t]*([*-])\s+([^\n]+)/g, function(_m, bol, _mk, body){
-                      return bol + `<div style="margin:2px 0 0;">• ${body}</div>`;
-                    });
-
-                  // 2.3) 「本文 → 1. ...」の境目だけ、改行ではなく余白にする（連続項目間は増やさない）
-                  try{
-                    // いったん「番号divの直前の改行」を全部 “スペーサーdiv” に変える
-                    out = String(out || '').replace(
-                      /\n(?=<div style="margin:0 0 6px;">\d+\.\s)/g,
-                      '<div style="height:6px"></div>'
-                    );
-                    // ただし、項目同士の間（</div>の直後）はスペーサーを消す＝余白が二重にならない
-                    out = out.replace(/<\/div><div style="height:6px"><\/div>/g, '</div>');
-                  }catch(_){}
-
-                  // 3) 退避したコードブロックを HTML として差し戻し（中身は esc_ 済み）
-                  blocks.forEach((b, i) => {
-                    const codeDecoded = decodeEntitiesForDisplay_(b.code);
-                    const codeSafe    = esc_(codeDecoded);
-
-                    const label = b.lang
-                      ? `<div style="
-                          font-size:11px;
-                          font-weight:700;
-                          color:#9ca3af;
-                          background:#111827;
-                          display:inline-block;
-                          padding:2px 8px;
-                          border-radius:6px;
-                          margin:0 0 6px;
-                          letter-spacing:0.04em;
-                        ">${esc_(b.lang)}</div>`
-                      : '';
-
-                    const html = [
-                      '<div style="margin:6px 0 14px;">',
-                        label,
-                        '<pre style="margin:0;',
-                          'padding:12px 14px;',
-                          'border:1px solid #1f2937 !important;',
-                          'border-radius:10px;',
-                          'background:#0f172a !important;',
-                          'color:#e5e7eb !important;',
-                          'font-size:12.5px;',
-                          'line-height:1.6;',
-                          'white-space:pre-wrap;',
-                          'word-break:break-word;',
-                          'font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;',
-                        '">',
-                          '<code style="color:inherit !important;">',
-                            codeSafe,
-                          '</code>',
-                        '</pre>',
-                      '</div>'
-                    ].join('');
-
-                    out = out.split(`@@@PDF_CODE_BLOCK_${i}@@@`).join(html);
-                  });
-
-                  // ★ 追加：コードブロック直前の「余計な改行/空白」を潰す
-                  try{
-                    out = String(out || '').replace(
-                      /<\/div>\s*(?:<br\s*\/?>\s*)*\s*(<div style="margin:4px 0 12px;">)/g,
-                      '</div>$1'
-                    );
-                  }catch(_){}
-
-                  // ★ 最終サニタイズ：自前で生成するタグ以外の "<" を全部殺す
-                  //   これで "<nav&gt;" のような表示崩れを根絶
-                  try{
-                    out = String(out || '')
-                      .replace(/<(?!\/?(div|pre|code|span|br|strong|em)\b)/g, '&lt;');
-                  }catch(_){}
-
-                  return out;
-                }
-
-                const safeBodyHtml = renderBodyHtml_(
-                  String(b.body || '').replace(/\*\*/g, '')
-                );
-
-                // ★ safeBodyHtml が “HTMLを含む” 場合、pre-wrap だと改行文字がそのまま空行として可視化されてレイアウトが崩れる
-                //   → HTML時は pre-wrap を外す（これで「コードブロック直前だけ余計な空行」が消える）
-                let __hasHtml = false;
-                try{
-                  __hasHtml = /<(div|pre|br|strong|em|code|span)\b/i.test(String(safeBodyHtml || ''));
-                }catch(_){ __hasHtml = false; }
-
-                const t = safeBodyHtml
-                  ? (__hasHtml
-                      ? `<div style="line-height:1.55;word-break:break-word;">${safeBodyHtml}</div>`
-                      : `<div style="white-space:pre-wrap;line-height:1.55;word-break:break-word;">${safeBodyHtml}</div>`
-                    )
-                  : '';
-
-                return `<div class="pdf-block" style="margin:0 0 10px;">${h}${t}</div>`;
-              }),
-
-            '</div>'
-          ].filter(Boolean).join('\n');
-
-          page.appendChild(htmlToEl_(html));
-
-          root.appendChild(page);
-        });
-
-        __axisOrder.forEach((ax) => {
-          if (!__seenAxisCover[ax] && __axisReportData[ax]) {
-            const __coverPage = buildAxisCoverPage_(ax, __axisReportData[ax]);
-            if (__coverPage) root.appendChild(__coverPage);
-            __seenAxisCover[ax] = true;
-          }
-        });
-      }
-    }catch(e){
-      console.warn('[PDF][C][IMPROVE][EX]', e);
-      root.appendChild(makePage_('pdf-report-improve', [
-        '<h1 class="pdf-h1">GEO診断</h1>',
-        '<h2 class="pdf-h2">改善ポイント</h2>',
-        '<div class="pdf-note">※ 改善ポイントの取り込みで例外が発生しました</div>'
-      ].join('\n')));
-    }
-
-    // 10) Compare page（任意：includeCompare のときだけ）
-    try{
-      console.warn('[PDF][C][COMPARE][GATE v1]', {hasJob: !!job, includeCompare: !!(job && job.includeCompare), jobKeys: job ? Object.keys(job) : null});
-
-      if (job?.includeCompare){
-
-        // ✅ まず「描画用の一時ページ」を作る（ここに3カード全部を描かせる）
-        const pageTmp = document.createElement('section');
-        pageTmp.className = 'pdf-page pdf-report-compare';
-
-        // ✅ タイトル画像っぽい見出し（＝このまま html2canvas されるので見栄えが安定する）
-        pageTmp.appendChild(htmlToEl_('<h1 class="pdf-h1">競合比較</h1>'));
-
-        // 1) PDF用の「器」
-        pageTmp.appendChild(htmlToEl_(
-          '<section class="card hide" id="compareRadarCard">' +
-            '<h2 class="pdf-h2">比較レーダーチャート</h2>' +
-            '<div class="chart-wrap" style="height:418px; max-height:418px; overflow:hidden;">' +
-              '<canvas id="compareRadar"></canvas>' +
-            '</div>' +
-          '</section>' +
-
-          '<section class="card" id="compareTableCard">' +
-            '<h2 class="pdf-h2">比較スコア</h2>' +
-            '<table id="compareScores" class="table">' +
-              '<thead><tr>' +
-                '<th>対象</th>' +
-                '<th>データ構造</th><th>文書構造</th><th>表現の明確さ</th><th>情報網羅性</th><th>信頼性</th>' +
-                '<th>合計</th>' +
-              '</tr></thead>' +
-              '<tbody></tbody>' +
-            '</table>' +
-          '</section>' +
-
-          '<section class="card hide" id="compareOutputs">' +
-            '<h2 class="pdf-h2">自社（Before）との比較</h2>' +
-            '<div id="cmp-summary" class="cmp-summary"></div>' +
-          '</section>'
-        ));
-
-        // 2) 「描画に渡す res」
-        const cmpRes =
-          (job && (job.compareRes || job.compare || job.cmp || null)) ||
-          (sections && (sections.compareRes || sections.compare || null)) ||
-          {};
-
-          function __pdfCmpDisplayLabel_(label){
-            const s = String(label || '').trim();
-            if (s === '競合A') return '比較対象1';
-            if (s === '競合B') return '比較対象2';
-            return s;
-          }
-          function __pdfCmpOrigin_(raw, fallback){
-            try{
-              let s = String(raw || '').trim();
-              if (!s) return fallback || '';
-              if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
-              return new URL(s).origin || fallback || '';
-            }catch(_){
-              return fallback || String(raw || '').trim();
-            }
-          }
-          function __pdfCmpSummaryForDisplay_(summaryText, res){
-            const originA = __pdfCmpOrigin_(res && (res.aUrl || res.targetA || res.competitorA), '比較対象1');
-            const originB = __pdfCmpOrigin_(res && (res.bUrl || res.targetB || res.competitorB), '比較対象2');
-            return String(summaryText || '')
-              .replace(/競合A/g, originA)
-              .replace(/競合B/g, originB)
-              .replace(/比較対象1/g, originA)
-              .replace(/比較対象2/g, originB);
-          }
-
-          // === [PDF][C][COMPARE][TARGETS-RESOLVE v3] 画面側が保存したA/Bを最優先で拾う ===
-          let __tA = '';
-          let __tB = '';
-          try{
-            // 1) job 由来（あれば最優先）
-            __tA = String(job?.compareTargetA || job?.targetA || job?.competitorA || '').trim();
-            __tB = String(job?.compareTargetB || job?.targetB || job?.competitorB || '').trim();
-
-            // 2) cmpRes 由来（あれば次）
-            if (!__tA) __tA = String(cmpRes?.aUrl || cmpRes?.targetA || cmpRes?.competitorA || cmpRes?.compA || '').trim();
-            if (!__tB) __tB = String(cmpRes?.bUrl || cmpRes?.targetB || cmpRes?.competitorB || cmpRes?.compB || '').trim();
-
-            // 3) 最後に localStorage（★今回ここが効く）
-            if (!__tA) __tA = String(Storage.prototype.getItem.call(localStorage,'aio:lastCompareTargetA') || '').trim();
-            if (!__tB) __tB = String(Storage.prototype.getItem.call(localStorage,'aio:lastCompareTargetB') || '').trim();
-
-            // 軽い正規化（末尾/だけ）
-            __tA = __tA.replace(/\/+$/,'');
-            __tB = __tB.replace(/\/+$/,'');
-          }catch(_){}
-
-          // cmpRes にも載せておく（後段の表示/デバッグが楽）
-          try{
-            if (__tA) cmpRes.targetA = __tA;
-            if (__tB) cmpRes.targetB = __tB;
-            if (__tA && !cmpRes.aUrl) cmpRes.aUrl = __tA;
-            if (__tB && !cmpRes.bUrl) cmpRes.bUrl = __tB;
-          }catch(_){}
-
-          try{
-            console.warn('[PDF][C][COMPARE][TARGETS-RESOLVE v3]', {hasA: !!__tA, hasB: !!__tB, a: __tA, b: __tB});
-          }catch(_){}
-          // === [/PDF][C][COMPARE][TARGETS-RESOLVE v3] ===
-
-        // ★ [PDF][C][COMPARE][INJECT_TABLE v1] cmpRes.table が無いときだけ LS から注入
-        try{
-          if (!Array.isArray(cmpRes.table) || !cmpRes.table.length) {
-            const raw = Storage.prototype.getItem.call(localStorage, 'aio:lastCompareTable');
-            if (raw) {
-              const arr = JSON.parse(raw);
-              if (Array.isArray(arr) && arr.length) {
-                cmpRes.table = arr;
-                console.warn('[PDF][C][COMPARE][INJECT_TABLE v1]', { rows: arr.length });
-              } else {
-                console.warn('[PDF][C][COMPARE][INJECT_TABLE v1] skip (parsed empty)');
-              }
-            } else {
-              console.warn('[PDF][C][COMPARE][INJECT_TABLE v1] skip (no storage)');
-            }
-          }
-        }catch(e){
-          console.warn('[PDF][C][COMPARE][INJECT_TABLE v1][ERR]', e);
-        }
-
-        // ★ [PDF][C][COMPARE][INJECT_SUMMARY v1] cmpRes.summaryText が無いときだけ LS から注入
-        try{
-          if (!cmpRes.summaryText) {
-            const s = String(
-              Storage.prototype.getItem.call(localStorage,'aio:lastCompareSummaryLLM') ||
-              Storage.prototype.getItem.call(localStorage,'aio:lastCompareSummary') ||
-              ''
-            ).trim();
-            if (s) {
-              cmpRes.summaryText = s;
-              console.warn('[PDF][C][COMPARE][INJECT_SUMMARY v1]', { len: s.length });
-            } else {
-              console.warn('[PDF][C][COMPARE][INJECT_SUMMARY v1] skip (no storage)');
-            }
-          }
-        }catch(e){
-          console.warn('[PDF][C][COMPARE][INJECT_SUMMARY v1][ERR]', e);
-        }
-
-        try{
-          if (Array.isArray(cmpRes.table)) {
-            cmpRes.table = cmpRes.table.map(function(r){
-              if (!r || typeof r !== 'object' || Array.isArray(r)) return r;
-              return Object.assign({}, r, { label: __pdfCmpDisplayLabel_(r.label) });
-            });
-          }
-          cmpRes.summaryText = __pdfCmpSummaryForDisplay_(cmpRes.summaryText || '', cmpRes);
-        }catch(e){
-          console.warn('[PDF][C][COMPARE][DISPLAY_LABELS][ERR]', e);
-        }
-
-        // 3) 画面と同じ処理で描画（✅ root にはまだ append しない）
-        const isFn = (typeof window.renderCompareDispatch === 'function');
-        console.warn('[PDF][C][COMPARE][CHARTJS v1]', {hasChart: !!window.Chart});
-
-        if (isFn){
-          // ✅ 先に「非表示ステージ」に刺してから描画（Chart.jsの白紙防止）
-          const stage = document.createElement('div');
-          stage.style.position = 'fixed';
-          stage.style.left = '-100000px';
-          stage.style.top  = '0';
-          stage.style.width = '794px';
-          stage.style.background = '#ffffff';
-          document.body.appendChild(stage);
-
-          try{
-            const fn = window.__CMP_CORE__ || window.renderCompareDispatch;
-
-            stage.appendChild(pageTmp);
-            try {
-              const t = Array.isArray(cmpRes.table) ? cmpRes.table : [];
-              const selfBefore = t.find(r => {
-                const label = String(r && r.label || '');
-                return label.indexOf('自社') >= 0 && label.indexOf('After') < 0;
-              });
-              const selfAfter = t.find(r => {
-                const label = String(r && r.label || '');
-                return label.indexOf('自社') >= 0 && label.indexOf('After') >= 0;
-              });
-
-              function toVec(r){
-                if (!r) return null;
-                if (Array.isArray(r.values)) return r.values.slice(0, 5).map(n => Number(n) || 0);
-                if (r.axes) return ['data','doc','clarity','coverage','trust'].map(k => Number(r.axes[k]) || 0);
-                return null;
-              }
-
-              const bVec = toVec(selfBefore);
-              const aVec = toVec(selfAfter);
-
-              if (bVec && aVec && bVec.length >= 5 && aVec.length >= 5) {
-                window.__diagAch = {
-                  keys: ['data','doc','clarity','coverage','trust'],
-                  before: bVec.slice(0, 5),
-                  after: aVec.slice(0, 5)
-                };
-                cmpRes.result = Object.assign({}, cmpRes.result || {}, {
-                  avgBefore: bVec.slice(0, 5).reduce((s,n) => s + (Number(n) || 0), 0),
-                  avgAfter: aVec.slice(0, 5).reduce((s,n) => s + (Number(n) || 0), 0),
-                  achPairs: ['data','doc','clarity','coverage','trust'].map((k, i) => ({
-                    axis: k,
-                    bAch: bVec[i],
-                    aAch: aVec[i]
-                  }))
-                });
-                console.warn('[PDF][COMPARE][SELF_SYNC_FROM_TABLE]', { before: bVec, after: aVec });
-              }
-            } catch(e) {
-              console.warn('[PDF][COMPARE][SELF_SYNC_ERR]', e);
-            }
-
-            fn(cmpRes, pageTmp);
-
-            try {
-              const summaryEl = pageTmp.querySelector('#cmp-summary');
-              if (summaryEl && cmpRes) {
-                if (cmpRes.summaryHtml) {
-                  summaryEl.innerHTML = String(cmpRes.summaryHtml || '');
-                } else if (cmpRes.summaryText) {
-                  summaryEl.textContent = String(cmpRes.summaryText || '');
-                }
-              }
-            } catch(e) {
-              console.warn('[PDF][COMPARE][SUMMARY_SYNC_ERROR]', e);
-            }
-
-            // === [PDF][C][COMPARE][SUMMARY-ONECOL v2] PDF内の比較サマリーだけ「2カラム化」を根絶 ===
-            try{
-              const wrap = pageTmp && pageTmp.querySelector ? pageTmp : null;
-              const out  = wrap ? wrap.querySelector('#compareOutputs') : null;
-
-              if (out){
-                const st = document.createElement('style');
-                st.setAttribute('data-pdf-compare', 'summary-onecol-v2');
-                st.textContent = `
-                  /* compare outputs 内だけに限定（画面へ漏れない） */
-                  #compareOutputs #compareSummaryBox,
-                  #compareOutputs #cmp-summary{
-                    box-sizing: border-box !important;
-                    width: 100% !important;
-                    max-width: 100% !important;
-
-                    /* ★ columns 起因の2カラムを根絶 */
-                    column-count: 1 !important;
-                    -webkit-column-count: 1 !important;
-                    -moz-column-count: 1 !important;
-                    columns: auto !important;
-                    -webkit-columns: auto !important;
-                    -moz-columns: auto !important;
-                    column-gap: 0 !important;
-                    -webkit-column-gap: 0 !important;
-                    -moz-column-gap: 0 !important;
-                  }
-
-                  /* 子孫に columns が付いてても全部殺す */
-                  #compareOutputs #cmp-summary *{
-                    box-sizing: border-box !important;
-                    max-width: 100% !important;
-                    column-count: 1 !important;
-                    -webkit-column-count: 1 !important;
-                    -moz-column-count: 1 !important;
-                    columns: auto !important;
-                    -webkit-columns: auto !important;
-                    -moz-columns: auto !important;
-                    column-gap: 0 !important;
-                    -webkit-column-gap: 0 !important;
-                    -moz-column-gap: 0 !important;
-                  }
-
-                  /* flex/grid の残骸があれば block に倒す（保険） */
-                  #compareOutputs #cmp-summary [style*="display:flex"],
-                  #compareOutputs #cmp-summary [style*="display: flex"],
-                  #compareOutputs #cmp-summary [style*="display:grid"],
-                  #compareOutputs #cmp-summary [style*="display: grid"]{
-                    display: block !important;
-                  }
-
-                  /* 直下の子が横並び指定されてても縦積みにする（保険） */
-                  #compareOutputs #cmp-summary > *{
-                    display: block !important;
-                    width: 100% !important;
-                    float: none !important;
-                    clear: both !important;
-                  }
-                `;
-
-                out.insertBefore(st, out.firstChild);
-              }
-            }catch(e){
-              console.warn('[PDF][C][COMPARE][SUMMARY-ONECOL v2][ERR]', e);
-            }
-            // === [/PDF][C][COMPARE][SUMMARY-ONECOL v2] ===
-
-            // ✅ Radar card / Outputs card を PDFでは表示させる（hide を外す）
-            try{
-              const r = pageTmp.querySelector('#compareRadarCard');
-              const o = pageTmp.querySelector('#compareOutputs');
-              if (r) r.classList.remove('hide');
-              if (o) o.classList.remove('hide');
-            }catch(_){}
-
-            // ★ PDF用：レーダーPNG固定化（既存処理を pageTmp 基準で動かす）
-            try{
-              if (!window.Chart) throw new Error('Chart.js not found');
-
-              const DPR = window.devicePixelRatio || 1;
-
-              const Wcss = 418;
-              const Hcss = 418;
-
-              const off = document.createElement('canvas');
-              off.style.width  = Wcss + 'px';
-              off.style.height = Hcss + 'px';
-              off.width  = Math.round(Wcss * DPR);
-              off.height = Math.round(Hcss * DPR);
-
-              // ★ 参照元（renderCompareDispatch が作った chart）
-              const srcCv = pageTmp.querySelector('#compareRadar');
-              if (!srcCv || !srcCv.__chart) throw new Error('src compareRadar chart not found (need cv.__chart)');
-
-              const srcChart = srcCv.__chart;
-              const srcType  = (srcChart.config && srcChart.config.type) ? srcChart.config.type : 'radar';
-              const srcData  = srcChart.data || {};
-
-              const RADAR_COLORS = [
-                { border:'rgba(54,162,235,1)',  bg:'rgba(54,162,235,0.08)',  point:'rgba(54,162,235,1)'  }, // 自社 Before
-                { border:'rgba(255,99,132,1)',  bg:'rgba(255,99,132,0.08)',  point:'rgba(255,99,132,1)'  }, // 自社 After
-                { border:'rgba(255,159,64,1)',  bg:'rgba(255,159,64,0.08)',  point:'rgba(255,159,64,1)'  }, // 比較対象1
-                { border:'rgba(255,205,86,1)',  bg:'rgba(255,205,86,0.08)',  point:'rgba(255,205,86,1)'  }  // 比較対象2
+          const userAgent = await subPage.evaluate(() => navigator.userAgent).catch(() => null);
+          const domMeta = await subPage.evaluate(() => {
+            const iframes = Array.from(document.querySelectorAll('iframe')).map((f, i) => ({
+              index: i,
+              src: f.getAttribute('src') || '',
+              id: f.id || null,
+              className: f.className || null
+            }));
+            return {
+              readyState: document.readyState,
+              bodyInnerTextLen: String(document.body && document.body.innerText || '').length,
+              iframeCount: iframes.length,
+              iframeSrcs: iframes.slice(0, 10),
+              scriptCount: document.querySelectorAll('script').length
+            };
+          }).catch(() => ({
+            readyState: null,
+            bodyInnerTextLen: 0,
+            iframeCount: 0,
+            iframeSrcs: [],
+            scriptCount: 0
+          }));
+
+          console.log('[SUBPAGE_FETCH_DEBUG][META]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            status: resp ? resp.status() : null,
+            title: await subPage.title().catch(() => ''),
+            userAgent,
+            contentType
+          }));
+          console.log('[SUBPAGE_FETCH_DEBUG][DOM]', JSON.stringify({
+            candidateUrl: url,
+            finalUrl,
+            readyState: domMeta.readyState,
+            bodyInnerTextLen: domMeta.bodyInnerTextLen,
+            iframeCount: domMeta.iframeCount,
+            iframeSrcs: domMeta.iframeCount > 0 ? domMeta.iframeSrcs : [],
+            scriptCount: domMeta.scriptCount
+          }));
+          if (/^https?:\/\/www\.fork\.co\.jp\/about\/?$/i.test(String(finalUrl || url || ''))) {
+            const domShape = await subPage.evaluate(() => {
+              const body = document.body;
+              const html = document.documentElement;
+              const bodyInnerHTML = String(body && body.innerHTML || '');
+              const docInnerHTML = String(html && html.innerHTML || '');
+              const bodyTextContent = String(body && body.textContent || '');
+              const bodyInnerText = String(body && body.innerText || '');
+
+              const hiddenSelectors = [
+                'main',
+                '#app',
+                '#__next',
+                '#__nuxt',
+                'app-index',
+                'body > *:first-child'
               ];
 
-              const clonedData = {
-                labels: Array.isArray(srcData.labels) ? srcData.labels.slice() : [],
-                datasets: Array.isArray(srcData.datasets) ? srcData.datasets.map((ds, idx) => {
-                  const c = RADAR_COLORS[idx] || RADAR_COLORS[RADAR_COLORS.length - 1];
+              const hiddenSignals = hiddenSelectors.map(sel => {
+                try {
+                  const el = document.querySelector(sel);
+                  if (!el) return { selector: sel, exists: false };
+                  const style = window.getComputedStyle(el);
                   return {
-                    label: String(ds && ds.label || ''),
-                    data: Array.isArray(ds && ds.data) ? ds.data.slice() : [],
-                    fill: true,
-                    borderWidth: 2,
-                    pointRadius: 3,
-                    pointHoverRadius: 3,
-                    pointHitRadius: 6,
-                    borderColor: c.border,
-                    backgroundColor: c.bg,
-                    pointBackgroundColor: c.point
+                    selector: sel,
+                    exists: true,
+                    displayNone: style.display === 'none',
+                    visibilityHidden: style.visibility === 'hidden'
                   };
-                }) : []
-              };
-
-              const clonedOpt = {
-                responsive: false,
-                maintainAspectRatio: false,
-                animation: false,
-                devicePixelRatio: DPR,
-                scales: {
-                  r: {
-                    min: 0,
-                    max: 100,
-                    beginAtZero: true,
-                    ticks: { stepSize: 20 },
-                    pointLabels: { padding: 6, font: { size: 11 } }
-                  }
-                },
-                plugins: {
-                  legend: { position: 'top', labels: { font: { size: 11 } } },
-                  tooltip: {
-                    enabled: true,
-                    mode: 'nearest',
-                    intersect: false,
-                    titleFont:  { size: 11 },
-                    bodyFont:   { size: 11 },
-                    footerFont: { size: 11 }
-                  }
-                },
-                elements: {
-                  line:  { tension: 0.15, borderWidth: 2 },
-                  point: { radius: 3, hoverRadius: 3, hitRadius: 6 }
-                },
-                interaction: { mode: 'nearest', intersect: false }
-              };
-
-              const ctx = off.getContext('2d');
-              const tmp = new Chart(ctx, { type: srcType, data: clonedData, options: clonedOpt });
-
-              try{ tmp.resize(Wcss, Hcss); }catch(_){}
-              try{ tmp.update('none'); }catch(_){}
-              try{ tmp.draw(); }catch(_){}
-
-              const png = off.toDataURL('image/png');
-              try{ tmp.destroy(); }catch(_){}
-
-              // ✅ compareRadar(canvas) を img に置換（白紙根絶）
-              const cv = pageTmp.querySelector('#compareRadar');
-              if (!cv) throw new Error('compareRadar not found in pageTmp');
-
-              const img = document.createElement('img');
-              img.alt = 'レーダーチャート';
-              img.style.display = 'block';
-              img.style.margin = '0 auto';
-              img.style.width = '418px';
-              img.style.height = 'auto';
-              img.style.maxHeight = '418px';
-              img.style.objectFit = 'contain';
-              img.src = png;
-
-              cv.replaceWith(img);
-
-            }catch(e){
-              console.warn('[PDF][C][COMPARE][RADAR_OFFSCREEN][ERR]', e);
-            }
-
-            // =========================
-            // ✅ ここからが本題：2ページに分割して root に append
-            //   1枚目：レーダー + 比較スコア
-            //   2枚目：自社（Before）との比較
-            // =========================
-
-            const radarCard   = pageTmp.querySelector('#compareRadarCard');
-            const tableCard   = pageTmp.querySelector('#compareTableCard');
-            const outputsCard = pageTmp.querySelector('#compareOutputs');
-
-            // 1ページ目
-            const page1 = document.createElement('section');
-            page1.className = 'pdf-page pdf-report-compare';
-            page1.appendChild(htmlToEl_('<h1 class="pdf-h1">競合比較</h1>'));
-
-            // === [PDF][C][COMPARE][TARGETS-TEXT v4] 比較対象をテキストで表示（tableからも復元して確実化） ===
-            try{
-              // 1) まずは明示フィールド（入っていればそれを優先）
-              let a = String(cmpRes?.targetA || cmpRes?.competitorA || '').trim();
-              let b = String(cmpRes?.targetB || cmpRes?.competitorB || '').trim();
-
-              // 2) 空なら compare table から復元（ここで “skipの種” を潰す）
-              //    table行の1列目に「比較対象1/2」または URL が入っている前提で拾う
-              if (!a || !b){
-                try{
-                  const rows = Array.isArray(cmpRes?.table) ? cmpRes.table : [];
-
-                  // 競合行っぽいものを抽出（最小：先頭セルが文字列なら拾う）
-                  const names = [];
-                  for (let i=0; i<rows.length; i++){
-                    const r = rows[i];
-                    if (!Array.isArray(r) || !r.length) continue;
-                    const cell0 = String(r[0] ?? '').trim();
-                    if (!cell0) continue;
-
-                    // よくあるパターン：'比較対象1', '比較対象2', URLそのもの
-                    names.push(cell0);
-                  }
-
-                  // a/b が空のときだけ埋める（上書きしない）
-                  // - names 内に URL があればそれを優先
-                  // - 無ければ「比較対象1/2」等でもとにかく入れる（PDFで空にしない）
-                  function pickUrlFirst(list){
-                    for (let i=0; i<list.length; i++){
-                      const s = String(list[i] || '').trim();
-                      if (/^https?:\/\//i.test(s)) return s;
-                    }
-                    return '';
-                  }
-
-                  const url1 = pickUrlFirst(names);
-                  // URLが1個しかないケースもあるので、2個目は別探索
-                  let url2 = '';
-                  if (url1){
-                    for (let i=0; i<names.length; i++){
-                      const s = String(names[i] || '').trim();
-                      if (/^https?:\/\//i.test(s) && s !== url1){ url2 = s; break; }
-                    }
-                  }
-
-                  if (!a){
-                    a = url1 || names.find(s=>String(s).includes('比較対象1')) || names.find(s=>String(s).includes('競合A')) || '';
-                    a = String(a || '').trim();
-                  }
-                  if (!b){
-                    b = url2 || names.find(s=>String(s).includes('比較対象2')) || names.find(s=>String(s).includes('競合B')) || '';
-                    b = String(b || '').trim();
-                  }
-
-                  console.warn('[PDF][C][COMPARE][TARGETS-RESOLVE v4]', {hasA:!!a, hasB:!!b, a, b, via:'table'});
-                }catch(e2){
-                  console.warn('[PDF][C][COMPARE][TARGETS-RESOLVE v4][ERR_TABLE]', e2);
+                } catch (_) {
+                  return { selector: sel, exists: false };
                 }
-              } else {
-                console.warn('[PDF][C][COMPARE][TARGETS-RESOLVE v4]', {hasA:!!a, hasB:!!b, a, b, via:'fields'});
-              }
+              });
 
-              // 3) 描画（空なら出さない、ただしここまで来れば空になる確率を潰している）
-              if (a || b){
-                const box = document.createElement('section');
-                box.className = 'card compare-section';
-                box.id = 'card-compare-targets-text';
+              return {
+                bodyChildElementCount: body ? body.childElementCount : 0,
+                bodyInnerHTMLHead: bodyInnerHTML.slice(0, 200),
+                documentInnerHTMLHead: docInnerHTML.slice(0, 200),
+                textContentLength: bodyTextContent.length,
+                innerTextLength: bodyInnerText.length,
+                hiddenSignals
+              };
+            }).catch(() => null);
 
-                box.appendChild(htmlToEl_('<h2 class="pdf-h2 compare-targets-title">比較対象</h2>'));
-
-                const lines = [
-                  a ? `<div class="compare-target-line">比較対象1：${esc_(a)}</div>` : '',
-                  b ? `<div class="compare-target-line">比較対象2：${esc_(b)}</div>` : ''
-                ].filter(Boolean).join('');
-
-                box.appendChild(htmlToEl_(`<div class="compare-targets-body">${lines}</div>`));
-                page1.appendChild(box);
-
-                console.warn('[PDF][C][COMPARE][TARGETS-TEXT v4] ok', {hasA:!!a, hasB:!!b});
-              }else{
-                console.warn('[PDF][C][COMPARE][TARGETS-TEXT v4] skip (empty)');
-              }
-            }catch(e){
-              console.warn('[PDF][C][COMPARE][TARGETS-TEXT v4][ERR]', e);
-            }
-            // === [/PDF][C][COMPARE][TARGETS-TEXT v4] ===
-
-            if (radarCard) page1.appendChild(radarCard);
-            if (tableCard) page1.appendChild(tableCard);
-
-            // 2ページ目
-            const page2 = document.createElement('section');
-            page2.className = 'pdf-page pdf-report-compare';
-            page2.appendChild(htmlToEl_('<h1 class="pdf-h1">競合比較</h1>'));
-            if (outputsCard) page2.appendChild(outputsCard);
-
-            root.appendChild(page1);
-            root.appendChild(page2);
-
-          }catch(e){
-            console.warn('[PDF][C][COMPARE][CALL_ERR v2]', e);
-            root.appendChild(makePage_('pdf-report-compare', [
-              '<div style="margin:0 0 10px;padding:10px 12px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:12px;">',
-                '<div style="font-size:18px;font-weight:900;line-height:1.2;">競合比較</div>',
-              '</div>',
-              '<div class="pdf-note">※ 競合比較の描画中にエラーが発生しました</div>'
-            ].join('\n')));
-          }finally{
-            try{ stage.remove(); }catch(_){}
+            console.log('[SUBPAGE_DOM_SHAPE][BODY]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyChildElementCount: domShape && domShape.bodyChildElementCount,
+              textContentLength: domShape && domShape.textContentLength,
+              innerTextLength: domShape && domShape.innerTextLength,
+              hiddenSignals: domShape && domShape.hiddenSignals
+            }));
+            console.log('[SUBPAGE_DOM_SHAPE][HTML]', JSON.stringify({
+              candidateUrl: url,
+              finalUrl,
+              bodyInnerHTMLHead: domShape && domShape.bodyInnerHTMLHead,
+              documentInnerHTMLHead: domShape && domShape.documentInnerHTMLHead
+            }));
           }
+        } catch (_) { }
+        try {
+          await subPage.waitForFunction(() => {
+            const bodyLen = (document.body && document.body.innerText ? document.body.innerText.length : 0);
+            const docLen = (document.documentElement && document.documentElement.innerText ? document.documentElement.innerText.length : 0);
+            const mainLen = (() => {
+              const el = document.querySelector('main,[role="main"]');
+              return el && el.innerText ? el.innerText.length : 0;
+            })();
+            return bodyLen > 0 || docLen > 0 || mainLen > 0;
+          }, { timeout: 1200 }).catch(()=>{});
+        } catch (_) { }
+        try{ await subPage.waitForTimeout(120); }catch(_){ }
 
-        } else {
-          root.appendChild(makePage_('pdf-report-compare', [
-            '<div style="margin:0 0 10px;padding:10px 12px;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:12px;">',
-              '<div style="font-size:18px;font-weight:900;line-height:1.2;">競合比較</div>',
-            '</div>',
-            '<div class="pdf-note">※ renderCompareDispatch が見つからないため、競合比較を描画できませんでした</div>'
-          ].join('\n')));
-          console.warn('[PDF][C][COMPARE][MISSING_RENDERER]');
-        }
+        const status = resp ? resp.status() : null;
+        const lite = await extractLiteFromPageVNext_(subPage, url, o, status);
+        if (!lite) continue;
+
+        const hasAny = !!(lite && (lite.title || (lite.headingTexts && lite.headingTexts.length) || (lite.jsonldTypes && lite.jsonldTypes.length)));
+        if (!hasAny) continue;
+
+        out.push(lite);
+        console.log('[SUBPAGE_BODY_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          status: lite.status,
+          title: lite.title,
+          mainCount: lite.mainCount,
+          bodyTextLen: lite.bodyTextLen,
+          bodyInnerTextLen: lite.bodyInnerTextLen,
+          mainInnerTextLen: lite.mainInnerTextLen,
+          wordCount: lite.wordCount
+        }));
+        console.log('[SUBPAGE_BODY_DEBUG][TEXT]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample,
+          bodyTextSample: lite.bodyTextSample
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][PAGE]', JSON.stringify({
+          candidateUrl: url,
+          locationHref: lite.locationHref,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          roleHeadingCount: lite.roleHeadingCount,
+          fallbackHeadingCount: lite.fallbackHeadingCount,
+          headingTexts: lite.headingTexts,
+          headingCandidateTexts: lite.headingCandidateTexts
+        }));
+        console.log('[SUBPAGE_HEADING_DEBUG][TEXT_SAMPLE]', JSON.stringify({
+          url: lite.url,
+          locationHref: lite.locationHref,
+          mainTextSample: lite.mainTextSample
+        }));
+        console.log('[SUBPAGE_ENRICH][PAGE]', JSON.stringify({
+          url: lite.url,
+          status: lite.status,
+          title: lite.title,
+          h1Count: lite.h1Count,
+          h2Count: lite.h2Count,
+          mainCount: lite.mainCount,
+          navCount: lite.navCount,
+          headerCount: lite.headerCount,
+          footerCount: lite.footerCount,
+          hasBreadcrumb: lite.hasBreadcrumb,
+          companyLikeSignals: lite.companyLikeSignals,
+          serviceLikeSignals: lite.serviceLikeSignals,
+          contactLikeSignals: lite.contactLikeSignals,
+          faqLikeSignals: lite.faqLikeSignals
+        }));
+        break;
+      }catch(e){
+        setDecision({
+          skipReason: out.length ? 'ok' : 'fetch_failed',
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+        console.warn('[SUBPAGE_ENRICH][PAGE][ERR]', JSON.stringify({ url, error: String(e && e.message || e) }));
       }
-
-    }catch(e){
-      console.warn('[PDF][C][COMPARE] failed', e);
     }
+  } finally {
+    try { if (subPage) await subPage.close(); } catch(_) {}
+    try { if (subContext) await subContext.close(); } catch(_) {}
+  }
 
-    // AI認識ログは競合比較の後ろに配置する（生成内容は変更しない）。
-    appendAiRecognitionLogPages_();
+  setDecision({
+    adoptedCount: out.length,
+    skipReason: out.length ? 'ok' : (dec && dec.skipReason && dec.skipReason !== 'not_reached' ? dec.skipReason : 'adopted_zero'),
+    elapsedMs: Math.max(0, Date.now() - startedAt)
+  });
+  console.log('[SUBPAGE_ENRICH][SUMMARY]', JSON.stringify({
+    count: out.length,
+    sample: out.slice(0, 1)
+  }));
+  console.log('[SUBPAGE_HEADING_DEBUG][SUMMARY]', JSON.stringify({
+    adoptedCount: out.length,
+    adoptedUrls: out.map(p => p && p.url).filter(Boolean)
+  }));
+  return out;
+}
+// ===== [M3][SUBPAGES_VNEXT v1] ここまで =====
 
-    // 11) Notes
-    root.appendChild(makePage_('pdf-notes', buildNotesHtml_()));
+async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
+  function uniq(arr) {
+    return Array.from(new Set((arr || []).map(v => String(v || '').trim()).filter(Boolean)));
+  }
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+  function flattenJsonLd(input, out) {
+    out = out || [];
+    if (!input) return out;
+    if (Array.isArray(input)) {
+      input.forEach(v => flattenJsonLd(v, out));
+      return out;
+    }
+    if (typeof input !== 'object') return out;
+    out.push(input);
+    if (Array.isArray(input['@graph'])) input['@graph'].forEach(v => flattenJsonLd(v, out));
+    return out;
+  }
+  function jsonLdTypeList(node) {
+    const t = node && node['@type'];
+    return (Array.isArray(t) ? t : (t ? [t] : [])).map(v => String(v || ''));
+  }
+  function emitTrace(data) {
+    try {
+      console.log('[PW][PRODUCT_SPEC_COLLECT_TRACE]', JSON.stringify({
+        tableCount: data && data.tableCount,
+        dlCount: data && data.dlCount,
+        headingCount: data && data.headingCount,
+        specLikeTablesCount: data && data.specLikeTablesCount,
+        comparisonLikeTablesCount: data && data.comparisonLikeTablesCount,
+        specCueCount: data && data.specCueCount,
+        comparisonCueCount: data && data.comparisonCueCount,
+        productJsonLdCount: data && data.productJsonLdCount,
+        serviceJsonLdCount: data && data.serviceJsonLdCount,
+        structuredSpecScore: data && data.structuredSpecScore,
+        comparisonReadinessLevel: data && data.comparisonReadinessLevel,
+        hasStructuredProductInfo: data && data.hasStructuredProductInfo,
+        hasComparisonReadyShape: data && data.hasComparisonReadyShape,
+        attached: !!(data && data.attached),
+        reason: data && data.reason
+      }));
+    } catch (_) {}
+  }
 
-    // 12) Notes (評価差分)
-    root.appendChild(makePage_('pdf-notes-diff', buildNotesDiffHtml_()));
+  const dom = await page.evaluate(() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const head = (s, n) => norm(s).slice(0, n || 80);
+    const SPEC_RE = /(仕様|スペック|サイズ|重量|重さ|価格|料金|材質|素材|対応|型番|品番|SKU|容量|寸法|幅|高さ|奥行|カラー|色|spec|specification|size|weight|price|material|model|sku|capacity|dimension|color)/i;
+    const COMP_RE = /(比較|違い|選び方|おすすめ|一覧|ラインアップ|性能差|compare|comparison|versus|vs\.?|difference|choose|ranking)/i;
 
-    document.body.appendChild(root);
-    return root;
-
-    function extractKpiFromSections_(sections){
+    function qa(root, sel) {
+      try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+    }
+    function openRoots() {
       const roots = [];
-      try{
-        if (sections?.dashboard) roots.push(sections.dashboard);
-        if (sections?.diagnosisRoot) roots.push(sections.diagnosisRoot);
-      }catch(_){}
-
-      const SELS = {
-        score: [
-          '#badgeAvg', '#resultScore', '#sumBefore', '[data-kpi="score"]',
-          '#kpiScore', '.kpi-score'
-        ],
-        rank: [
-          '#resultRank', '#dv2-kpi-rank', '[data-kpi="rank"]',
-          '#kpiRank', '.kpi-rank'
-        ],
-        diff: [
-          '#dv2-kpi-gap',          // ★これを追加（確定）
-          '#kpiDiff', '#prevDiff', '[data-kpi="diff"]',
-          '.kpi-diff', '.kpi-prev-diff'
-        ]
-      };
-
-      function getText_(root, sel){
-        try{
-          const el = root && root.querySelector ? root.querySelector(sel) : null;
-          if (!el) return '';
-          return (el.textContent || '').trim();
-        }catch(_){ return ''; }
-      }
-
-      function pickTextAny_(cands){
-        for (const r of roots){
-          for (const sel of cands){
-            const t = getText_(r, sel);
-            if (t) return t;
-          }
-        }
-        for (const sel of cands){
-          const t = getText_(document, sel);
-          if (t) return t;
-        }
-        return '';
-      }
-
-      function pickNumber_(s){
-        try{
-          const m = String(s||'').replace(/,/g,'').match(/(\d+(?:\.\d+)?)/);
-          if (!m) return null;
-          const n = Number(m[1]);
-          return Number.isFinite(n) ? n : null;
-        }catch(_){ return null; }
-      }
-
-      const rawScore = pickTextAny_(SELS.score);
-      const rawRank  = pickTextAny_(SELS.rank);
-      const rawDiff  = pickTextAny_(SELS.diff);
-
-      const score = pickNumber_(rawScore);
-
-      const out = {
-        score: (score == null ? null : score),
-        rank: rawRank || '',
-        diffText: rawDiff || ''
-      };
-
-      const miss = [];
-      if (out.score == null) miss.push('Score');
-      if (!out.rank)        miss.push('Rank');
-      if (!out.diffText)    miss.push('Diff');
-      if (miss.length){
-        out._note = '※ 画面DOMからKPIを取得できませんでした: ' + miss.join(', ');
-      }
-      return out;
-    }
-
-    function extractAxisScoresFromSections_(sections){
-      const root = sections?.diagnosisRoot || sections?.dashboard || document;
-      const card = root.querySelector ? root.querySelector('#v2-card-score-table') : null;
-      const table = card ? card.querySelector('table#resultScores') : (root.querySelector ? root.querySelector('table#resultScores') : null);
-
-      const out = {
-        rows: [], // {label, beforeText, afterText}
-        totalBefore: null,
-        totalAfter: null
-      };
-
-      if (!table) return out;
-
-      const trs = Array.from(table.querySelectorAll('tbody tr'));
-      trs.forEach(tr => {
-        const th = tr.querySelector('th');
-        const tds = Array.from(tr.querySelectorAll('td'));
-
-        // 合計行（<th>合計</th><th>68</th><th>86</th>）
-        if (th && th.textContent.trim() === '合計'){
-          const ths = Array.from(tr.querySelectorAll('th'));
-          if (ths[1]) out.totalBefore = ths[1].textContent.trim();
-          if (ths[2]) out.totalAfter  = ths[2].textContent.trim();
-          return;
-        }
-
-        // 通常行：<td>指標</td><td>Beforeセル</td><td>Afterセル</td>
-        if (tds.length >= 3){
-          const label = (tds[0].textContent || '').trim();
-          const beforeText = pickScoreText_(tds[1]);
-          const afterText  = pickScoreText_(tds[2]);
-          if (label){
-            out.rows.push({ label, beforeText, afterText });
-          }
-        }
-      });
-
-      return out;
-
-      function pickScoreText_(cell){
-        // "17/30" などは span.small.muted の中にある
-        const span = cell.querySelector('span.small.muted');
-        const t = (span ? span.textContent : cell.textContent) || '';
-        return t.trim();
-      }
-    }
-
-    function esc_(s){
-      return String(s)
-        .replaceAll('&','&amp;')
-        .replaceAll('<','&lt;')
-        .replaceAll('>','&gt;')
-        .replaceAll('"','&quot;')
-        .replaceAll("'","&#39;");
-    }
-
-    function normalizePriJP_(p){
-      const s = String(p || '').trim().toLowerCase();
-      if (!s) return '';
-      if (s === 'high' || s === '高') return '高';
-      // ★ ここに middle を追加
-      if (s === 'medium' || s === 'mid' || s === 'middle' || s === '中') return '中';
-      if (s === 'low' || s === '低') return '低';
-      return String(p || '').trim();
-    }
-
-    function pdfPriBadge_(pri){
-      try{
-        let priJP = normalizePriJP_(pri);
-
-        // ★ priority が空のカードでも、画面と同様に "中" を表示する（表示上の下駄）
-        if (!priJP) priJP = '中';
-
-        // ★ 括弧は“まず付ける”だけ（中身は次段で決める）
-        const suffix = '（品質向上）'; // ←いったん仮。次にスコア影響へ分岐させる
-
-        return `<span class="pdf-pri pdf-pri-${esc_(priJP)}">優先度：${esc_(priJP + suffix)}</span>`;
-      }catch(_){
-        return '';
-      }
-    }
-
-    function parseFrac_(txt){
-      const m = String(txt||'').match(/(\d+)\s*\/\s*(\d+)/);
-      if (!m) return { ok:false, pct:0 };
-      const x = Number(m[1]), y = Number(m[2]);
-      if (!Number.isFinite(x) || !Number.isFinite(y) || y<=0) return { ok:false, pct:0 };
-      return { ok:true, pct: Math.max(0, Math.min(100, (x/y)*100)) };
-    }
-
-    function barHtml_(o, type){
-      const pct = (o && o.ok) ? Math.round(o.pct) : 0;
-      const cls = (type === 'after') ? 'after' : 'before';
-      // DOM通り: 高さ8px / 角丸4px / 背景#eee
-      return `<div class="pdf-bar" style="height:8px;background:#eee;border-radius:4px;overflow:hidden">
-        <div class="pdf-bar-fill ${cls}" style="height:100%;width:${pct}%;"></div>
-      </div>`;
-    }
-
-    function axisKeyOf_(s){
-      const t = String(s || '').trim().toLowerCase();
-      if (!t) return '';
-      if (t === 'data' || t.includes('データ')) return 'data';
-      if (t === 'doc' || t.includes('文書')) return 'doc';
-      if (t === 'clarity' || t.includes('明確')) return 'clarity';
-      if (t === 'coverage' || t.includes('網羅')) return 'coverage';
-      if (t === 'trust' || t.includes('信頼')) return 'trust';
-      return '';
-    }
-
-    function axisKeyFromTitleForPdf_(title){
-      const t = String(title || '').trim();
-      if (!t) return '';
-
-      if (
-        t === 'WebSite 構造化データの整備' ||
-        t === 'Breadcrumb 構造化データの整備' ||
-        t === '構造化データにおけるエンティティ間の関連付け'
-      ) return 'data';
-
-      if (
-        t === '見出し構造（H1等）の整備' ||
-        t === 'ナビゲーション領域のセマンティック明示'
-      ) return 'doc';
-
-      if (
-        t === 'お問い合わせ導線の明確化' ||
-        t === '主要情報導線の不足' ||
-        t === '主要導線とナビゲーション構造の整合' ||
-        t === '主要導線（ナビ/回遊）の薄さ改善' ||
-        t === 'HTMLサイトマップの整備'
-      ) return 'coverage';
-
-      if (t === '連絡先情報の信頼性・明示性の強化') return 'trust';
-
-      if (t.indexOf('【データ構造】') === 0) return 'data';
-      if (t.indexOf('【文書構造】') === 0) return 'doc';
-      if (t.indexOf('【表現の明確さ】') === 0) return 'clarity';
-      if (t.indexOf('【情報網羅性】') === 0) return 'coverage';
-      if (t.indexOf('【信頼性】') === 0) return 'trust';
-
-      return '';
-    }
-
-    function axisMeta_(){
-      return {
-        data:     { label:'データ構造', max:30 },
-        doc:      { label:'文書構造', max:20 },
-        clarity:  { label:'表現の明確さ', max:10 },
-        coverage: { label:'情報網羅性', max:15 },
-        trust:    { label:'信頼性', max:25 }
-      };
-    }
-
-    function pickLatestDiagRes_(){
-      const cands = [
-        window.__AIO_DETAIL__,
-        window.__AIO_DETAIL,
-        window.__AIO_LATEST_RES__,
-        window.__LATEST_DIAG_RES__,
-        window.__AIO_LAST_RES__,
-        window.__AIO_LAST_SS_RES__,
-        window.__AIO_DEBUG_LAST_SS_RESULT,
-        window.__AIO_LATEST_RESULT__
-      ];
-      for (const c of cands){
-        if (c && typeof c === 'object') return c;
-      }
-      return null;
-    }
-
-    function pickFirstArray_(){
-      for (let i = 0; i < arguments.length; i++) {
-        const v = arguments[i];
-        if (Array.isArray(v)) return v;
-      }
-      return [];
-    }
-
-    function pickFirstNonEmptyArray_(){
-      for (let i = 0; i < arguments.length; i++) {
-        const v = arguments[i];
-        if (Array.isArray(v) && v.length) return v;
-      }
-      return [];
-    }
-
-    function pickFirstObject_(){
-      for (let i = 0; i < arguments.length; i++) {
-        const v = arguments[i];
-        if (v && typeof v === 'object' && !Array.isArray(v)) return v;
-      }
-      return null;
-    }
-
-    function parseJsonObject_(v){
-      if (v && typeof v === 'object' && !Array.isArray(v)) return v;
-      if (typeof v !== 'string' || !v.trim()) return null;
       try {
-        const parsed = JSON.parse(v);
-        return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null;
-      } catch (_) {
-        return null;
-      }
-    }
-
-    function cardRuleIdOf_(card){
-      return String((card && (card.sourceRuleId || card.ruleId || card.id)) || '').trim();
-    }
-
-    function axisOfRuleId_(ruleId){
-      const s = String(ruleId || '').toUpperCase();
-      if (s.indexOf('DATA_') === 0) return 'data';
-      if (s.indexOf('DOC_') === 0) return 'doc';
-      if (s.indexOf('CLAR_') === 0) return 'clarity';
-      if (s.indexOf('COV_') === 0) return 'coverage';
-      if (s.indexOf('TRUST_') === 0) return 'trust';
-      return '';
-    }
-
-    function normalizeMinorRuleId_(rawId, penaltyItems, cards){
-      const raw = String(rawId || '').trim();
-      const upper = raw.toUpperCase();
-      if (axisOfRuleId_(upper)) return upper;
-
-      const pis = Array.isArray(penaltyItems) ? penaltyItems : [];
-      for (let i = 0; i < pis.length; i++) {
-        const it = pis[i] || {};
-        const rid = String((it.ruleId || it.id) || '').trim().toUpperCase();
-        if (!rid) continue;
-        if (
-          raw === String(it.cardKey || '').trim() ||
-          raw === String(it.ruleId || '').trim() ||
-          raw === String(it.id || '').trim()
-        ) {
-          return rid;
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) roots.push(el.shadowRoot);
+          if (roots.length >= 8) break;
         }
-      }
-
-      const cs = Array.isArray(cards) ? cards : [];
-      for (let i = 0; i < cs.length; i++) {
-        const c = cs[i] || {};
-        const rid = cardRuleIdOf_(c).toUpperCase();
-        if (!rid) continue;
-        if (
-          raw === String(c.cardKey || '').trim() ||
-          raw === String(c.templateCardKey || '').trim() ||
-          raw === String(c.effectiveCardKey || '').trim() ||
-          raw === String(c.themeKey || '').trim() ||
-          raw === String(c.id || '').trim()
-        ) {
-          return rid;
-        }
-      }
-
-      const map = {
-        trust_copyright: 'TRUST_FRESHNESS_WEAK_V1',
-        trust_sameas: 'TRUST_SAMEAS_WEAK',
-        trust_nap_thin: 'TRUST_NAP_THIN_WEAK',
-        trust_sameas_absent: 'TRUST_SAMEAS_ABSENT_WEAK',
-        trust_address_missing_minor: 'TRUST_ADDRESS_MISSING_MINOR',
-        clar_meta_core: 'CLAR_META_DESCRIPTION_SHORT',
-        coverage_nav_thin: 'COV_NAVCOUNT_THIN_WEAK',
-        cov_recruit_minor: 'COV_RECRUIT_LINK_MISSING_MINOR',
-        doc_main_minor: 'DOC_MAIN_LANDMARK_MISSING_MINOR',
-        data_structured_core: 'DATA_JSONLD_VARIANTS_FEW'
-      };
-      return map[raw] || upper;
-    }
-
-    function minorReasonText_(ruleId){
-      const map = {
-        CLAR_ABSTRACT_LINKTEXT: '冒頭要約内のリンク文言は確認できるものの、遷移先や内容が文言だけで読み分けられるかまでは判定できていません。リンク文言の具体性を確認してください。',
-        CLAR_EVIDENCE_SIGNAL_MISSING: '説明候補となる本文や見出しは確認できるものの、主張を支える具体例や根拠文が添えられているかまでは判定できていません。根拠となる説明文や具体例の有無を確認してください。',
-        CLAR_HEADING_GENERIC_MIX: '見出しの存在は確認できるものの、抽象語が混在せず内容ごとに区別できる表現になっているかまでは判定できていません。見出し文言の言い分けを確認してください。',
-        CLAR_HEADING_THIN: '見出しの存在は確認できるものの、各セクションの要点が見出しだけで伝わる情報量になっているかまでは判定できていません。見出しの具体性を確認してください。',
-        CLAR_META_DESCRIPTION_TOO_SHORT: 'meta description の存在は確認できるものの、ページ主題と価値を要約できる長さが確保されているかまでは判定できていません。要約文の情報量を確認してください。',
-        CLAR_META_DESCRIPTION_TOO_SHORT_MINOR: 'meta description の存在は確認できるものの、ページ主題と価値を要約できる長さが確保されているかまでは判定できていません。要約文の情報量を確認してください。',
-        CLAR_META_DESCRIPTION_SHORT: 'meta description の存在は確認できるものの、主題と価値を十分に伝える説明量になっているかまでは判定できていません。説明文の長さと内容を確認してください。',
-        CLAR_META_DESCRIPTION_LONG: 'meta description の存在は確認できるものの、主題が一読で伝わる長さと焦点に収まっているかまでは判定できていません。要約文の長さと焦点を確認してください。',
-        CLAR_NAV_ABSTRACT_RATIO: '主要導線のリンク文言は確認できるものの、遷移先ごとの差が文言だけで読み分けられるかまでは判定できていません。リンク文言の具体性を確認してください。',
-        CLAR_NAV_GENERIC_MIX: 'ナビゲーションのリンク文言は確認できるものの、汎用語が混在せず役割ごとに区別できる表現になっているかまでは判定できていません。導線ラベルの言い分けを確認してください。',
-        CLAR_PRIMARY_MESSAGE_SPECIFICITY_WEAK: '主題説明の具体性・利用者視点の補強',
-        CLAR_SPEC_COMPARISON_WEAK: '仕様・比較情報の明確化',
-        CLAR_TITLE_LENGTH_WEAK: 'title の存在は確認できるものの、主題を過不足なく伝える長さに収まっているかまでは判定できていません。title の長さと主題の一致を確認してください。',
-        DATA_BREADCRUMB_SCHEMA_MISSING: 'BreadcrumbList に相当する構造化データの一部は確認できるものの、親ページから現在ページまでの階層情報が機械可読に整理されているかまでは判定できていません。BreadcrumbList の項目構造を確認してください。',
-        DATA_BREADCRUMB_SCHEMA_UNVERIFIED_WEAK: 'パンくずに相当する情報は確認できるものの、BreadcrumbList として階層順・名称・URL が整っているかまでは判定できていません。構造化データの階層定義を確認してください。',
-        DATA_JSONLD_VARIANTS_FEW: '構造化データの存在は確認できるものの、WebSite や Organization など必要な型が十分にそろっているかまでは判定できていません。JSON-LD の型構成を確認してください。',
-        DATA_ORG_PROFILE_THIN: 'Organization 構造化データの存在は確認できるものの、名称・URL・連絡先・所在地などの基本プロフィールが整理されているかまでは判定できていません。Organization の基本プロパティを確認してください。',
-        DOC_MAIN_LANDMARK_MISSING_MINOR: '本文に相当するコンテンツの存在は確認できるものの、main 要素や main ランドマークで主要領域が明示されているかまでは判定できていません。main の配置と範囲を確認してください。',
-        TRUST_FRESHNESS_WEAK_V1: '更新に関する表記は一部確認できるものの、最新性を継続的に示す日時や更新情報が整理されているかまでは判定できていません。更新日や更新導線の表示を確認してください。',
-        TRUST_NAP_THIN_WEAK: '事業者情報に相当する記載は確認できるものの、名称・住所・連絡先がそろって一貫表示されているかまでは判定できていません。基本事業者情報の掲載内容を確認してください。',
-        TRUST_SAMEAS_WEAK: '外部参照先の存在は確認できるものの、公式SNSや外部プロフィールへ主体情報を十分につなげられているかまでは判定できていません。sameAs の接続先を確認してください。',
-        TRUST_NAP_THIN: '事業者情報に相当する記載は確認できるものの、名称・住所・連絡先が基本情報としてそろっているかまでは判定できていません。事業者情報の掲載項目を確認してください。',
-        TRUST_ADDRESS_MISSING_MINOR: '事業者情報の掲載箇所は確認できるものの、所在地まで明示されているかまでは判定できていません。所在地表記の有無を確認してください。',
-        TRUST_SAMEAS_ABSENT_WEAK: '主体情報に相当する記載は確認できるものの、公式SNSや外部プロフィールとの接続まで整理されているかまでは判定できていません。外部プロフィールへの接続を確認してください。',
-        TRUST_PRIVACY_LABEL_WEAK: 'プライバシー関連ページへのリンクは確認できるものの、リンク名だけで役割が分かる表現になっているかまでは判定できていません。プライバシー導線のラベルを確認してください。',
-        TRUST_CONTACT_INFO_SEMANTICS: '連絡先情報の意味づけ・信頼性の補強',
-        TRUST_FRESHNESS_OPERATION_WEAK: '更新運用シグナルの明確化',
-        TRUST_COPYRIGHT_STALE: '著作権表記の存在は確認できるものの、現在の運営年と整合した年表記になっているかまでは判定できていません。著作権年の最新性を確認してください。',
-        COV_NAVCOUNT_THIN_WEAK: '主要導線の存在は確認できるものの、会社情報・サービス・問い合わせなどへ十分な本数で到達できる構成かまでは判定できていません。主要導線の配置数を確認してください。',
-        COV_NAV_UNKNOWN_MINOR: '主要導線に相当する要素は確認できるものの、会社情報・サービス・問い合わせなどのカテゴリごとに到達性を判定できる状態かまでは確認できていません。主要導線のカテゴリ分けを確認してください。',
-        COV_FOOTER_NAV_THIN: 'フッター導線や主要ナビゲーションの情報量が限定的です。会社情報・プライバシー情報・利用規約など、補助導線の配置と見つけやすさを確認してください。',
-        COV_RECRUIT_LINK_MISSING_MINOR: '企業情報に相当する導線は確認できるものの、採用情報ページへ継続的に到達できる構成かまでは判定できていません。採用導線の有無と配置を確認してください。',
-        COV_HTML_SITEMAP_STRUCTURE: 'HTMLサイトマップの存在は確認できるものの、見出しやリストによる階層構造が整理されているかまでは判定できていません。構造と一覧性を確認してください。',
-        COV_STRUCTURE_THIN: '主要カテゴリへの導線は一部確認できるものの、会社情報・問い合わせ・FAQ などへ偏りなく到達できる構成かまでは判定できていません。主要カテゴリの露出バランスを確認してください。'
-      };
-      return map[String(ruleId || '').trim()] || String(ruleId || '').trim();
-    }
-
-    function stripAxisPrefixForPdf_(title){
-      return String(title || '')
-        .replace(/^【データ構造】\s*/, '')
-        .replace(/^【文書構造】\s*/, '')
-        .replace(/^【表現の明確さ】\s*/, '')
-        .replace(/^【情報網羅性】\s*/, '')
-        .replace(/^【信頼性】\s*/, '')
-        .trim();
-    }
-
-    function axisEvalText_(before, after, max, proposalTitles, minorReasons){
-      const proposalList = Array.isArray(proposalTitles) ? proposalTitles.filter(Boolean) : [];
-      const minorCount = Array.isArray(minorReasons) ? minorReasons.length : 0;
-      const topThemes = proposalList.slice(0, 2).map(stripAxisPrefixForPdf_).filter(Boolean);
-      const hasThemes = topThemes.length > 0;
-      const themeText = topThemes.length >= 2
-        ? '「' + topThemes[0] + '」と「' + topThemes[1] + '」'
-        : topThemes.length === 1
-          ? '「' + topThemes[0] + '」'
-          : '';
-
-      if (!(Number.isFinite(before) && Number.isFinite(after) && Number.isFinite(max) && max > 0)) {
-        return [
-          '現状スコアと改善後（想定）スコアの数値を十分に取得できていないため、この軸の改善幅を定量的には説明できません。',
-          (hasThemes
-            ? (themeText + ' が主な改善テーマです。')
-            : 'この軸では現時点で対応すべき主要な改善提案は確認されていません。'),
-          'これらの対応により、生成AIや検索システムがこの軸に関わる重要情報を理解しやすくなることが期待されます。',
-          (minorCount > 0
-            ? 'あわせて、補足改善ポイントも確認されています。'
-            : '補足改善ポイントは現時点では確認されていません。')
-        ].join('\n');
-      }
-      if (!hasThemes) {
-        return [
-          '現状は ' + before + ' / ' + max + ' 点で、改善後（想定）スコアも同水準です。',
-          'この軸では現時点で対応すべき主要な改善提案は確認されていません。',
-          '現行の構造・状態は、生成AIや検索システムにとって十分に理解しやすい状態にあります。',
-          (minorCount > 0
-            ? 'あわせて、補足改善ポイントも確認されています。'
-            : '補足改善ポイントは現時点では確認されていません。')
-        ].join('\n');
-      }
-      return [
-        '現状は ' + before + ' / ' + max + ' 点で、改善後（想定）スコアは ' + after + ' / ' + max + ' 点を見込んでいます。',
-        themeText + ' が主な改善テーマです。',
-        'これらの対応により、生成AIや検索システムがページ構造や重要情報を理解しやすくなることが期待されます。',
-        (minorCount > 0
-          ? 'あわせて、補足改善ポイントも確認されています。'
-          : '補足改善ポイントは現時点では確認されていません。')
-      ].join('\n');
-    }
-
-    function buildAxisReportData_(sections, domTitlesByAxis){
-      const meta = axisMeta_();
-      const res = pickLatestDiagRes_() || {};
-      const snap =
-        pickFirstObject_(
-          parseJsonObject_(res && res.snapshotJSON),
-          parseJsonObject_(res && res.snapshotJSONText),
-          parseJsonObject_(res && res.snapshot),
-          parseJsonObject_(res && res.detailPayload && res.detailPayload.snapshotJSON),
-          parseJsonObject_(res && res.detailPayload && res.detailPayload.snapshotJSONText),
-          parseJsonObject_(res && res.diagnosis && res.diagnosis.snapshotJSON),
-          parseJsonObject_(res && res.diagnosis && res.diagnosis.snapshotJSONText)
-        ) || {};
-      const scoreAxis =
-        pickFirstObject_(
-          res && res.score && res.score.axis,
-          res && res.axis,
-          res && res.diagnosis && res.diagnosis.axis,
-          res && res.meta && res.meta.axis
-        ) || {};
-
-      const cards =
-        pickFirstArray_(
-          res && res.cards,
-          res && res.detailPayload && res.detailPayload.cards,
-          res && res.diagnosis && res.diagnosis.cards,
-          res && res.improveItems
-        );
-
-      const penaltyItems =
-        pickFirstArray_(
-          res && res.penaltyItems,
-          res && res.detailPayload && res.detailPayload.penaltyItems,
-          res && res.diagnosis && res.diagnosis.penaltyItems,
-          res && res.meta && res.meta.penaltyItems,
-          res && res.score && res.score.details && res.score.details.penaltyItems,
-          snap && snap.penaltyItems,
-          snap && snap.diagnosis && snap.diagnosis.penaltyItems,
-          snap && snap.meta && snap.meta.penaltyItems
-        );
-
-      const minorItems =
-        pickFirstNonEmptyArray_(
-          res && res.minorPenaltyItems,
-          res && res.detailPayload && res.detailPayload.minorPenaltyItems,
-          res && res.diagnosis && res.diagnosis.minorPenaltyItems,
-          res && res.meta && res.meta.minorPenaltyItems,
-          res && res.score && res.score.details && res.score.details.minorPenaltyItems,
-          snap && snap.minorPenaltyItems,
-          snap && snap.diagnosis && snap.diagnosis.minorPenaltyItems,
-          snap && snap.meta && snap.meta.minorPenaltyItems
-        );
-
-      const minorByAxis =
-        pickFirstObject_(
-          res && res.minorByAxis,
-          res && res.detailPayload && res.detailPayload.minorByAxis,
-          res && res.diagnosis && res.diagnosis.minorByAxis,
-          res && res.meta && res.meta.minorByAxis,
-          res && res.meta && res.meta.penalty && res.meta.penalty.minor && res.meta.penalty.minor.byAxis,
-          snap && snap.minorByAxis,
-          snap && snap.diagnosis && snap.diagnosis.minorByAxis,
-          snap && snap.meta && snap.meta.minorByAxis,
-          snap && snap.meta && snap.meta.penalty && snap.meta.penalty.minor && snap.meta.penalty.minor.byAxis
-        ) || {};
-      const minorAxisSources = [
-        res && res.minorByAxis,
-        res && res.detailPayload && res.detailPayload.minorByAxis,
-        res && res.diagnosis && res.diagnosis.minorByAxis,
-        res && res.meta && res.meta.minorByAxis,
-        res && res.meta && res.meta.penalty && res.meta.penalty.minor && res.meta.penalty.minor.byAxis,
-        snap && snap.minorByAxis,
-        snap && snap.diagnosis && snap.diagnosis.minorByAxis,
-        snap && snap.meta && snap.meta.minorByAxis,
-        snap && snap.meta && snap.meta.penalty && snap.meta.penalty.minor && snap.meta.penalty.minor.byAxis
-      ].filter(v => v && typeof v === 'object');
-
-      let minorIds =
-        pickFirstNonEmptyArray_(
-          res && res.minorPenaltyIds,
-          res && res.detailPayload && res.detailPayload.minorPenaltyIds,
-          res && res.diagnosis && res.diagnosis.minorPenaltyIds,
-          res && res.meta && res.meta.minorPenaltyIds,
-          res && res.meta && res.meta.penalty && res.meta.penalty.minor && res.meta.penalty.minor.lowIds,
-          snap && snap.minorPenaltyIds,
-          snap && snap.diagnosis && snap.diagnosis.minorPenaltyIds,
-          snap && snap.meta && snap.meta.minorPenaltyIds,
-          snap && snap.meta && snap.meta.penalty && snap.meta.penalty.minor && snap.meta.penalty.minor.lowIds
-        ).slice();
-
-      const rawMinorIds = minorIds.slice();
-
-      if (!minorIds.length) {
-        minorIds = (minorItems.length ? minorItems : penaltyItems)
-          .filter(it => String((it && it.group) || '') === 'minor')
-          .map(it => String((it && (it.ruleId || it.id)) || ''))
-          .filter(Boolean);
-      }
-
-      function appendMinorId_(rid){
-        const s = String(rid || '').trim();
-        if (s && minorIds.indexOf(s) < 0) minorIds.push(s);
-      }
-      function appendMinorIdsFromValue_(v){
-        if (!v) return;
-        if (typeof v === 'string') {
-          appendMinorId_(v);
-          return;
-        }
-        if (Array.isArray(v)) {
-          v.forEach(appendMinorIdsFromValue_);
-          return;
-        }
-        if (typeof v === 'object') {
-          appendMinorId_(v.ruleId || v.id);
-          appendMinorIdsFromValue_(v.ruleIds || v.ids || v.minorPenaltyIds || v.items || v.penaltyItems);
-        }
-      }
-      minorAxisSources.forEach(src => {
-        ['data','doc','clarity','coverage','trust'].forEach(ax => {
-          appendMinorIdsFromValue_(src && src[ax]);
-        });
-      });
-
-      const axisScores = {};
-      Object.keys(meta).forEach(ax => {
-        const before = scoreAxis && scoreAxis.before ? scoreAxis.before[ax] : null;
-        const after  = scoreAxis && scoreAxis.after  ? scoreAxis.after[ax]  : null;
-        axisScores[ax] = {
-          before: Number.isFinite(before) ? before : null,
-          after: Number.isFinite(after) ? after : null
-        };
-      });
-
-      const domAxis = extractAxisScoresFromSections_(sections);
-      (domAxis.rows || []).forEach(row => {
-        const ax = axisKeyOf_(row && row.label);
-        if (!ax) return;
-        const b = parseFrac_(row.beforeText || '');
-        const a = parseFrac_(row.afterText || '');
-        if (axisScores[ax].before == null && b.ok) axisScores[ax].before = Math.round((b.pct / 100) * meta[ax].max);
-        if (axisScores[ax].after  == null && a.ok) axisScores[ax].after  = Math.round((a.pct / 100) * meta[ax].max);
-      });
-
-      const proposalTitlesByAxis = { data:[], doc:[], clarity:[], coverage:[], trust:[] };
-      const proposalTraceByAxis = { data:[], doc:[], clarity:[], coverage:[], trust:[] };
-      cards.forEach(card => {
-        const rid = cardRuleIdOf_(card);
-        const ax = axisKeyOf_(card && card.axis) || axisOfRuleId_(rid);
-        const ttl = String((card && card.title) || '').trim();
-        if (!ax || !ttl) return;
-        if (proposalTitlesByAxis[ax].indexOf(ttl) < 0) {
-          proposalTitlesByAxis[ax].push(ttl);
-        }
-        if (proposalTraceByAxis[ax]) {
-          proposalTraceByAxis[ax].push({
-            ruleId: rid,
-            cardKey: String((card && card.cardKey) || ''),
-            templateCardKey: String((card && card.templateCardKey) || ''),
-            effectiveCardKey: String((card && card.effectiveCardKey) || ''),
-            title: ttl
-          });
-        }
-      });
-
-      Object.keys(meta).forEach(ax => {
-        if (!proposalTitlesByAxis[ax].length && domTitlesByAxis && Array.isArray(domTitlesByAxis[ax])) {
-          proposalTitlesByAxis[ax] = domTitlesByAxis[ax].slice();
-        }
-      });
-
-      const minorReasonsByAxis = { data:[], doc:[], clarity:[], coverage:[], trust:[] };
-      const finalRenderedMinorItems = [];
-      const minorRenderIds = minorIds.slice();
-      minorItems.forEach(it => {
-        if (!it || String(it.group || '') !== 'minor') return;
-        const rid = String((it.ruleId || it.id) || '').trim();
-        const ax = axisKeyOf_(it.axis) || axisOfRuleId_(rid);
-        if (rid && ax && minorRenderIds.indexOf(rid) < 0) minorRenderIds.push(rid);
-      });
-      minorRenderIds.forEach(rid => {
-        const ruleId = normalizeMinorRuleId_(rid, penaltyItems, cards);
-        const ax = axisOfRuleId_(ruleId);
-        if (!ax) return;
-        const text = minorReasonText_(ruleId);
-        if (text && minorReasonsByAxis[ax].indexOf(text) < 0) {
-          minorReasonsByAxis[ax].push(text);
-          finalRenderedMinorItems.push({ ruleId: ruleId, axis: ax, reason: text });
-        }
-      });
-
-      try {
-        console.log('[PDF_MINOR_SOURCE_TRACE]', JSON.stringify({
-          minorIds: minorIds,
-          minorItems: minorItems.map(it => ({
-            ruleId: String((it && (it.ruleId || it.id)) || ''),
-            axis: String((it && it.axis) || ''),
-            group: String((it && it.group) || ''),
-            title: String((it && it.title) || '')
-          })),
-          minorByAxis: minorByAxis,
-          dataReasons: minorReasonsByAxis.data
-        }));
       } catch (_) {}
-      try {
-        console.log('[PDF_MINOR_RENDER_TRACE]', JSON.stringify({
-          rawMinorIds: rawMinorIds,
-          rawMinorItems: minorItems.map(it => ({
-            ruleId: String((it && (it.ruleId || it.id)) || ''),
-            axis: String((it && it.axis) || ''),
-            group: String((it && it.group) || ''),
-            surfaced: it && it.surfaced,
-            title: String((it && it.title) || '')
-          })),
-          dataMinorItems: finalRenderedMinorItems.filter(it => it.axis === 'data'),
-          filteredMinorItems: minorRenderIds.map(rid => normalizeMinorRuleId_(rid, penaltyItems, cards)),
-          finalRenderedMinorItems: finalRenderedMinorItems,
-          hasDataBreadcrumbMinor: finalRenderedMinorItems.some(it => it.ruleId === 'DATA_BREADCRUMB_SCHEMA_MISSING')
-        }));
-      } catch (_) {}
-      try {
-        console.log('[PDF_AXIS_PROPOSAL_TRACE]', JSON.stringify({
-          counts: Object.keys(proposalTitlesByAxis).reduce((acc, ax) => {
-            acc[ax] = proposalTitlesByAxis[ax].length;
-            return acc;
-          }, {}),
-          data: proposalTraceByAxis.data
-        }));
-      } catch (_) {}
-
-      const out = {};
-      Object.keys(meta).forEach(ax => {
-        const before = axisScores[ax].before;
-        const after = axisScores[ax].after;
-        const max = meta[ax].max;
-        out[ax] = {
-          axis: ax,
-          label: meta[ax].label,
-          max: max,
-          before: before,
-          after: after,
-          beforeText: Number.isFinite(before) ? `${before}/${max}` : '—',
-          afterText: Number.isFinite(after) ? `${after}/${max}` : '—',
-          proposalTitles: proposalTitlesByAxis[ax],
-          minorReasons: minorReasonsByAxis[ax]
-        };
-        out[ax].evaluation = axisEvalText_(
-          before,
-          after,
-          max,
-          out[ax].proposalTitles,
-          out[ax].minorReasons
-        );
-      });
-      return out;
+      return roots;
     }
+    const roots = [document].concat(openRoots());
+    const all = (sel) => roots.flatMap(root => qa(root, sel));
 
-    function buildAxisCoverPage_(axisKey, axisData){
-      if (!axisData) return null;
-      const proposals = (axisData.proposalTitles && axisData.proposalTitles.length)
-        ? axisData.proposalTitles.map(t => stripAxisPrefixForPdf_(t)).filter(Boolean)
-        : [];
-      const hasProposals = proposals.length > 0;
-      const minorReasons = (axisData.minorReasons && axisData.minorReasons.length)
-        ? axisData.minorReasons.map(t => String(t || '').trim()).filter(Boolean)
-        : [];
-      const hasMinorReasons = minorReasons.length > 0;
+    let specLikeTablesCount = 0;
+    let comparisonLikeTablesCount = 0;
+    let specCueCount = 0;
+    let comparisonCueCount = 0;
+    let specDlCount = 0;
+    const evidenceSources = [];
 
-      const html = [
-        '<h1 class="pdf-h1">GEO診断</h1>',
-        `<h2 class="pdf-h2">${esc_(axisData.label)}</h2>`,
-        '<div class="pdf-card pdf-axis-cover-frame">',
-          '<div class="pdf-axis-cover-field">',
-            '<div class="pdf-axis-cover-label">現状スコア</div>',
-            `<div class="pdf-axis-cover-value">${esc_(axisData.beforeText)}</div>`,
-          '</div>',
-          '<div class="pdf-axis-cover-field">',
-            '<div class="pdf-axis-cover-label">改善後（想定）スコア</div>',
-            `<div class="pdf-axis-cover-value">${esc_(axisData.afterText)}</div>`,
-          '</div>',
-          '<div class="pdf-axis-cover-field">',
-            '<div class="pdf-axis-cover-label">評価</div>',
-            `<div class="pdf-axis-cover-value" style="white-space:pre-line;">${esc_(axisData.evaluation)}</div>`,
-          '</div>',
-          '<div class="pdf-axis-cover-field">',
-            '<div class="pdf-axis-cover-label">この指標の改善提案</div>',
-            (hasProposals
-              ? [
-                  '<ul class="pdf-axis-cover-list">',
-                    proposals.map(t => `<li>${esc_(t)}</li>`).join(''),
-                  '</ul>'
-                ].join('\n')
-              : '<div class="pdf-axis-cover-value">該当なし</div>'),
-          '</div>',
-          [
-            '<div class="pdf-axis-cover-field">',
-              '<div class="pdf-axis-cover-label">補足改善ポイント</div>',
-              (hasMinorReasons
-                ? [
-                    '<div class="pdf-axis-cover-value">GEOへの影響は軽微のため改善施策としては提示していませんが、<br>以下の理由により減点されています。</div>',
-                    '<ul class="pdf-axis-cover-list" style="margin-top:8px;">',
-                      minorReasons.map(t => `<li>${esc_(t)}</li>`).join(''),
-                    '</ul>'
-                  ].join('\n')
-                : '<div class="pdf-axis-cover-value">該当なし</div>'),
-            '</div>'
-          ].join('\n'),
-        '</div>'
-      ].join('\n');
-
-      return makePage_('pdf-report-axis-cover', html);
-    }
-
-    function safeCanvasPng_(sel){
-      try{
-        const c = document.querySelector(sel);
-        if (c && c.toDataURL) return c.toDataURL('image/png');
-      }catch(_){}
-      return '';
-    }
-  }
-
-  function makePage_(cls, innerHtml){
-    const page = document.createElement('section');
-    page.className = `pdf-page ${cls}`;
-
-    // ★ ヘッダー/フッター直描き（y=8 / pageH-6）と本文の衝突を避けるための安全余白
-    //  - jsPDF の header/footer を動かさず、HTML側に上下の“物理的な空白”を確保する
-    const SAFE_TOP_H = 0;
-    const SAFE_BOT_H = 0;
-
-    const wrap = document.createElement('div');
-    wrap.innerHTML = [
-      (SAFE_TOP_H ? `<div style="height:${SAFE_TOP_H}px;"></div>` : ''),
-      innerHtml,
-      (SAFE_BOT_H ? `<div style="height:${SAFE_BOT_H}px;"></div>` : '')
-    ].join('\n');
-
-    page.appendChild(wrap);
-
-    // ★ 表紙だけ：縦センター寄せ（上半分に偏るのを防ぐ）
-    if (String(cls).includes('pdf-cover')) {
-      page.style.minHeight = '1040px';
-      page.style.display = 'flex';
-      page.style.flexDirection = 'column';
-      page.style.justifyContent = 'center';
-    }
-
-    return page;
-  }
-
-  function forceVisibleTree_(root){
-    try{
-      root.querySelectorAll('[hidden]').forEach(n => n.removeAttribute('hidden'));
-      root.querySelectorAll('[aria-hidden="true"]').forEach(n => n.setAttribute('aria-hidden','false'));
-      root.querySelectorAll('*').forEach(n => {
-        if (!n || !n.style) return;
-        if (n.style.display === 'none') n.style.display = 'block';
-        if (n.style.visibility === 'hidden') n.style.visibility = 'visible';
-        if (n.style.opacity === '0') n.style.opacity = '1';
-      });
-    }catch(_){}
-  }
-
-  // =========================================================
-  // 5) HTML templates (cover / conditions / notes)
-  // =========================================================
-  function buildCoverHtml_(ctx){
-    const authorLine = ctx.authorName
-      ? `<div style="margin-top:10px;font-size:13px;">作成：${escapeHtml_(ctx.authorName)}</div>`
-      : '';
-
-    return `
-      <div style="text-align:center;margin-top:120px;">
-        <div style="
-          position:absolute;
-          top:32px;
-          left:32px;
-          font-size:14px;
-          text-align:left;
-        ">
-          ${escapeHtml_(ctx.clientName || '(未入力)')} 御中
-        </div>
-
-        <div style="font-size:36px;font-weight:800;letter-spacing:.02em;">
-          GEO診断レポート
-        </div>
-        <div style="margin-top:14px;font-size:15px;opacity:.9;">
-          AI可視性（AI Visibility）に基づくWebサイト評価
-        </div>
-
-        <div style="margin-top:56px;font-size:16px;font-weight:400;">
-          株式会社フォーク
-        </div>
-
-        <div style="position:absolute; right:48px; bottom:0px; font-size:14px; display:flex; gap:16px; align-items:flex-end;">
-          <div>${authorLine}</div>
-          <div>作成日：${escapeHtml_(ctx.reportDateText || ctx.diagnosisDateText || '—')}</div>
-        </div>
-      </div>
-    `;
-  }
-
-  function buildConditionsHtml_(ctx){
-    return `
-      <h1 class="pdf-h1">検査条件</h1>
-
-      <div class="pdf-text" style="font-size:13px;line-height:1.7;">
-        <h2 style="margin-top:14px;">診断日</h2>
-        <div>${escapeHtml_(ctx.diagnosisDateText || ctx.dateJST || '—')}</div>
-
-        <h2 style="margin-top:14px;">対象URL</h2>
-        <div>${escapeHtml_(ctx.origin || '—')}</div>
-
-        <h2 style="margin-top:14px;">診断対象</h2>
-        ${ul_(ctx.scopeLines)}
-
-        <!-- ★ 指標の説明：ここに移動＋ ul_() で統一 -->
-        <h2 style="margin-top:14px;">評価指標</h2>
-        <div>
-          本診断では、Webサイトを以下の5つの観点から評価しています。
-        </div>
-        ${ul_([
-          '【データ構造】AIが情報を正確に理解できるよう、構造化データやHTML構造が適切に設計されているか',
-          '【文書構造】ページ内の見出し構成や情報の並びが論理的で、内容の把握がしやすい構成になっているか',
-          '【表現の明確さ】サービス内容や提供価値が、AIにとって把握しやすい形で提示されているか',
-          '【情報網羅性】ページ内外の主要情報・補助導線が、利用者とAIにとって辿りやすく整理されているか',
-          '【信頼性】運営主体や実績、方針など、信頼につながる情報が明示されているか'
-        ])}
-
-        <h2 style="margin-top:14px;">使用したAIモデル</h2>
-        ${ul_(ctx.modelLines)}
-
-        <h2 style="margin-top:14px;">観測したAIの種類</h2>
-        ${ul_(ctx.aiOverviewLines)}
-
-      </div>
-    `;
-  }
-
-  function buildNotesHtml_(){
-    // Use your already agreed notes copy; this is a compact v1 placeholder.
-    return `
-      <h1 class="pdf-h1">注記</h1>
-      <div style="font-size:13px;line-height:1.7;">
-        <h2 style="margin-top:14px;">本レポートについて</h2>
-        <div>本レポートは、対象URLおよび構造化データ等をもとに、生成AI時代におけるWebサイトの可読性・評価傾向を多角的に分析したものです。診断結果および改善提案は、診断実施時点の情報に基づくスナップショットです。</div>
-
-        <h2 style="margin-top:14px;">診断範囲と前提条件</h2>
-        <ul>
-          <li>本診断はトップページを主対象とし、構造化データ（JSON-LD等）の有無・内容を解析対象に含みます。</li>
-          <li>下層ページ全体の網羅的なクロールや内容評価は行っていません。</li>
-          <li>サイト構成やページ種別により、評価の重みづけや注視点が異なる場合があります。</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">指標およびスコアについて</h2>
-        <ul>
-          <li>各スコアおよびランクは、複数の評価軸をもとに算出されています。</li>
-          <li>Afterスコアは、改善カードに記載した対策を実施した場合に、GEO/AI可視性上で観測済みの改善余地がどこまで補えるかを示す想定値です。</li>
-          <li>時間・コストに対して効果が限定的、または運用継続が前提となる項目（例：情報設計の厚み、表記ゆれ・保守性、継続的な更新運用など）は、Afterスコアにも減点が残る場合があります。</li>
-          <li>数値は相対評価を目的とした指標であり、検索順位や成果を直接保証するものではありません。</li>
-          <li>評価スコアは明確な欠落の有無だけでなく、情報の網羅性や内容の厚みを含めた相対的な水準をもとに算出されます。改善カードが表示されない場合でも、評価が最大値に達しないケースがあります。</li>
-          <li>評価ロジック上、「評価差分」として扱われる代表的な観点については、次ページにて補足しています。</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">改善提案について</h2>
-        <ul>
-          <li>改善ポイントとは、診断実施時点の情報をもとに自動生成された提案です。</li>
-          <li>実装にあたっては、サイトの目的・優先度・運用体制に応じた検討が必要です。</li>
-          <li>AI流入や検索順位などの効果測定を保証するものではなく、構造面における改善余地を示す診断結果です。</li>
-          <li>特定のページや要素に対して、明確な欠落や不備が確認できる場合にのみ、改善カードが表示されます。</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">AI認識ログについて</h2>
-        <ul>
-          <li>AI認識ログは特定モデルに対して対象URLの情報を入力し、その時点での認識傾向を記録したものです。</li>
-          <li>出力はモデル仕様や時間経過により変動する可能性があります。</li>
-          <li>本レポートではAI認識ログを定点観測の参考情報として位置づけています。</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">AI可視性に関する対応状況について</h2>
-        <ul>
-          <li>各項目は、AIが参照しやすい構造・宣言・情報設計の有無を確認しています。</li>
-          <li>特定の検索順位や生成AIでの表示結果を保証するものではありません。</li>
-        </ul>
-      </div>
-    `;
-  }
-
-  function buildNotesDiffHtml_(){
-    return `
-      <h1 class="pdf-h1">評価差分について</h1>
-      <div style="font-size:13px;line-height:1.7;">
-
-        <!-- ><h2 style="margin-top:14px;">評価差分について</h2> -->
-        <p>
-          以下は、改善カードとして表示される場合もありますが、
-          AIによる構造理解や確信度評価の過程で、スコア差分や残差要因としても扱われる代表的な補足観点です。
-          これらは不具合や欠陥を示すものではなく、機械的な解釈精度や情報の集約度の違いによって生じる評価調整要因であり、
-          本診断では改善カードとあわせて、スコア算出上の補足要素として位置づけています。
-        </p>
-
-        <h2 style="margin-top:14px;">データ構造</h2>
-        <ul>
-          <li>JSON-LDは存在するが、ページ種別や主要情報の構造化範囲が限定的で、本文上の情報との対応関係に確認余地がある</li>
-          <li>取得タイミングやJavaScript依存により、機械的解釈の確実性が低下する可能性がある（例：タイムアウト・遅延描画・動的挿入）</li>
-          <li>ページ上の主題は読めるが、構造化データ上で「主役」が固定されず、確信度が最大化されない（例：mainEntity/author/providerが未定義）</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">文書構造</h2>
-        <ul>
-          <li>見出し階層は成立しているが、情報ブロックの論理粒度が均一でない（例：同じ階層に目的の異なるセクションが混在）</li>
-          <li>セマンティック構造は有効だが、AIが全体像を把握するまでに追加解釈を要する（例：nav/main/header/footerの役割が複数パターン）</li>
-          <li>リンク群・注釈・補足が本文と近接し、主要情報の抽出でノイズになり得る（例：共通パーツが本文に混ざって見える）</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">表現の明確さ</h2>
-        <ul>
-          <li>意味は成立するが、主語・条件・前提が暗黙的な表現が含まれる（例：「〜できます」だけで対象・条件が省略される）</li>
-          <li>略語や専門用語の定義がページ内で完結していない（例：初出での補足がなく、他ページ前提になる）</li>
-          <li>ページ単体での要約は可能だが、用語・表記ゆれにより同一概念の統合精度が下がる（例：名称揺れ、表記の混在）</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">情報網羅性</h2>
-        <ul>
-          <li>情報欠落はないが、内部リンク設計や情報集約性に改善余地がある（例：重要情報が分散し、ハブが弱い）</li>
-          <li>AIが構造を把握するために複数ページの横断を要する構成（例：導線はあるが、階層・役割が明示されない）</li>
-          <li>一覧性はあるが、分類軸が曖昧で「どこに何があるか」の確信度が上がりにくい（例：フッター/サイトマップの情報設計）</li>
-        </ul>
-
-        <h2 style="margin-top:14px;">信頼性</h2>
-        <ul>
-          <li>運営・法的・技術的な信頼シグナルは存在するが、強度や即時性にばらつきがある（例：確認できるが目立たない／到達が遠い）</li>
-          <li>信頼情報が分散配置されており、確信度が最大化されていない（例：運営者情報・規約・連絡先が別ページに散る）</li>
-          <li>技術的には問題がなくても、第三者的な裏取りや更新運用の継続性を示すシグナルが弱い場合がある</li>
-        </ul>
-
-      </div>
-    `;
-  }
-
-  function siteTypeDescription_(siteTypeLabel){
-    // Keep short (2–3 sentences). Avoid implying "we read/understand the prose".
-    const t = String(siteTypeLabel || '');
-
-    if (t.includes('コーポレート')){
-      return '企業・組織（※公共施設・団体サイトを含む）の運営主体情報をAIが正しく把握できるよう、情報が構造的に整理・提示されているかを重視します。運営主体の概要、役割・提供内容、所在地や連絡先（NAP）の明示性、主要ページ（概要・お問い合わせ・ポリシー等）への導線、ならびに構造化データ（Organization／WebSite 等）を評価対象とします。';
-    }
-
-    if (t.includes('サービス') || t.includes('LP')){
-      return 'サービス内容を判断するために必要な情報が、過不足なく整理・提示されているかを重視します。サービス概要・料金・対象ユーザー・提供価値の明示と、事例・FAQ・問い合わせ等の主要導線、ならびに構造化データ（Service／Offer／Organization 等）を評価対象とします。';
-    }
-
-    if (t.includes('EC')){
-      return '商品の購入判断に必要な情報が、適切な粒度で整理され、購入までの導線が明確かを重視します。商品情報（価格・在庫・SKU・画像・レビュー等）の明示、送料・返品ポリシーへの導線、ならびに構造化データ（Product／Offer 等）を評価対象とします。';
-    }
-
-    if (t.includes('メディア') || t.includes('オウンド')){
-      return '記事内容の信頼性を判断するための手がかりが明示され、記事群が整理されているかを重視します。著者・更新日・出典等の明示、カテゴリ・タグ・パンくず等の整理に加え、運営主体情報の明確さ、ならびに構造化データ（Article／BlogPosting／Organization 等）を評価対象とします。';
-    }
-
-    return '';
-  }
-
-  function ul_(items){
-    const arr = Array.isArray(items) ? items : [];
-    if (!arr.length) return '—';
-    return `<ul style="margin:0;padding-left:18px;">${
-      arr.map(s => `<li>${escapeHtml_(String(s))}</li>`).join('')
-    }</ul>`;
-  }
-
-  // =========================================================
-  // 6) PDF render (TODO integrate your current pipeline)
-  // =========================================================
-  async function renderPdfAndDownload_(job, printRoot){
-    // --- dependency checks ---
-    const h2c = window.html2canvas;
-    const jsPDFCtor =
-      (window.jspdf && window.jspdf.jsPDF) ||
-      window.jsPDF ||
-      null;
-
-    if (typeof h2c !== 'function') {
-      throw new Error('html2canvas が未ロードです（window.html2canvas がありません）');
-    }
-    if (!jsPDFCtor) {
-      throw new Error('jsPDF が未ロードです（window.jspdf.jsPDF / window.jsPDF がありません）');
-    }
-
-    // --- mount printRoot clone to offscreen stage (layout fix) ---
-    const stage = document.createElement('div');
-    stage.style.position = 'fixed';
-    stage.style.left = '-100000px';
-    stage.style.top  = '0';
-    stage.style.width = '794px'; // A4相当
-    stage.style.background = '#ffffff';
-    stage.style.pointerEvents = 'none';
-    stage.style.zIndex = '-1';
-    document.body.appendChild(stage);
-
-    // ★ 本体は動かさず、クローンだけ使う
-    const printClone = printRoot.cloneNode(true);
-    stage.appendChild(printClone);
-
-    // === [PDF][WIDTH-NORMALIZE v1] radar/summary だけ「固定幅焼き付け」を解除して100%に戻す（cloneのみ） ===
-    try{
-      const pageSels = [
-        '.pdf-page.pdf-report-radar-axis',
-        '.pdf-page.pdf-report-summary'
-      ];
-
-      pageSels.forEach(sel=>{
-        const p = printClone.querySelector(sel);
-        if (!p) return;
-
-        Array.from(p.children || []).forEach(ch=>{
-          // 見出しはそのまま
-          if (ch && ch.classList && ch.classList.contains('pdf-h1')) return;
-          if (!ch || !ch.style) return;
-
-          // “焼き付いた固定幅” を殺して、ページ有効幅(722px)いっぱいに揃える
-          ch.style.width = '100%';
-          ch.style.maxWidth = '100%';
-          ch.style.boxSizing = 'border-box';
-
-          // 左右ズレの温床になりやすいので明示的にゼロ（paddingは触らない）
-          ch.style.marginLeft  = '0';
-          ch.style.marginRight = '0';
-
-          // transform が焼けてたら右欠け/左寄りに見えるので念のため無効化
-          if (ch.style.transform && ch.style.transform !== 'none'){
-            ch.style.transform = 'none';
-          }
-        });
-      });
-
-      console.warn('[PDF][WIDTH-NORMALIZE][DONE]');
-    }catch(e){
-      console.warn('[PDF][WIDTH-NORMALIZE][EXC]', e);
-    }
-
-    // === [PDF][RADAR-CENTER-SAFE v1] 診断レーダーを“幅を変えずに”中央寄せ（printCloneだけ） ===
-    try{
-      const card = printClone.querySelector('#dv2-card-result-radar');
-      if (card){
-        const wrap =
-          card.querySelector('.chart-wrap') ||
-          (card.querySelector('#dv2-radar-canvas') && card.querySelector('#dv2-radar-canvas').parentElement) ||
-          null;
-
-        if (wrap){
-          // いまの見た目幅を保持して中央寄せ（width:100% は絶対に触らない）
-          const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-          const w = r && r.width ? Math.round(r.width) : 0;
-
-          wrap.style.marginLeft  = 'auto';
-          wrap.style.marginRight = 'auto';
-
-          if (w > 0){
-            wrap.style.width    = w + 'px';
-            wrap.style.maxWidth = w + 'px';
-          }
-
-          // 念のため “左寄せの原因が親flex” でも中央に来るように
-          const parent = wrap.parentElement;
-          if (parent && parent.style){
-            parent.style.justifyContent = 'center';
-          }
+    const tables = all('table').slice(0, 24);
+    tables.forEach((table) => {
+      const caption = head((table.querySelector('caption') || {}).innerText || '', 60);
+      const thTexts = qa(table, 'th').slice(0, 24).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const tdTexts = qa(table, 'td').slice(0, 80).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const rowCount = qa(table, 'tr').length;
+      const firstRowCells = qa(table, 'tr:first-child th, tr:first-child td').length;
+      const colCount = Math.max(firstRowCells, thTexts.length ? Math.min(thTexts.length, 8) : 0);
+      const text = [caption].concat(thTexts, tdTexts.slice(0, 24)).join(' ');
+      const hasSpecCue = SPEC_RE.test(text);
+      const hasComparisonCue = COMP_RE.test(text);
+      if (hasSpecCue) {
+        specLikeTablesCount++;
+        specCueCount++;
+        if (evidenceSources.length < 8) {
+          evidenceSources.push('table: ' + head(caption || thTexts.join(' / ') || tdTexts.join(' / '), 80));
         }
       }
-    }catch(_){}
-
-    // === [PDF][CLONE-ID-PROBE v1] printClone内に実在する dv2/compare 系IDを列挙 ===
-    try{
-      const ids = Array.from(printClone.querySelectorAll('[id]'))
-        .map(n => String(n.id || ''))
-        .filter(id => id && (id.startsWith('dv2-') || id.startsWith('compare') || id.includes('chart')))
-        .slice(0, 200);
-
-      console.warn('[PDF][CLONE-ID-PROBE]', {count: ids.length, ids});
-    }catch(e){
-      console.warn('[PDF][CLONE-ID-PROBE][EXC]', e);
-    }
-
-    // === [PDF][CHART-INJECT v1] printClone側にcanvasが無い場合、画面側canvasをPNG化して枠へ流し込む ===
-    try{
-      function injectChartByContainerId_(containerId){
-        try{
-          // 1) 画面側：container配下のcanvasを探してPNG化
-          const liveBox = document.getElementById(containerId);
-          if (!liveBox) return {ok:false, why:'no_live_box'};
-
-          const liveCanvas =
-            (liveBox.tagName === 'CANVAS') ? liveBox : liveBox.querySelector('canvas');
-          if (!liveCanvas) return {ok:false, why:'no_live_canvas'};
-
-          let dataUrl = '';
-          try{ dataUrl = liveCanvas.toDataURL('image/png'); }catch(_){ dataUrl = ''; }
-          if (!dataUrl || !dataUrl.startsWith('data:image/')) return {ok:false, why:'no_dataurl'};
-
-          // 2) printClone側：同じidの枠を探して中身をIMGに置換
-          const cloneBox = printClone.querySelector('#' + containerId);
-          if (!cloneBox) return {ok:false, why:'no_clone_box'};
-
-          // 枠の高さが潰れるのを防ぐ（最低限）
-          try{
-            if (cloneBox.style && cloneBox.style.setProperty){
-              cloneBox.style.setProperty('display', 'block', 'important');
-              cloneBox.style.setProperty('min-height', '220px', 'important'); // 必要なら後で調整
-            }
-          }catch(_){}
-
-          // 既存の中身をクリアして画像を入れる
-          cloneBox.innerHTML = '';
-          const img = document.createElement('img');
-          img.src = dataUrl;
-          img.alt = 'chart';
-          img.style.display = 'block';
-          img.style.width = '100%';
-          img.style.height = 'auto';
-          img.style.margin = '0';
-          cloneBox.appendChild(img);
-
-          return {ok:true};
-        }catch(e){
-          return {ok:false, why:'exc'};
+      if (hasComparisonCue || (hasSpecCue && rowCount >= 3 && colCount >= 3)) {
+        comparisonLikeTablesCount++;
+        comparisonCueCount++;
+        if (evidenceSources.length < 8) {
+          evidenceSources.push('comparison-table: rows=' + rowCount + ', cols=' + colCount);
         }
       }
-
-      const targets = [
-        'dv2-chart-score',   // 総合スコア推移（あなたのKILL_SELECTORSにも出てる）
-        'dv2-chart-clicks',  // 改善ポイント件数/クリック等（同上）
-        'dv2-chart-state'    // 状態チャートがあるなら
-      ];
-
-      const rep = {};
-      let okCount = 0;
-      targets.forEach(id=>{
-        const r = injectChartByContainerId_(id);
-        rep[id] = r;
-        if (r && r.ok) okCount++;
-      });
-
-      console.warn('[PDF][CHART-INJECT][DONE]', {okCount, rep});
-    }catch(e){
-      console.warn('[PDF][CHART-INJECT][SKIP]', e);
-    }
-
-    // --- collect pages ---
-    let pages = [];
-    try{
-      pages = Array.from(printClone.querySelectorAll('.pdf-page')) || [];
-      const head = (pages[0] && (pages[0].innerText || pages[0].textContent || '')) || '';
-    }catch(e){
-      console.error('[PDF][PAGES][EXC]', e);
-      // ★ ここまで来て落ちるなら DOM か selector 周り
-      pages = [];
-    }
-
-    if (!pages.length) {
-      throw new Error('.pdf-page が見つかりません（printRoot 組み立てに失敗している可能性）');
-    }
-
-    // --- filename ---
-    const safeClient = sanitizeFilePart_(job.clientName || '');
-    const ymd = formatDateFileYmd_(new Date());
-    const fname = safeClient
-      ? `GEO診断レポート_${safeClient}_${ymd}.pdf`
-      : `GEO診断レポート_${ymd}.pdf`;
-
-    // --- create pdf (A4 portrait, mm) ---
-    const pdf = new jsPDFCtor({
-      orientation: 'p',
-      unit: 'mm',
-      format: 'a4'
     });
 
-    // A4 size in mm
-    const pageW = 210;
-    const pageH = 297;
-
-    // --- render each .pdf-page as an image, one-by-one ---
-    for (let i = 0; i < pages.length; i++){
-      const el = pages[i];
-
-      // ★ Step4: 強制表示を「ここ1箇所」に集約（Improveページだけ）
-      // - 目的：.hide / [hidden] / aria-hidden / display:none !important を “最小限” で解除
-      function forceShowForPdfImprove_(pageEl){
-        try{
-          if (!pageEl) return;
-
-          // Improveページかどうか（“GEO診断改善ポイント”を含むページだけ）
-          const t = String(pageEl.textContent || '');
-          const isImprove = t.includes('GEO診断改善ポイント') || t.includes('改善ポイント');
-          if (!isImprove) return;
-
-          // 1) まずページ自身を確実に表示（これだけで直るケースが多い）
-          try{
-            pageEl.classList && pageEl.classList.remove('hide');
-            pageEl.removeAttribute('hidden');
-            pageEl.removeAttribute('aria-hidden');
-
-            if (pageEl.style && pageEl.style.setProperty) {
-              pageEl.style.setProperty('display', 'block', 'important');
-              pageEl.style.setProperty('visibility', 'visible', 'important');
-              pageEl.style.setProperty('opacity', '1', 'important');
-              pageEl.style.setProperty('transform', 'none', 'important');
-            }
-          }catch(_){}
-
-          // 2) Improveブロック配下だけ最小限で解除（子孫全部は触らない）
-          //    ※ “改善ポイントブロック”のルートを絞る（id/classが無くてもテキスト近傍で拾う）
-          let root = null;
-          try{
-            // 可能なら既知のid/classがあれば優先（存在しないならスキップされる）
-            root =
-              pageEl.querySelector('#improveSummary') ||
-              pageEl.querySelector('#improveSummaryText') ||
-              pageEl.querySelector('[data-improve]') ||
-              null;
-          }catch(_){}
-
-          // 見つからない場合は「見出しを含む要素の近いコンテナ」を拾う
-          if (!root) {
-            try{
-              const head = Array.from(pageEl.querySelectorAll('*')).find(n => {
-                const s = (n.textContent || '').trim();
-                return s === 'GEO診断改善ポイント' || s === '改善ポイント';
-              });
-              root = head ? (head.closest('.card, section, div') || head) : null;
-            }catch(_){}
-          }
-          if (!root) return;
-
-          // root と “直下少数” だけ解除（深い全探索はしない）
-          const targets = [root].concat(Array.from(root.children || []));
-          targets.forEach(node => {
-            try{
-              node.classList && node.classList.remove('hide');
-              node.removeAttribute && node.removeAttribute('hidden');
-              node.removeAttribute && node.removeAttribute('aria-hidden');
-
-              if (node.style && node.style.setProperty) {
-                node.style.setProperty('display', 'block', 'important');
-                node.style.setProperty('visibility', 'visible', 'important');
-                node.style.setProperty('opacity', '1', 'important');
-                node.style.setProperty('transform', 'none', 'important');
-              }
-            }catch(_){}
-          });
-        }catch(_){}
+    const dls = all('dl').slice(0, 24);
+    dls.forEach((dl) => {
+      const labels = qa(dl, 'dt').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const values = qa(dl, 'dd').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const text = labels.concat(values.slice(0, 10)).join(' ');
+      if (labels.length >= 3 && SPEC_RE.test(text)) {
+        specDlCount++;
+        specCueCount++;
+        if (evidenceSources.length < 8) evidenceSources.push('dl: ' + head(labels.join(' / '), 80));
       }
+      if (COMP_RE.test(text)) comparisonCueCount++;
+    });
 
-      // Ensure layout is stable
-      await nextFrame_();
+    const headingTexts = all('h1,h2,h3,h4,[role="heading"]').slice(0, 80)
+      .map(el => norm(el.innerText || el.textContent))
+      .filter(Boolean);
+    headingTexts.forEach((txt) => {
+      if (SPEC_RE.test(txt)) specCueCount++;
+      if (COMP_RE.test(txt)) comparisonCueCount++;
+    });
 
-      // ★ 診断ページだけ：レーダー枠を一時的に正方形固定（html2canvasの縦長化対策）
-      let __radarFix = null;
-      try{
-        const radarCard = el.querySelector && el.querySelector('#dv2-card-result-radar');
-        if (radarCard) {
-          const box =
-            radarCard.querySelector('.chart-wrap') ||
-            radarCard.querySelector('canvas')?.parentElement ||
-            radarCard;
+    return {
+      tableCount: tables.length,
+      dlCount: dls.length,
+      headingCount: headingTexts.length,
+      specLikeTablesCount,
+      comparisonLikeTablesCount,
+      specDlCount,
+      specCueCount,
+      comparisonCueCount,
+      evidenceSources: evidenceSources.slice(0, 8)
+    };
+  }).catch(() => null);
 
-          const prev = {
-            height: box.style.height,
-            maxHeight: box.style.maxHeight,
-            aspectRatio: box.style.aspectRatio,
-            display: box.style.display,
-            paddingTop: box.style.paddingTop
-          };
+  if (!dom || typeof dom !== 'object') {
+    emitTrace({
+      attached: false,
+      reason: 'extraction_error'
+    });
+    return null;
+  }
 
-          // 正方形fix
-          const w = Math.max(320, Math.round(box.getBoundingClientRect().width || 0));
-          box.style.display = 'block';
-          box.style.aspectRatio = '1 / 1';
-          box.style.height = w + 'px';
-          box.style.maxHeight = w + 'px';
+  const jsonldNodes = flattenJsonLd(jsonldForFlags || [], []);
+  const productJsonLdCount = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^Product$/i.test(t))
+  ).length;
+  const serviceJsonLdCount = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^Service$/i.test(t))
+  ).length;
+  const productLikeNodes = jsonldNodes.filter(node =>
+    jsonLdTypeList(node).some(t => /^(Product|Service|Offer|AggregateOffer)$/i.test(t))
+  );
+  const propertyKeys = [
+    'name', 'description', 'sku', 'mpn', 'model', 'brand', 'offers',
+    'additionalProperty', 'category', 'url', 'provider', 'serviceType',
+    'areaServed', 'itemOffered'
+  ];
+  const jsonLdPropertyHits = productLikeNodes.map(node =>
+    propertyKeys.filter(k => node && Object.prototype.hasOwnProperty.call(node, k)).length
+  );
+  const maxJsonLdPropertyCount = jsonLdPropertyHits.length ? Math.max(...jsonLdPropertyHits) : 0;
+  const hasProductLikeJsonLd = productLikeNodes.length > 0;
 
-          // “確定で入ってる上余白” をゼロへ（これが効いた）
-          box.style.paddingTop = '0px';
+  const hasStructuredProductInfo = !!(
+    dom.specLikeTablesCount > 0 ||
+    dom.specDlCount > 0 ||
+    (hasProductLikeJsonLd && maxJsonLdPropertyCount >= 4)
+  );
+  const hasComparisonReadyShape = !!(
+    dom.comparisonLikeTablesCount > 0 ||
+    (dom.specLikeTablesCount > 0 && dom.comparisonCueCount > 0)
+  );
 
-          __radarFix = { box, prev };
-        }
-      }catch(e){
-        console.warn('[PDF][v1] radar square fix failed', e);
+  const hasRealObservationMaterial = !!(
+    dom.specLikeTablesCount > 0 ||
+    dom.comparisonLikeTablesCount > 0 ||
+    dom.specDlCount > 0 ||
+    hasProductLikeJsonLd
+  );
+  if (!hasRealObservationMaterial) {
+    const hasCueOnly = Number(dom.specCueCount || 0) > 0 || Number(dom.comparisonCueCount || 0) > 0;
+    emitTrace({
+      tableCount: Number(dom.tableCount || 0),
+      dlCount: Number(dom.dlCount || 0),
+      headingCount: Number(dom.headingCount || 0),
+      specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+      comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+      specCueCount: Number(dom.specCueCount || 0),
+      comparisonCueCount: Number(dom.comparisonCueCount || 0),
+      productJsonLdCount,
+      serviceJsonLdCount,
+      structuredSpecScore: null,
+      comparisonReadinessLevel: null,
+      hasStructuredProductInfo,
+      hasComparisonReadyShape,
+      attached: false,
+      reason: hasCueOnly ? 'cue_only_guard' : 'no_structured_signal'
+    });
+    return null;
+  }
+
+  let structuredSpecScore = 0;
+  if (dom.specLikeTablesCount > 0) structuredSpecScore += 35;
+  if (dom.specDlCount > 0) structuredSpecScore += 20;
+  if (hasProductLikeJsonLd) structuredSpecScore += clamp(maxJsonLdPropertyCount * 6, 10, 30);
+  if (dom.comparisonLikeTablesCount > 0) structuredSpecScore += 25;
+  if (hasComparisonReadyShape) structuredSpecScore += 10;
+  structuredSpecScore = clamp(Math.round(structuredSpecScore), 0, 100);
+
+  const comparisonReadinessLevel =
+    structuredSpecScore >= 70 ? 'strong' :
+    structuredSpecScore >= 40 ? 'medium' :
+    structuredSpecScore > 0 ? 'weak' : 'none';
+
+  const evidenceSources = uniq([]
+    .concat(dom.evidenceSources || [])
+    .concat(hasProductLikeJsonLd ? ['jsonld: Product/Service/Offer nodes=' + productLikeNodes.length] : [])
+  ).slice(0, 8);
+
+  emitTrace({
+    tableCount: Number(dom.tableCount || 0),
+    dlCount: Number(dom.dlCount || 0),
+    headingCount: Number(dom.headingCount || 0),
+    specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+    comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+    specCueCount: Number(dom.specCueCount || 0),
+    comparisonCueCount: Number(dom.comparisonCueCount || 0),
+    productJsonLdCount,
+    serviceJsonLdCount,
+    structuredSpecScore,
+    comparisonReadinessLevel,
+    hasStructuredProductInfo,
+    hasComparisonReadyShape,
+    attached: true,
+    reason: 'attached'
+  });
+
+  return {
+    hasStructuredProductInfo,
+    hasComparisonReadyShape,
+    structuredSpecScore,
+    comparisonReadinessLevel,
+    specLikeTablesCount: Number(dom.specLikeTablesCount || 0),
+    comparisonLikeTablesCount: Number(dom.comparisonLikeTablesCount || 0),
+    specCueCount: Number(dom.specCueCount || 0),
+    comparisonCueCount: Number(dom.comparisonCueCount || 0),
+    evidenceSources
+  };
+}
+
+async function collectMultimodalSignals(page, jsonldForFlags) {
+  function compactUrl(v) {
+    return String(v || '').trim();
+  }
+  function uniq(arr) {
+    return Array.from(new Set((arr || []).map(v => compactUrl(v)).filter(Boolean)));
+  }
+  function take(arr, n) {
+    return (arr || []).filter(Boolean).slice(0, n || 5);
+  }
+  function flattenJsonLd(input, out) {
+    out = out || [];
+    if (!input) return out;
+    if (Array.isArray(input)) {
+      input.forEach(v => flattenJsonLd(v, out));
+      return out;
+    }
+    if (typeof input !== 'object') return out;
+    out.push(input);
+    if (Array.isArray(input['@graph'])) input['@graph'].forEach(v => flattenJsonLd(v, out));
+    return out;
+  }
+  function typeList(node) {
+    const t = node && node['@type'];
+    return (Array.isArray(t) ? t : (t ? [t] : [])).map(v => String(v || '').trim()).filter(Boolean);
+  }
+  function firstTextValue(v) {
+    if (!v) return '';
+    if (typeof v === 'string') return compactUrl(v);
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        const s = firstTextValue(item);
+        if (s) return s;
       }
+      return '';
+    }
+    if (typeof v === 'object') {
+      return firstTextValue(v.url || v.contentUrl || v.thumbnailUrl || v['@id'] || v.image);
+    }
+    return '';
+  }
 
-      // レイアウト反映待ち
-      if (__radarFix) await nextFrame_();
-
-      // ★ html2canvas直前：診断レーダーだけ “見えている実体” を必要ならPNG化し、必要なら上に詰める
-      let __radarImgSwap = null;
-      try{
-        const radarCard = el.querySelector && el.querySelector('#dv2-card-result-radar');
-
-        const target = radarCard && radarCard.querySelector && (
-          radarCard.querySelector('#dv2-radar-canvas') ||
-          radarCard.querySelector('canvas') ||
-          radarCard.querySelector('img[alt="radar"], img[alt="chart"], img[src^="data:image/"]')
-        );
-
-        if (radarCard && target) {
-          const wrap =
-            (target.closest && target.closest('.chart-wrap')) ||
-            (radarCard.querySelector && radarCard.querySelector('.chart-wrap')) ||
-            radarCard;
-
-          // ★ 統一フォーマット（ここだけ覚えればOK）
-          __radarImgSwap = {
-            wrap,
-            prevWrap: {
-              paddingTop: wrap && wrap.style ? wrap.style.paddingTop : '',
-              marginTop:  wrap && wrap.style ? wrap.style.marginTop  : '',
-              overflow:   wrap && wrap.style ? wrap.style.overflow   : ''
-            },
-            // “元の実体” と “置換後の実体” を分けて持つ
-            originalEl: target,
-            replacedEl: null,
-            prevReplacedStyle: null
-          };
-
-          // 1) まずwrapの上余白を潰して、枠外描画は止める
-          if (wrap && wrap.style) {
-            wrap.style.paddingTop = '0';
-            wrap.style.marginTop  = '0';
-            wrap.style.overflow   = 'hidden';
-          }
-
-          // 2) CANVASなら PNG化して差し替え、IMGならそのまま使う
-          let visibleEl = target;
-
-          if (target.tagName === 'CANVAS' && window.Chart) {
-            const cv = target;
-            const ch = (Chart.getChart ? Chart.getChart(cv) : (cv.__chart || cv.chart || null));
-            if (ch) {
-              try { if (ch.options) { ch.options.animation = false; ch.options.animations = false; } } catch(_){}
-              try { ch.update('none'); } catch(_){}
-
-              let dataUrl = '';
-              try { dataUrl = (typeof ch.toBase64Image === 'function') ? ch.toBase64Image() : cv.toDataURL('image/png'); } catch(_){}
-
-              if (dataUrl && dataUrl.startsWith('data:image/')) {
-                const img = document.createElement('img');
-                img.src = dataUrl;
-                img.alt = 'radar';
-                img.style.display = 'block';
-                img.style.width  = '100%';
-                img.style.height = 'auto';
-                img.style.margin = '0';
-
-                cv.replaceWith(img);
-                __radarImgSwap.replacedEl = img;
-                visibleEl = img;
-              }
-            }
-          }
-
-          // 3) “見えている実体(IMG)” を gap 分だけ上に詰める（本命）
-          if (wrap && visibleEl && wrap.getBoundingClientRect && visibleEl.getBoundingClientRect) {
-            const br = wrap.getBoundingClientRect();
-            const vr = visibleEl.getBoundingClientRect();
-            const gap = Math.round(vr.top - br.top);
-
-            // style退避（置換してない場合も、IMGを動かすので退避する）
-            __radarImgSwap.prevReplacedStyle = {
-              position: visibleEl.style ? visibleEl.style.position : '',
-              top:      visibleEl.style ? visibleEl.style.top      : '',
-              marginTop:visibleEl.style ? visibleEl.style.marginTop: ''
-            };
-
-            if (gap > 0 && visibleEl.style) {
-              visibleEl.style.position = 'relative';
-              visibleEl.style.marginTop = '0';
-
-              const maxUp = Math.max(80, Math.round(br.height - 20));
-              const up = Math.min(gap, maxUp);
-
-              // ★ 調整量（px）：正の値ほど「下がる」
-              const OFFSET_PX = 25;
-
-              visibleEl.style.top = (-(up - OFFSET_PX)) + 'px';
-            }
-
-            // “動かした実体”を必ず記録（復元で使う）
-            if (!__radarImgSwap.replacedEl) __radarImgSwap.replacedEl = visibleEl;
-            __radarImgSwap.movedEl = visibleEl; // ★ styleを動かした実体
-          }
+  try {
+    const dom = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const abs = (u) => {
+        try { return u ? new URL(u, document.baseURI).toString() : ''; } catch (_) { return String(u || '').trim(); }
+      };
+      const firstMeta = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const v = el && el.getAttribute('content');
+          if (norm(v)) return norm(v);
         }
-      }catch(e){
-        console.warn('[PDF][v1] radar img swap failed', e);
-      }
-
-      // === 追加：競合比較レーダー（compareRadar）も同じ“沈み/凡例チラ見え”対策を適用 ===
-      try{
-        const cmpCard =
-          (el.querySelector && el.querySelector('#compareRadarCard')) ||
-          null;
-
-        const target2 = cmpCard && cmpCard.querySelector && (
-          cmpCard.querySelector('#compareRadar') ||
-          cmpCard.querySelector('canvas') ||
-          cmpCard.querySelector('img[alt="radar"], img[alt="chart"], img[src^="data:image/"]')
-        );
-
-        if (cmpCard && target2) {
-          const wrap2 =
-            (target2.closest && target2.closest('.chart-wrap')) ||
-            (cmpCard.querySelector && cmpCard.querySelector('.chart-wrap')) ||
-            cmpCard;
-
-          // 診断と同じフォーマットで退避（復元は既存の __radarImgSwap 復元で“共用”したいので、配列にする）
-          // 既存が単体なら、配列化して両方突っ込む
-          const pushSwap = (sw) => {
-            if (!sw) return;
-            if (!__radarImgSwap) { __radarImgSwap = [sw]; return; }
-            if (Array.isArray(__radarImgSwap)) { __radarImgSwap.push(sw); return; }
-            __radarImgSwap = [__radarImgSwap, sw];
-          };
-
-          const sw2 = {
-            wrap: wrap2,
-            prevWrap: {
-              paddingTop: wrap2 && wrap2.style ? wrap2.style.paddingTop : '',
-              marginTop:  wrap2 && wrap2.style ? wrap2.style.marginTop  : '',
-              overflow:   wrap2 && wrap2.style ? wrap2.style.overflow   : ''
-            },
-            originalEl: target2,
-            replacedEl: null,
-            movedEl: null,
-            prevReplacedStyle: null
-          };
-
-          // 1) wrapの上余白/クリップを潰す
-          if (wrap2 && wrap2.style) {
-            wrap2.style.paddingTop = '0';
-            wrap2.style.marginTop  = '0';
-            wrap2.style.overflow   = 'hidden';
-          }
-
-          // 2) CANVASならPNG化して差し替え（競合比較もChart.jsなので効く）
-          let visible2 = target2;
-          if (target2.tagName === 'CANVAS' && window.Chart) {
-            const cv2 = target2;
-            const ch2 = (Chart.getChart ? Chart.getChart(cv2) : (cv2.__chart || cv2.chart || null));
-            if (ch2) {
-              try { if (ch2.options) { ch2.options.animation = false; ch2.options.animations = false; } } catch(_){}
-              try { ch2.update('none'); } catch(_){}
-
-              let dataUrl2 = '';
-              try { dataUrl2 = (typeof ch2.toBase64Image === 'function') ? ch2.toBase64Image() : cv2.toDataURL('image/png'); } catch(_){}
-
-              if (dataUrl2 && dataUrl2.startsWith('data:image/')) {
-                const img2 = document.createElement('img');
-                img2.src = dataUrl2;
-                img2.alt = 'radar';
-                img2.style.display = 'block';
-                img2.style.width  = '100%';
-                img2.style.height = 'auto';
-                img2.style.margin = '0';
-
-                cv2.replaceWith(img2);
-                sw2.replacedEl = img2;
-                visible2 = img2;
-              }
-            }
-          }
-
-          // 3) “見えている実体” の gap を測って上に詰める（あなたの 25px 調整込み）
-          if (wrap2 && visible2 && wrap2.getBoundingClientRect && visible2.getBoundingClientRect) {
-            const br2 = wrap2.getBoundingClientRect();
-            const vr2 = visible2.getBoundingClientRect();
-            const gap2 = Math.round(vr2.top - br2.top);
-
-            sw2.prevReplacedStyle = {
-              position: visible2.style ? visible2.style.position : '',
-              top:      visible2.style ? visible2.style.top      : '',
-              marginTop:visible2.style ? visible2.style.marginTop: ''
-            };
-
-            if (gap2 > 0 && visible2.style) {
-              visible2.style.position = 'relative';
-              visible2.style.marginTop = '0';
-              const maxUp2 = Math.max(80, Math.round(br2.height - 20));
-              const up2 = Math.min(gap2, maxUp2);
-              visible2.style.top = (-(up2 - 25)) + 'px'; // ★ あなたの“ちょうど良かった”調整
-            }
-
-            sw2.movedEl = visible2;
-            if (!sw2.replacedEl) sw2.replacedEl = visible2;
-          }
-
-          pushSwap(sw2);
+        return '';
+      };
+      const firstLink = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const v = el && el.getAttribute('href');
+          if (norm(v)) return abs(v);
         }
-      }catch(_){}
+        return '';
+      };
+      const collect = (sel) => Array.from(document.querySelectorAll(sel));
+      const openRoots = [];
+      try {
+        const all = Array.from(document.querySelectorAll('*'));
+        for (const el of all) {
+          if (el && el.shadowRoot) openRoots.push(el.shadowRoot);
+          if (openRoots.length >= 8) break;
+        }
+      } catch (_) {}
+      const queryAll = (sel) => {
+        const out = collect(sel);
+        for (const root of openRoots) {
+          try { out.push(...Array.from(root.querySelectorAll(sel))); } catch (_) {}
+        }
+        return out;
+      };
 
-      // 1フレ待ってレイアウト安定
-      await nextFrame_();
+      const ogImageUrl = abs(firstMeta([
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[property="og:image:secure_url"]'
+      ]));
+      const twitterImageUrl = abs(firstMeta([
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]'
+      ]));
+      const faviconUrl = firstLink([
+        'link[rel~="icon"][href]',
+        'link[rel="shortcut icon"][href]'
+      ]);
+      const appleTouchIconUrl = firstLink([
+        'link[rel~="apple-touch-icon"][href]',
+        'link[rel="apple-touch-icon-precomposed"][href]'
+      ]);
 
-      // html2canvas（★wrap方式は撤廃：このページ要素 el をそのままキャプチャ）
-      const canvas = await h2c(el, {
-        backgroundColor: '#ffffff',
-        useCORS: true,
-        allowTaint: true,
-        scale: Math.min(2, (window.devicePixelRatio || 1)),
-        logging: false
+      const images = queryAll('img').slice(0, 500);
+      const imageUrls = [];
+      let altMissingCount = 0;
+      images.forEach((img) => {
+        const alt = norm(img.getAttribute('alt'));
+        if (!alt) altMissingCount++;
+        const src = abs(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-original'));
+        if (src && imageUrls.length < 5) imageUrls.push(src);
+      });
+      const imageCount = images.length;
+      const altTotal = imageCount;
+      const imgAltRatio = imageCount ? ((imageCount - altMissingCount) / imageCount) : null;
+
+      const iframes = queryAll('iframe');
+      const iframeSrcs = iframes.map(el => abs(el.getAttribute('src'))).filter(Boolean);
+      const youtubeIframes = iframeSrcs.filter(src => /(^|\/\/)(www\.)?(youtube\.com|youtu\.be)|youtube-nocookie\.com/i.test(src));
+      const vimeoIframes = iframeSrcs.filter(src => /(^|\/\/)(player\.)?vimeo\.com/i.test(src));
+      const audioEmbedIframes = iframeSrcs.filter(src => /(spotify\.com|soundcloud\.com|podcasts\.apple\.com|anchor\.fm|podbean\.com)/i.test(src));
+
+      const videoTags = queryAll('video');
+      const audioTags = queryAll('audio');
+      const tracks = queryAll('track');
+      const captionTracks = tracks.filter(t => /^(captions|subtitles)$/i.test(norm(t.getAttribute('kind'))));
+      const transcriptLinks = queryAll('a[href]').filter(a => {
+        const txt = norm((a.innerText || a.textContent || '') + ' ' + (a.getAttribute('href') || ''));
+        return /(transcript|caption|subtitles?|文字起こし|字幕|書き起こし)/i.test(txt);
       });
 
-      // cleanup（wrapは使っていない）
+      const figures = queryAll('figure');
+      const figcaptions = queryAll('figcaption');
+      const mediaAriaNodes = queryAll('img,video,audio,iframe,figure').filter(el =>
+        norm(el.getAttribute('aria-label') || el.getAttribute('title'))
+      );
+      const mediaCaptionSamples = [];
+      figcaptions.forEach(el => {
+        const t = norm(el.innerText || el.textContent);
+        if (t && mediaCaptionSamples.length < 5) mediaCaptionSamples.push(t.slice(0, 120));
+      });
+      mediaAriaNodes.forEach(el => {
+        const t = norm(el.getAttribute('aria-label') || el.getAttribute('title'));
+        if (t && mediaCaptionSamples.length < 5) mediaCaptionSamples.push(t.slice(0, 120));
+      });
 
-      // ★ 復元（clone内だけだが念のため）
-      try{
-        // 0) radarFix を戻す
-        try{
-          if (__radarFix && __radarFix.box && __radarFix.prev) {
-            const b = __radarFix.box;
-            const p = __radarFix.prev;
-            b.style.height      = p.height;
-            b.style.maxHeight   = p.maxHeight;
-            b.style.aspectRatio = p.aspectRatio;
-            b.style.display     = p.display;
-            b.style.paddingTop  = p.paddingTop;
-          }
-        }catch(_){}
+      return {
+        ogImageUrl,
+        twitterImageUrl,
+        faviconUrl,
+        appleTouchIconUrl,
+        imageCount,
+        altTotal,
+        altMissingCount,
+        imgAltRatio,
+        imageUrlsSample: imageUrls.slice(0, 5),
+        videoTagCount: videoTags.length,
+        hasYoutubeIframe: youtubeIframes.length > 0,
+        hasVimeoIframe: vimeoIframes.length > 0,
+        videoIframeCount: youtubeIframes.length + vimeoIframes.length,
+        audioTagCount: audioTags.length,
+        audioEmbedCount: audioEmbedIframes.length,
+        trackCount: tracks.length,
+        captionTrackCount: captionTracks.length,
+        transcriptLinkCount: transcriptLinks.length,
+        figureCount: figures.length,
+        figcaptionCount: figcaptions.length,
+        mediaAriaLabelCount: mediaAriaNodes.length,
+        mediaCaptionSamples: mediaCaptionSamples.slice(0, 5)
+      };
+    });
 
-        // 1)〜3) の復元は “単体/配列どっちでも” 戻せるようにする
-        try{
-          const list = !__radarImgSwap ? [] : (Array.isArray(__radarImgSwap) ? __radarImgSwap : [__radarImgSwap]);
+    const nodes = flattenJsonLd(jsonldForFlags || [], []);
+    const structuredImageTypes = [];
+    let structuredLogoUrl = '';
+    let structuredImageCount = 0;
+    let imageObjectCount = 0;
+    let primaryImageOfPage = '';
+    let thumbnailUrlCount = 0;
+    let videoObjectCount = 0;
+    let videoThumbnailUrlCount = 0;
+    let audioObjectCount = 0;
 
-          list.forEach(sw => {
-            if (!sw) return;
+    nodes.forEach((node) => {
+      if (!node || typeof node !== 'object') return;
+      const types = typeList(node);
+      const hasImage = !!firstTextValue(node.image);
+      const hasLogo = !!firstTextValue(node.logo);
+      const primaryImage = firstTextValue(node.primaryImageOfPage);
+      const thumb = firstTextValue(node.thumbnailUrl);
 
-            // (1) CANVAS→IMG を戻す（CANVASだった時だけ）
-            try{
-              if (sw.originalEl && sw.replacedEl &&
-                  sw.originalEl.tagName === 'CANVAS' && sw.replacedEl.tagName === 'IMG') {
-                sw.replacedEl.replaceWith(sw.originalEl);
-              }
-            }catch(_){}
-
-            // (2) wrap を戻す
-            try{
-              if (sw.wrap && sw.prevWrap && sw.wrap.style) {
-                sw.wrap.style.paddingTop = sw.prevWrap.paddingTop;
-                sw.wrap.style.marginTop  = sw.prevWrap.marginTop;
-                sw.wrap.style.overflow   = sw.prevWrap.overflow;
-              }
-            }catch(_){}
-
-            // (3) 動かした実体のstyleを戻す
-            try{
-              const v = sw.movedEl || sw.replacedEl;
-              const p = sw.prevReplacedStyle;
-              if (v && p && v.style) {
-                v.style.position = p.position;
-                v.style.top      = p.top;
-                v.style.marginTop= p.marginTop;
-              }
-            }catch(_){}
-          });
-        }catch(_){}
-      }catch(_){}
-
-      // Convert to image
-      const imgData = canvas.toDataURL('image/jpeg', 0.95);
-
-      // Fit image to A4 width
-      const imgPxW = canvas.width;
-      const imgPxH = canvas.height;
-
-      // Convert px aspect -> mm fit
-      const imgMmW = pageW;
-      const imgMmH = (imgPxH * imgMmW) / imgPxW;
-
-      // --- header/footer reserved space (mm) ---
-      // ★ 表紙(i===0)はヘッダ/フッタを出さない
-      const HEADER_MM = (i === 0) ? 0 : 14;
-      const FOOTER_MM = (i === 0) ? 0 : 12;
-      const CONTENT_H = pageH - HEADER_MM - FOOTER_MM;
-
-      // ★ ここで必ず宣言する（while より前）
-      let remainingH = imgMmH;
-      let offsetY = 0;
-
-      // ★ 追加：スライスの重なり（mm）
-      // まずは 3〜5mm で試すのが安全。文字がまだ切れるなら 7〜9mm に上げる。
-      const OVERLAP_MM = 3; // ← 2 か 3。おすすめは 3
-
-      // ★ 追加：次へ進む量（mm）= 1ページ分 - 重なり
-      const STEP_MM = Math.max(1, CONTENT_H - OVERLAP_MM);
-
-      while (remainingH > 0) {
-
-        // ★ 中身（画像）自体をヘッダー分だけ下げる
-        pdf.addImage(imgData, 'JPEG', 0, HEADER_MM - offsetY, imgMmW, imgMmH);
-
-        // ★ 白帯：ヘッダ/フッタの領域は必ず白で確保（ヘッダ文字と画像の重なり防止）
-        try{
-          if (HEADER_MM || FOOTER_MM){
-            pdf.setFillColor(255, 255, 255);
-
-            // 上（ヘッダ余白）
-            if (HEADER_MM) {
-              pdf.rect(0, 0, pageW, HEADER_MM, 'F');
-            }
-
-            // 下（フッタ余白）
-            if (FOOTER_MM) {
-              pdf.rect(0, pageH - FOOTER_MM, pageW, FOOTER_MM, 'F');
-            }
-          }
-        }catch(_){}
-
-        // Header / Footer（英字固定）※表紙(i===0)では出さない
-        if (i !== 0) {
-          try{
-            const pageNo = pdf.getNumberOfPages();
-
-            pdf.setFontSize(9);
-            pdf.text('AI Connect', 10, 8);
-
-            pdf.setFontSize(9);
-            pdf.text('FORK CORPORATION', 10, pageH - 6);
-
-            pdf.setFontSize(9);
-            pdf.text(String(pageNo), pageW - 10, pageH - 6, { align: 'right' });
-          }catch(_){}
-        }
-
-        // // ★ 次のスライスへ
-        // remainingH -= CONTENT_H;
-        // offsetY += CONTENT_H;
-
-        // ★ 次のスライスへ（OVERLAPあり：進みを少し小さくして、前ページ末尾を次ページ先頭に重ねる）
-        const STEP_H = Math.max(1, CONTENT_H - (OVERLAP_MM || 0));
-        remainingH -= STEP_H;
-        offsetY    += STEP_H;
-
-        // ✅ slice内の改ページ（これは必要）
-        if (remainingH > 2) {
-          pdf.addPage();
-
-          // ===== Improve（画像）：2ページ目以降もタイトルを同位置に描く =====
-          try{
-            pdf.setFontSize(18);
-            pdf.text('GEO診断', LEFT_MM, HEADER_MM + 12);
-
-            pdf.setFontSize(14);
-            pdf.text('改善ポイント', LEFT_MM, HEADER_MM + 20);
-          }catch(_){}
-        }
+      if (hasLogo && !structuredLogoUrl) structuredLogoUrl = firstTextValue(node.logo);
+      if (hasImage || hasLogo || primaryImage || thumb) {
+        structuredImageCount++;
+        types.forEach(t => structuredImageTypes.push(t));
       }
-      // ★ 次の .pdf-page に進むときだけ改ページ（空白ページ防止）
-      if (i < pages.length - 1) pdf.addPage();
-    }
-
-    pdf.save(fname);
-    try { if (!window.__PDF_DEBUG_KEEP_STAGE__) stage.remove(); } catch(_){}
-  }
-
-  // -------- helpers for renderPdfAndDownload_ --------
-  function sanitizeFilePart_(s){
-    return String(s || '')
-      .trim()
-      .replace(/[\\\/:*?"<>|]/g, '_')
-      .replace(/\s+/g, ' ')
-      .slice(0, 40);
-  }
-
-  function formatDateFileYmd_(d){
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth()+1).padStart(2,'0');
-    const dd = String(d.getDate()).padStart(2,'0');
-    return `${yyyy}${mm}${dd}`;
-  }
-
-  function nextFrame_(){
-    return new Promise((r) => requestAnimationFrame(() => r()));
-  }
-
-  // =========================================================
-  // 7) Loader / Toast helpers (safe no-op)
-  // =========================================================
-  function loaderOn_(message){
-    try{
-      const TITLE = String(message || 'PDFを生成しています');
-      const DESC  = 'この処理は数十秒で終わります\n画面を閉じずにお待ちください';
-
-      // ✅ AIO共通の全画面ローダー（最優先）
-      try{
-        if (typeof window.__AIO_GLOBAL_LOADER_SHOW__ === 'function'){
-          window.__AIO_GLOBAL_LOADER_SHOW__('pdf', TITLE, DESC);
-          return;
-        }
-      }catch(_){}
-
-      // 既存互換（環境によってはある）
-      if (typeof window.showGlobalLoader === 'function') return window.showGlobalLoader(message);
-      if (typeof window.globalLoaderOn === 'function') return window.globalLoaderOn(message);
-
-      // no-op fallback（UIは増やさない）
-    }catch(e){
-      console.warn('[PDF][v1] loaderOn_ failed', e);
-    }
-  }
-
-  function loaderOff_(){
-    try{
-      // ✅ AIO共通の全画面ローダー（最優先）
-      try{
-        if (typeof window.__AIO_GLOBAL_LOADER_HIDE__ === 'function'){
-          // key指定が必要な実装・不要な実装どちらも吸収
-          try { window.__AIO_GLOBAL_LOADER_HIDE__('pdf'); } catch(_) { window.__AIO_GLOBAL_LOADER_HIDE__(); }
-          return;
-        }
-      }catch(_){}
-
-      // 既存互換
-      if (typeof window.hideGlobalLoader === 'function') return window.hideGlobalLoader();
-      if (typeof window.globalLoaderOff === 'function') return window.globalLoaderOff();
-
-      // no-op fallback（UIは増やさない）
-    }catch(e){
-      console.warn('[PDF][v1] loaderOff_ failed', e);
-    }
-  }
-
-  function toast_(msg){
-    try{
-      if (typeof window.toast === 'function') return window.toast(msg);
-      // Minimal fallback
-      console.log('[PDF][toast]', msg);
-    }catch(_){}
-  }
-
-  // =========================================================
-  // 8) Cleanup
-  // =========================================================
-  function cleanup_(){
-    document.getElementById(PRINT_ROOT_ID)?.remove();
-    document.getElementById(MODAL_ID)?.remove();
-  }
-
-  // =========================================================
-  // 9) Getters (v1 best-effort)
-  // =========================================================
-  function getActiveOrigin_(){
-    // Priority order: active variables -> storage -> res/snapshot -> location
-    let o = '';
-
-    // 1) 明示変数（最強）
-    try{
-      o = String(window.__AIO_ACTIVE_ORIGIN__ || '').trim();
-      if (o) return normalizeOrigin_(o);
-    }catch(_){}
-
-    // 2) storage（ピッカー復元がここに入る想定）
-    const keys = ['aio:activeOrigin','aio:lastOrigin'];
-    for (const k of keys){
-      try{
-        const v = String(localStorage.getItem(k) || '').trim();
-        if (v) return normalizeOrigin_(v);
-      }catch(_){}
-    }
-    try{
-      const v = String(sessionStorage.getItem('aio:lastOrigin') || '').trim();
-      if (v) return normalizeOrigin_(v);
-    }catch(_){}
-
-    // 3) 直近res（揺れ救済：あなたの実装で実際に使われてる名前も拾う）
-    try{
-      const r =
-        window.__AIO_LAST_RES__ ||
-        window.__AIO_LAST_SS_RES__ ||
-        window.__AIO_DEBUG_LAST_SS_RESULT ||
-        window.__AIO_LATEST_RES__ ||
-        window.__LATEST_DIAG_RES__ ||
-        null;
-
-      if (r && (r.siteOrigin || r.origin)) return normalizeOrigin_(r.siteOrigin || r.origin);
-    }catch(_){}
-
-    // 4) snapshot（PDF時に一番取りやすい：SS保存の単一情報源）
-    try{
-      const snapRaw = localStorage.getItem('aio:snapshot:v1');
-      if (snapRaw){
-        const snap = JSON.parse(snapRaw);
-        const so = snap && (snap.siteOrigin || snap.origin);
-        if (so) return normalizeOrigin_(so);
+      if (types.some(t => /^ImageObject$/i.test(t))) imageObjectCount++;
+      if (primaryImage && !primaryImageOfPage) primaryImageOfPage = primaryImage;
+      if (thumb) thumbnailUrlCount++;
+      if (types.some(t => /^VideoObject$/i.test(t))) {
+        videoObjectCount++;
+        if (thumb) videoThumbnailUrlCount++;
       }
-    }catch(_){}
+      if (types.some(t => /^AudioObject$/i.test(t))) audioObjectCount++;
+    });
 
-    // 5) 最後：画面自身のorigin（GASのオリジンは normalizeOrigin_ で弾かれる可能性がある）
+    return {
+      checked: true,
+      source: 'top_dom_head_meta_jsonld',
+      image: {
+        hasOgImage: !!(dom && dom.ogImageUrl),
+        ogImageUrl: (dom && dom.ogImageUrl) || '',
+        hasTwitterImage: !!(dom && dom.twitterImageUrl),
+        twitterImageUrl: (dom && dom.twitterImageUrl) || '',
+        hasFavicon: !!(dom && dom.faviconUrl),
+        faviconUrl: (dom && dom.faviconUrl) || '',
+        hasAppleTouchIcon: !!(dom && dom.appleTouchIconUrl),
+        appleTouchIconUrl: (dom && dom.appleTouchIconUrl) || '',
+        imageCount: Number((dom && dom.imageCount) || 0),
+        altTotal: Number((dom && dom.altTotal) || 0),
+        altMissingCount: Number((dom && dom.altMissingCount) || 0),
+        imgAltRatio: (dom && typeof dom.imgAltRatio === 'number') ? dom.imgAltRatio : null,
+        imageUrlsSample: take(dom && dom.imageUrlsSample, 5)
+      },
+      structured: {
+        hasStructuredLogo: !!structuredLogoUrl,
+        structuredLogoUrl: structuredLogoUrl || '',
+        structuredImageCount,
+        imageObjectCount,
+        structuredImageTypes: take(uniq(structuredImageTypes), 12),
+        primaryImageOfPage: primaryImageOfPage || '',
+        thumbnailUrlCount
+      },
+      video: {
+        hasVideoTag: Number((dom && dom.videoTagCount) || 0) > 0,
+        videoTagCount: Number((dom && dom.videoTagCount) || 0),
+        hasYoutubeIframe: !!(dom && dom.hasYoutubeIframe),
+        hasVimeoIframe: !!(dom && dom.hasVimeoIframe),
+        videoIframeCount: Number((dom && dom.videoIframeCount) || 0),
+        hasVideoObject: videoObjectCount > 0,
+        videoObjectCount,
+        videoThumbnailUrlCount,
+        trackCount: Number((dom && dom.trackCount) || 0),
+        captionTrackCount: Number((dom && dom.captionTrackCount) || 0),
+        transcriptLinkCount: Number((dom && dom.transcriptLinkCount) || 0)
+      },
+      audio: {
+        hasAudioTag: Number((dom && dom.audioTagCount) || 0) > 0,
+        audioTagCount: Number((dom && dom.audioTagCount) || 0),
+        hasAudioObject: audioObjectCount > 0,
+        audioObjectCount,
+        audioEmbedCount: Number((dom && dom.audioEmbedCount) || 0),
+        audioTranscriptLinkCount: Number((dom && dom.transcriptLinkCount) || 0)
+      },
+      general: {
+        figureCount: Number((dom && dom.figureCount) || 0),
+        figcaptionCount: Number((dom && dom.figcaptionCount) || 0),
+        mediaAriaLabelCount: Number((dom && dom.mediaAriaLabelCount) || 0),
+        mediaCaptionSamples: take(dom && dom.mediaCaptionSamples, 5)
+      }
+    };
+  } catch (e) {
+    return {
+      checked: false,
+      source: 'top_dom_head_meta_jsonld',
+      errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+    };
+  }
+}
+
+async function collectLiveDomLightweightSignals(page) {
+  try {
+    return await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const abs = (u) => {
+        try { return u ? new URL(u, document.baseURI).toString() : ''; } catch (_) { return String(u || '').trim(); }
+      };
+      const uniqPush = (arr, value, limit) => {
+        const v = norm(value);
+        if (!v || arr.includes(v)) return;
+        if (arr.length < limit) arr.push(v);
+      };
+      const uniqPushUrl = (arr, value, limit) => {
+        const v = abs(value);
+        if (!v || arr.includes(v)) return;
+        if (arr.length < limit) arr.push(v);
+      };
+      const regionOf = (el) => {
+        try {
+          if (el.closest('nav')) return 'nav';
+          if (el.closest('[role="navigation"]')) return 'role-navigation';
+          if (el.closest('header,[role="banner"]')) return 'header';
+          if (el.closest('footer,[role="contentinfo"]')) return 'footer';
+          if (el.closest('main,[role="main"]')) return 'main';
+        } catch (_) {}
+        return 'body';
+      };
+      const anchorText = (a) => norm(
+        (a && (a.innerText || a.textContent)) ||
+        (a && a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title'))) ||
+        ''
+      );
+      const textFrom = (el) => norm(el && (el.innerText || el.textContent));
+      const looksUiOnly = (s) => /^(menu|close|open|ログイン|メニュー|閉じる|開く|お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(norm(s));
+      const isTextCandidate = (s) => {
+        const t = norm(s);
+        if (t.length < 20 || t.length > 180) return false;
+        if (looksUiOnly(t)) return false;
+        if (/^(©|Copyright|All Rights Reserved)/i.test(t)) return false;
+        return true;
+      };
+      const splitCandidates = (text) => {
+        const out = [];
+        const parts = norm(text).split(/[。．.!?！？\n\r]+/);
+        for (const p of parts) {
+          const t = norm(p);
+          if (!isTextCandidate(t)) continue;
+          uniqPush(out, t, 5);
+          if (out.length >= 5) break;
+        }
+        return out;
+      };
+      const classifyCoverage = (hay) => {
+        const s = String(hay || '').toLowerCase();
+        return {
+          company: /(会社|企業|会社概要|企業情報|about|company|corporate)/i.test(s),
+          service: /(サービス|料金|プラン|事業|製品|service|business|product|plan|price)/i.test(s),
+          contact: /(お問い合わせ|問合せ|お問合せ|問い合わせ|連絡|contact|inquiry|support)/i.test(s),
+          faq: /(faq|よくある質問|q&a|q & a|help|ヘルプ|サポート)/i.test(s)
+        };
+      };
+      const classifyTrust = (hay) => {
+        const s = String(hay || '').toLowerCase();
+        return {
+          privacy: /(privacy|プライバシー|個人情報|個人データ)/i.test(s),
+          terms: /(terms|利用規約|規約|約款|legal|法務|特定商取引|ポリシー)/i.test(s),
+          legal: /(legal|法務|特定商取引|利用規約|規約|約款|policy|ポリシー)/i.test(s),
+          contact: /(お問い合わせ|問合せ|お問合せ|問い合わせ|連絡|contact|inquiry|support)/i.test(s)
+        };
+      };
+
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      const navLinkTexts = [];
+      const navAnchorsSample = [];
+      const coverageNav = {
+        hasCompanyNav: false,
+        hasServiceNav: false,
+        hasContactNav: false,
+        hasFaqNav: false,
+        matchedLabels: [],
+        matchedHrefs: []
+      };
+      const trustLinks = {
+        hasPrivacyPolicyLink: false,
+        hasLegalLink: false,
+        hasTermsLink: false,
+        hasContactLink: false,
+        privacyUrls: [],
+        legalUrls: [],
+        contactUrls: []
+      };
+
+      let headerAnchorCount = 0;
+      let footerAnchorCount = 0;
+      let navAnchorCount = 0;
+      let roleNavigationAnchorCount = 0;
+
+      anchors.forEach((a) => {
+        const href = abs(a.getAttribute('href') || a.href);
+        const text = anchorText(a);
+        if (!href || !text) return;
+        const region = regionOf(a);
+        const hay = href + ' ' + text;
+        if (region === 'header') headerAnchorCount++;
+        if (region === 'footer') footerAnchorCount++;
+        if (region === 'nav') navAnchorCount++;
+        if (region === 'role-navigation') roleNavigationAnchorCount++;
+        if (region === 'nav' || region === 'role-navigation' || region === 'header' || region === 'footer') {
+          uniqPush(navLinkTexts, text, 50);
+          if (navAnchorsSample.length < 20) navAnchorsSample.push({ text, href, region });
+        }
+
+        const cov = classifyCoverage(hay);
+        if (cov.company) {
+          coverageNav.hasCompanyNav = true;
+          uniqPush(coverageNav.matchedLabels, text, 20);
+          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
+        }
+        if (cov.service) {
+          coverageNav.hasServiceNav = true;
+          uniqPush(coverageNav.matchedLabels, text, 20);
+          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
+        }
+        if (cov.contact) {
+          coverageNav.hasContactNav = true;
+          uniqPush(coverageNav.matchedLabels, text, 20);
+          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
+        }
+        if (cov.faq) {
+          coverageNav.hasFaqNav = true;
+          uniqPush(coverageNav.matchedLabels, text, 20);
+          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
+        }
+
+        const tr = classifyTrust(hay);
+        if (tr.privacy) {
+          trustLinks.hasPrivacyPolicyLink = true;
+          uniqPushUrl(trustLinks.privacyUrls, href, 10);
+        }
+        if (tr.terms) {
+          trustLinks.hasTermsLink = true;
+          uniqPushUrl(trustLinks.legalUrls, href, 10);
+        }
+        if (tr.legal) {
+          trustLinks.hasLegalLink = true;
+          uniqPushUrl(trustLinks.legalUrls, href, 10);
+        }
+        if (tr.contact) {
+          trustLinks.hasContactLink = true;
+          uniqPushUrl(trustLinks.contactUrls, href, 10);
+        }
+      });
+
+      const main = document.querySelector('main,[role="main"],article,#content,.content,.main');
+      const hero = document.querySelector('[class*="hero"],[class*="kv"],[class*="fv"],[id*="hero"],[id*="kv"],[id*="fv"]');
+      const mainText = textFrom(main);
+      const heroText = textFrom(hero);
+      const renderedText = textFrom(document.body);
+      let bodyTextCandidatesFallback = splitCandidates(mainText).concat(splitCandidates(heroText));
+      if (bodyTextCandidatesFallback.length < 5) {
+        bodyTextCandidatesFallback = bodyTextCandidatesFallback.concat(splitCandidates(renderedText));
+      }
+      const bodyUniq = [];
+      bodyTextCandidatesFallback.forEach((t) => uniqPush(bodyUniq, t, 5));
+
+      return {
+        checked: true,
+        source: 'live_dom_lightweight_v1',
+        allAnchorCount: anchors.length,
+        navLinkTexts: navLinkTexts.slice(0, 50),
+        navAnchorsSample: navAnchorsSample.slice(0, 20),
+        navCount: document.querySelectorAll('nav').length,
+        navAnchorCount,
+        headerAnchorCount,
+        footerAnchorCount,
+        roleNavigationCount: document.querySelectorAll('[role="navigation"]').length,
+        roleNavigationAnchorCount,
+        coverageNav,
+        trustLinks,
+        text: {
+          bodyTextCandidatesFallback: bodyUniq.slice(0, 5),
+          mainTextHead: mainText.slice(0, 500),
+          heroTextHead: heroText.slice(0, 300),
+          renderedTextLength: renderedText.length,
+          mainTextLength: mainText.length
+        }
+      };
+    });
+  } catch (e) {
+    return {
+      checked: false,
+      source: 'live_dom_lightweight_v1',
+      errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+    };
+  }
+}
+
+// === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
+async function buildAuditSigFromPage(page) {
+  // === [AIO][JSONLD_WAIT v1] JSON-LDの出現待ち＋状態を付けて probe をラップ ===
+  async function probeJsonLdAndCopyrightWithWaitV1(page, opt){
+    opt = opt || {};
+    const T_MS = Number(opt.timeoutMs || 7000); // ★ 5〜8秒：まずは7秒
+    const out = {
+      jsonld_scan_started: false,
+      jsonld_scan_finished: false,
+      jsonld_parse_failed: false,
+      consent_wall_suspected: false,
+      jsonld_wait_ms: 0,
+
+      // ★追加：同意クリックの試行結果（原因切り分け用）
+      consent_click_tried: false,
+      consent_click_succeeded: false
+    };
+
+    const t0 = Date.now();
+    out.jsonld_scan_started = true;
+
+    // 1) まず “出現待ち” をする（無ければ timeout）
+    //    - type="application/ld+json" だけでなく、typeゆらぎや中身("@context"+"@type")でも拾う
+    let selectorFound = false;
     try{
-      const lo = String(location.origin || '').trim();
-      const n  = normalizeOrigin_(lo);
-      return n || ''; // ← normalize が弾いたら空のまま（誤って googleusercontent を採用しない）
+      await page.waitForFunction(() => {
+        // 1) 正攻法：ld+json
+        const ld = document.querySelector('script[type*="ld+json" i]');
+        if (ld) return true;
+
+        // 2) typeゆらぎ救済：type無し/別typeでも中身で判定（重くしない）
+        const scripts = Array.from(document.querySelectorAll('script')).slice(0, 50);
+        return scripts.some(s => {
+          const t = String(s.getAttribute('type') || '').toLowerCase().trim();
+
+          // JSONっぽいtype or type無しだけ対象（雑に広げすぎない）
+          if (t && !(t.includes('json') || t.includes('ld+json'))) return false;
+
+          const txt = String(s.textContent || '').trim();
+          if (!txt) return false;
+
+          // 最小条件：JSON-LDっぽいキーが両方ある
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }, { timeout: T_MS });
+
+      selectorFound = true;
     }catch(_){
-      return '';
+      selectorFound = false;
     }
-  }
+    out.jsonld_wait_ms = Date.now() - t0;
 
-  function getSiteTypeLabel_(){
-    function normalizeCode_(siteType){
+    // 2) consent wall 疑い（timeoutのときだけ軽く判定）
+    if (!selectorFound){
       try{
-        if (typeof normalizeSiteTypeCode_ === 'function'){
-          const code = String(normalizeSiteTypeCode_(siteType) || '').trim().toLowerCase();
-          if (code === 'corp') return 'corporate';
-          if (code === 'ec' || code === 'media' || code === 'saas') return code;
-        }
-      }catch(_){}
+        const htmlLower = String(await page.content() || '').toLowerCase();
+        // 最小セット：cookie/同意/consent が濃いと疑う
+        out.consent_wall_suspected =
+          /cookie|consent|同意|クッキー|プライバシー|privacy/.test(htmlLower) &&
+          /同意|accept|agree|consent|許可/.test(htmlLower);
+      }catch(_){
+        out.consent_wall_suspected = false;
+      }
+    }
 
+    // 2.5) consent wall 疑いなら「同意操作」を1回だけ試してから再度 wait をやり直す
+    //      - 成功したら selectorFound=true に寄せ、consent_wall_suspected も false に戻す
+    if (!selectorFound && out.consent_wall_suspected){
       try{
-        if (!siteType) return '';
-        if (typeof siteType === 'string'){
-          const s = siteType.trim().toLowerCase();
-          if (s === 'corp' || s === 'corporate') return 'corporate';
-          if (s === 'ec' || s === 'ecommerce') return 'ec';
-          if (s === 'media' || s === 'news') return 'media';
-          if (s === 'saas' || s === 'service') return 'saas';
-          return '';
+        // よくある同意ボタン候補（最小セット）
+        const clicked = await page.evaluate(() => {
+          function clickByText(txt){
+            const els = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+            const hit = els.find(el => {
+              const t = (el.innerText || el.value || '').trim();
+              return t && t.includes(txt);
+            });
+            if (hit){
+              try{
+                if (typeof hit.click === 'function') hit.click();
+                else hit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+              }catch(_){}
+              return true;
+            }
+            return false;
+          }
+
+          // 日本語/英語の最低限
+          return (
+            clickByText('同意') ||
+            clickByText('許可') ||
+            clickByText('OK') ||
+            clickByText('Accept') ||
+            clickByText('Agree')
+          );
+        });
+
+        out.consent_click_tried = true;
+
+        if (clicked){
+          out.consent_click_succeeded = true;
+
+          // クリック後の反映待ち
+          await page.waitForTimeout(1200);
+
+          // もう一回だけ “出現待ち” をやり直す（短めでOK）
+          try{
+            await page.waitForFunction(() => {
+              const ld = document.querySelector('script[type*="ld+json" i]');
+              if (ld) return true;
+
+              const scripts = Array.from(document.querySelectorAll('script')).slice(0, 50);
+              return scripts.some(s => {
+                const t = String(s.getAttribute('type') || '').toLowerCase().trim();
+                if (t && !(t.includes('json') || t.includes('ld+json'))) return false;
+                const txt = String(s.textContent || '').trim();
+                if (!txt) return false;
+                return txt.includes('"@context"') && txt.includes('"@type"');
+              });
+            }, { timeout: Math.min(2500, T_MS) });
+
+            selectorFound = true;
+            out.consent_wall_suspected = false;
+          }catch(_){
+            // まだ見つからないなら従来どおり（suspected=true のまま）
+          }
         }
-        if (typeof siteType === 'object'){
-          if (siteType.isSaaSOrService) return 'saas';
-          if (siteType.isEC) return 'ec';
-          if (siteType.isMedia) return 'media';
-          if (siteType.isCorporate) return 'corporate';
-        }
-      }catch(_){}
-      return '';
+      }catch(_){
+        // 失敗しても従来どおり
+      }
     }
 
-    function pickFromContainer_(obj){
-      try{
-        if (!obj || typeof obj !== 'object') return '';
-        const code =
-          normalizeCode_(obj.siteType) ||
-          normalizeCode_(obj.rawSiteType) ||
-          normalizeCode_(obj.siteMode) ||
-          normalizeCode_(obj.meta && obj.meta.siteType) ||
-          normalizeCode_(obj.meta && obj.meta.rawSiteType) ||
-          normalizeCode_(obj.meta && obj.meta.siteMode);
-        if (code) return code;
-
-        const snap =
-          (obj.snapshot && typeof obj.snapshot === 'object') ? obj.snapshot :
-          (obj.snapshotJSON && typeof obj.snapshotJSON === 'object') ? obj.snapshotJSON :
-          (obj.snap && typeof obj.snap === 'object') ? obj.snap :
-          null;
-        if (!snap) return '';
-        return (
-          normalizeCode_(snap.siteType) ||
-          normalizeCode_(snap.rawSiteType) ||
-          normalizeCode_(snap.siteMode) ||
-          normalizeCode_(snap.diagnosis && snap.diagnosis.siteType) ||
-          normalizeCode_(snap.diagnosis && snap.diagnosis.rawSiteType) ||
-          normalizeCode_(snap.diagnosis && snap.diagnosis.siteMode)
-        );
-      }catch(_){}
-      return '';
+    // 3) 既存プローブを実行（ここは既存資産を活かす）
+    let jp = {};
+    try{
+      jp = await probeJsonLdAndCopyright(page);
+    }catch(e){
+      jp = { jsonld_scan_failed: true, jsonld_probe_err: String(e && (e.stack||e.message||e)) };
     }
 
+    // 4) 状態を jp にマージして返す（snake_caseで揃える）
+    //    - “出現待ちtimeout” が起きた場合のみ timed_out を真にする（雑な0件=timeoutを防ぐ）
     try{
-      const detailCandidates = [
-        window.__AIO_LAST_RES__,
-        window.__AIO_LAST_SS_RES__,
-        window.__AIO_DEBUG_LAST_SS_RESULT
-      ];
-      for (const r of detailCandidates){
-        const code = pickFromContainer_(r);
-        if (code) return code;
-      }
+      const detectCount = Number((jp && jp.jsonld_detect_count) || 0);
+      const scanFailed  = !!(jp && jp.jsonld_scan_failed);
+
+      jp = jp || {};
+      jp.jsonld_scan_started = out.jsonld_scan_started;
+      jp.jsonld_scan_finished = true;
+      jp.jsonld_parse_failed = !!(jp && jp.jsonld_parse_failed); // 既存があれば尊重
+      jp.consent_wall_suspected = out.consent_wall_suspected;
+      jp.jsonld_wait_ms = out.jsonld_wait_ms;
+
+      jp.consent_click_tried = out.consent_click_tried;
+      jp.consent_click_succeeded = out.consent_click_succeeded;
+
+      // ★ timeout判定は “出現待ち” 基準に統一
+      //    - selectorが見つかったなら timed_out=false
+      //    - 見つからず、かつ検出0で、scanFailedでないなら timed_out=true
+      jp.jsonld_timed_out = (!selectorFound && !scanFailed && detectCount === 0 && out.consent_wall_suspected === true);
     }catch(_){}
 
-    try{
-      const snapRaw = localStorage.getItem('aio:snapshot:v1');
-      if (snapRaw){
-        const snap = JSON.parse(snapRaw);
-        const code = pickFromContainer_(snap);
-        if (code) return code;
-      }
-    }catch(_){}
-
-    try{
-      const latestCandidates = [
-        window.__AIO_LATEST_RES__,
-        window.__LATEST_DIAG_RES__,
-        window.__AIO_LATEST_RESULT__
-      ];
-      for (const r of latestCandidates){
-        const code = pickFromContainer_(r);
-        if (code) return code;
-      }
-    }catch(_){}
-
-    return '';
+    return jp;
   }
 
-  function getDiagnosisDateText_(){
-    try{
-      const r = window.__AIO_LATEST_RES__ || window.__LATEST_DIAG_RES__ || null;
-      const d = (r && (r.dateJST || (r.meta && r.meta.dateJST))) || '';
-      if (d) return String(d);
-    }catch(_){}
-    return '';
-  }
+  // それぞれのヘルパーを並列で実行
+  const [headMeta, jsonldProbe] = await Promise.all([
+    extractHeadMetaV1(page),
+    probeJsonLdAndCopyrightWithWaitV1(page, { timeoutMs: 7000 })
+  ]);
 
-  function getAuthorName_(){
-    // Optional. If you already have a constant somewhere, return it.
-    // v1: empty is OK.
-    return '';
-  }
+  const hm = headMeta || {};
+  const jp = jsonldProbe || {};
 
-  function normalizeOrigin_(s){
-    let t = String(s||'').trim();
-    t = t.replace(/\/+$/,''); // drop trailing slash
-    return t;
-  }
+  // JSON-LD 関連
+  const jsonldCount    = Number(jp.jsonld_detect_count || 0);
+  const jsonldDetected = jsonldCount > 0;
+  const jsonldTimedOut = (/application\/ld\+json/i.test(String(await page.content()||''))) ? !!jp.jsonld_timed_out : false;
+  const jsonldTypesAll = Array.isArray(jp.jsonld_types_all)
+    ? jp.jsonld_types_all
+    : [];
 
-  function formatDateYmd_(d){
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth()+1).padStart(2,'0');
-    const dd = String(d.getDate()).padStart(2,'0');
-    return `${yyyy}年${mm}月${dd}日`;
-  }
+  // ★ 追加：どこまで進んだか（永続未判定の原因切り分け用）
+  const jsonldScanStarted   = !!jp.jsonld_scan_started;
+  const jsonldScanFinished  = !!jp.jsonld_scan_finished;
+  const jsonldParseFailed   = !!jp.jsonld_parse_failed;
+  const consentWallSuspected = !!jp.consent_wall_suspected;
+  const jsonldWaitMs        = Number(jp.jsonld_wait_ms || 0);
 
-  // =========================================================
-  // 10) Utilities
-  // =========================================================
-  function htmlToEl_(html){
-    const tpl = document.createElement('template');
-    tpl.innerHTML = String(html || '').trim();
+  // head/meta 関連（タイトル・description）
+  const hasTitle            = !!hm.hasTitle;
+  const hasMetaDescription  = !!hm.hasMetaDescription;
+  const metaDescriptionLen  = Number(hm.metaDescriptionLen || 0);
+  const metaDescriptionText = String(hm.metaDescriptionText || '');
+  const titleText           = String(hm.titleText || '');
 
-    // 1要素ならその要素を返す（従来互換）
-    const els = Array.from(tpl.content.children || []);
-    if (els.length === 1) return els[0];
+  // コピーライト関連
+  const copyrightHit           = !!jp.copyright_hit;
+  const copyrightExcerpt       = String(jp.copyright_excerpt || '');
+  const copyrightFooterPresent = !!jp.copyright_footer_present;
+  const copyrightHitToken      = String(jp.copyright_hit_token || '');
 
-    // 複数要素ならラッパーDIVにまとめて返す（ここが修正点）
-    const wrap = document.createElement('div');
-    wrap.style.display = 'block';
-    while (tpl.content.firstChild) wrap.appendChild(tpl.content.firstChild);
-    return wrap;
-  }
+  // ★ SPA観測値（probe 側のラッチ結果を拾う）
+  const hasMainLandmark = !!jp.hasMainLandmark;
 
-  function escapeHtml_(s){
-    return String(s ?? '')
-      .replaceAll('&','&amp;')
-      .replaceAll('<','&lt;')
-      .replaceAll('>','&gt;')
-      .replaceAll('"','&quot;')
-      .replaceAll("'","&#39;");
-  }
+  // probe 側が snake_case で返してくる想定（header_present / nav_count / h1_count）
+  const headerPresent = !!jp.header_present;
+  const footerPresent = !!jp.footer_present;
+  const navCount      = Number(jp.nav_count || 0);
+  const h1Count       = Number(jp.h1_count  || 0);
 
-  (function bindPdfButtonOnce(){
-    if (window.__PDF_EXPORT_V1_BOUND__) return;
-    window.__PDF_EXPORT_V1_BOUND__ = true;
+  // --- NEW: ナビ/フッターを含めた coverage 導線フラグ検出 ---
+  let coverageNav = {
+    hasCompanyNav: false,
+    hasServiceNav: false,
+    hasContactNav: false,
+    hasFaqNav: false
+  };
 
-    const btn = document.getElementById('btnShare');
-    if (!btn) {
-      console.warn('[PDF][v1] #btnShare not found');
-      return;
+  try {
+    const html = await page.content();
+    const htmlStr   = String(html || '');
+    const htmlLower = htmlStr.toLowerCase();
+
+    function hasJP(re) {
+      try { return re.test(htmlStr); }
+      catch (_) { return false; }
     }
 
-    btn.addEventListener('click', function(ev){
-      ev.preventDefault();
-      if (typeof window.runPdfExportV1 === 'function') {
-        window.runPdfExportV1();
-      } else {
-        console.warn('[PDF][v1] runPdfExportV1 is not ready');
+    function hasEN(re) {
+      try { return re.test(htmlLower); }
+      catch (_) { return false; }
+    }
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyNav =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/about\s+us|about\s+company|company(\s+(info|information|profile))?|corporate(\s+(profile|info))?/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServiceNav =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactNav =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact(\s+us)?/);
+
+    // FAQ / よくある質問 / Q&A
+    const hasFaqNav =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/\bfaq\b/);
+
+    coverageNav = {
+      hasCompanyNav: !!hasCompanyNav,
+      hasServiceNav: !!hasServiceNav,
+      hasContactNav: !!hasContactNav,
+      hasFaqNav:     !!hasFaqNav
+    };
+  } catch (_) {
+    // 失敗しても coverageNav はデフォルト(false)のまま
+  }
+
+  console.log('[AUDIT_SIG][coverageNav]', coverageNav);
+
+  const traceId = `covnav|${(await page.url()).replace(/[#?].*$/,'').replace(/\/+$/,'')}|${Date.now()}`;
+
+  console.log('[TRACE_COVNAV][NODE][auditSig-ready]', {
+    traceId,
+    url: await page.url(),
+    coverageNav,
+    htmlLen: (await page.content()).length
+  });
+
+  console.log(
+    '[AUDIT_SIG][FINAL]',
+    {
+      url: await page.url(),
+      hasMainLandmark_from_probe: jp.hasMainLandmark,
+      hasMainLandmark_final: hasMainLandmark
+    }
+  );
+
+  console.log('[AUDIT_SIG][HAS-SPA4]', { headerPresent, footerPresent, navCount, h1Count });
+
+  let htmlLang = await page.evaluate(() => {
+    const el = document.documentElement;
+    return el ? (el.getAttribute('lang') || '') : '';
+  });
+
+  htmlLang = String(htmlLang || '').trim(); // ★ 正規化（空白やnullを潰す）
+
+  return {
+    // JSON-LD 周り
+    jsonldDetected,
+    jsonldCount,
+    jsonldTimedOut,
+    jsonldWaitMs,
+    jsonldScanStarted,
+    jsonldScanFinished,
+    jsonldParseFailed,
+    consentWallSuspected,
+    jsonldSampleHead: String(jp.jsonld_sample_head || ''),
+    jsonldTypes: jsonldTypesAll,
+
+    // ★ main
+    hasMainLandmark,
+
+    // ★ header/footer
+    headerPresent,
+    footerPresent,
+    navCount,
+    h1Count,
+
+    // ★ html lang（追加）
+    htmlLang: htmlLang || '',
+    hasHtmlLang: !!htmlLang,
+
+    // head/meta 周り
+    hasTitle,
+    hasMetaDescription,
+    metaDescriptionLen,
+    metaDescriptionText,
+    titleText,
+
+    // コピーライト周り
+    copyrightHit,
+    copyrightExcerpt,
+    copyrightFooterPresent,
+    copyrightHitToken,
+
+    // NEW: ナビ導線フラグ
+    coverageNav
+  };
+}
+
+// === [COV_NAV][DETECT v2] HTML から会社情報/サービス/お問い合わせ/FAQ 導線をざっくり検出 ===
+function detectCoverageNavFromHtml_FOR_SCORING_ONLY(html) {
+  try {
+    html = String(html || '');
+    if (!html) {
+      return {
+        hasCompanyNav: false,
+        hasServiceNav: false,
+        hasContactNav: false,
+        hasFaqNav: false
+      };
+    }
+
+    const htmlLower = html.toLowerCase();
+
+    const hasJP = (re) => {
+      try { return re.test(html); } catch (_) { return false; }
+    };
+    const hasEN = (re) => {
+      try { return re.test(htmlLower); } catch (_) { return false; }
+    };
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyInfoLink =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/corporate\s+profile|corporate\s+info|about\s+us|about\s+company/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServicePageLink =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactLink =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact\s*us|contact/);
+
+    // 採用情報 / CAREER
+    const hasRecruitLink =
+      hasJP(/採用情報|求人情報|キャリア採用|新卒採用|中途採用/) ||
+      hasEN(/careers?|recruit/);
+
+    // FAQ / よくある質問
+    const hasFaqLink =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/faq/);
+
+      const flags = {
+        hasCompanyNav: !!hasCompanyInfoLink,
+        hasServiceNav: !!hasServicePageLink,
+        hasContactNav: !!hasContactLink,
+        hasFaqNav:     !!hasFaqLink
+      };
+
+    try {
+      console.log('[COV_NAV][FLAGS]', flags);
+    } catch (_) {}
+
+    return flags;
+  } catch (e) {
+    try {
+      console.warn('[COV_NAV][ERR]', e);
+    } catch (_) {}
+
+    return {
+      hasCompanyInfoLink: false,
+      hasServicePageLink: false,
+      hasContactLink: false,
+      hasRecruitLink: false,
+      hasFaqLink: false
+    };
+  }
+}
+
+const playwright = require('playwright');
+// === minimal Playwright scrape (QUALITY MODE) ===
+async function playScrapeMinimal(url) {
+  const browser = await playwright.chromium.launch({
+    args: ['--no-sandbox','--disable-setuid-sandbox']
+  });
+  const page = await browser.newPage({ javaScriptEnabled: true });
+
+  // 画像・フォント・メディアはブロック（テキスト優先で高速化）
+  await page.route('**/*', (route) => {
+    const t = route.request().resourceType();
+    if (['image','font','media'].includes(t)) return route.abort();
+    return route.continue();
+  });
+
+  // 1) 初期ロード（DOM完成）→ ネットワーク静穏を1回待つ
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  try { await page.waitForLoadState('networkidle', { timeout: 12000 }); } catch(_) {}
+
+  // ★ここに追加
+  const metaDescription = await page.evaluate(() => {
+    const el =
+      document.querySelector('meta[name="description"]') ||
+      document.querySelector('meta[property="og:description"]') ||
+      document.querySelector('meta[name="twitter:description"]');
+    return el ? (el.getAttribute('content') || '').trim() : '';
+  });
+
+  // 2) SPAレンダ待ち（候補セレクタ）
+  const waitSelectors = ['main', '#app', '[id*="root"]', 'body'];
+  for (const sel of waitSelectors) {
+    try { await page.waitForSelector(sel, { timeout: 6000 }); break; } catch (_) {}
+  }
+
+  // 3) 遅延読込対策：自動スクロール（下のヘルパを後で追加します）
+  try { await autoScroll(page, { step: 1200, pauseMs: 300, maxScrolls: 8 }); } catch (_) {}
+
+  // 4) スクリプト後レンダ対策：再度 networkidle を短く
+  try { await page.waitForLoadState('networkidle', { timeout: 6000 }); } catch(_) {}
+
+  // 5) 十分な本文長になるまで“しつこく待つ” （質優先）
+  //    閾値は 600 文字に上げます（以前は 200）
+  const THRESH = 600;
+  try {
+    await page.waitForFunction(
+      (n) => document.body && document.body.innerText && document.body.innerText.length > n,
+      { timeout: 12000 },
+      THRESH
+    );
+  } catch (_) {
+    // ここは妥協点。超えなくても続行。
+  }
+
+  // 6) 抽出
+  const fullHtml = await page.content();
+  const innerText = await page.evaluate(() => (document.body?.innerText || '').trim());
+  const jsonldRaw = await page.$$eval(
+    'script[type="application/ld+json"]',
+    nodes => nodes.map(n => n.textContent).filter(Boolean)
+  );
+
+  // ★ coverage ナビ導線フラグ（会社情報・サービス・お問い合わせなど）
+  const coverageNavFlags = detectCoverageNavFromHtml_FOR_SCORING_ONLY(fullHtml);
+
+  // ★ 互換：GAS側が hasCompanyNav 等を見る場合に備えて“同義キー”も用意（既存を壊さない）
+  const coverageNavCompat = (function(){
+    try{
+      const f = coverageNavFlags || {};
+      // すでに hasCompanyNav 形式ならそのまま
+      if (typeof f.hasCompanyNav === 'boolean' ||
+          typeof f.hasServiceNav === 'boolean' ||
+          typeof f.hasContactNav === 'boolean' ||
+          typeof f.hasFaqNav === 'boolean') {
+        return f;
       }
-    }, { passive: false });
+      // FOR_SCORING_ONLY が hasCompanyInfoLink 形式ならマップする
+      return {
+        hasCompanyNav: !!f.hasCompanyInfoLink,
+        hasServiceNav: !!f.hasServicePageLink,
+        hasContactNav: !!f.hasContactLink,
+        hasFaqNav:     !!f.hasFaqLink
+      };
+    }catch(_){
+      return coverageNavFlags || { hasCompanyNav:false, hasServiceNav:false, hasContactNav:false, hasFaqNav:false };
+    }
   })();
 
-})();
-</script>
+  // JSON-LD パース
+  const jsonld = [];
+  for (const t of jsonldRaw) {
+    try { const j = JSON.parse(t); Array.isArray(j) ? jsonld.push(...j) : jsonld.push(j); }
+    catch (_) {}
+  }
+
+  await browser.close();
+
+  return {
+    innerText,
+    html: fullHtml,
+    jsonld,
+
+    // ★ 互換キーも返す
+    metaDescription,                  // ← page.evaluate で取ったやつ
+    coverageNav: coverageNavCompat,   // ← GAS互換（hasCompanyNav形式）
+    coverageNavRaw: coverageNavFlags, // ← 元の検出結果（デバッグ/後方互換）
+
+    // ★ SSOT：下流がどこを見ても拾えるようにここに入れる
+    facts: {
+      auditSig: {
+        coverageNav: coverageNavCompat,     // ← “互換の正” を入れるのが安全
+        coverageNavRaw: coverageNavFlags    // ← 元も残すならここにも
+      }
+    },
+
+    waitStrategy:'quality:domcontentloaded→networkidle→autoscroll→networkidle→len>600',
+    blockedResources:['image','font','media'],
+    fallbackJsonld:{}
+  };
+}
+
+// === scrape adapter (FIX v3: signals) ===
+/**
+ * 役割：
+ * - /scrape が返す bodyText/html を最優先で拾う
+ * - それでも innerText が空なら、cheerio で HTML→本文を復元
+ * - JSON-LD はなければ HTML から抽出
+ */
+async function scrapeForScoring(url) {
+  const r = (typeof playScrapeMinimal === 'function')
+    ? await playScrapeMinimal(url)
+    : await yourExistingScrape(url);
+
+  let innerText = r.innerText || r.bodyText || r.text || '';
+  const fullHtml = r.html || r.fullHtml || '';
+
+  // 既存 /scrape の bodyText が内文より長い場合は優先して採用
+  const altText = r.bodyText || '';
+  if (altText.length > innerText.length) innerText = altText;
+
+  // innerText が空なら HTML→本文復元
+  if ((!innerText || innerText.length === 0) && fullHtml) {
+    try {
+      const $ = cheerio.load(fullHtml);
+      innerText = $('body').text().replace(/\s+\n/g, '\n').replace(/[ \t]+/g, ' ').trim();
+    } catch (_) {}
+  }
+
+  // --- 追加：DOMシグナル抽出（根拠用） ---
+  let h1 = 0, h2 = 0, lists = 0, tables = 0, links = 0;
+  let hasTel = false, hasAddress = false;
+  let jsonldArr = Array.isArray(r.jsonld) ? r.jsonld : [];
+
+  if (fullHtml) {
+    try {
+      const $ = cheerio.load(fullHtml);
+      h1 = $('h1').length;
+      h2 = $('h2').length;
+      lists = $('ul,ol').length;
+      tables = $('table').length;
+      links = $('a[href]').length;
+
+      // JSON-LD 抽出（なければ）
+      if (!jsonldArr || jsonldArr.length === 0) {
+        jsonldArr = $('script[type="application/ld+json"]').toArray().flatMap(n => {
+          const t = $(n).text();
+          try { const j = JSON.parse(t); return Array.isArray(j) ? j : [j]; } catch { return []; }
+        });
+      }
+    } catch (_) {}
+  }
+
+  // 連絡先の簡易検出（日本語サイト向け・HTMLテキストも併用）
+  try {
+    const $all = fullHtml ? cheerio.load(fullHtml) : null;
+    const htmlText = $all ? $all('body').text() : '';
+    // innerText + HTMLテキストを結合して判定
+    const joined = ((innerText || '') + ' ' + (htmlText || '')).trim();
+
+    // 全角→半角、全角ハイフン→半角
+    const z2hMap = { '０': '0', '１': '1', '２': '2', '３': '3', '４': '4', '５': '5', '６': '6', '７': '7', '８': '8', '９': '9', '－': '-', 'ー': '-', '―': '-' };
+    const norm = joined.replace(/[０-９ー―－]/g, ch => z2hMap[ch] || ch).replace(/\s+/g, ' ').trim();
+
+    // 電話番号（国内パターンを緩めに網羅）
+    const telRe = /(TEL[:：]?\s*)?(\(0\d{1,4}\)|0\d{1,4})[\s-]?\d{1,4}[\s-]?\d{3,4}/i;
+    hasTel = telRe.test(norm);
+
+    // 住所（郵便番号 or 都道府県名）
+    const zipRe = /(〒?\s*\d{3}-\d{4})/;
+    const prefRe = /(北海道|青森県|岩手県|宮城県|秋田県|山形県|福島県|茨城県|栃木県|群馬県|埼玉県|千葉県|東京都|神奈川県|新潟県|富山県|石川県|福井県|山梨県|長野県|岐阜県|静岡県|愛知県|三重県|滋賀県|京都府|大阪府|兵庫県|奈良県|和歌山県|鳥取県|島根県|岡山県|広島県|山口県|徳島県|香川県|愛媛県|高知県|福岡県|佐賀県|長崎県|熊本県|大分県|宮崎県|鹿児島県|沖縄県)/;
+    hasAddress = zipRe.test(norm) || prefRe.test(norm);
+
+    // デバッグしやすいようにサンプルも保持
+    var innerTextSample = norm.slice(0, 160);
+  } catch (e) {
+    console.warn('[adapter] contact regex failed:', e && e.message ? e.message : e);
+  }
+
+  // === [SITE-FACTS-LITE v1] 汎用の “存在事実” を抽出して auditSig に保存 ===
+  // 目的: LLMの推測で「採用がない/OGPがない/更新日がない/実績がない」等の嘘カードが出るのを恒久的に防ぐ
+  let __siteFactsLite = null;
+    try{
+      const __html = String(fullHtml || '');
+      const __text = String(innerText || '');
+
+      // meta: OGP/Twitter
+      const __og = (__html.match(/<meta[^>]+property=["']og:/ig) || []).length;
+      const __tw = (__html.match(/<meta[^>]+name=["']twitter:/ig) || []).length;
+      const __ogpDetected = (__og + __tw) > 0;
+
+      // links: 採用/実績/お知らせ/FAQ の導線（href とテキスト両方で汎用検知）
+      const __hrefs = Array.from(__html.matchAll(/<a[^>]+href=["']([^"']+)["'][^>]*>/ig)).map(m=>String(m[1]||''));
+      const __aTexts = Array.from(__html.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/ig)).map(m=>String(m[1]||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim());
+
+      const __H = (' ' + __hrefs.join(' ') + ' ').toLowerCase();
+      const __T = (' ' + __aTexts.join(' ') + ' ').toLowerCase();
+
+      const __hasRecruit = /\/recruit\b|\/career\b|\/jobs?\b/.test(__H) || /(採用|求人|キャリア)/.test(__T);
+      const __hasWorks   = /\/case\b|\/works\b|\/portfolio\b/.test(__H) || /(実績|事例|works|case|portfolio)/.test(__T);
+      const __hasNews    = /\/information\b|\/news\b|\/press\b|\/info\b/.test(__H) || /(お知らせ|ニュース|press|information)/.test(__T);
+      const __hasFaq     = /\/faq\b/.test(__H) || /(faq|よくある質問)/.test(__T);
+
+      // sections: 日付シグナル（ニュース欄や更新日らしき表示）
+      const __dateRe = /(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})|(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)/g;
+      const __dates = Array.from(new Set((__text.match(__dateRe) || []).map(s=>String(s).trim()))).slice(0,20);
+
+      // sections: 実績件数の目安（liの繰り返し or "role=listitem"）
+      const __roleListitem = (__html.match(/role=["']listitem["']/ig) || []).length;
+      const __liCount = (__html.match(/<li\b/ig) || []).length;
+      const __worksCount = Math.max(__roleListitem, __liCount);
+
+      __siteFactsLite = {
+        meta: { ogCount: __og, twCount: __tw, ogpDetected: __ogpDetected },
+        links: { hasRecruit: __hasRecruit, hasWorks: __hasWorks, hasNews: __hasNews, hasFaq: __hasFaq },
+        sections: { dates: __dates, worksCount: __worksCount }
+      };
+
+      // ★ auditSig にマージ（SSOTに残すのが目的）
+      try{
+        r.facts = r.facts || {};
+        r.facts.auditSig = r.facts.auditSig || {};
+        r.facts.auditSig.siteFactsLite = __siteFactsLite;
+
+        // 互換用ショートフラグ（後段のカード制御が書きやすい）
+        r.facts.auditSig.hasOgpMetaLite       = !!__ogpDetected;
+        r.facts.auditSig.hasRecruitLinkLite   = !!__hasRecruit;
+        r.facts.auditSig.hasWorksLinkLite     = !!__hasWorks;
+        r.facts.auditSig.hasNewsLinkLite      = !!__hasNews;
+        r.facts.auditSig.newsDatesCountLite   = __dates.length;
+        r.facts.auditSig.worksCountLite       = __worksCount;
+      }catch(_){}
+
+      // ★ 保険：auditSig の直下にも同じものを持たせる（取り回し差異に負けない）
+      try{
+        r.auditSig = r.auditSig || {};
+        if (r.auditSig.siteFactsLite === undefined) r.auditSig.siteFactsLite = __siteFactsLite;
+
+        if (r.auditSig.hasOgpMetaLite       === undefined) r.auditSig.hasOgpMetaLite       = !!__ogpDetected;
+        if (r.auditSig.hasRecruitLinkLite   === undefined) r.auditSig.hasRecruitLinkLite   = !!__hasRecruit;
+        if (r.auditSig.hasWorksLinkLite     === undefined) r.auditSig.hasWorksLinkLite     = !!__hasWorks;
+        if (r.auditSig.hasNewsLinkLite      === undefined) r.auditSig.hasNewsLinkLite      = !!__hasNews;
+        if (r.auditSig.newsDatesCountLite   === undefined) r.auditSig.newsDatesCountLite   = __dates.length;
+        if (r.auditSig.worksCountLite       === undefined) r.auditSig.worksCountLite       = __worksCount;
+      }catch(_){}
+    }catch(e){
+    // 抽出に失敗してもスクレイプ自体は継続（空でよい）
+    __siteFactsLite = null;
+  }
+  // === [SITE-FACTS-LITE v1] ここまで ===
+
+  const signals = {
+    h1, h2, lists, tables, links,
+    hasTel, hasAddress,
+    jsonldTypes: (jsonldArr || []).map(x => x && x['@type']).filter(Boolean)
+  };
+
+  return {
+    fromScrape: true,
+    hydrated: (innerText && innerText.length > 600) ? true : false,
+    innerTextLen: innerText ? innerText.length : 0,
+    fullHtmlLen: fullHtml ? fullHtml.length : 0,
+    jsonld: jsonldArr,
+    waitStrategy: r.waitStrategy || 'main|#app|[id*=root]',
+    blockedResources: r.blockedResources || ['font','media'],
+    facts: r.facts || {},
+    fallbackJsonld: r.fallbackJsonld || {},
+    signals,                      // ← 既存ならOK
+    innerTextSample: (innerText || '').slice(0, 160), // ← 追加
+  };
+}
+
+// -------------------- CORS --------------------
+app.use((_, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
+
+// -------------------- ヘルス --------------------
+app.get('/', (_, res) => res.status(200).json({ ok: true }));
+app.get('/__version', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
+app.get('/health', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG, now: new Date().toISOString() }));
+
+// 軽量ヘルスチェック（RSS を見るとメモリ傾向を掴みやすい）
+app.get('/healthz', (_, res) => {
+  const m = process.memoryUsage();
+  res.status(200).json({ ok: true, rss: m.rss, heapUsed: m.heapUsed });
+});
+
+// -------------------- Simple in-memory cache --------------------
+const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 既定6h
+const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
+const scrapeCache = new Map(); // key=url, val={ ts, json }
+
+// LRU風に古いものを落とす
+function cacheSet(url, json) {
+  if (!url) return;
+  if (scrapeCache.size >= CACHE_MAX_ENTRIES) {
+    const firstKey = scrapeCache.keys().next().value; // Mapは挿入順
+    if (firstKey) scrapeCache.delete(firstKey);
+  }
+  scrapeCache.set(url, { ts: Date.now(), json });
+}
+function cacheGet(url) {
+  const entry = url ? scrapeCache.get(url) : null;
+  if (!entry) return null;
+  const age = Date.now() - entry.ts;
+  if (age > CACHE_TTL_MS) { scrapeCache.delete(url); return null; }
+  // LRU リフレッシュ
+  scrapeCache.delete(url);
+  scrapeCache.set(url, entry);
+  return { age, json: entry.json };
+}
+
+// -------------------- ユーティリティ --------------------
+function uniq(a){ return Array.from(new Set((a||[]).filter(Boolean))); }
+function stripTags(s){ return String(s||'').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
+function digitsOnly(s){ return String(s||'').replace(/\D+/g,''); }
+
+function normalizeJpPhone(raw){
+  if (!raw) return null;
+  let s = String(raw).trim();
+  s = s.replace(/^\+81[-\s()]?/, '0');   // +81→0
+  s = s.replace(/[^\d-]/g, '');
+  const d = s.replace(/-/g,'');
+  if (!/^0\d{8,10}$/.test(d)) return null;
+  if (/^0[36]\d{8}$/.test(d)) return d.replace(/^(\d{2})(\d{4})(\d{4})$/, '$1-$2-$3'); // 03/06
+  if (/^\d{11}$/.test(d))     return d.replace(/^(\d{4})(\d{3})(\d{4})$/, '$1-$2-$3'); // 4-3-4
+  if (/^\d{10}$/.test(d))     return d.replace(/^(\d{3})(\d{3})(\d{4})$/, '$1-$2-$3'); // 3-3-4
+  return d.replace(/^(\d{2,4})(\d{2,4})(\d{4})$/, '$1-$2-$3');
+}
+function looksLikeZip7(s){ return /^〒?\d{3}-?\d{4}$/.test(String(s).trim()); }
+function decodeUnicodeEscapes(s){
+  return String(s || '').replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+    String.fromCharCode(parseInt(hex, 16))
+  );
+}
+// ===== JSON-LD 抽出・正規化まわり =====
+
+// URL 正規化（クエリ・ハッシュ除去）
+function normalizeUrl(u) {
+  try {
+    const x = new URL(u);
+    return x.origin + x.pathname;
+  } catch {
+    return String(u || '');
+  }
+}
+
+// HTML文字列から <script type="application/ld+json"> を全部抜いて JSON.parse
+function extractJsonLdFromHtml(html) {
+  const out = [];
+  if (!html) return out;
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const raw = (m[1] || '').trim();
+    if (!raw) continue;
+    try {
+      // JSON-LD には配列とオブジェクトの両方が来る
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) out.push(...parsed);
+      else out.push(parsed);
+    } catch(_) {}
+  }
+  return out;
+}
+
+// === [COVNAV][NODE-DETECT v1] HTMLから会社情報/サービス/お問い合わせ/FAQナビをざっくり検出 ===
+function detectCoverageNavFromHtmlNode(html) {
+  try {
+    html = String(html || '');
+    if (!html) {
+      return {
+        hasCompanyNav: false,
+        hasServiceNav: false,
+        hasContactNav: false,
+        hasFaqNav:     false
+      };
+    }
+
+    const htmlLower = html.toLowerCase();
+
+    const hasJP = (re) => {
+      try { return re.test(html); } catch { return false; }
+    };
+    const hasEN = (re) => {
+      try { return re.test(htmlLower); } catch { return false; }
+    };
+
+    // 会社情報 / 企業情報 / コーポレート系
+    const hasCompanyNav =
+      hasJP(/会社情報|会社概要|企業情報|企業概要|会社案内/) ||
+      hasEN(/corporate\s+profile|corporate\s+info|about\s+us|about\s+company/);
+
+    // サービス / 事業内容 / ソリューション / 製品
+    const hasServiceNav =
+      hasJP(/サービス(一覧|紹介)?|事業内容|事業紹介|ソリューション|製品情報|プロダクト/) ||
+      hasEN(/services|our\s+services|products|solutions/);
+
+    // お問い合わせ / 資料請求 / CONTACT
+    const hasContactNav =
+      hasJP(/お問い合わせ|お問合せ|問合せ|お問い合せ|資料請求/) ||
+      hasEN(/contact\s*us|contact/);
+
+    // FAQ / よくある質問 / Q&A
+    const hasFaqNav =
+      hasJP(/FAQ|ＦＡＱ|よくある質問|よくあるご質問|Q＆A|Q&A/) ||
+      hasEN(/faq/);
+
+    return {
+      hasCompanyNav: !!hasCompanyNav,
+      hasServiceNav: !!hasServiceNav,
+      hasContactNav: !!hasContactNav,
+      hasFaqNav:     !!hasFaqNav
+    };
+  } catch {
+    return {
+      hasCompanyNav: false,
+      hasServiceNav: false,
+      hasContactNav: false,
+      hasFaqNav:     false
+    };
+  }
+}
+
+// JSON-LD から Organization/Corporation 類や住所/電話/設立が入っていそうなノードだけを抽出
+function pickOrgNodes(jsonldArray) {
+  const arr = Array.isArray(jsonldArray) ? jsonldArray : [];
+  const okType = /^(Organization|Corporation|LocalBusiness|NGO|EducationalOrganization|GovernmentOrganization)$/i;
+  const picked = [];
+
+  const flatten = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(flatten); return; }
+    if (node['@graph']) { flatten(node['@graph']); }
+    if (node['@type']) {
+      const t = Array.isArray(node['@type']) ? node['@type'].join(',') : String(node['@type']||'');
+      if (okType.test(t)) picked.push(node);
+    }
+  };
+
+  arr.forEach(flatten);
+  return picked.length ? picked : arr; // 見つからなければ全体を返す（比較用）
+}
+
+// GTM/外部タグの有無を検知（json-ld 注入のリスク記録用）
+function hasGtmOrExternal(html) {
+  if (!html) return false;
+  return /googletagmanager\.com|googletagservices\.com|gtm\.js|google-analytics\.com/i.test(html);
+}
+
+// トップと /about の JSON-LD を比較して “/about 優先” の Organization 候補を返す
+function preferAboutJsonLd(topArr, aboutArr) {
+  const topOrg = pickOrgNodes(topArr);
+  const aboutOrg = pickOrgNodes(aboutArr);
+  if (aboutOrg && aboutOrg.length) return aboutOrg;  // /about を優先
+  return topOrg || [];
+}
+
+// ====== PHONE scoring & picking (代表電話ラベル優先) ======
+function isDummyPhone(n){
+  if (!n) return true;
+  const d = String(n).replace(/[^\d]/g, '');
+  if (/^(012|000|007|017|089)/.test(d)) return true;         // 典型ダミー/π断片
+  if (/(\d)\1{3,}/.test(d)) return true;                     // 3333, 0000 など
+  if (n === '03-3333-3333') return true;                     // よくあるダミー
+  return false;
+}
+function scorePhoneBasic(n){
+  let s = 0;
+  if (/^03-/.test(n)) s += 3;       // 都内
+  else if (/^06-/.test(n)) s += 2;  // 大阪
+  if (isDummyPhone(n)) s -= 10;
+  return s;
+}
+function pickBestPhone({ telLinks=[], phones=[], labelHits=[], corpusText='' } = {}){
+  const labeled = Array.from(new Set(labelHits
+    .map(normalizeJpPhone)
+    .filter(n => n && !isDummyPhone(n))));
+  if (labeled.length) return labeled[0];
+  const DUMMY_PREFIX = /^(007|017|089|000)/;
+  for (const raw of telLinks) {
+    const n = normalizeJpPhone(raw);
+    if (!n) continue;
+    const digits = n.replace(/-/g,'');
+    if (DUMMY_PREFIX.test(digits)) continue;
+    if (!isDummyPhone(n)) return n;
+  }
+  const cand = [];
+  for (const raw of phones) {
+    const n = normalizeJpPhone(raw);
+    if (!n || isDummyPhone(n)) continue;
+    const nd = (n||'').replace(/\D+/g,'');
+    const cd = String(corpusText||'').replace(/\D+/g,'');
+    const ctx = (nd && cd.includes(nd)) ? 25 : 0;
+    cand.push({ n, s: scorePhoneBasic(n) + ctx });
+  }
+  cand.sort((a,b) => b.s - a.s);
+  return cand.length ? cand[0].n : null;
+}
+
+const PREF_RE = /(北海道|東京都|(?:京都|大阪)府|..県)/;
+function parseBestAddressFromLines(lines){
+  if (!lines || !lines.length) return null;
+  const cleaned = lines.map(stripTags).filter(Boolean);
+  for (const line of cleaned){
+    const mZip  = line.match(/〒?\s?(\d{3})-?(\d{4})/);
+    const mPref = line.match(PREF_RE);
+    if (!mZip || !mPref) continue;
+
+    const postal = mZip[1] + '-' + mZip[2];
+    const pref   = mPref[0];
+    const afterPref = line.slice(line.indexOf(pref) + pref.length).trim();
+
+    const locM = afterPref.match(/^([^\s、,，]+?(市|区|郡|町|村))/);
+    const locality = locM ? locM[1] : '';
+
+    let rest = afterPref.slice(locality.length).replace(/^、|^,|^，/, '').trim();
+    rest = rest.replace(/^〒?\s?\d{3}-?\d{4}\s*/, '').trim();
+
+    const addr = {
+      postalCode: postal,
+      addressRegion: pref,
+      addressLocality: locality || undefined,
+      streetAddress: rest || undefined,
+      addressCountry: 'JP'
+    };
+    return addr;
+  }
+  return null;
+}
+
+// -------------------- 設立（STRICT: DOM/HTML構造のみ） --------------------
+const FOUNDED_MODE = process.env.SCRAPE_FOUNDED_MODE || 'strict'; // 'strict' | 'off'
+
+function parseJpDateToISO(input) {
+  if (!input) return '';
+  const t = String(input).replace(/\s+/g, '');
+  const m = t.match(/((?:19|20)\d{2})\D{0,5}(\d{1,2})\D{0,5}(\d{1,2})/);
+  if (!m) return '';
+  const Y = String(m[1]).padStart(4, '0');
+  const M = String(m[2]).padStart(2, '0');
+  const D = String(m[3]).padStart(2, '0');
+  const iso = `${Y}-${M}-${D}`;
+  const dt = new Date(iso);
+  return (!Number.isNaN(+dt) && (dt.getUTCMonth() + 1) === Number(M)) ? iso : '';
+}
+
+async function getFoundingFromDOM(page) {
+  try {
+    const txt = await page.evaluate(() => {
+      const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      // 1) <dl><dt>設立</dt><dd>…</dd>
+      for (const dt of Array.from(document.querySelectorAll('dl dt'))) {
+        if (/設立|創業/.test(dt.textContent || '')) {
+          const dd = dt.nextElementSibling;
+          if (dd) return clean(dd.textContent || '');
+        }
+      }
+      // 2) <table><th>設立</th><td>…</td>
+      for (const th of Array.from(document.querySelectorAll('table th'))) {
+        if (/設立|創業/.test(th.textContent || '')) {
+          const td = th.nextElementSibling;
+          if (td) return clean(td.textContent || '');
+        }
+      }
+      return '';
+    }).catch(() => '');
+    return parseJpDateToISO(txt) || '';
+  } catch { return ''; }
+}
+
+function getFoundingFromHTML(html) {
+  if (!html) return '';
+  const h = String(html);
+
+  // dt/dd
+  let m = h.match(/<dt[^>]*>\s*(?:設立|創業)\s*<\/dt>[\s\S]{0,200}?<dd[^>]*>\s*([\s\S]*?)\s*<\/dd>/i);
+  if (m && m[1]) {
+    const raw = m[1].replace(/<[^>]+>/g, ' ');
+    const iso = parseJpDateToISO(raw);
+    if (iso) return iso;
+  }
+  // th/td
+  m = h.match(/<th[^>]*>\s*(?:設立|創業)\s*<\/th>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/i);
+  if (m && m[1]) {
+    const raw = m[1].replace(/<[^>]+>/g, ' ');
+    const iso = parseJpDateToISO(raw);
+    if (iso) return iso;
+  }
+  // タグ剥がし後の「設立/創業 19xx …」
+  const flat = h.replace(/<[^>]+>/g, ' ');
+  const near = flat.match(/(設立|創業)[^\d]{0,30}((?:19|20)\d{2})[^\d]{0,8}(\d{1,2})[^\d]{0,8}(\d{1,2})/);
+  if (near) {
+    return parseJpDateToISO(`${near[2]}-${near[3]}-${near[4]}`);
+  }
+  return '';
+}
+
+// ================== Scoring core (add to index.js) ==================
+const cheerio = require('cheerio');
+
+function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+function pct(x, min, max){
+  if (max <= min) return 0;
+  return clamp01((x - min) / (max - min));
+}
+function toScore(x){ return Math.round(clamp01(x) * 100); }
+function safe(s){ return (s==null?'':String(s)); }
+
+function parseJsonLdList(jsonldRaw) {
+  // jsonldRaw は配列 or 文字列 or オブジェクトの可能性がある
+  if (!jsonldRaw) return [];
+  if (Array.isArray(jsonldRaw)) return jsonldRaw.filter(Boolean);
+  if (typeof jsonldRaw === 'string') {
+    try { 
+      const v = JSON.parse(jsonldRaw);
+      return Array.isArray(v) ? v : [v];
+    } catch { return []; }
+  }
+  if (typeof jsonldRaw === 'object') return [jsonldRaw];
+  return [];
+}
+function flatTypesFromJsonLd(arr) {
+  const types = new Set();
+  for (const node of arr) {
+    const t = node && node['@type'];
+    if (!t) continue;
+    if (Array.isArray(t)) t.forEach(x => types.add(String(x)));
+    else types.add(String(t));
+    // @graph 内まで掘る
+    if (node['@graph'] && Array.isArray(node['@graph'])) {
+      for (const g of node['@graph']) {
+        const tg = g && g['@type'];
+        if (Array.isArray(tg)) tg.forEach(x => types.add(String(x)));
+        else if (tg) types.add(String(tg));
+      }
+    }
+  }
+  return Array.from(types);
+}
+function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
+
+function analyzeHtmlBasics(html) {
+  const $ = cheerio.load(html || '');
+  const title = $('head > title').text().trim();
+  const metaDesc = $('meta[name="description"]').attr('content') || '';
+  const lang = $('html').attr('lang') || '';
+
+  // セマンティック要素
+  const semanticTags = ['header','nav','main','article','section','aside','footer'];
+  const semanticCount = semanticTags.reduce((a,t)=>a + $(t).length, 0);
+
+  // 見出し
+  const h1s = $('h1');
+  const h2s = $('h2');
+  const h3s = $('h3');
+  const headings = $('h1,h2,h3,h4,h5,h6').get().map(e => Number(e.tagName.slice(1)));
+  // レベル飛び検出（例: h2→h4 など）
+  let levelJumps = 0;
+  for (let i=1; i<headings.length; i++) {
+    const prev = headings[i-1], cur = headings[i];
+    if (cur > prev+1) levelJumps++;
+  }
+
+  // 画像の alt 率
+  const imgs = $('img');
+  const imgCount = imgs.length;
+  const imgAltCount = imgs.filter((_,el)=>!!$(el).attr('alt')).length;
+  const imgAltRatio = imgCount ? (imgAltCount / imgCount) : 1;
+
+  // aタグのラベル性（hrefだけ、"詳しくはこちら"のみ等は弱い）
+  const links = $('a').get();
+  const meaningfulLinks = links.filter(a=>{
+    const txt = ($(a).text() || '').trim();
+    if (!txt) return false;
+    const ng = ['こちら','click','詳しくはこちら','more','詳細','read more'];
+    return !ng.includes(txt.toLowerCase());
+  }).length;
+  const linkRatio = links.length ? meaningfulLinks/links.length : 1;
+
+  // Open Graph / Twitter Card
+  const ogTitle = $('meta[property="og:title"]').attr('content') || '';
+  const ogDesc  = $('meta[property="og:description"]').attr('content') || '';
+  const twCard  = $('meta[name="twitter:card"]').attr('content') || '';
+
+  // パンくず（構造 or 見た目）
+  const hasBreadcrumbDom = $('.breadcrumb, nav[aria-label="breadcrumb"]').length > 0;
+
+  return {
+    title, metaDesc, lang, semanticCount,
+    h1Count: h1s.length, h2Count: h2s.length, h3Count: h3s.length,
+    levelJumps, imgCount, imgAltRatio, linkRatio,
+    hasBreadcrumbDom, hasOg: !!(ogTitle||ogDesc), hasTwitterCard: !!twCard,
+  };
+}
+
+function analyzeTextReadability(bodyText) {
+  const text = safe(bodyText);
+  // 句点で文を割る（日本語想定）
+  const sentences = text.split(/。|\n/).map(s=>s.trim()).filter(Boolean);
+  const charLen = (s)=>s.replace(/\s/g,'').length;
+
+  const lens = sentences.map(charLen);
+  const totalChars = lens.reduce((a,b)=>a+b,0);
+  const avgLen = sentences.length ? totalChars / sentences.length : 0;
+
+  // 長すぎる文の割合（80文字超）
+  const longRatio = sentences.length ? (countIf(lens, L=>L>80) / sentences.length) : 0;
+
+  // 箇条書きの有無（"- "や"・"の頻度）
+  const bullets = (text.match(/(^|\n)\s*[-・＊*●◼︎]/g) || []).length;
+
+  // 漢字だらけ判定を軽く（記号除去後のひらがなカタカナ比率）
+  const onlyChars = text.replace(/[\s0-9!-~、。・…—―「」『』（）【】［］【】\u3000]/g,'');
+  const hiraKata = (onlyChars.match(/[ぁ-んァ-ヶ]/g) || []).length;
+  const ratioHiraKata = onlyChars.length ? (hiraKata / onlyChars.length) : 0;
+
+  return { sentences: sentences.length, avgLen, longRatio, bullets, ratioHiraKata };
+}
+
+function analyzeCoverage(bodyText, html) {
+  const hay = (safe(bodyText) + '\n' + safe(html)).toLowerCase();
+  // 意思決定に効く情報がサイトに揃っているか（キーワード網羅）
+  const keys = [
+    'サービス','製品','特徴','強み','実績','事例','導入','料金','価格','費用',
+    '比較','プラン','サポート','faq','よくある質問','お問い合わせ','連絡先',
+    '会社概要','アクセス','採用','メンバー','チーム','ブログ','ニュース'
+  ];
+  const hits = countIf(keys, k => hay.indexOf(k.toLowerCase()) >= 0);
+  // セクションの多様性（article/section/ul/table）
+  const $ = cheerio.load(html||'');
+  const diversity = ['article','section','ul','ol','table','dl','figure'].reduce((a,t)=>a + ($(t).length>0?1:0), 0);
+  return { keysTotal: keys.length, keysHit: hits, diversity };
+}
+
+function analyzeTrust(bodyText, html, url) {
+  const text = (safe(bodyText) + '\n' + safe(html)).toLowerCase();
+  const trustKeys = [
+    '会社概要','企業情報','特定商取引','プライバシーポリシー','個人情報保護','利用規約',
+    '住所','所在地','電話','tel','お問い合わせ','責任者','監修','著者','発行日','更新日'
+  ];
+  const trustHits = countIf(trustKeys, k => text.indexOf(k.toLowerCase()) >= 0);
+
+  // 住所・電話の露出（実体文字）
+  const hasPhone = /tel[:：]?\s*\+?\d|\d{2,4}-\d{2,4}-\d{3,4}/i.test(text);
+  const hasAddr  = /(東京都|北海道|京都府|大阪府|..県|..市|丁目|番地)/.test(text);
+
+  // 組織系のJSON-LD
+  // 呼び出し側で typesFromJsonLd を渡してもらう
+  return { trustHits, hasPhone, hasAddr, isHttps: /^https:\/\//i.test(url||'') };
+}
+
+// ---- 各スコア（0-100） ----
+function scoreDataStructure(htmlBasics, types) {
+  // 要素: title, meta desc, セマンティック要素数, 画像alt率, 意味のあるリンク率, OG/TwitterCard, パンくず, JSON-LDの量
+  const hasTitle = htmlBasics.title.length > 0;
+  const hasDesc  = htmlBasics.metaDesc.length > 30;
+  const semScore = clamp01(htmlBasics.semanticCount / 4);   // 4種以上で頭打ち
+  const altScore = htmlBasics.imgAltRatio;                  // 0-1
+  const linkScore= htmlBasics.linkRatio;                    // 0-1
+  const ogScore  = htmlBasics.hasOg ? 1 : 0;
+  const twScore  = htmlBasics.hasTwitterCard ? 1 : 0;
+  const bcScore  = htmlBasics.hasBreadcrumbDom ? 1 : 0;
+  const jsonldScore = clamp01(types.length / 4);            // 4タイプ（WebSite/WebPage/Org/Breadcrumb/FAQ等）で満点
+
+  const w = {title:.10, desc:.10, sem:.15, alt:.10, link:.10, og:.05, tw:.05, bc:.05, jsonld:.30};
+  const v = (hasTitle?w.title:0) + (hasDesc?w.desc:0) + semScore*w.sem + altScore*w.alt +
+            linkScore*w.link + ogScore*w.og + twScore*w.tw + bcScore*w.bc + jsonldScore*w.jsonld;
+  return toScore(v);
+}
+
+function scoreDocumentStructure(htmlBasics, html) {
+  const $ = cheerio.load(html||'');
+  const headings = $('h1,h2,h3,h4,h5,h6').get().map(e => Number(e.tagName.slice(1)));
+  const hasH1 = htmlBasics.h1Count === 1;            // h1は1つが理想
+  const hasH2 = htmlBasics.h2Count > 0;
+  const notJump = htmlBasics.levelJumps === 0;
+  const paraCount = $('p').length;
+  const listCount = $('ul,ol').length;
+  const tableCount = $('table').length;
+
+  const w = {h1:.25, h2:.15, notJump:.20, para:.20, list:.10, table:.10};
+  const paraScore = clamp01(paraCount / 10);     // 段落10以上で頭打ち
+  const listScore = clamp01(listCount / 3);      // 3つ以上で頭打ち
+  const tableScore= clamp01(tableCount / 1);     // 1つでOK
+
+  const v = (hasH1?w.h1:0) + (hasH2?w.h2:0) + (notJump?w.notJump:0) +
+            paraScore*w.para + listScore*w.list + tableScore*w.table;
+  return toScore(v);
+}
+
+function scoreClarity(textStats) {
+  // 平均文長が短く、長文比が低く、箇条書きある、ひらカナ比率がそれなりにある → 高得点
+  const sLen = 1 - clamp01((textStats.avgLen - 40) / (120 - 40)); // 40〜120 で線形
+  const sLong= 1 - clamp01(textStats.longRatio);                   // 長文比が低いほど良い
+  const sBul = clamp01(textStats.bullets / 5);                     // 箇条書き（最大5で頭打ち）
+  const sKana= clamp01(textStats.ratioHiraKata / 0.5);             // かな比 0.5 で満点（難語だらけ抑制）
+
+  const w = {len:.35,long:.25,bul:.20,kana:.20};
+  const v = clamp01(sLen)*w.len + clamp01(sLong)*w.long + sBul*w.bul + sKana*w.kana;
+  return toScore(v);
+}
+
+function scoreCoverage(cov) {
+  const k = clamp01(cov.keysHit / Math.max(6, cov.keysTotal)); // 主要6個以上で頭打ち
+  const d = clamp01(cov.diversity / 5);                         // 5要素で満点
+  const v = k*0.7 + d*0.3;
+  return toScore(v);
+}
+
+function scoreTrust(tr, types) {
+  const hasOrg = types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation');
+  const hasContact = types.includes('ContactPoint');
+  const hasBreadcrumb = types.includes('BreadcrumbList');
+  const base = clamp01(tr.trustHits / 6);     // 信頼系の露出 6項目で満点
+  const bonus = (tr.hasPhone?0.1:0) + (tr.hasAddr?0.1:0) + (tr.isHttps?0.1:0) +
+                (hasOrg?0.1:0) + (hasContact?0.05:0) + (hasBreadcrumb?0.05:0);
+  return toScore(clamp01(base + bonus));
+}
+
+function rankFromAvg(avg){
+  const n = Number(avg)||0;
+  if (n >= 85) return 'A';
+  if (n >= 70) return 'B';
+  if (n >= 55) return 'C';
+  if (n >= 40) return 'D';
+  return 'E';
+}
+
+function buildDescriptions({data,doc,clar,cov,tr}) {
+  return {
+    'データ構造': `title/description/セマンティック要素:${data.semanticCount}，画像alt率:${Math.round(data.imgAltRatio*100)}%，リンク可読率:${Math.round(data.linkRatio*100)}%。JSON-LDタイプ:${data.types.join(', ') || 'なし'}`,
+    '文書構造': `h1:${doc.h1Count}，h2:${doc.h2Count}，見出しのレベル飛び:${doc.levelJumps}。段落・箇条書き・表の整備状況を評価。`,
+    '表現の明確さ': `平均文長:${Math.round(clar.avgLen)}字，長文比:${Math.round(clar.longRatio*100)}%，箇条書き:${clar.bullets}，かな比:${Math.round(clar.ratioHiraKata*100)}%。`,
+    '情報網羅性': `意思決定キーワード命中:${cov.keysHit}/${cov.keysTotal}，コンテンツ多様性:${cov.diversity}。`,
+    '信頼性': `信頼キーワード命中:${tr.trustHits}，電話:${tr.hasPhone?'◯':'×'}，住所:${tr.hasAddr?'◯':'×'}，HTTPS:${tr.isHttps?'◯':'×'}. JSON-LD(Org/Contact/Breadcrumb):${data.flags.org? '◯':'×'}/${data.flags.contact? '◯':'×'}/${data.flags.bc? '◯':'×'}`,
+  };
+}
+
+// scraped: { url, html, bodyText, jsonld, structured, jsonldSynth }
+function buildScoresFromScrape(scraped) {
+  const url = scraped.url || '';
+  const html = (scraped.scoring && scraped.scoring.html)     || scraped.html  || '';
+  const body = (scraped.scoring && scraped.scoring.bodyText) || scraped.bodyText || '';
+
+  // JSON-LD（現状=Before）
+  const jsonldArr = parseJsonLdList(scraped.jsonld);
+  const types = flatTypesFromJsonLd(jsonldArr);
+
+  const htmlBasics = analyzeHtmlBasics(html);
+  const textStats  = analyzeTextReadability(body);
+  const cov        = analyzeCoverage(body, html);
+  const tr         = analyzeTrust(body, html, url);
+
+  const sData = scoreDataStructure({...htmlBasics, types, flags:{
+    org: types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation'),
+    contact: types.includes('ContactPoint'),
+    bc: types.includes('BreadcrumbList')
+  }}, types);
+  const sDoc  = scoreDocumentStructure(htmlBasics, html);
+  const sClr  = scoreClarity(textStats);
+  const sCov  = scoreCoverage(cov);
+  const sTr   = scoreTrust(tr, types);
+
+  const beforeScores = [sData, sDoc, sClr, sCov, sTr];
+  const avgBefore = Math.round(beforeScores.reduce((a,b)=>a+b,0)/beforeScores.length);
+
+  // ==== After（JSON-LD強化があれば “その分だけ” 反映）====
+  // scraped.jsonldSynth に FAQPage / BreadcrumbList / Organization 等が含まれていれば、
+  // データ構造＋（該当時のみ）網羅性を実増。文書構造/明確さ/信頼性は基本据え置き。
+  let afterScores = beforeScores.slice(0);
+  const synthArr = parseJsonLdList(scraped.jsonldSynth || scraped.structured);
+  if (synthArr.length) {
+    const t2 = flatTypesFromJsonLd(synthArr);
+
+    // データ構造の再計算（types を置換）
+    const sDataAfter = scoreDataStructure({...htmlBasics, types:t2, flags:{
+      org: t2.includes('Organization') || t2.includes('LocalBusiness') || t2.includes('Corporation'),
+      contact: t2.includes('ContactPoint'),
+      bc: t2.includes('BreadcrumbList')
+    }}, t2);
+
+    // FAQPageやItemListが入った場合のみ “情報網羅性” を小幅に見直す
+    const hasFaq = t2.includes('FAQPage');
+    const hasItemList = t2.includes('ItemList');
+    const sCovAfter = hasFaq || hasItemList ? Math.max(sCov, Math.min(100, sCov + 10)) : sCov;
+
+    afterScores = [sDataAfter, sDoc, sClr, sCovAfter, sTr];
+  }
+
+  const avgAfter = Math.round(afterScores.reduce((a,b)=>a+b,0)/afterScores.length);
+
+  return {
+    url,
+    beforeScores,
+    afterScores,
+    avgBeforeScore: avgBefore,
+    avgAfterScore:  avgAfter,
+    beforeRank: rankFromAvg(avgBefore),
+    afterRank:  rankFromAvg(avgAfter),
+    descriptions: buildDescriptions({
+      data:{...htmlBasics, types, flags:{
+        org: types.includes('Organization') || types.includes('LocalBusiness') || types.includes('Corporation'),
+        contact: types.includes('ContactPoint'),
+        bc: types.includes('BreadcrumbList')
+      }},
+      doc: htmlBasics, clar: textStats, cov, tr
+    }),
+    meta: {
+      scoringVersion: '1.0.0 (/scrape integrated)',
+      generatedAt: new Date().toISOString(),
+    }
+  };
+}
+// ================== end Scoring core ==================
+
+// -------------------- /scrape --------------------
+// 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
+const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
+const queue = new PQueue({ concurrency: CONCURRENCY });
+
+console.log('[BOOT][MEMO]', JSON.stringify({
+  initialized: [
+    'express-app',
+    'weights-config',
+    'helper-functions',
+    'pqueue-instance',
+    'empty-scrape-cache'
+  ],
+  browserAtBoot: false,
+  contextAtBoot: false,
+  pageAtBoot: false,
+  queueConcurrency: CONCURRENCY,
+  cacheMaxEntries: CACHE_MAX_ENTRIES,
+  cacheTtlMs: CACHE_TTL_MS,
+  rss: process.memoryUsage().rss
+}));
+
+app.get('/scrape', async (req, res) => {
+  console.log('[TEST][SCRAPE_ENTRY] entered /scrape');
+  // キューに積んだ Promise を必ず返す（Express が先に切られないように）
+  return queue.add(() => scrapeOnce(req, res)).catch(err => {
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'queue_error', message: String(err) });
+    }
+  });
+});
+
+async function scrapeOnce(req, res) {
+  const urlToFetch = req.query.url;
+
+  // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
+  const noCache = String(req.query.nocache || '').toLowerCase() === '1';
+
+  if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
+
+  // --- CACHE CHECK (early return) ---
+  try {
+    if (!noCache) {
+      const cached = cacheGet(urlToFetch);
+      if (cached && cached.json) {
+        const payload = JSON.parse(JSON.stringify(cached.json));
+        if (!payload.debug) payload.debug = {};
+        payload.debug.cache = { hit: true, ageMs: cached.age, ttlMs: CACHE_TTL_MS, nocache: false };
+
+        console.log('[TRACE_COVNAV][NODE][cache-hit-return]', {
+          url: urlToFetch,
+          hasAuditSig: !!payload.auditSig,
+          hasCoverageNav: !!(payload.auditSig && payload.auditSig.coverageNav),
+          coverageNav: payload.auditSig && payload.auditSig.coverageNav
+        });
+
+        return res.status(200).json(payload);
+      }
+    }
+  } catch(_) {}
+
+  // メモリが既に逼迫している場合はソフトフェイル（Render の再起動ループ回避）
+  const RSS_HARD_LIMIT = Number(process.env.RSS_HARD_LIMIT || 900 * 1024 * 1024); // ~900MB 目安
+  if (process.memoryUsage().rss > RSS_HARD_LIMIT) {
+    return res.status(503).json({ error: 'over_memory_limit', hint: 'reduce concurrency or upgrade instance' });
+  }
+
+  let browser = null;
+  let context = null;
+  let page = null;
+  const t0 = Date.now();
+  const scrapeTiming = {
+    spans: {
+      browser_launch_context: 0,
+      initial_goto_and_waits: 0,
+      collectEnrichedObservations: 0,
+      dom_shadow_text_extract: 0,
+      top_about_same_fetch: 0,
+      resource_json_tap: 0,
+      resource_js_tap: 0,
+      chunk_tap: 0,
+      jsonld_wait_probe: 0,
+      subpages_vnext: 0,
+      response_payload_build: 0
+    },
+    responsePayloadSubspans: {
+      heading_extract: 0,
+      primary_heading_extract: 0,
+      body_text_candidates_extract: 0,
+      primary_message_extract: 0,
+      response_object_assembly: 0,
+      jsonld_flags_patch: 0,
+      build_scores_from_scrape: 0,
+      output_object_assembly: 0
+    },
+    payload_size_summary: null,
+    subpagesVNextDecision: {
+      enabled: !!ENABLE_SUBPAGES_VNEXT,
+      envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+      origin: null,
+      candidateCount: 0,
+      candidateSample: [],
+      attemptedCount: 0,
+      adoptedCount: 0,
+      skipReason: 'not_reached',
+      errorMessage: '',
+      limit: 1,
+      elapsedMs: 0
+    }
+  };
+  let hydratedForTiming = null;
+  const addScrapeSpan = (name, start) => {
+    try {
+      if (!Object.prototype.hasOwnProperty.call(scrapeTiming.spans, name)) scrapeTiming.spans[name] = 0;
+      scrapeTiming.spans[name] += Math.max(0, Date.now() - Number(start || Date.now()));
+    } catch (_) {}
+  };
+  const safeTimingUrl = () => {
+    try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return String(urlToFetch || '').slice(0, 120); }
+  };
+  const addResponsePayloadSpan = (name, start) => {
+    try {
+      const spans = scrapeTiming.responsePayloadSubspans || {};
+      if (!Object.prototype.hasOwnProperty.call(spans, name)) spans[name] = 0;
+      spans[name] += Math.max(0, Date.now() - Number(start || Date.now()));
+      scrapeTiming.responsePayloadSubspans = spans;
+    } catch (_) {}
+  };
+  const safeLength = (v) => {
+    try { return typeof v === 'string' ? v.length : 0; } catch (_) { return 0; }
+  };
+  const safeArrayLength = (v) => {
+    try { return Array.isArray(v) ? v.length : 0; } catch (_) { return 0; }
+  };
+
+  try {
+    const __timingBrowserStart = Date.now();
+    browser = await chromium.launch({
+      headless: true,
+      // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
+
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                 'Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo'
+    });
+
+    page = await context.newPage();
+    // デフォルトタイムアウト（ENV で調整可）
+    const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    page.setDefaultTimeout(NAV_TIMEOUT_MS);
+
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    addScrapeSpan('browser_launch_context', __timingBrowserStart);
+
+    // ---- 主要待機（軽め） ----
+    const __timingInitialWaitStart = Date.now();
+    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    await Promise.race([
+      page.waitForResponse(r => {
+        const u = r.url();
+        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
+      }, { timeout: 20_000 }).catch(()=>null),
+      page.waitForTimeout(20_000)
+    ]);
+    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
+    const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
+    await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
+
+    // === ここから追記（本文長しきい値で待機）===
+    await page.waitForFunction(() => {
+      const hasHeader = !!document.querySelector('header,[role="banner"]');
+      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasMain   = !!document.querySelector('main,[role="main"]');
+      return hasHeader || hasFooter || hasMain;
+    }, { timeout: 8000 }).catch(()=>{});
+
+    // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
+    await page.waitForFunction(() => {
+      const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
+      return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
+    }, { timeout: 8000 }).catch(()=>{});
+    addScrapeSpan('initial_goto_and_waits', __timingInitialWaitStart);
+
+    const __timingEnrichedStart = Date.now();
+    const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
+    addScrapeSpan('collectEnrichedObservations', __timingEnrichedStart);
+
+    // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
+    const obs = {};
+
+    // --- HTTP headers (main document only) ---
+    const __timingDomTextStart = Date.now();
+    try{
+      const h = (resp && typeof resp.allHeaders === 'function')
+        ? await resp.allHeaders()
+        : ((resp && typeof resp.headers === 'function') ? resp.headers() : {});
+
+      const responseHeaders = {
+        'strict-transport-security': h['strict-transport-security'] ?? null,
+        'content-security-policy':   h['content-security-policy']   ?? null,
+        'x-frame-options':           h['x-frame-options']           ?? null,
+        'x-content-type-options':    h['x-content-type-options']    ?? null,
+        'referrer-policy':           h['referrer-policy']           ?? null,
+        'permissions-policy':        h['permissions-policy']        ?? null
+      };
+
+      obs.http = {
+        ok: !!resp,
+        status: resp ? resp.status() : null,
+        url: resp ? resp.url() : null,
+        // Playwrightは小文字キーのことが多い
+        hsts: !!responseHeaders['strict-transport-security'],
+        xfo:  !!responseHeaders['x-frame-options'],
+        nosniff: !!responseHeaders['x-content-type-options'],
+        csp:  !!responseHeaders['content-security-policy'],
+        referrerPolicy: !!responseHeaders['referrer-policy'],
+        permissionsPolicy: !!responseHeaders['permissions-policy'],
+        responseHeaders,
+        // 監査用に生ヘッダも残す（必要なら後で削る）
+        headers: h
+      };
+    }catch(e){
+      obs.http = { ok:false, reason:String(e && e.message || e) };
+    }
+
+    // --- DOM観測（nav / anchors / headings）---
+    const domObs = await page.evaluate(() => {
+      const norm = (s) => String(s || '').replace(/\s+/g,' ').trim();
+
+      // Shadow DOM を含めて要素を列挙
+      const allElementsDeep = () => {
+        const out = [];
+        const seen = new WeakSet();
+
+        const walk = (root) => {
+          if (!root) return;
+          const nodes = (root instanceof Document)
+            ? [root.documentElement]
+            : [root];
+
+          for (const n of nodes) {
+            if (!n) continue;
+            const stack = [n];
+            while (stack.length) {
+              const el = stack.pop();
+              if (!el || seen.has(el)) continue;
+              seen.add(el);
+
+              if (el.nodeType === Node.ELEMENT_NODE) {
+                out.push(el);
+                // shadow root
+                const sr = el.shadowRoot;
+                if (sr) {
+                  Array.from(sr.children || []).forEach(c => stack.push(c));
+                  Array.from(sr.childNodes || []).forEach(c => {
+                    if (c && c.nodeType === Node.ELEMENT_NODE) stack.push(c);
+                  });
+                }
+                // normal children
+                Array.from(el.children || []).forEach(c => stack.push(c));
+              }
+            }
+          }
+        };
+
+        walk(document);
+        return out;
+      };
+
+      const els = allElementsDeep();
+
+      const isTag = (el, tag) => el && el.tagName && el.tagName.toLowerCase() === tag;
+      const text = (el) => norm(el && (el.textContent || ''));
+      const href = (a) => norm(a && a.getAttribute && a.getAttribute('href'));
+
+      // nav（shadow含む）
+      const navs = els.filter(el => isTag(el, 'nav'));
+      const navAnchors = [];
+      for (const n of navs) {
+        // nav配下のaも shadow を掘る必要があるので、全要素から “nav内にいるa” を集める
+        // （closest は shadow 境界で壊れることがあるので contains ベース）
+        for (const el of els) {
+          if (!isTag(el, 'a')) continue;
+          try { if (n.contains(el)) navAnchors.push(el); } catch(_) {}
+        }
+      }
+
+      // ul/li 構造（shadow含む）
+      const navHasList = navs.some(n => {
+        for (const el of els) {
+          if (!el || !el.tagName) continue;
+          const t = el.tagName.toLowerCase();
+          if (t !== 'li') continue;
+          try { if (n.contains(el)) return true; } catch(_) {}
+        }
+        return false;
+      });
+
+      // アンカーテキスト汎用語（shadow含む）
+      const generic = new Set(['こちら','次へ','もっと見る','詳細を見る','詳しく見る','続きを読む','click','クリック','more','detail']);
+      const allA = els.filter(el => isTag(el, 'a'));
+      const genericHits = [];
+      for (const a of allA){
+        const t = text(a);
+        if (!t) continue;
+        if (generic.has(t)) genericHits.push({ t, href: href(a) });
+      }
+
+      // 見出し（shadow含む）
+      const hs = els
+        .filter(el => /^h[1-6]$/.test((el.tagName || '').toLowerCase()))
+        .map(h => ({ tag: h.tagName.toLowerCase(), text: text(h) }))
+        .filter(x => x.text);
+
+      return {
+        navCount: navs.length,
+        navAnchorCount: navAnchors.length,
+        navHasList,
+        genericAnchorCount: genericHits.length,
+        genericAnchorSamples: genericHits.slice(0, 10),
+        headings: hs,
+        hasH1: hs.some(x => x.tag === 'h1')
+      };
+    }).catch(()=>null);
+
+    obs.dom = domObs || { ok:false };
+
+    // === DOM観測リトライ（レンダ遅延対策）===
+    if (obs.dom && typeof obs.dom.navCount === 'number' && obs.dom.navCount === 0) {
+      await page.waitForTimeout(1200).catch(()=>{});
+      const domObs2 = await page.evaluate(() => {
+        const navs = Array.from(document.querySelectorAll('nav'));
+        const navAnchors = navs.flatMap(n => Array.from(n.querySelectorAll('a')));
+        const navHasList = navs.some(n => n.querySelector('ul li'));
+
+        return {
+          navCount: navs.length,
+          navAnchorCount: navAnchors.length,
+          navHasList
+        };
+      }).catch(()=>null);
+
+      if (domObs2 && typeof domObs2.navCount === 'number' && domObs2.navCount > 0) {
+        obs.dom = { ...obs.dom, ...domObs2 };
+      }
+    }
+
+    // ここで obs を返却payloadに合流させる（下流が壊れない場所に）
+
+    // ---- DOMテキスト（空でもOK）----
+    const [innerText, docText] = await Promise.all([
+      page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
+      page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
+    ]);
+    const hydrated = ((innerText || '').replace(/\s+/g,'').length > 120);
+    hydratedForTiming = hydrated;
+
+  // === ここから追記（Shadow DOMも含めて深くテキストを収集）===
+  const deepText = await page.evaluate(() => {
+    const seen = new WeakSet();
+    const getText = (root) => {
+      let out = '';
+      const walk = (node) => {
+        if (!node || seen.has(node)) return;
+        seen.add(node);
+        if (node.nodeType === Node.TEXT_NODE) {
+          out += (node.nodeValue || '') + '\n';
+          return;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const sr = node.shadowRoot;
+          if (sr) Array.from(sr.childNodes).forEach(walk);   // Shadow root
+          Array.from(node.childNodes).forEach(walk);         // 通常DOM
+        }
+      };
+      walk(root);
+      return out.replace(/\s+\n/g, '\n').trim();
+    };
+    return getText(document.documentElement);
+  }).catch(() => '');
+
+  // === ここからさらに追記（meta description を head から直接取る）===
+  const metaDescription = await page.evaluate(() => {
+    const el = document.head?.querySelector(
+      'meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]'
+    );
+    return el?.getAttribute('content')?.replace(/\s+/g, ' ').trim() || '';
+  });
+
+  // “描画本文”として優先利用
+  const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
+    ? deepText
+    : (innerText || docText || '');
+  addScrapeSpan('dom_shadow_text_extract', __timingDomTextStart);
+
+  // --- トップと /about の JSON-LD を比較 ---
+  const __timingTopAboutSameStart = Date.now();
+  const targetUrl = normalizeUrl(urlToFetch);
+  const u = new URL(targetUrl);
+  const topUrl   = u.origin + '/';
+  const aboutUrl = u.origin + '/about';
+
+  // HTML を取得（ナビゲーションはしない・request 経由）
+  let topHtml = '';
+  let aboutHtml = '';
+  try {
+    const r1 = await page.request.get(topUrl, { timeout: 20000 });
+    if (r1.ok()) topHtml = await r1.text();
+  } catch(_) {}
+  try {
+    const r2 = await page.request.get(aboutUrl, { timeout: 20000 });
+    if (r2.ok()) aboutHtml = await r2.text();
+  } catch(_) {}
+
+  const jsonldTopAll   = extractJsonLdFromHtml(topHtml);
+  const jsonldAboutAll = extractJsonLdFromHtml(aboutHtml);
+  const jsonldPref     = preferAboutJsonLd(jsonldTopAll, jsonldAboutAll);
+  const jsonldTopAboutAll = []
+    .concat(Array.isArray(jsonldTopAll) ? jsonldTopAll : [])
+    .concat(Array.isArray(jsonldAboutAll) ? jsonldAboutAll : []);
+
+  const gtmTop   = hasGtmOrExternal(topHtml);
+  const gtmAbout = hasGtmOrExternal(aboutHtml);
+
+  // 既存の jsonld（動的レンダリングで拾った分）があればそのまま維持しつつ、比較結果は debug に載せる
+
+    // ---- HTMLソース（タグあり）----
+    // === ここから追加 ===
+    const htmlSource = await page.content().catch(() => '');
+
+    const shadowNavHtml = await page.evaluate(() => {
+      const out = [];
+      const seenHtml = new Set();
+
+      const pushIfMatch = (el) => {
+        if (!el || !el.tagName) return;
+        const tag = el.tagName.toLowerCase();
+        if (tag !== 'header' && tag !== 'nav') return;
+
+        const html = String(el.outerHTML || '').trim();
+        if (!html) return;
+        if (seenHtml.has(html)) return;
+
+        seenHtml.add(html);
+        out.push(html);
+      };
+
+      const walk = (root) => {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = Array.from(root.querySelectorAll('*'));
+        for (const el of nodes) {
+          pushIfMatch(el);
+          if (el.shadowRoot) {
+            walk(el.shadowRoot);
+          }
+        }
+      };
+
+      walk(document);
+      return out.join('\n');
+    }).catch(() => '');
+
+    const payloadHtml = shadowNavHtml
+      ? htmlSource + '\n<!-- shadow-nav-fragments -->\n' + shadowNavHtml
+      : htmlSource;
+    // === ここまで追加 ===
+
+    // ---- 設立（STRICT: DOM/HTML 構造のみ）----
+    let foundFoundingDate = '';
+    let foundFoundingDateSource = null;
+
+    if (FOUNDED_MODE !== 'off') {
+      const domIso = await getFoundingFromDOM(page);
+      if (domIso) { foundFoundingDate = domIso; foundFoundingDateSource = 'dom'; }
+      if (!foundFoundingDate) {
+        const htmlIso = getFoundingFromHTML(htmlSource);
+        if (htmlIso) { foundFoundingDate = htmlIso; foundFoundingDateSource = 'html'; }
+      }
+    }
+
+    // ---- sameAs（ページ内 a[href] & HTML直書きURL）----
+    const bundleSameAs = [];
+    const SOCIAL_HOST_RE = /(twitter\.com|x\.com|facebook\.com|instagram\.com|youtube\.com|linkedin\.com|note\.com|wantedly\.com|tiktok\.com)/i;
+
+    const anchorHrefs = await page.$$eval('a[href]', as => as.map(a => a.getAttribute('href') || '').filter(Boolean)).catch(()=>[]);
+    for (const href of anchorHrefs) {
+      try {
+        const u = new URL(href, urlToFetch);
+        if (SOCIAL_HOST_RE.test(u.hostname)) bundleSameAs.push(u.toString());
+      } catch(_) {}
+    }
+    try {
+      const resp0 = await page.request.get(urlToFetch, { timeout: 20000 });
+      if (resp0.ok()) {
+        const html0 = await resp0.text();
+        const urlMatches0 = html0.match(/https?:\/\/[^\s"'<>]+/g) || [];
+        for (const rawUrl of urlMatches0) {
+          try {
+            const host = new URL(rawUrl).hostname;
+            if (SOCIAL_HOST_RE.test(host)) bundleSameAs.push(String(rawUrl));
+          } catch (_) {}
+        }
+      }
+    } catch {}
+
+    // ---- JSON-LD（参考）----
+    const jsonld = await page.evaluate(() => {
+      const arr = [];
+      for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
+        try { arr.push(JSON.parse(s.textContent.trim())); } catch(_) {}
+      }
+      return arr;
+    }).catch(()=>[]);
+
+    // === [JSONLD][ORG-WEBSITE-FLAGS v1] Org / WebSite 用フラグを算出 ===
+    // flags 判定では Org-only の jsonldPref を使わず、
+    // top + about の全 JSON-LD を優先し、無ければ DOM 由来へフォールバックする。
+    const jsonldForFlags = (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length)
+      ? jsonldTopAboutAll
+      : (Array.isArray(jsonld) ? jsonld : []);
+
+    const jsonldTypesAll = flatTypesFromJsonLd(jsonldForFlags);
+
+    // const hasJsonLdFlag =
+    //   Array.isArray(jsonldForFlags) && jsonldForFlags.length > 0;
+
+    // const hasOrgJsonLdFlag = jsonldTypesAll.some(t =>
+    //   /^(Organization|Corporation|LocalBusiness)$/i.test(String(t))
+    // );
+
+    // const hasWebsiteJsonLdFlag = jsonldTypesAll.some(t =>
+    //   /^(WebSite|WebPage)$/i.test(String(t))
+    // );
+
+    // ---- script/src と modulepreload から JS 候補URLを収集 ----
+    const { scriptSrcs, preloadHrefs } = await page.evaluate(() => {
+      const s = Array.from(document.querySelectorAll('script[src]')).map(el => el.getAttribute('src')).filter(Boolean);
+      const l = Array.from(document.querySelectorAll('link[rel="modulepreload"][href]')).map(el => el.getAttribute('href')).filter(Boolean);
+      return { scriptSrcs: s, preloadHrefs: l };
+    });
+    const abs = (u) => { try { return new URL(u, urlToFetch).toString(); } catch { return null; } };
+    const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
+
+    // --- ページで読み込まれたリソース一覧から JSON 系も拾う（電話/住所/同社SNSのみに使用）---
+    const resourceUrls = await page.evaluate(() => {
+      try {
+        return performance.getEntriesByType('resource')
+          .map(e => e.name)
+          .filter(Boolean);
+      } catch { return []; }
+    });
+    const extraJsonUrls = uniq(resourceUrls.filter(u =>
+      /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(u)
+    ));
+    const jsonToTap = extraJsonUrls.filter(u => !jsUrls.includes(u));
+    addScrapeSpan('top_about_same_fetch', __timingTopAboutSameStart);
+
+    // ---- 正規表現（電話/郵便のみ）----
+    const PHONE_RE = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
+    const ZIP_RE   = /〒?\d{3}-?\d{4}/g;
+
+    const bundlePhones = [];
+    const bundleZips   = [];
+    const bundleAddrs  = [];
+    const fetchedMeta  = [];
+    const tappedUrls   = [];
+    const tappedAppIndexBodies = [];
+    const labelHitPhones = [];
+    const LABEL_RE = /(代表電話|代表|電話|お問い合わせ|TEL|Tel|Phone)/i;
+
+    // tel:リンク
+    const telLinks = await page.$$eval('a[href^="tel:"]',
+      as => as.map(a => (a.getAttribute('href') || '')
+        .replace(/^tel:/i,'')
+        .replace(/^\+81[-\s()]?/,'0')
+        .trim()
+      )
+    ).catch(()=>[]);
+
+    // --- リソース由来の JSON（電話/住所/同社SNSのみに使用）---
+    const __timingJsonTapStart = Date.now();
+    for (const u of jsonToTap) {
+      try {
+        const resp = await page.request.get(u, { timeout: 10000 });
+        if (!resp.ok()) continue;
+        const body = await resp.text();
+        if (!body) continue;
+
+        const raw = body;
+        const decoded = decodeUnicodeEscapes(raw);
+        const scan = raw + '\n' + decoded;
+
+        // 電話
+        (scan.match(PHONE_RE) || [])
+          .map(normalizeJpPhone)
+          .filter(Boolean)
+          .forEach(v => bundlePhones.push(v));
+
+        // 郵便番号
+        (scan.match(ZIP_RE) || [])
+          .filter(looksLikeZip7)
+          .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+        // 住所っぽい行
+        for (const line of scan.split(/\n+/)) {
+          if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
+            bundleAddrs.push(line.replace(/\s+/g,' ').trim());
+          }
+        }
+
+        // sameAs（JSON内の直書きURL）
+        const urlMatches = scan.match(/https?:\/\/[^\s"'<>]+/g) || [];
+        for (const rawUrl of urlMatches) {
+          try {
+            const p = new URL(rawUrl);
+            if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+          } catch(_) {}
+        }
+      } catch {}
+    }
+    addScrapeSpan('resource_json_tap', __timingJsonTapStart);
+
+    // ページが教えてくれたJS候補 + 典型的なエントリ
+    const jsToTap = uniq([
+      ...jsUrls,
+      `${new URL(urlToFetch).origin}/app-index.js`
+    ]);
+
+    // ---- JS/JSON 本文を取得して抽出（※設立は見ない）----
+    const __timingJsTapStart = Date.now();
+    for (const u of jsToTap) {
+      try {
+        const resp = await page.request.get(u, { timeout: 20_000 });
+        if (!resp.ok()) continue;
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        if (!(ct.includes('javascript') || ct.includes('json') || u.endsWith('.js') || u.endsWith('.json'))) continue;
+
+        const text = await resp.text();
+        if (/\/app-index\.js(\?|$)/.test(u)) {
+          tappedAppIndexBodies.push(text || '');
+        }
+        if (!text) continue;
+
+        const raw = text || '';
+        const decoded = decodeUnicodeEscapes(raw);
+        const scan = raw + '\n' + decoded;
+
+        tappedUrls.push(u);
+        fetchedMeta.push({ url: u, ct, textLen: raw.length });
+
+        // ラベル近接での電話抽出
+        try {
+          for (const m of scan.matchAll(PHONE_RE)) {
+            const rawNum = m[0];
+            const idx = m.index ?? -1;
+            let near = '';
+            if (idx >= 0) {
+              const start = Math.max(0, idx - 60);
+              const end   = Math.min(scan.length, idx + rawNum.length + 60);
+              near = scan.slice(start, end);
+            }
+            if (near && LABEL_RE.test(near)) {
+              const n = normalizeJpPhone(rawNum);
+              if (n) labelHitPhones.push(n);
+            }
+          }
+        } catch {}
+
+        // 電話
+        (scan.match(PHONE_RE) || [])
+          .map(normalizeJpPhone)
+          .filter(Boolean)
+          .forEach(v => bundlePhones.push(v));
+
+        // 郵便番号
+        (scan.match(ZIP_RE) || [])
+          .filter(looksLikeZip7)
+          .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+        // 住所っぽい行
+        for (const line of scan.split(/\n+/)) {
+          if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
+            bundleAddrs.push(line.replace(/\s+/g,' ').trim());
+          }
+        }
+
+        // sameAs らしき URL（スクリプト内の直書き）
+        const urlMatches = scan.match(/https?:\/\/[^\s"'<>]+/g) || [];
+        for (const rawUrl of urlMatches) {
+          try {
+            const p = new URL(rawUrl);
+            if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+          } catch(_) {}
+        }
+      } catch(_) {}
+    }
+    addScrapeSpan('resource_js_tap', __timingJsTapStart);
+
+    // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃（※設立は見ない）--------
+    const __timingChunkTapStart = Date.now();
+    try {
+      const extraChunkUrls = new Set();
+      for (const t of tappedAppIndexBodies) {
+        const m = (t || '').match(/["'`](\/chunk-[A-Za-z0-9-]+\.js)["'`]/g) || [];
+        for (const raw of m) {
+          const rel = raw.replace(/^["'`]|["'`]$/g, '');
+          try {
+            const absUrl = new URL(rel, urlToFetch).toString();
+            if (!tappedUrls.includes(absUrl)) extraChunkUrls.add(absUrl);
+          } catch {}
+        }
+      }
+
+      let count = 0;
+      for (const u of Array.from(extraChunkUrls)) {
+        if (count++ >= 8) break;
+        try {
+          const resp = await page.request.get(u, { timeout: 15_000 });
+          if (!resp.ok()) continue;
+          const ct = (resp.headers()['content-type'] || '').toLowerCase();
+          if (!(ct.includes('javascript') || u.endsWith('.js'))) continue;
+
+          const text = await resp.text();
+          if (!text) continue;
+
+          const raw = text || '';
+          const decoded = decodeUnicodeEscapes(raw);
+          const scan = raw + '\n' + decoded;
+
+          // 電話
+          (scan.match(PHONE_RE) || [])
+            .map(normalizeJpPhone)
+            .filter(Boolean)
+            .forEach(v => bundlePhones.push(v));
+
+          // 郵便番号
+          (scan.match(ZIP_RE) || [])
+            .filter(looksLikeZip7)
+            .forEach(v => bundleZips.push(v.replace(/^〒/, '')));
+
+          // 住所っぽい行
+          for (const line of scan.split(/\n+/)) {
+            if (/[都道府県]|市|区|町|村|丁目/.test(line) && line.length < 200) {
+              bundleAddrs.push(line.replace(/\s+/g,' ').trim());
+            }
+          }
+
+          // sameAs
+          const urlMatches = scan.match(/https?:\/\/[^\s"'<>]+/g) || [];
+          for (const rawUrl of urlMatches) {
+            try {
+              const p = new URL(rawUrl);
+              if (SOCIAL_HOST_RE.test(p.hostname)) bundleSameAs.push(p.toString());
+            } catch(_) {}
+          }
+        } catch {}
+      }
+    } catch {}
+    // -------- 2nd pass end --------
+    addScrapeSpan('chunk_tap', __timingChunkTapStart);
+
+    // ---- 整理 & 採用値の決定 ----
+    const phones = uniq(bundlePhones);
+    const zips   = uniq(bundleZips);
+    const addrs  = uniq(bundleAddrs);
+
+    const pickedPhone = pickBestPhone({
+      telLinks,
+      phones,
+      labelHits: labelHitPhones,
+      corpusText: innerText || docText || ''
+    });
+    const pickedAddress = parseBestAddressFromLines(addrs);
+
+    // bodyText フォールバック
+    let bodyText = innerText && innerText.trim() ? innerText : '';
+    if (!bodyText) {
+      const lines = [];
+      if (pickedPhone) lines.push('TEL: ' + pickedPhone);
+      if (pickedAddress) {
+        const p = pickedAddress;
+        const addrLine = [p.postalCode, p.addressRegion, p.addressLocality, p.streetAddress]
+          .filter(Boolean).join(' ');
+        lines.push('ADDR: ' + addrLine);
+      } else {
+        if (zips.length)  lines.push('ZIP: ' + zips.slice(0,3).join(', '));
+        if (addrs.length) lines.push('ADDR: ' + addrs.slice(0,2).join(' / '));
+      }
+      bodyText = lines.join('\n') || '（抽出対象のテキストが見つかりませんでした）';
+    }
+
+    // --- sameAs フィルタ＆重複排除（SNS系のみ残す） ---
+    const ALLOW_HOST_SNS = /(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|youtube\.com|linkedin\.com|tiktok\.com)/i;
+    const sameAsClean = Array.from(new Set(
+      (bundleSameAs || [])
+        .map(u => String(u || '').trim())
+        .filter(u => /^https?:\/\//i.test(u))
+        .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
+    ));
+
+    // === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
+    const scoringHtml  = (aboutHtml || topHtml || payloadHtml || '');
+    const scoringBodyA = renderedText || '';
+    const scoringBodyB = stripTags(scoringHtml);
+    const scoringBody  = (scoringBodyA.replace(/\s+/g,'').length >= 200) ? scoringBodyA : scoringBodyB;
+
+    // === JSON-LD の実出現をピンポイント待機（最大 20 秒に延長） ===
+    const __timingJsonLdProbeStart = Date.now();
+    await page.waitForFunction(() => {
+      return !!document.querySelector('script[type="application/ld+json" i]');
+    }, { timeout: 20000 }).catch(()=>{}); // ← 12s→20s に延長
+
+    // === 出現後スナップショット（短時間プローブ） ===
+    const __probe = await probeJsonLdAndCopyright(page, { maxWaitMs: 600, pollMs: 100 });
+
+    // === Fallback: app-index.js 内の JSON-LD リテラル検出（DOM挿入前でも実装あり扱い） ===
+    try {
+      if (!__probe.jsonld_detected_once) {
+        const jsBodies = Array.isArray(tappedAppIndexBodies) ? tappedAppIndexBodies : [];
+        const hit = jsBodies.find(txt =>
+          /"@context"\s*:\s*"https?:\/\/schema\.org"/i.test(txt) ||
+          /type\s*[:=]\s*["']application\/ld\+json["']/i.test(txt)
+        );
+        if (hit) {
+          const start = hit.indexOf('{');
+          const head = start >= 0 ? hit.slice(start, start + 80) : hit.slice(0, 80);
+
+          // 1) JSON-LD が「ありそう」というフラグ類
+          __probe.jsonld_detected_once = true;
+          __probe.jsonld_detect_count  = Math.max(1, __probe.jsonld_detect_count || 0);
+          __probe.jsonld_timed_out     = false;
+          __probe.jsonld_sample_head   = head;
+
+          // 2) "@type" をざっくり抜き出して jsonld_types に積む
+          try {
+            const types = [];
+            const re = /"@type"\s*:\s*"([^"]+)"/g;
+            let m;
+            while ((m = re.exec(hit)) !== null) {
+              const typ = (m[1] || '').trim();
+              if (typ) types.push(typ);
+            }
+            if (types.length) {
+              const uniqTypes = Array.from(new Set(types));
+              if (!Array.isArray(__probe.jsonld_types)) {
+                __probe.jsonld_types = uniqTypes;
+              } else {
+                __probe.jsonld_types = Array.from(
+                  new Set(__probe.jsonld_types.concat(uniqTypes))
+                );
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    addScrapeSpan('jsonld_wait_probe', __timingJsonLdProbeStart);
+
+    // === Fallback（コピーライト）：CSR前でも静的/レンダ済みから検知 ===
+    try {
+      if (!__probe.copyright_hit) {
+        const hayA = (typeof scoringHtml === 'string' ? scoringHtml : '') + '\n' + (renderedText || '');
+        const hayB = htmlSource || '';
+        const re = /©|&copy;|&#169;|copyright|コピーライト|著作権/i;
+
+        const hitA = re.test(hayA);
+        const hitB = re.test(hayB);
+
+        if (hitA || hitB) {
+          const src = hitA ? hayA : hayB;
+          const i = src.search(re);
+          const excerpt = i >= 0 ? src.slice(Math.max(0, i - 10), i + 90) : src.slice(0, 100);
+
+          __probe.copyright_hit = true;
+          __probe.copyright_hit_token = '©';
+          __probe.copyright_excerpt = excerpt;
+        }
+      }
+    } catch (_) {}
+
+    // === Fallback: app-index.js 内の JSON-LD リテラル検出（DOM挿入前でも実装ありとみなす） ===
+    try {
+      if (!__probe.jsonld_detected_once) {
+        // すでに上流で収集済み（/app-index.js の本文）
+        const jsBodies = Array.isArray(tappedAppIndexBodies) ? tappedAppIndexBodies : [];
+        const hit = jsBodies.find(txt =>
+          /"@context"\s*:\s*"https?:\/\/schema\.org"/i.test(txt) ||
+          /type\s*[:=]\s*["']application\/ld\+json["']/i.test(txt)
+        );
+        if (hit) {
+          const start = hit.indexOf('{');
+          const head = start >= 0 ? hit.slice(start, start + 80) : hit.slice(0, 80);
+          __probe.jsonld_detected_once = true;
+          __probe.jsonld_detect_count = Math.max(1, __probe.jsonld_detect_count || 0);
+          __probe.jsonld_timed_out = false;
+          __probe.jsonld_sample_head = head;
+        }
+      }
+    } catch (_) {}
+
+    // ---- 返却ペイロードを組み立て ----
+    const structured = {
+      telephone: pickedPhone || null,
+      address: pickedAddress || null,
+      foundingDate: foundFoundingDate || null,
+      sameAs: sameAsClean
+    };
+
+    const responseOrigin = (() => { try { return new URL(urlToFetch).origin; } catch (_) { return ''; } })();
+    let subPagesVNext = [];
+    let publisherInfo = null;
+    const __timingSubpagesStart = Date.now();
+    if (ENABLE_SUBPAGES_VNEXT) {
+      if (typeof buildSubPagesVNext_V1_ === 'function') {
+        subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin, scrapeTiming.subpagesVNextDecision);
+        publisherInfo = buildPublisherInfoFromSubPagesVNext_(subPagesVNext, structured, responseOrigin);
+      } else {
+        try {
+          Object.assign(scrapeTiming.subpagesVNextDecision, {
+            enabled: true,
+            envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+            origin: responseOrigin,
+            skipReason: 'build_function_missing',
+            errorMessage: 'buildSubPagesVNext_V1_ is not defined',
+            elapsedMs: Math.max(0, Date.now() - __timingSubpagesStart)
+          });
+        } catch (_) {}
+      }
+    } else {
+      try {
+        Object.assign(scrapeTiming.subpagesVNextDecision, {
+          enabled: false,
+          envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
+          origin: responseOrigin,
+          skipReason: 'disabled_by_env',
+          elapsedMs: Math.max(0, Date.now() - __timingSubpagesStart)
+        });
+      } catch (_) {}
+      console.log('[SUBPAGE_ENRICH][DISABLED]', JSON.stringify({
+        url: urlToFetch,
+        reason: 'ENABLE_SUBPAGES_VNEXT=0'
+      }));
+    }
+    addScrapeSpan('subpages_vnext', __timingSubpagesStart);
+    try {
+      if (scrapeTiming.subpagesVNextDecision && !scrapeTiming.subpagesVNextDecision.elapsedMs) {
+        scrapeTiming.subpagesVNextDecision.elapsedMs = Math.max(0, Date.now() - __timingSubpagesStart);
+      }
+    } catch (_) {}
+    const securityHeaders = summarizeSecurityHeaders_((obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {});
+
+    if (enrichedObservations && typeof enrichedObservations === 'object') {
+      enrichedObservations.subpages = subPagesVNext;
+      enrichedObservations.subpageDetails = subPagesVNext;
+      enrichedObservations.pageDetails = subPagesVNext;
+      enrichedObservations.publisherInfo = publisherInfo;
+      enrichedObservations.securityHeaders = securityHeaders;
+    }
+
+    console.log('[PUBLISHER_INFO][SUMMARY]', JSON.stringify({
+      checked: !!publisherInfo,
+      sourceUrl: publisherInfo && publisherInfo.sourceUrl,
+      companyName: publisherInfo && publisherInfo.companyName,
+      organizationName: publisherInfo && publisherInfo.organizationName,
+      hasAddress: !!(publisherInfo && publisherInfo.address),
+      hasTelephone: !!(publisherInfo && publisherInfo.telephone),
+      hasContactEmail: !!(publisherInfo && publisherInfo.contactEmail),
+      hasRepresentative: !!(publisherInfo && publisherInfo.representative),
+      hasCorporateNumber: !!(publisherInfo && publisherInfo.corporateNumber)
+    }));
+    console.log('[SECURITY_HEADERS][SUMMARY]', JSON.stringify({
+      checked: !!securityHeaders,
+      strictTransportSecurity: !!(securityHeaders && securityHeaders.strictTransportSecurity),
+      contentSecurityPolicy: !!(securityHeaders && securityHeaders.contentSecurityPolicy),
+      xFrameOptions: !!(securityHeaders && securityHeaders.xFrameOptions),
+      xContentTypeOptions: !!(securityHeaders && securityHeaders.xContentTypeOptions),
+      referrerPolicy: !!(securityHeaders && securityHeaders.referrerPolicy),
+      permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
+    }));
+
+    structured.jsonld = await page.evaluate(() => {
+      var nodes = [];
+
+      function qa(root, sel) {
+        try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
+      }
+
+      function pushNode(n){
+        if (!n || typeof n !== 'object') return;
+        nodes.push(n);
+      }
+
+      function walk(input){
+        if (!input) return;
+
+        if (Array.isArray(input)) {
+          input.forEach(walk);
+          return;
+        }
+
+        if (typeof input !== 'object') return;
+
+        pushNode(input);
+
+        if (Array.isArray(input['@graph'])) {
+          input['@graph'].forEach(function(n){
+            if (n && typeof n === 'object') nodes.push(n);
+          });
+        }
+      }
+
+      var hosts = Array.from(document.querySelectorAll('*'));
+      var openRoots = [];
+      for (var i = 0; i < hosts.length; i++) {
+        var el = hosts[i];
+        if (el && el.shadowRoot) openRoots.push(el.shadowRoot);
+        if (openRoots.length >= 8) break;
+      }
+
+      var allScriptsLight = qa(document, 'script');
+      var allScriptsShadow = openRoots.flatMap(function(root){ return qa(root, 'script'); });
+      var allScripts = allScriptsLight.concat(allScriptsShadow);
+
+      var scripts = allScripts.filter(function(el){
+        var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+        return t.includes('ld+json');
+      });
+
+      if (scripts.length === 0) {
+        scripts = allScripts.filter(function(el){
+          var t = String(el && el.getAttribute && el.getAttribute('type') || '').toLowerCase().trim();
+          if (t && t !== 'application/json' && t !== 'text/plain' && t !== 'text/template') return false;
+          var txt = String(el && el.textContent || '').trim();
+          return txt.includes('"@context"') && txt.includes('"@type"');
+        });
+      }
+
+      scripts.forEach(function(el){
+        var raw = String(el && el.textContent || '').trim();
+        if (!raw) return;
+
+        try {
+          var parsed = JSON.parse(raw);
+          walk(parsed);
+        } catch (_) {}
+      });
+
+      return nodes;
+    }).catch(() => []);
+
+    const jsonldSynth = [{
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "url": normalizeUrl(urlToFetch),
+      "name": "企業情報",
+      ...(pickedPhone ? { "telephone": pickedPhone } : {}),
+      ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
+      ...(sameAsClean && sameAsClean.length ? { "sameAs": sameAsClean } : {}),
+      ...(foundFoundingDate ? { "foundingDate": foundFoundingDate } : {})
+    }];
+
+    const elapsedMs = Date.now() - t0;
+
+    // === JSON-LD 種別フラグ（Org / WebSite）を算出 ===
+    let hasJsonLdFlag = false;
+    let hasOrgJsonLdFlag = false;
+    let hasWebsiteJsonLdFlag = false;
+
+    try {
+      // flags 判定では Org-only の jsonldPref を使わず、top + about 全体を優先する
+      const baseJsonLd = Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length
+        ? jsonldTopAboutAll
+        : jsonld;
+
+      const flatTypes = flatTypesFromJsonLd(baseJsonLd || []);
+
+      hasJsonLdFlag = !!(baseJsonLd && baseJsonLd.length > 0);
+      hasOrgJsonLdFlag = flatTypes.some(t =>
+        /^(Organization|LocalBusiness|Corporation)$/i.test(String(t))
+      );
+      hasWebsiteJsonLdFlag = flatTypes.some(t =>
+        /^(WebSite|WebPage)$/i.test(String(t))
+      );
+
+      // （必要ならデバッグ用ログ）
+      // console.log('[JSONLD-FLAGS][probe]', {
+      //   hasJsonLdFlag, hasOrgJsonLdFlag, hasWebsiteJsonLdFlag, flatTypes
+      // });
+    } catch (_) {
+      // フラグ計算に失敗しても全体は止めない
+    }
+
+    // ★ 追加: head/meta + JSON-LD + コピーライトをまとめた auditSig を構築
+    let auditSig = null;
+    const __timingAuditSigProbeStart = Date.now();
+    try {
+      auditSig = await buildAuditSigFromPage(page);
+    } catch (_) {
+      auditSig = null;  // 失敗しても全体は止めない
+    }
+    addScrapeSpan('jsonld_wait_probe', __timingAuditSigProbeStart);
+
+    let productSpecComparisonSignals = null;
+    try {
+      console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
+        phase: 'before_collect',
+        hasAuditSig: !!auditSig,
+        auditSigKeys: Object.keys(auditSig || {}).slice(0, 20)
+      }));
+      productSpecComparisonSignals = await collectProductSpecComparisonSignals(page, jsonldForFlags);
+      if (auditSig && typeof auditSig === 'object' && productSpecComparisonSignals) {
+        auditSig.productSpecComparisonSignals = productSpecComparisonSignals;
+      }
+      console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS]', JSON.stringify({
+        attached: !!productSpecComparisonSignals,
+        comparisonReadinessLevel: productSpecComparisonSignals && productSpecComparisonSignals.comparisonReadinessLevel,
+        structuredSpecScore: productSpecComparisonSignals && productSpecComparisonSignals.structuredSpecScore,
+        hasStructuredProductInfo: productSpecComparisonSignals && productSpecComparisonSignals.hasStructuredProductInfo,
+        hasComparisonReadyShape: productSpecComparisonSignals && productSpecComparisonSignals.hasComparisonReadyShape,
+        evidenceSources: productSpecComparisonSignals && productSpecComparisonSignals.evidenceSources
+      }));
+    } catch (e) {
+      productSpecComparisonSignals = null;
+      console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
+    }
+
+    let multimodalSignals = null;
+    const __timingMultimodalSignalStart = Date.now();
+    try {
+      multimodalSignals = await collectMultimodalSignals(page, jsonldForFlags);
+      if (auditSig && typeof auditSig === 'object') {
+        auditSig.multimodalSignals = multimodalSignals;
+      }
+      if (enrichedObservations && typeof enrichedObservations === 'object') {
+        enrichedObservations.multimodalSignals = multimodalSignals;
+      }
+    } catch (e) {
+      multimodalSignals = {
+        checked: false,
+        source: 'top_dom_head_meta_jsonld',
+        errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+      };
+      if (auditSig && typeof auditSig === 'object') {
+        auditSig.multimodalSignals = multimodalSignals;
+      }
+      if (enrichedObservations && typeof enrichedObservations === 'object') {
+        enrichedObservations.multimodalSignals = multimodalSignals;
+      }
+    }
+    addScrapeSpan('multimodal_signal_collect', __timingMultimodalSignalStart);
+
+    // ★ 追記: auditSig.jsonldTypes で Org / WebSite フラグを補強
+    try {
+      if (auditSig && Array.isArray(auditSig.jsonldTypes)) {
+        const typesFromAudit = auditSig.jsonldTypes.map(t => String(t || ''));
+
+        // 何か 1 つでも type があれば「JSON-LD あり」とみなす
+        if (!hasJsonLdFlag && typesFromAudit.length > 0) {
+          hasJsonLdFlag = true;
+        }
+
+        // Organization / Corporation / LocalBusiness が 1 つでもあれば Org フラグ ON
+        if (!hasOrgJsonLdFlag &&
+            typesFromAudit.some(t => /(Organization|Corporation|LocalBusiness)/i.test(t))) {
+          hasOrgJsonLdFlag = true;
+        }
+
+        // WebSite / WebPage があれば WebSite フラグ ON（あれば）
+        if (!hasWebsiteJsonLdFlag &&
+            typesFromAudit.some(t => /(WebSite|WebPage)/i.test(t))) {
+          hasWebsiteJsonLdFlag = true;
+        }
+      }
+    } catch (_) {
+      // 補強に失敗しても全体は止めない
+    }
+
+  // ★ coverage ナビフラグ：/about やトップのHTMLを優先しつつ検出
+  const coverageNav = detectCoverageNavFromHtmlNode(
+    topHtml || htmlSource || scoringHtml || bodyText
+  );
+
+  // ★ 追加：auditSig にも載せる（GAS 側で auditSig.coverageNav を参照できるように）
+  if (auditSig && typeof auditSig === 'object') auditSig.coverageNav = coverageNav;
+
+  // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
+  let hasSitemapXml = false;
+  try {
+    let origin = null;
+    try {
+      origin = new URL(urlToFetch).origin;
+    } catch (_) {
+      origin = null;
+    }
+
+    if (origin) {
+      const sitemapUrl = origin.replace(/\/+$/, '') + '/sitemap.xml';
+
+      const sitemapResp = await page.request.get(sitemapUrl, { timeout: 8000 });
+      if (sitemapResp.ok()) {
+        const ctype = (sitemapResp.headers()['content-type'] || '').toLowerCase();
+
+        // content-type に xml が含まれていればほぼ sitemap とみなす
+        if (ctype.includes('xml')) {
+          hasSitemapXml = true;
+        } else {
+          // content-type が微妙な場合は先頭だけテキストを見て XML っぽいか確認
+          const head = (await sitemapResp.text()).slice(0, 512);
+          if (/^\s*</.test(head)) {
+            hasSitemapXml = true;
+          }
+        }
+      }
+    }
+
+    // auditSig があれば、ついでにそこにも載せておく（GAS 側互換用）
+    if (auditSig && typeof auditSig === 'object') {
+      auditSig.hasSitemapXml = hasSitemapXml;
+    }
+  } catch (_) {
+    // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
+  }
+
+  const __timingResponsePayloadStart = Date.now();
+  const __timingHeadingExtractStart = Date.now();
+  const headingTexts = await page.evaluate(() => {
+    function collect(root) {
+      const out = [];
+
+      // 通常DOM
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      // shadow DOM 再帰
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collect(el.shadowRoot));
+        }
+      }
+      return out;
+    }
+
+    const nodes = collect(document);
+
+    return nodes
+      .map(n => (n.innerText || '').trim())
+      .filter(t => t.length > 0);
+  }).catch(() => []);
+  addResponsePayloadSpan('heading_extract', __timingHeadingExtractStart);
+
+  console.log('[PW][HEADINGS_RAW]', {
+    count: headingTexts ? headingTexts.length : null,
+    sample: Array.isArray(headingTexts) ? headingTexts.slice(0, 5) : null
+  });
+
+  const __timingPrimaryHeadingExtractStart = Date.now();
+  const primaryHeadingText = await page.evaluate(() => {
+    function textOf(el) {
+      return String((el && (el.innerText || el.textContent)) || '').trim();
+    }
+
+    function collectHeadings(root) {
+      const out = [];
+      if (!root || !root.querySelectorAll) return out;
+
+      out.push(...Array.from(root.querySelectorAll('h1,h2,h3')));
+
+      const all = root.querySelectorAll('*');
+      for (const el of all) {
+        if (el.shadowRoot) {
+          out.push(...collectHeadings(el.shadowRoot));
+        }
+      }
+      return out;
+    }
+
+    function pickHeading(root) {
+      const nodes = collectHeadings(root)
+        .map(el => ({
+          tag: String((el.tagName || '')).toLowerCase(),
+          text: textOf(el)
+        }))
+        .filter(x => x.text);
+
+      const h1 = nodes.find(x => x.tag === 'h1');
+      if (h1) return h1.text;
+
+      const h2 = nodes.find(x => x.tag === 'h2');
+      if (h2) return h2.text;
+
+      const h3 = nodes.find(x => x.tag === 'h3');
+      if (h3) return h3.text;
+
+      return '';
+    }
+
+    const scopedRoots = [
+      document.querySelector('main'),
+      document.querySelector('[role="main"]'),
+      document.querySelector('article'),
+      document.querySelector('#content'),
+      document.querySelector('.content'),
+      document.querySelector('.main'),
+      document.querySelector('.page')
+    ].filter(Boolean);
+
+    for (const root of scopedRoots) {
+      const t = pickHeading(root);
+      if (t) return t;
+    }
+
+    return pickHeading(document);
+  }).catch(() => '');
+  addResponsePayloadSpan('primary_heading_extract', __timingPrimaryHeadingExtractStart);
+
+  console.log('[PW][PRIMARY_HEADING]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
+  async function getBodyTextCandidates(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
+
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
+
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
+
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      const out = [];
+      for (const root of roots) {
+        collectCandidates(root, out);
+        if (out.length >= 5) break;
+      }
+
+      const uniq = [];
+      const seen = Object.create(null);
+      for (const t of out) {
+        if (!seen[t]) {
+          seen[t] = true;
+          uniq.push(t);
+        }
+        if (uniq.length >= 5) break;
+      }
+
+      return uniq;
+    });
+  }
+
+  async function getPrimaryMessageText(page) {
+    await page.waitForFunction(() => {
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      function hasMeaningfulText(root) {
+        if (!root || !root.querySelectorAll) return false;
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = (n.innerText || '').trim();
+          if (t && t.length >= 20) return true;
+        }
+        return false;
+      }
+
+      return roots.some(hasMeaningfulText);
+    }, { timeout: 3000 }).catch(() => {});
+
+    return await page.evaluate(() => {
+      function textOf(el) {
+        return String((el && (el.innerText || el.textContent)) || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+
+      function isValidText(t) {
+        const s = String(t || '').trim();
+        if (!s) return false;
+        if (s.length < 20) return false;
+        if (/^(お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(s)) return false;
+        return true;
+      }
+
+      function collectCandidates(root, out) {
+        if (!root || !root.querySelectorAll) return;
+
+        const nodes = root.querySelectorAll('p, h2, h3');
+        for (const n of nodes) {
+          const t = textOf(n);
+          if (isValidText(t)) out.push(t);
+        }
+
+        const all = root.querySelectorAll('*');
+        for (const el of all) {
+          if (el.shadowRoot) {
+            collectCandidates(el.shadowRoot, out);
+          }
+        }
+      }
+
+      const roots = [
+        document.querySelector('main'),
+        document.querySelector('[role="main"]'),
+        document.querySelector('article'),
+        document.querySelector('#content'),
+        document.querySelector('.content'),
+        document.querySelector('.main'),
+        document.body
+      ].filter(Boolean);
+
+      for (const root of roots) {
+        const out = [];
+        collectCandidates(root, out);
+        if (out.length) return out[0];
+      }
+
+      return null;
+    });
+  }
+
+  const __timingBodyTextCandidatesExtractStart = Date.now();
+  let bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
+  addResponsePayloadSpan('body_text_candidates_extract', __timingBodyTextCandidatesExtractStart);
+  const __timingPrimaryMessageExtractStart = Date.now();
+  const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
+  addResponsePayloadSpan('primary_message_extract', __timingPrimaryMessageExtractStart);
+
+  const __timingLiveDomSignalsStart = Date.now();
+  const liveDomSignals = await collectLiveDomLightweightSignals(page).catch((e) => ({
+    checked: false,
+    source: 'live_dom_lightweight_v1',
+    errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
+  }));
+  addScrapeSpan('live_dom_signal_collect', __timingLiveDomSignalsStart);
+
+  const liveTextFallback = liveDomSignals && liveDomSignals.text && Array.isArray(liveDomSignals.text.bodyTextCandidatesFallback)
+    ? liveDomSignals.text.bodyTextCandidatesFallback
+    : [];
+  if (Array.isArray(liveTextFallback) && liveTextFallback.length && (!Array.isArray(bodyTextCandidates) || bodyTextCandidates.length < 5)) {
+    const seenBody = new Set((Array.isArray(bodyTextCandidates) ? bodyTextCandidates : []).map(v => String(v || '').trim()).filter(Boolean));
+    const mergedBody = Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : [];
+    for (const cand of liveTextFallback) {
+      const t = String(cand || '').replace(/\s+/g, ' ').trim();
+      if (!t || seenBody.has(t)) continue;
+      seenBody.add(t);
+      mergedBody.push(t);
+      if (mergedBody.length >= 5) break;
+    }
+    bodyTextCandidates = mergedBody;
+  }
+
+  const liveCoverageNav = liveDomSignals && liveDomSignals.coverageNav && typeof liveDomSignals.coverageNav === 'object'
+    ? liveDomSignals.coverageNav
+    : null;
+  const liveTrustLinks = liveDomSignals && liveDomSignals.trustLinks && typeof liveDomSignals.trustLinks === 'object'
+    ? liveDomSignals.trustLinks
+    : null;
+  const liveNavLinkTexts = liveDomSignals && Array.isArray(liveDomSignals.navLinkTexts)
+    ? liveDomSignals.navLinkTexts.slice(0, 50)
+    : [];
+  const mergeCoverageFlag = (base, live) => {
+    if (base === true || live === true) return true;
+    if (base === false || live === false) return false;
+    return null;
+  };
+  const mergedCoverageNav = {
+    hasCompanyNav: mergeCoverageFlag(coverageNav && coverageNav.hasCompanyNav, liveCoverageNav && liveCoverageNav.hasCompanyNav),
+    hasServiceNav: mergeCoverageFlag(coverageNav && coverageNav.hasServiceNav, liveCoverageNav && liveCoverageNav.hasServiceNav),
+    hasContactNav: mergeCoverageFlag(coverageNav && coverageNav.hasContactNav, liveCoverageNav && liveCoverageNav.hasContactNav),
+    hasFaqNav: mergeCoverageFlag(coverageNav && coverageNav.hasFaqNav, liveCoverageNav && liveCoverageNav.hasFaqNav),
+    matchedLabels: liveCoverageNav && Array.isArray(liveCoverageNav.matchedLabels) ? liveCoverageNav.matchedLabels.slice(0, 20) : [],
+    matchedHrefs: liveCoverageNav && Array.isArray(liveCoverageNav.matchedHrefs) ? liveCoverageNav.matchedHrefs.slice(0, 10) : []
+  };
+
+  console.log('[PW][LIVE_DOM_SIGNALS]', JSON.stringify({
+    navLinkTextsCount: liveNavLinkTexts.length,
+    allAnchorCount: liveDomSignals && typeof liveDomSignals.allAnchorCount === 'number' ? liveDomSignals.allAnchorCount : null,
+    navAnchorCount: liveDomSignals && typeof liveDomSignals.navAnchorCount === 'number' ? liveDomSignals.navAnchorCount : null,
+    headerAnchorCount: liveDomSignals && typeof liveDomSignals.headerAnchorCount === 'number' ? liveDomSignals.headerAnchorCount : null,
+    footerAnchorCount: liveDomSignals && typeof liveDomSignals.footerAnchorCount === 'number' ? liveDomSignals.footerAnchorCount : null,
+    roleNavigationCount: liveDomSignals && typeof liveDomSignals.roleNavigationCount === 'number' ? liveDomSignals.roleNavigationCount : null,
+    coverageNav: mergedCoverageNav,
+    trustLinks: {
+      hasPrivacyPolicyLink: !!(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink),
+      hasLegalLink: !!(liveTrustLinks && liveTrustLinks.hasLegalLink),
+      hasTermsLink: !!(liveTrustLinks && liveTrustLinks.hasTermsLink),
+      hasContactLink: !!(liveTrustLinks && liveTrustLinks.hasContactLink)
+    },
+    bodyTextCandidatesFallbackCount: liveTextFallback.length,
+    renderedTextLength: liveDomSignals && liveDomSignals.text ? liveDomSignals.text.renderedTextLength : null,
+    mainTextLength: liveDomSignals && liveDomSignals.text ? liveDomSignals.text.mainTextLength : null
+  }));
+
+  console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  }));
+
+  console.log('[PW][PRIMARY_MESSAGE]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
+  const existingAuditSig = (auditSig && typeof auditSig === 'object') ? auditSig : null;
+
+  console.log('[PW][HEADINGS_TO_AUDITSIG]', {
+    count: headingTexts ? headingTexts.length : null
+  });
+
+  console.log('[PW][PRIMARY_HEADING_TO_AUDITSIG]', {
+    text: primaryHeadingText || '',
+    length: primaryHeadingText ? primaryHeadingText.length : 0
+  });
+
+  console.log('[PW][PRIMARY_MESSAGE_TO_AUDITSIG]', {
+    text: primaryMessageText || '',
+    length: primaryMessageText ? primaryMessageText.length : 0
+  });
+
+  console.log('[PW][BODY_TEXT_CANDIDATES_TO_AUDITSIG]', JSON.stringify({
+    count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
+    sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
+  }));
+
+  const __timingResponseObjectAssemblyStart = Date.now();
+  const responsePayload = {
+    url: urlToFetch,
+    enrichedObservations,
+    responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
+      'strict-transport-security': null,
+      'content-security-policy': null,
+      'x-frame-options': null,
+      'x-content-type-options': null,
+      'referrer-policy': null,
+      'permissions-policy': null
+    },
+    bodyText,
+    html: payloadHtml,
+
+    confirmed: {
+      has_hsts: !!(obs.http && obs.http.ok && obs.http.hsts),
+      has_xfo: !!(obs.http && obs.http.ok && obs.http.xfo),
+      has_nosniff: !!(obs.http && obs.http.ok && obs.http.nosniff),
+      has_csp: !!(obs.http && obs.http.ok && obs.http.csp),
+      has_generic_anchor_text: !!(obs.dom && typeof obs.dom.genericAnchorCount === 'number' && obs.dom.genericAnchorCount > 0),
+      generic_anchor_count: (obs.dom && typeof obs.dom.genericAnchorCount === 'number') ? obs.dom.genericAnchorCount : null,
+      has_nav_element: !!(obs.dom && typeof obs.dom.navCount === 'number' && obs.dom.navCount > 0),
+      nav_count: (obs.dom && typeof obs.dom.navCount === 'number') ? obs.dom.navCount : null,
+      nav_has_list: (obs.dom && typeof obs.dom.navHasList === 'boolean') ? obs.dom.navHasList : null
+    },
+
+    // ★ 追加：レンダリング後のテキスト（deepText 優先）
+    //   - GAS 側のナビ検出・嘘カードフィルタは、今後はこれを見る前提にする
+    renderedText,
+    headingTexts,
+    bodyTextCandidates,
+    liveDomSignals,
+    navLinkTexts: liveNavLinkTexts,
+    coverageNav: mergedCoverageNav,
+    ...(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink === true ? { hasPrivacyPolicyLink: true } : {}),
+    ...(liveTrustLinks && liveTrustLinks.hasLegalLink === true ? { hasLegalLink: true } : {}),
+    ...(liveTrustLinks && liveTrustLinks.hasTermsLink === true ? { hasTermsLink: true } : {}),
+    ...(liveTrustLinks && liveTrustLinks.hasContactLink === true ? { hasContactLink: true } : {}),
+
+    jsonld,
+    structured,
+    jsonldSynth,
+    scoring: { html: scoringHtml, bodyText: scoringBody, headingTexts },
+    metaDescription,
+
+    // ★ ADD: HTTPS 判定（GAS facts 用）
+    isHttps: urlToFetch.startsWith('https://'),
+
+    // ★ ADD: XML サイトマップ有無（GAS facts 用）
+    hasSitemapXml,
+
+    // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
+    hasJsonLd: hasJsonLdFlag,
+    hasOrgJsonLd: hasOrgJsonLdFlag,
+    hasWebsiteJsonLd: hasWebsiteJsonLdFlag,
+    ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
+    ...(multimodalSignals ? { multimodalSignals } : {}),
+
+    // === HEAD / META 情報を GAS に直接渡すフラグ（v2 facts 用） ===
+    // Playwright 側の auditSig をそのまま噛ませる
+    hasTitle:           auditSig ? !!auditSig.hasTitle           : false,
+    hasMetaDescription: auditSig ? !!auditSig.hasMetaDescription : (
+      typeof metaDescription === 'string' && metaDescription.trim().length > 0
+    ),
+    metaDescriptionLen: auditSig && typeof auditSig.metaDescriptionLen === 'number'
+      ? auditSig.metaDescriptionLen
+      : (typeof metaDescription === 'string' ? metaDescription.length : 0),
+
+    // ★ NEW: JSON-LD 種別フラグ（Organization / WebSite）を計算して auditSig ＋トップレベルに載せる
+    ...(function () {
+      const __timingJsonLdFlagsPatchStart = Date.now();
+      try {
+        if (!auditSig || typeof auditSig !== 'object') return {};
+
+        // JSON-LD ノード集合（flags 用と同じく top+about 全体を優先）
+        var nodes = [];
+        if (Array.isArray(jsonldTopAboutAll) && jsonldTopAboutAll.length) {
+          nodes = jsonldTopAboutAll.slice();
+        } else {
+          if (Array.isArray(jsonld)) nodes = nodes.concat(jsonld);
+        }
+
+        var hasOrg  = false;
+        var hasSite = false;
+
+        nodes.forEach(function (node) {
+          if (!node || typeof node !== 'object') return;
+          var t = node['@type'];
+          var types = Array.isArray(t) ? t : (t ? [t] : []);
+
+          types.forEach(function (tt) {
+            if (typeof tt !== 'string') return;
+            if (/Organization|Corporation|LocalBusiness/i.test(tt)) {
+              hasOrg = true;
+            }
+            if (/WebSite/i.test(tt)) {
+              hasSite = true;
+            }
+          });
+        });
+
+        // auditSig 自体にもフラグを書き込む（GAS 側では auditSig.hasOrgJsonLd で参照）
+        auditSig.hasOrgJsonLd     = hasOrg;
+        auditSig.hasWebsiteJsonLd = hasSite;
+
+        // Node 環境なので console.log を使う
+        try {
+          console.log('[PW][JSONLD-FLAGS]', {
+            hasOrgJsonLd: hasOrg,
+            hasWebsiteJsonLd: hasSite,
+            nodeCount: nodes.length
+          });
+        } catch (e) {}
+
+        // トップレベル facts にもコピーして返す
+        return {
+          hasOrgJsonLd: hasOrg,
+          hasWebsiteJsonLd: hasSite
+        };
+      } catch (e) {
+        try {
+          console.log('[PW][JSONLD-FLAGS][ERR]', String(e && e.stack || e));
+        } catch (_) {}
+        return {};
+      } finally {
+        addResponsePayloadSpan('jsonld_flags_patch', __timingJsonLdFlagsPatchStart);
+      }
+    })(),
+
+    // ★ NEW: GAS 側に渡す auditSig オブジェクト（従来通り＋新フラグ付き）
+    auditSig: {
+      ...(existingAuditSig || {}),
+      headingTexts,
+      primaryHeadingText: primaryHeadingText,
+      primaryMessageText: primaryMessageText,
+      bodyTextCandidates: bodyTextCandidates,
+      navLinkTexts: liveNavLinkTexts,
+      coverageNav: mergedCoverageNav,
+      liveDomSignals,
+      ...(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink === true ? { hasPrivacyPolicyLink: true } : {}),
+      ...(liveTrustLinks && liveTrustLinks.hasLegalLink === true ? { hasLegalLink: true } : {}),
+      ...(liveTrustLinks && liveTrustLinks.hasTermsLink === true ? { hasTermsLink: true } : {}),
+      ...(liveTrustLinks && liveTrustLinks.hasContactLink === true ? { hasContactLink: true } : {}),
+      ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
+      ...(multimodalSignals ? { multimodalSignals } : {})
+    },
+
+    subPages_vNext: subPagesVNext,
+    subpages: subPagesVNext,
+    subpageDetails: subPagesVNext,
+    pageDetails: subPagesVNext,
+    publisherInfo,
+    securityHeaders,
+
+    // === ADD: Playwright→GAS I/F（トップレベルで返す・互換用） ===
+    jsonld_detected_once: auditSig ? auditSig.jsonldDetected       : __probe.jsonld_detected_once,
+    jsonld_detect_count:  auditSig ? auditSig.jsonldCount          : __probe.jsonld_detect_count,
+    jsonld_wait_ms:       __probe.jsonld_wait_ms,
+    jsonld_timed_out:     auditSig ? auditSig.jsonldTimedOut       : __probe.jsonld_timed_out,
+    jsonld_sample_head:   auditSig ? auditSig.jsonldSampleHead     : __probe.jsonld_sample_head,
+
+    // ★ 追加：同意クリックの試行結果（compareの原因切り分け用）
+    consent_click_tried:     !!(__probe && __probe.consent_click_tried),
+    consent_click_succeeded: !!(__probe && __probe.consent_click_succeeded),
+
+    copyright_footer_present: auditSig ? auditSig.copyrightFooterPresent : __probe.copyright_footer_present,
+    copyright_hit:           auditSig ? auditSig.copyrightHit           : __probe.copyright_hit,
+    copyright_hit_token:     auditSig ? auditSig.copyrightHitToken      : __probe.copyright_hit_token,
+    copyright_excerpt:       auditSig ? auditSig.copyrightExcerpt       : __probe.copyright_excerpt,
+
+    debug: {
+      build: BUILD_TAG,
+      hydrated,
+      innerTextLen: innerText.length,
+      docTextLen: docText.length,
+      jsUrls: jsUrls.slice(0, 10),
+      tappedUrls: tappedUrls.slice(0, 40),
+      tappedBodiesMeta: fetchedMeta.slice(0, 10),
+      bundlePhones: phones.slice(0, 10),
+      bundleZips: zips.slice(0, 10),
+      bundleAddrs: addrs.slice(0, 10),
+      pickedPhone: pickedPhone || null,
+      pickedAddressPreview: pickedAddress
+        ? [pickedAddress.postalCode, pickedAddress.addressRegion, pickedAddress.addressLocality, pickedAddress.streetAddress]
+            .filter(Boolean).join(' ')
+        : null,
+      jsonldTopCount: Array.isArray(jsonldTopAll) ? jsonldTopAll.length : 0,
+      jsonldAboutCount: Array.isArray(jsonldAboutAll) ? jsonldAboutAll.length : 0,
+      jsonldPreferredCount: Array.isArray(jsonldPref) ? jsonldPref.length : 0,
+      jsonldPreferredHint: (Array.isArray(jsonldPref) && jsonldPref.length) ? 'about>top' : 'top_only_or_none',
+      hasGtmTop: !!gtmTop,
+      hasGtmAbout: !!gtmAbout,
+      normalizedUrl: normalizeUrl(urlToFetch),
+      labelHitPhones: Array.from(new Set(labelHitPhones)).slice(0,10),
+      foundingDatePicked: foundFoundingDate || null,
+      foundingDateSource: foundFoundingDate ? (foundFoundingDateSource || 'dom/html') : null,
+      sameAsCount: new Set(sameAsClean).size,
+      elapsedMs,
+
+      // === ADD: デバッグ用にプローブ結果も残す（任意）
+      jsonldProbe: __probe,
+
+      obs: { http: obs.http ? { ok:obs.http.ok, status:obs.http.status, hsts:obs.http.hsts, xfo:obs.http.xfo, nosniff:obs.http.nosniff, csp:obs.http.csp } : null, dom: obs.dom || null },
+    }
+  }; // ← ここで必ず閉じる！
+  addResponsePayloadSpan('response_object_assembly', __timingResponseObjectAssemblyStart);
+  try {
+    scrapeTiming.payload_size_summary = {
+      htmlLength: safeLength(responsePayload.html),
+      bodyTextLength: safeLength(responsePayload.bodyText),
+      renderedTextLength: safeLength(responsePayload.renderedText),
+      scoringHtmlLength: safeLength(responsePayload.scoring && responsePayload.scoring.html),
+      scoringBodyTextLength: safeLength(responsePayload.scoring && responsePayload.scoring.bodyText),
+      enrichedObservationsCount: responsePayload.enrichedObservations && typeof responsePayload.enrichedObservations === 'object'
+        ? Object.keys(responsePayload.enrichedObservations).length
+        : 0,
+      subpagesCount: safeArrayLength(responsePayload.subpages),
+      subpageDetailsCount: safeArrayLength(responsePayload.subpageDetails),
+      pageDetailsCount: safeArrayLength(responsePayload.pageDetails),
+      jsonldCount: safeArrayLength(responsePayload.jsonld),
+      headingTextsCount: safeArrayLength(responsePayload.headingTexts),
+      bodyTextCandidatesCount: safeArrayLength(responsePayload.bodyTextCandidates)
+    };
+  } catch (_) {}
+
+  console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
+    phase: 'after_responsePayload',
+    hasTopLevel: Object.prototype.hasOwnProperty.call(responsePayload, 'productSpecComparisonSignals'),
+    hasAuditSigSignal: !!(responsePayload.auditSig && responsePayload.auditSig.productSpecComparisonSignals),
+    topLevelType: typeof responsePayload.productSpecComparisonSignals,
+    auditSigSignalType: typeof (responsePayload.auditSig && responsePayload.auditSig.productSpecComparisonSignals)
+  }));
+
+  // --- 追加: /scrape で採点も実施して返す ---
+  const __timingBuildScoresStart = Date.now();
+  const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
+  addResponsePayloadSpan('build_scores_from_scrape', __timingBuildScoresStart);
+  const __timingOutputObjectAssemblyStart = Date.now();
+  const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
+  addResponsePayloadSpan('output_object_assembly', __timingOutputObjectAssemblyStart);
+  addScrapeSpan('response_payload_build', __timingResponsePayloadStart);
+
+  // --- CACHE SET（成功時のみ保存）
+  try { if (!noCache) cacheSet(urlToFetch, out); } catch(_) {}
+
+  out.debug = out.debug || {};
+  if (noCache) out.debug.cache = { hit: false, nocache: true };
+
+  // ★ COVNAV 最終スナップショット（必ず1回出る・検索しやすい）
+  try{
+    const covTop  = out && (out.coverageNav || out.coverageNavRaw);
+    const covSig  = out && out.auditSig && out.auditSig.coverageNav;
+    const covFact = out && out.facts && out.facts.auditSig && out.facts.auditSig.coverageNav;
+
+    console.log('[COVNAV][SCRAPE][OUT v1]', {
+      url: urlToFetch,
+      has_cov_top:  !!covTop,
+      has_cov_sig:  !!covSig,
+      has_cov_fact: !!covFact,
+      cov_top:  covTop || null,
+      cov_sig:  covSig || null,
+      cov_fact: covFact || null,
+      auditSig_keys: out && out.auditSig ? Object.keys(out.auditSig).slice(0,40) : []
+    });
+  }catch(e){
+    console.log('[COVNAV][SCRAPE][OUT v1][ERR]', String(e && (e.stack||e)));
+  }
+
+  console.log('[TEST][RESPONSE_PATH_HIT] bodyText debug marker');
+  console.log('[TEST][RESPONSE_PAYLOAD_KEYS]', JSON.stringify({
+    hasPayload: !!out,
+    keys: out && typeof out === 'object' ? Object.keys(out).slice(0, 50) : []
+  }));
+
+  // 正常終了
+  return res.status(200).json(out);
+
+  } catch (err) {
+    const elapsedMs = Date.now() - t0;
+    return res.status(500).json({
+      error: 'scrape failed',
+      details: err?.message || String(err),
+      build: BUILD_TAG,
+      elapsedMs
+    });
+  } finally {
+    try {
+      console.log('[PW][SCRAPE_TIMING]', JSON.stringify({
+        url: safeTimingUrl(),
+        hydrated: hydratedForTiming,
+        nocache: noCache,
+        totalMs: Math.max(0, Date.now() - t0),
+        spans: scrapeTiming.spans,
+        responsePayloadSubspans: scrapeTiming.responsePayloadSubspans,
+        payload_size_summary: scrapeTiming.payload_size_summary,
+        subpagesVNextDecision: scrapeTiming.subpagesVNextDecision
+      }));
+    } catch (_) {}
+    // 終了順：page → context → browser（全て握りつぶし）
+    try { if (page)    await page.close(); } catch(_) {}
+    try { if (context) await context.close(); } catch(_) {}
+    try { if (browser) await browser.close(); } catch(_) {}
+  }
+}
+
+// === /api/score route (ADD) ===
+app.get('/api/score', async (req, res) => {
+  const url = req.query.url;
+  const force = req.query.force; // 'real' | 'dummy'
+  if (!url) return res.status(400).json({ error: 'missing url' });
+
+  const t0 = Date.now();
+  let s = null;
+  try {
+    s = await scrapeForScoring(url); // ← ブロックBの関数
+  } catch (e) {
+    console.error('[scrapeForScoring] failed:', e);
+    s = { fromScrape:false, hydrated:false, innerTextLen:0, fullHtmlLen:0, jsonld:[], waitStrategy:'(failed)', blockedResources:[], facts:{}, fallbackJsonld:{} };
+  }
+
+  // ダミー（5軸）
+  const dummy = {
+    overall: 65,
+    axes5: {
+      dataStructure: 68,
+      expressionClarity: 62,
+      coverage: 64,
+      documentStructure: 60,
+      trust: 66
+    },
+    weights5: WEIGHTS5,
+    source: 'DUMMY_FIXTURE'
+  };
+
+  // 実スコア
+  let real = null;
+  if ((USE_REAL_SCORE || force === 'real') && force !== 'dummy') {
+    try {
+      real = await scoreWithGemini5axes({ url, scrape: s });
+    } catch (e) {
+      console.error('[scoreWithGemini5axes] failed:', e);
+    }
+  }
+
+  const payload = {
+    meta: {
+      targetUrl: url,
+      generatedAt: new Date().toISOString(),
+      'j-from-scrape': !!s?.fromScrape,
+      hydrated: !!s?.hydrated,
+      innerTextLen: s?.innerTextLen || 0,
+      fullHtmlLen: s?.fullHtmlLen || 0,
+      jsonldCount: Array.isArray(s?.jsonld) ? s.jsonld.length : 0,
+      elapsedMs: Date.now() - t0
+    },
+    scores: { real, dummy },
+    before: { source: 'SCRAPE', facts: s?.facts || {} },
+    after: { source: 'FALLBACK_BUILD', jsonld: s?.fallbackJsonld || {} },
+    afterObj: { source: 'FALLBACK_BUILD', jsonld: s?.fallbackJsonld || {} },
+    debug: { wait: s?.waitStrategy, blockedResources: s?.blockedResources, scorerModel: real ? 'gemini-1.5-pro' : 'dummy' }
+  };
+
+  if (!payload.auditSig) payload.auditSig = {};
+
+  // === [AUDITSIG-MERGE v1] facts.auditSig を payload.auditSig に合流（coverageNav 以外も運ぶ） ===
+  try{
+    const srcAuditSig =
+      s?.facts?.auditSig ||
+      s?.facts?.auditSigV2 ||
+      s?.auditSig ||
+      null;
+
+    if (srcAuditSig && typeof srcAuditSig === 'object'){
+      // 既存payload.auditSigを優先しつつ、足りないキーだけ補完
+      payload.auditSig = payload.auditSig || {};
+      Object.keys(srcAuditSig).forEach(k=>{
+        if (payload.auditSig[k] === undefined) payload.auditSig[k] = srcAuditSig[k];
+      });
+    }
+  }catch(e){
+
+    // srcAuditSig が取れなかった（または空）なら、フラット形式を auditSig に昇格
+    try{
+      const as = payload.auditSig || (payload.auditSig = {});
+      const hasAny = Object.keys(as).length > 0;
+
+      if (!hasAny){
+        const keys = [
+          // jsonld系
+          'jsonldDetected','jsonldCount','jsonldTimedOut','jsonldWaitMs',
+          'jsonldScanStarted','jsonldScanFinished','jsonldParseFailed','consentWallSuspected',
+          'jsonldTypes','hasJsonLd','hasOrgJsonLd','hasWebsiteJsonLd','hasBreadcrumbJsonLd',
+          // doc系
+          'htmlLang','hasHtmlLang','hasTitle','hasMetaDescription','metaDescriptionLen','titleText',
+          'h1Count','headerPresent','footerPresent','navCount','hasMainLandmark',
+          // coverage/trust系
+          'hasSitemapXml','coverageNav',
+          'hasPrivacyPolicyLink','hasLegalLink','hasFooterNavForTrust',
+          // 連絡先系（あるなら）
+          'telephone','address','sameAsCount'
+        ];
+
+        keys.forEach(k=>{
+          if (payload[k] !== undefined && as[k] === undefined) as[k] = payload[k];
+        });
+      }
+    }catch(_){}
+
+    console.log('[AUDITSIG-MERGE][ERR]', String(e && (e.stack || e)));
+  }
+  // === [AUDITSIG-MERGE v1] ここまで ===
+
+  if (payload.auditSig.coverageNav == null) { // null/undefined のときだけ補完
+    payload.auditSig.coverageNav =
+      s?.auditSig?.coverageNav ||
+      s?.facts?.auditSig?.coverageNav ||
+      s?.facts?.coverageNav ||
+      null;
+  }
+
+  try {
+    const covNav =
+      payload?.auditSig?.coverageNav ||
+      payload?.before?.facts?.auditSig?.coverageNav ||
+      payload?.before?.facts?.coverageNav ||
+      s?.auditSig?.coverageNav ||
+      s?.facts?.auditSig?.coverageNav ||
+      null;
+
+    console.log('[TRACE_COVNAV][NODE][payload-ready]', {
+      url,
+      hasAuditSig: !!(payload?.auditSig || payload?.before?.facts?.auditSig || s?.auditSig || s?.facts?.auditSig),
+      hasCoverageNav: !!covNav,
+      coverageNav: covNav
+    });
+  } catch (e) {
+    console.log('[TRACE_COVNAV][NODE][payload-ready][ERR]', String(e && (e.stack || e)));
+  }
+
+  if (force === 'dummy') payload.scores.real = null;
+
+  try{
+    const srcAuditSig =
+      s?.facts?.auditSig ||
+      s?.facts?.auditSigV2 ||
+      s?.auditSig ||
+      null;
+
+    const probe = {
+      hasS: !!s,
+      sKeys: s ? Object.keys(s).slice(0,30) : [],
+      hasFacts: !!(s && s.facts),
+      factsKeys: (s && s.facts) ? Object.keys(s.facts).slice(0,30) : [],
+      hasSrcAuditSig: !!srcAuditSig,
+      srcAuditSigKeys: srcAuditSig ? Object.keys(srcAuditSig).slice(0,60) : [],
+
+      // 核心：siteFactsLite がどこに居るか
+      hasSiteFactsLiteInSrc: !!(srcAuditSig && srcAuditSig.siteFactsLite),
+      hasSiteFactsLiteInFacts: !!(s && s.facts && s.facts.auditSig && s.facts.auditSig.siteFactsLite),
+      hasSiteFactsLiteInS: !!(s && s.auditSig && s.auditSig.siteFactsLite),
+
+      // ついでに：payload側に入っているか（マージ後なら true になるはず）
+      hasSiteFactsLiteInPayload: !!(payload && payload.auditSig && payload.auditSig.siteFactsLite),
+      payloadAuditSigKeys: (payload && payload.auditSig) ? Object.keys(payload.auditSig).slice(0,60) : []
+    };
+
+    // ① Nodeログ（従来通り）
+    console.log('[AUDITSIG-MERGE][PROBE]', probe);
+
+    // ② レスポンスにも埋め込む（診断結果で見れるようにする）
+    payload.debug = payload.debug || {};
+    payload.debug.auditSigProbe = probe;
+
+  }catch(e){
+    console.log('[AUDITSIG-MERGE][PROBE][ERR]', String(e && (e.stack || e)));
+    try{
+      payload.debug = payload.debug || {};
+      payload.debug.auditSigProbeErr = String(e && (e.stack || e));
+    }catch(_){}
+  }
+
+  // ===== ADD: compare用に coverageNav / navCount をレスポンスへ載せる（siteFactsLite優先・既存キーは壊さない）=====
+  try{
+    const sfl =
+      (srcAuditSig && srcAuditSig.siteFactsLite && typeof srcAuditSig.siteFactsLite === 'object') ? srcAuditSig.siteFactsLite :
+      (payload && payload.auditSig && payload.auditSig.siteFactsLite && typeof payload.auditSig.siteFactsLite === 'object') ? payload.auditSig.siteFactsLite :
+      null;
+
+    // coverageNav は siteFactsLite から作る（payload側に無いのが今回の原因）
+    if (payload.coverageNav == null && sfl && sfl.coverageNav && typeof sfl.coverageNav === 'object'){
+      const c = sfl.coverageNav;
+      payload.coverageNav = {
+        hasCompanyNav: (typeof c.hasCompanyNav === 'boolean') ? c.hasCompanyNav : null,
+        hasServiceNav: (typeof c.hasServiceNav === 'boolean') ? c.hasServiceNav : null,
+        hasContactNav: (typeof c.hasContactNav === 'boolean') ? c.hasContactNav : null,
+        hasFaqNav:     (typeof c.hasFaqNav     === 'boolean') ? c.hasFaqNav     : null,
+        hasPricingNav: (typeof c.hasPricingNav === 'boolean') ? c.hasPricingNav : null,
+        hasCasesNav:   (typeof c.hasCasesNav   === 'boolean') ? c.hasCasesNav   : null
+      };
+    }
+
+    // navCount も siteFactsLite から（無ければ触らない）
+    if (payload.navCount == null && sfl){
+      const n =
+        (typeof sfl.navCount === 'number' && Number.isFinite(sfl.navCount)) ? sfl.navCount :
+        (typeof sfl.nav_count === 'number' && Number.isFinite(sfl.nav_count)) ? sfl.nav_count :
+        null;
+
+      if (n != null) payload.navCount = n;
+    }
+
+    console.log('[AUDITSIG][COVNAV][FINAL v2] navCount=%s cov=%s hasSFL=%s',
+      String(payload.navCount),
+      payload.coverageNav ? JSON.stringify(payload.coverageNav) : 'null',
+      String(!!sfl)
+    );
+  }catch(e){
+    console.log('[AUDITSIG][COVNAV][FINAL v2][ERR]', String(e && (e.stack || e)));
+  }
+  // ===== /ADD =====
+
+  console.log('[TEST][BODYTEXT][RESPONSE_PAYLOAD]', JSON.stringify({
+    hasBodyTextCandidates: Array.isArray(payload && payload.bodyTextCandidates),
+    count: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.length : 0,
+    sample: Array.isArray(payload && payload.bodyTextCandidates) ? payload.bodyTextCandidates.slice(0, 5) : [],
+    responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 50) : []
+  }));
+
+  res.json(payload);
+});
+
+app.listen(PORT, () => {
+  console.log('[BOOT][LISTENING]', JSON.stringify({
+    build: BUILD_TAG,
+    port: PORT,
+    pid: process.pid,
+    rss: process.memoryUsage().rss,
+    ts: new Date().toISOString()
+  }));
+  console.log(`[${BUILD_TAG}] running on ${PORT}`);
+});
