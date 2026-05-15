@@ -1053,7 +1053,7 @@ async function extractHeadMetaV1(page) {
 }
 
 // ===== [M3][SUBPAGES_VNEXT v1] 追加観測（v2非干渉：新キー subPages_vNext のみ） =====
-const ENABLE_SUBPAGES_VNEXT = true;
+const ENABLE_SUBPAGES_VNEXT = process.env.ENABLE_SUBPAGES_VNEXT !== '0';
 const SUBPAGES_VNEXT_MAX = 8;
 
 function pickSubPageCandidatesVNext_(origin){
@@ -1062,14 +1062,14 @@ function pickSubPageCandidatesVNext_(origin){
 
   const candidates = [
     o + '/about',
+    o + '/company',
     o + '/service',
     o + '/contact',
-    o + '/privacy',
-    o + '/company',
-    o + '/business',
-    o + '/inquiry',
-    o + '/policy',
     o + '/faq',
+    o + '/policy',
+    o + '/privacy',
+    o + '/inquiry',
+    o + '/business',
     o + '/support',
   ];
 
@@ -1357,7 +1357,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
     enabled: !!ENABLE_SUBPAGES_VNEXT,
     envValue: process.env.ENABLE_SUBPAGES_VNEXT ?? null,
     origin: String(origin || '').trim().replace(/\/+$/,''),
-    limit: 4,
+    limit: 1,
     skipReason: 'not_reached'
   });
   if (!ENABLE_SUBPAGES_VNEXT) {
@@ -1418,11 +1418,11 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
     try{ await subPage.waitForTimeout(150); }catch(_){ }
   }catch(_){ }
 
-  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 4);
+  const candidates = pickSubPageCandidatesVNext_(o).slice(0, 1);
   setDecision({
     candidateCount: candidates.length,
     candidateSample: candidates.slice(0, 5),
-    limit: 4
+    limit: 1
   });
   console.log(`[SUBPAGE_ENRICH][TARGETS] count=${candidates.length}`, JSON.stringify({ origin: o, targets: candidates }));
   if (!candidates.length) {
@@ -1433,7 +1433,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
   const out = [];
   try {
     for (const url of candidates){
-      if (out.length >= 4) break;
+      if (out.length >= 1) break;
       setDecision({ attemptedCount: (dec && Number(dec.attemptedCount || 0) || 0) + 1 });
       try{
         const resp = await subPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
@@ -1615,6 +1615,7 @@ async function buildSubPagesVNext_V1_(browserPage, origin, decision){
           contactLikeSignals: lite.contactLikeSignals,
           faqLikeSignals: lite.faqLikeSignals
         }));
+        break;
       }catch(e){
         setDecision({
           skipReason: out.length ? 'ok' : 'fetch_failed',
