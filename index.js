@@ -2166,7 +2166,9 @@ async function collectMultimodalSignals(page, jsonldForFlags) {
 
 async function collectLiveDomLightweightSignals(page) {
   try {
-    return await page.evaluate(() => {
+    console.log('[PW][LIVE_DOM_ENTER]', page && typeof page.url === 'function' ? page.url() : '');
+    console.log('[PW][LIVE_DOM_BEFORE_EVAL]');
+    const result = await page.evaluate(() => {
       const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
       const abs = (u) => {
         try { return u ? new URL(u, document.baseURI).toString() : ''; } catch (_) { return String(u || '').trim(); }
@@ -2352,7 +2354,10 @@ async function collectLiveDomLightweightSignals(page) {
         }
       };
     });
+    console.log('[PW][LIVE_DOM_AFTER_EVAL]');
+    return result;
   } catch (e) {
+    console.log('[PW][LIVE_DOM_ERR]', String(e && (e.message || e) || '').slice(0, 300));
     return {
       checked: false,
       source: 'live_dom_lightweight_v1',
@@ -3841,21 +3846,34 @@ async function scrapeOnce(req, res) {
   };
 
   try {
+    console.log('[PW][BOOTSTRAP_ENTER]');
     const __timingBrowserStart = Date.now();
-    browser = await chromium.launch({
-      headless: true,
-      // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--no-zygote',
-        '--no-first-run',
-        '--no-default-browser-check'
-      ]
-    });
+    console.log('[PW][BEFORE_CHROMIUM_LAUNCH]');
+    const __chromiumLaunchStart = Date.now();
+    console.log('[PW][CHROMIUM_LAUNCH_START]');
+    try {
+      browser = await chromium.launch({
+        headless: true,
+        // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-software-rasterizer',
+          '--no-zygote',
+          '--no-first-run',
+          '--no-default-browser-check'
+        ]
+      });
+      console.log('[PW][CHROMIUM_LAUNCH_OK]');
+    } catch (err) {
+      console.log('[PW][CHROMIUM_LAUNCH_ERR]', err && err.message ? err.message : String(err));
+      throw err;
+    } finally {
+      console.log('[PW][CHROMIUM_LAUNCH_MS]', Date.now() - __chromiumLaunchStart);
+    }
+    console.log('[PW][AFTER_CHROMIUM_LAUNCH]');
 
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -3867,8 +3885,10 @@ async function scrapeOnce(req, res) {
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
+    console.log('[PW][AFTER_CONTEXT]');
 
     page = await context.newPage();
+    console.log('[PW][AFTER_PAGE]');
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
@@ -3877,6 +3897,7 @@ async function scrapeOnce(req, res) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    console.log('[PW][AFTER_INIT_SCRIPT]');
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
 
     // ---- 主要待機（軽め） ----
@@ -5593,6 +5614,7 @@ async function scrapeOnce(req, res) {
   return res.status(200).json(out);
 
   } catch (err) {
+    console.log('[PW][BOOTSTRAP_ERR]', err && err.message ? err.message : String(err));
     const elapsedMs = Date.now() - t0;
     return res.status(500).json({
       error: 'scrape failed',
