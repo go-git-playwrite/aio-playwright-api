@@ -3743,11 +3743,13 @@ async function scrapeOnce(req, res) {
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
+  const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
     url: String(urlToFetch || '').slice(0, 180),
-    nocache: noCache
+    nocache: noCache,
+    signalsOnly
   });
   logSfMemory('scrape_enter');
 
@@ -5625,6 +5627,31 @@ async function scrapeOnce(req, res) {
     keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0
   });
   logSfMemory('before_response_send');
+  if (signalsOnly) {
+    logSf('SIGNALS_ONLY_RESPONSE', {
+      keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0
+    });
+    logSfMemory('signals_only_response');
+    return res.status(200).json({
+      ok: true,
+      mode: 'signalsOnly',
+      url: urlToFetch,
+      finalUrl: page && typeof page.url === 'function' ? page.url() : urlToFetch,
+      status: resp && typeof resp.status === 'function' ? resp.status() : null,
+      geoSignalsV1,
+      debug: {
+        keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0,
+        hasHtml: Boolean(out && out.html),
+        htmlLength: String((out && out.html) || '').length,
+        hasBodyText: Boolean(out && out.bodyText),
+        bodyTextLength: String((out && out.bodyText) || '').length,
+        hasRenderedText: Boolean(out && out.renderedText),
+        renderedTextLength: String((out && out.renderedText) || '').length,
+        hasAuditSig: Boolean(out && out.auditSig),
+        hasData: Boolean(out && out.data)
+      }
+    });
+  }
   return res.status(200).json(out);
 
   } catch (err) {
