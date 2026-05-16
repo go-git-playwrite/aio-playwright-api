@@ -4751,6 +4751,7 @@ async function scrapeOnce(req, res) {
       permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
     }));
 
+    console.log('[PW][BEFORE_STRUCTURED_JSONLD]');
     structured.jsonld = await page.evaluate(() => {
       var nodes = [];
 
@@ -4819,7 +4820,11 @@ async function scrapeOnce(req, res) {
       });
 
       return nodes;
-    }).catch(() => []);
+    }).catch((err) => {
+      console.log('[PW][STRUCTURED_JSONLD_ERR]', err && err.message ? err.message : String(err));
+      return [];
+    });
+    console.log('[PW][AFTER_STRUCTURED_JSONLD]');
 
     const jsonldSynth = [{
       "@context": "https://schema.org",
@@ -4867,14 +4872,18 @@ async function scrapeOnce(req, res) {
     let auditSig = null;
     const __timingAuditSigProbeStart = Date.now();
     try {
+      console.log('[PW][BEFORE_BUILD_AUDITSIG]');
       auditSig = await buildAuditSigFromPage(page);
-    } catch (_) {
+      console.log('[PW][AFTER_BUILD_AUDITSIG]');
+    } catch (e) {
+      console.log('[PW][BUILD_AUDITSIG_ERR]', e && e.message ? e.message : String(e));
       auditSig = null;  // 失敗しても全体は止めない
     }
     addScrapeSpan('jsonld_wait_probe', __timingAuditSigProbeStart);
 
     let productSpecComparisonSignals = null;
     try {
+      console.log('[PW][BEFORE_PRODUCT_SPEC]');
       console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
         phase: 'before_collect',
         hasAuditSig: !!auditSig,
@@ -4892,14 +4901,17 @@ async function scrapeOnce(req, res) {
         hasComparisonReadyShape: productSpecComparisonSignals && productSpecComparisonSignals.hasComparisonReadyShape,
         evidenceSources: productSpecComparisonSignals && productSpecComparisonSignals.evidenceSources
       }));
+      console.log('[PW][AFTER_PRODUCT_SPEC]');
     } catch (e) {
       productSpecComparisonSignals = null;
+      console.log('[PW][PRODUCT_SPEC_ERR]', e && e.message ? e.message : String(e));
       console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
     }
 
     let multimodalSignals = null;
     const __timingMultimodalSignalStart = Date.now();
     try {
+      console.log('[PW][BEFORE_MULTIMODAL]');
       multimodalSignals = await collectMultimodalSignals(page, jsonldForFlags);
       if (auditSig && typeof auditSig === 'object') {
         auditSig.multimodalSignals = multimodalSignals;
@@ -4907,7 +4919,9 @@ async function scrapeOnce(req, res) {
       if (enrichedObservations && typeof enrichedObservations === 'object') {
         enrichedObservations.multimodalSignals = multimodalSignals;
       }
+      console.log('[PW][AFTER_MULTIMODAL]');
     } catch (e) {
+      console.log('[PW][MULTIMODAL_ERR]', e && e.message ? e.message : String(e));
       multimodalSignals = {
         checked: false,
         source: 'top_dom_head_meta_jsonld',
@@ -4949,9 +4963,11 @@ async function scrapeOnce(req, res) {
     }
 
   // ★ coverage ナビフラグ：/about やトップのHTMLを優先しつつ検出
+  console.log('[PW][BEFORE_COVERAGE_NAV]');
   const coverageNav = detectCoverageNavFromHtmlNode(
     topHtml || htmlSource || scoringHtml || bodyText
   );
+  console.log('[PW][AFTER_COVERAGE_NAV]');
 
   // ★ 追加：auditSig にも載せる（GAS 側で auditSig.coverageNav を参照できるように）
   if (auditSig && typeof auditSig === 'object') auditSig.coverageNav = coverageNav;
@@ -4959,6 +4975,7 @@ async function scrapeOnce(req, res) {
   // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
   let hasSitemapXml = false;
   try {
+    console.log('[PW][BEFORE_SITEMAP_CHECK]');
     let origin = null;
     try {
       origin = new URL(urlToFetch).origin;
@@ -4990,12 +5007,15 @@ async function scrapeOnce(req, res) {
     if (auditSig && typeof auditSig === 'object') {
       auditSig.hasSitemapXml = hasSitemapXml;
     }
-  } catch (_) {
+    console.log('[PW][AFTER_SITEMAP_CHECK]');
+  } catch (e) {
+    console.log('[PW][SITEMAP_CHECK_ERR]', e && e.message ? e.message : String(e));
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
   }
 
   const __timingResponsePayloadStart = Date.now();
   const __timingHeadingExtractStart = Date.now();
+  console.log('[PW][BEFORE_HEADING_EXTRACT]');
   const headingTexts = await page.evaluate(() => {
     function collect(root) {
       const out = [];
@@ -5019,6 +5039,7 @@ async function scrapeOnce(req, res) {
       .map(n => (n.innerText || '').trim())
       .filter(t => t.length > 0);
   }).catch(() => []);
+  console.log('[PW][AFTER_HEADING_EXTRACT]');
   addResponsePayloadSpan('heading_extract', __timingHeadingExtractStart);
 
   console.log('[PW][HEADINGS_RAW]', {
@@ -5027,6 +5048,7 @@ async function scrapeOnce(req, res) {
   });
 
   const __timingPrimaryHeadingExtractStart = Date.now();
+  console.log('[PW][BEFORE_PRIMARY_HEADING]');
   const primaryHeadingText = await page.evaluate(() => {
     function textOf(el) {
       return String((el && (el.innerText || el.textContent)) || '').trim();
@@ -5084,6 +5106,7 @@ async function scrapeOnce(req, res) {
 
     return pickHeading(document);
   }).catch(() => '');
+  console.log('[PW][AFTER_PRIMARY_HEADING]');
   addResponsePayloadSpan('primary_heading_extract', __timingPrimaryHeadingExtractStart);
 
   console.log('[PW][PRIMARY_HEADING]', {
@@ -5256,10 +5279,14 @@ async function scrapeOnce(req, res) {
   }
 
   const __timingBodyTextCandidatesExtractStart = Date.now();
+  console.log('[PW][BEFORE_BODY_CANDIDATES]');
   let bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
+  console.log('[PW][AFTER_BODY_CANDIDATES]');
   addResponsePayloadSpan('body_text_candidates_extract', __timingBodyTextCandidatesExtractStart);
   const __timingPrimaryMessageExtractStart = Date.now();
+  console.log('[PW][BEFORE_PRIMARY_MESSAGE]');
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
+  console.log('[PW][AFTER_PRIMARY_MESSAGE]');
   addResponsePayloadSpan('primary_message_extract', __timingPrimaryMessageExtractStart);
 
   const __timingLiveDomSignalsStart = Date.now();
