@@ -160,6 +160,27 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+function logSfMemory(label) {
+  try {
+    const m = process.memoryUsage();
+    console.log('[SF][MEMORY]', JSON.stringify({
+      label,
+      rssMB: Math.round(m.rss / 1024 / 1024),
+      heapUsedMB: Math.round(m.heapUsed / 1024 / 1024),
+      heapTotalMB: Math.round(m.heapTotal / 1024 / 1024),
+      externalMB: Math.round(m.external / 1024 / 1024)
+    }));
+  } catch (e) {}
+}
+
+function logSf(label, extra) {
+  try {
+    console.log('[SF][' + label + ']', JSON.stringify(extra || {}));
+  } catch (e) {
+    console.log('[SF][' + label + ']');
+  }
+}
+
 console.log('[BOOT][START]', JSON.stringify({
   build: BUILD_TAG,
   pid: process.pid,
@@ -3704,6 +3725,11 @@ console.log('[BOOT][MEMO]', JSON.stringify({
 
 app.get('/scrape', async (req, res) => {
   console.log('[TEST][SCRAPE_ENTRY] entered /scrape');
+  logSf('SCRAPE_ENTER', {
+    url: req && req.query ? String(req.query.url || '').slice(0, 180) : '',
+    nocache: req && req.query ? req.query.nocache || null : null
+  });
+  logSfMemory('scrape_enter_route');
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
   return queue.add(() => scrapeOnce(req, res)).catch(err => {
     if (!res.headersSent) {
@@ -3717,6 +3743,13 @@ async function scrapeOnce(req, res) {
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
+
+  logSf('SCRAPE_ENTER', {
+    stage: 'scrapeOnce',
+    url: String(urlToFetch || '').slice(0, 180),
+    nocache: noCache
+  });
+  logSfMemory('scrape_enter');
 
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
 
@@ -3856,7 +3889,14 @@ async function scrapeOnce(req, res) {
 
     // ---- 主要待機（軽め） ----
     const __timingInitialWaitStart = Date.now();
+    logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
+    logSfMemory('before_goto');
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    logSf('AFTER_GOTO', {
+      status: resp && typeof resp.status === 'function' ? resp.status() : null,
+      finalUrl: page && typeof page.url === 'function' ? page.url() : null
+    });
+    logSfMemory('after_goto');
     await Promise.race([
       page.waitForResponse(r => {
         const u = r.url();
@@ -3884,8 +3924,16 @@ async function scrapeOnce(req, res) {
     addScrapeSpan('initial_goto_and_waits', __timingInitialWaitStart);
 
     const __timingEnrichedStart = Date.now();
+    logSf('BEFORE_COLLECT_ENRICHED');
+    logSfMemory('before_collect_enriched');
     const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
     addScrapeSpan('collectEnrichedObservations', __timingEnrichedStart);
+    logSf('AFTER_COLLECT_ENRICHED', {
+      keys: enrichedObservations && typeof enrichedObservations === 'object'
+        ? Object.keys(enrichedObservations).length
+        : 0
+    });
+    logSfMemory('after_collect_enriched');
 
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
@@ -4128,7 +4176,11 @@ async function scrapeOnce(req, res) {
 
     // ---- HTMLソース（タグあり）----
     // === ここから追加 ===
+    logSf('BEFORE_CONTENT');
+    logSfMemory('before_content');
     const htmlSource = await page.content().catch(() => '');
+    logSf('AFTER_CONTENT', { htmlLength: typeof htmlSource === 'string' ? htmlSource.length : 0 });
+    logSfMemory('after_content');
 
     const shadowNavHtml = await page.evaluate(() => {
       const out = [];
@@ -4282,6 +4334,8 @@ async function scrapeOnce(req, res) {
 
     // --- リソース由来の JSON（電話/住所/同社SNSのみに使用）---
     const __timingJsonTapStart = Date.now();
+    logSf('BEFORE_RESOURCE_TAP', { type: 'json', count: Array.isArray(jsonToTap) ? jsonToTap.length : 0 });
+    logSfMemory('before_resource_json_tap');
     for (const u of jsonToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 10000 });
@@ -4322,6 +4376,8 @@ async function scrapeOnce(req, res) {
       } catch {}
     }
     addScrapeSpan('resource_json_tap', __timingJsonTapStart);
+    logSf('AFTER_RESOURCE_TAP', { type: 'json' });
+    logSfMemory('after_resource_json_tap');
 
     // ページが教えてくれたJS候補 + 典型的なエントリ
     const jsToTap = uniq([
@@ -4331,6 +4387,8 @@ async function scrapeOnce(req, res) {
 
     // ---- JS/JSON 本文を取得して抽出（※設立は見ない）----
     const __timingJsTapStart = Date.now();
+    logSf('BEFORE_RESOURCE_JS_TAP', { count: Array.isArray(jsToTap) ? jsToTap.length : 0 });
+    logSfMemory('before_resource_js_tap');
     for (const u of jsToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 20_000 });
@@ -4398,9 +4456,13 @@ async function scrapeOnce(req, res) {
       } catch(_) {}
     }
     addScrapeSpan('resource_js_tap', __timingJsTapStart);
+    logSf('AFTER_RESOURCE_JS_TAP', { tappedCount: Array.isArray(tappedUrls) ? tappedUrls.length : 0 });
+    logSfMemory('after_resource_js_tap');
 
     // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃（※設立は見ない）--------
     const __timingChunkTapStart = Date.now();
+    logSf('BEFORE_CHUNK_TAP');
+    logSfMemory('before_chunk_tap');
     try {
       const extraChunkUrls = new Set();
       for (const t of tappedAppIndexBodies) {
@@ -4461,6 +4523,8 @@ async function scrapeOnce(req, res) {
     } catch {}
     // -------- 2nd pass end --------
     addScrapeSpan('chunk_tap', __timingChunkTapStart);
+    logSf('AFTER_CHUNK_TAP');
+    logSfMemory('after_chunk_tap');
 
     // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
@@ -4613,6 +4677,8 @@ async function scrapeOnce(req, res) {
     let subPagesVNext = [];
     let publisherInfo = null;
     const __timingSubpagesStart = Date.now();
+    logSf('BEFORE_SUBPAGES', { enabled: !!ENABLE_SUBPAGES_VNEXT });
+    logSfMemory('before_subpages');
     if (ENABLE_SUBPAGES_VNEXT) {
       if (typeof buildSubPagesVNext_V1_ === 'function') {
         subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin, scrapeTiming.subpagesVNextDecision);
@@ -4645,6 +4711,8 @@ async function scrapeOnce(req, res) {
       }));
     }
     addScrapeSpan('subpages_vnext', __timingSubpagesStart);
+    logSf('AFTER_SUBPAGES', { count: Array.isArray(subPagesVNext) ? subPagesVNext.length : 0 });
+    logSfMemory('after_subpages');
     try {
       if (scrapeTiming.subpagesVNextDecision && !scrapeTiming.subpagesVNextDecision.elapsedMs) {
         scrapeTiming.subpagesVNextDecision.elapsedMs = Math.max(0, Date.now() - __timingSubpagesStart);
@@ -4681,6 +4749,8 @@ async function scrapeOnce(req, res) {
       permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
     }));
 
+    logSf('BEFORE_STRUCTURED_JSONLD');
+    logSfMemory('before_structured_jsonld');
     structured.jsonld = await page.evaluate(() => {
       var nodes = [];
 
@@ -4750,6 +4820,8 @@ async function scrapeOnce(req, res) {
 
       return nodes;
     }).catch(() => []);
+    logSf('AFTER_STRUCTURED_JSONLD', { count: Array.isArray(structured.jsonld) ? structured.jsonld.length : 0 });
+    logSfMemory('after_structured_jsonld');
 
     const jsonldSynth = [{
       "@context": "https://schema.org",
@@ -4797,9 +4869,17 @@ async function scrapeOnce(req, res) {
     let auditSig = null;
     const __timingAuditSigProbeStart = Date.now();
     try {
+      logSf('BEFORE_AUDITSIG');
+      logSfMemory('before_auditsig');
       auditSig = await buildAuditSigFromPage(page);
+      logSf('AFTER_AUDITSIG', {
+        keys: auditSig && typeof auditSig === 'object' ? Object.keys(auditSig).length : 0
+      });
+      logSfMemory('after_auditsig');
     } catch (_) {
       auditSig = null;  // 失敗しても全体は止めない
+      logSf('AFTER_AUDITSIG', { error: true });
+      logSfMemory('after_auditsig_error');
     }
     addScrapeSpan('jsonld_wait_probe', __timingAuditSigProbeStart);
 
@@ -4810,7 +4890,11 @@ async function scrapeOnce(req, res) {
         hasAuditSig: !!auditSig,
         auditSigKeys: Object.keys(auditSig || {}).slice(0, 20)
       }));
+      logSf('BEFORE_PRODUCT_SPEC');
+      logSfMemory('before_product_spec');
       productSpecComparisonSignals = await collectProductSpecComparisonSignals(page, jsonldForFlags);
+      logSf('AFTER_PRODUCT_SPEC', { ok: !!productSpecComparisonSignals });
+      logSfMemory('after_product_spec');
       if (auditSig && typeof auditSig === 'object' && productSpecComparisonSignals) {
         auditSig.productSpecComparisonSignals = productSpecComparisonSignals;
       }
@@ -4824,13 +4908,19 @@ async function scrapeOnce(req, res) {
       }));
     } catch (e) {
       productSpecComparisonSignals = null;
+      logSf('AFTER_PRODUCT_SPEC', { error: true, message: String(e && e.message || e).slice(0, 180) });
+      logSfMemory('after_product_spec_error');
       console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
     }
 
     let multimodalSignals = null;
     const __timingMultimodalSignalStart = Date.now();
     try {
+      logSf('BEFORE_MULTIMODAL');
+      logSfMemory('before_multimodal');
       multimodalSignals = await collectMultimodalSignals(page, jsonldForFlags);
+      logSf('AFTER_MULTIMODAL', { checked: !!(multimodalSignals && multimodalSignals.checked) });
+      logSfMemory('after_multimodal');
       if (auditSig && typeof auditSig === 'object') {
         auditSig.multimodalSignals = multimodalSignals;
       }
@@ -4838,6 +4928,8 @@ async function scrapeOnce(req, res) {
         enrichedObservations.multimodalSignals = multimodalSignals;
       }
     } catch (e) {
+      logSf('AFTER_MULTIMODAL', { error: true, message: String(e && e.message || e).slice(0, 180) });
+      logSfMemory('after_multimodal_error');
       multimodalSignals = {
         checked: false,
         source: 'top_dom_head_meta_jsonld',
@@ -4879,9 +4971,15 @@ async function scrapeOnce(req, res) {
     }
 
   // ★ coverage ナビフラグ：/about やトップのHTMLを優先しつつ検出
+  logSf('BEFORE_COVERAGE_NAV');
+  logSfMemory('before_coverage_nav');
   const coverageNav = detectCoverageNavFromHtmlNode(
     topHtml || htmlSource || scoringHtml || bodyText
   );
+  logSf('AFTER_COVERAGE_NAV', {
+    keys: coverageNav && typeof coverageNav === 'object' ? Object.keys(coverageNav).length : 0
+  });
+  logSfMemory('after_coverage_nav');
 
   // ★ 追加：auditSig にも載せる（GAS 側で auditSig.coverageNav を参照できるように）
   if (auditSig && typeof auditSig === 'object') auditSig.coverageNav = coverageNav;
@@ -4889,6 +4987,8 @@ async function scrapeOnce(req, res) {
   // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
   let hasSitemapXml = false;
   try {
+    logSf('BEFORE_SITEMAP_CHECK');
+    logSfMemory('before_sitemap_check');
     let origin = null;
     try {
       origin = new URL(urlToFetch).origin;
@@ -4920,12 +5020,18 @@ async function scrapeOnce(req, res) {
     if (auditSig && typeof auditSig === 'object') {
       auditSig.hasSitemapXml = hasSitemapXml;
     }
+    logSf('AFTER_SITEMAP_CHECK', { hasSitemapXml });
+    logSfMemory('after_sitemap_check');
   } catch (_) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
+    logSf('AFTER_SITEMAP_CHECK', { error: true });
+    logSfMemory('after_sitemap_check_error');
   }
 
   const __timingResponsePayloadStart = Date.now();
   const __timingHeadingExtractStart = Date.now();
+  logSf('BEFORE_HEADING_EXTRACT');
+  logSfMemory('before_heading_extract');
   const headingTexts = await page.evaluate(() => {
     function collect(root) {
       const out = [];
@@ -4950,6 +5056,8 @@ async function scrapeOnce(req, res) {
       .filter(t => t.length > 0);
   }).catch(() => []);
   addResponsePayloadSpan('heading_extract', __timingHeadingExtractStart);
+  logSf('AFTER_HEADING_EXTRACT', { count: Array.isArray(headingTexts) ? headingTexts.length : 0 });
+  logSfMemory('after_heading_extract');
 
   console.log('[PW][HEADINGS_RAW]', {
     count: headingTexts ? headingTexts.length : null,
@@ -4957,6 +5065,8 @@ async function scrapeOnce(req, res) {
   });
 
   const __timingPrimaryHeadingExtractStart = Date.now();
+  logSf('BEFORE_PRIMARY_HEADING');
+  logSfMemory('before_primary_heading');
   const primaryHeadingText = await page.evaluate(() => {
     function textOf(el) {
       return String((el && (el.innerText || el.textContent)) || '').trim();
@@ -5015,6 +5125,8 @@ async function scrapeOnce(req, res) {
     return pickHeading(document);
   }).catch(() => '');
   addResponsePayloadSpan('primary_heading_extract', __timingPrimaryHeadingExtractStart);
+  logSf('AFTER_PRIMARY_HEADING', { length: primaryHeadingText ? primaryHeadingText.length : 0 });
+  logSfMemory('after_primary_heading');
 
   console.log('[PW][PRIMARY_HEADING]', {
     text: primaryHeadingText || '',
@@ -5186,11 +5298,19 @@ async function scrapeOnce(req, res) {
   }
 
   const __timingBodyTextCandidatesExtractStart = Date.now();
+  logSf('BEFORE_BODY_CANDIDATES');
+  logSfMemory('before_body_candidates');
   const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
   addResponsePayloadSpan('body_text_candidates_extract', __timingBodyTextCandidatesExtractStart);
+  logSf('AFTER_BODY_CANDIDATES', { count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0 });
+  logSfMemory('after_body_candidates');
   const __timingPrimaryMessageExtractStart = Date.now();
+  logSf('BEFORE_PRIMARY_MESSAGE');
+  logSfMemory('before_primary_message');
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
   addResponsePayloadSpan('primary_message_extract', __timingPrimaryMessageExtractStart);
+  logSf('AFTER_PRIMARY_MESSAGE', { length: primaryMessageText ? primaryMessageText.length : 0 });
+  logSfMemory('after_primary_message');
 
   console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
     count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
@@ -5223,8 +5343,17 @@ async function scrapeOnce(req, res) {
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
   }));
 
+  logSf('BEFORE_GEO_SIGNALS');
+  logSfMemory('before_geo_signals');
   const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+  logSf('AFTER_GEO_SIGNALS', {
+    hasGeoSignals: !!geoSignalsV1,
+    error: geoSignalsV1 && geoSignalsV1.error ? true : false
+  });
+  logSfMemory('after_geo_signals');
 
+  logSf('BEFORE_RESPONSE_PAYLOAD');
+  logSfMemory('before_response_payload');
   const __timingResponseObjectAssemblyStart = Date.now();
   const responsePayload = {
     url: urlToFetch,
@@ -5448,8 +5577,12 @@ async function scrapeOnce(req, res) {
 
   // --- 追加: /scrape で採点も実施して返す ---
   const __timingBuildScoresStart = Date.now();
+  logSf('BEFORE_DATA_BUILD');
+  logSfMemory('before_data_build');
   const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
   addResponsePayloadSpan('build_scores_from_scrape', __timingBuildScoresStart);
+  logSf('AFTER_DATA_BUILD', { hasScoreBundle: !!scoreBundle });
+  logSfMemory('after_data_build');
   const __timingOutputObjectAssemblyStart = Date.now();
   const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
   addResponsePayloadSpan('output_object_assembly', __timingOutputObjectAssemblyStart);
@@ -5488,9 +5621,18 @@ async function scrapeOnce(req, res) {
   }));
 
   // 正常終了
+  logSf('BEFORE_RESPONSE_SEND', {
+    keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0
+  });
+  logSfMemory('before_response_send');
   return res.status(200).json(out);
 
   } catch (err) {
+    logSf('SCRAPE_CATCH', {
+      name: err && err.name ? String(err.name).slice(0, 80) : '',
+      message: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240)
+    });
+    logSfMemory('scrape_catch');
     const elapsedMs = Date.now() - t0;
     return res.status(500).json({
       error: 'scrape failed',
@@ -5499,6 +5641,8 @@ async function scrapeOnce(req, res) {
       elapsedMs
     });
   } finally {
+    logSf('SCRAPE_FINALLY');
+    logSfMemory('scrape_finally');
     try {
       console.log('[PW][SCRAPE_TIMING]', JSON.stringify({
         url: safeTimingUrl(),
