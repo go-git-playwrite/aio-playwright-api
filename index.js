@@ -3747,7 +3747,32 @@ async function scrapeOnce(req, res) {
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
   const probeMode = (probeModeRaw === 'resource-json' || probeModeRaw === 'resourcetap')
     ? 'resourcejson'
-    : (['content', 'text', 'audit', 'data', 'resourcejson'].includes(probeModeRaw) ? probeModeRaw : '');
+    : ((probeModeRaw === 'js-tap' || probeModeRaw === 'js') ? 'jstap' : (
+      (probeModeRaw === 'js-fetch' || probeModeRaw === 'jsbody' || probeModeRaw === 'js-body') ? 'jsfetch' : (
+      (probeModeRaw === 'js-scan' || probeModeRaw === 'jsdecode' || probeModeRaw === 'js-decode') ? 'jsscan' : (
+      (probeModeRaw === 'js-chunk' || probeModeRaw === 'chunk' || probeModeRaw === 'chunktap' || probeModeRaw === 'chunk-tap') ? 'jschunk' : (
+      (probeModeRaw === 'subpage' || probeModeRaw === 'linkedpages' || probeModeRaw === 'linked-pages') ? 'subpages' : (
+      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages'].includes(probeModeRaw) ? probeModeRaw : ''
+      )
+      )
+      )
+      )
+    ));
+  const probeMaxFetchRaw = Number(req.query.maxFetch);
+  const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
+    ? Math.floor(probeMaxFetchRaw)
+    : 8
+  ));
+  const probeMaxChunkFetchRaw = Number(req.query.maxChunkFetch);
+  const probeMaxChunkFetch = Math.max(0, Math.min(30, Number.isFinite(probeMaxChunkFetchRaw) && probeMaxChunkFetchRaw >= 0
+    ? Math.floor(probeMaxChunkFetchRaw)
+    : 10
+  ));
+  const probeMaxSubpageFetchRaw = Number(req.query.maxSubpageFetch);
+  const probeMaxSubpageFetch = Math.max(0, Math.min(10, Number.isFinite(probeMaxSubpageFetchRaw) && probeMaxSubpageFetchRaw >= 0
+    ? Math.floor(probeMaxSubpageFetchRaw)
+    : 3
+  ));
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
@@ -4063,6 +4088,545 @@ async function scrapeOnce(req, res) {
             maxBodyLength: resourceJsonSummary.maxBodyLength
           });
           logSfMemory('probe_after_resource_json');
+        } else if (probeMode === 'jstap') {
+          logSf('PROBE_BEFORE_JS_TAP');
+          logSfMemory('probe_before_js_tap');
+          const jsTapSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            moduleScriptCount: 0,
+            preloadScriptCount: 0,
+            chunkLikeCount: 0,
+            nextStaticCount: 0,
+            sampleScriptUrls: [],
+            sampleChunkUrls: [],
+            totalUrlChars: 0,
+            maxUrlLength: 0
+          };
+          try {
+            jsTapSummary.stage = 'collect_script_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => ({
+                    src: clean(el.getAttribute('src')),
+                    type: clean(el.getAttribute('type')),
+                    async: !!el.async,
+                    defer: !!el.defer
+                  })).filter(x => x.src),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => ({
+                    href: clean(el.getAttribute('href')),
+                    rel: clean(el.getAttribute('rel')),
+                    as: clean(el.getAttribute('as'))
+                  })).filter(x => x.href),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const scriptUrls = uniq((Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : []).map(x => absProbeUrl(x && x.src)).filter(Boolean));
+            const preloadUrls = uniq((Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : []).map(x => absProbeUrl(x && x.href)).filter(Boolean));
+            const perfUrls = uniq((Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : []).map(absProbeUrl).filter(Boolean));
+            const allUrls = uniq([].concat(scriptUrls, preloadUrls, perfUrls));
+            const chunkUrls = allUrls.filter(u => /chunk|webpack|\/_next\/static\/|app-index|\.m?js(\?|$)/i.test(String(u || '')));
+            jsTapSummary.scriptCount = scriptUrls.length;
+            jsTapSummary.moduleScriptCount = (Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .filter(x => /module/i.test(String(x && x.type || ''))).length;
+            jsTapSummary.preloadScriptCount = preloadUrls.length;
+            jsTapSummary.chunkLikeCount = chunkUrls.length;
+            jsTapSummary.nextStaticCount = allUrls.filter(u => /\/_next\/static\//i.test(String(u || ''))).length;
+            jsTapSummary.sampleScriptUrls = allUrls.slice(0, 20);
+            jsTapSummary.sampleChunkUrls = chunkUrls.slice(0, 20);
+            jsTapSummary.totalUrlChars = allUrls.reduce((sum, u) => sum + String(u || '').length, 0);
+            jsTapSummary.maxUrlLength = allUrls.reduce((max, u) => Math.max(max, String(u || '').length), 0);
+            jsTapSummary.stage = 'done';
+          } catch (e) {
+            jsTapSummary.stage = 'error';
+            jsTapSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsTapSummary = jsTapSummary;
+          logSf('PROBE_AFTER_JS_TAP', {
+            stage: jsTapSummary.stage,
+            scriptCount: jsTapSummary.scriptCount,
+            preloadScriptCount: jsTapSummary.preloadScriptCount,
+            chunkLikeCount: jsTapSummary.chunkLikeCount,
+            totalUrlChars: jsTapSummary.totalUrlChars
+          });
+          logSfMemory('probe_after_js_tap');
+        } else if (probeMode === 'jsfetch') {
+          logSf('PROBE_BEFORE_JS_FETCH', { maxFetch: probeMaxFetch });
+          logSfMemory('probe_before_js_fetch');
+          const jsFetchSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            maxBodyLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            sampleResults: []
+          };
+          try {
+            jsFetchSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            jsFetchSummary.scriptCount = jsUrls.length;
+            jsFetchSummary.stage = 'fetch_js_start';
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsFetchSummary.attemptedCount += 1;
+              jsFetchSummary.stage = 'fetch_js_each';
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                if (row.ok) jsFetchSummary.okCount += 1;
+                jsFetchSummary.totalBytes += row.bodyLength;
+                jsFetchSummary.maxBodyLength = Math.max(jsFetchSummary.maxBodyLength, row.bodyLength);
+              } catch (e) {
+                jsFetchSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsFetchSummary.totalElapsedMs += row.elapsedMs;
+                if (jsFetchSummary.sampleResults.length < 10) jsFetchSummary.sampleResults.push(row);
+              }
+            }
+            jsFetchSummary.stage = 'done';
+          } catch (e) {
+            jsFetchSummary.stage = 'error';
+            jsFetchSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsFetchSummary = jsFetchSummary;
+          logSf('PROBE_AFTER_JS_FETCH', {
+            stage: jsFetchSummary.stage,
+            scriptCount: jsFetchSummary.scriptCount,
+            attemptedCount: jsFetchSummary.attemptedCount,
+            okCount: jsFetchSummary.okCount,
+            errorCount: jsFetchSummary.errorCount,
+            totalBytes: jsFetchSummary.totalBytes,
+            totalElapsedMs: jsFetchSummary.totalElapsedMs,
+            maxBodyLength: jsFetchSummary.maxBodyLength
+          });
+          logSfMemory('probe_after_js_fetch');
+        } else if (probeMode === 'jsscan') {
+          logSf('PROBE_BEFORE_JS_SCAN', { maxFetch: probeMaxFetch });
+          logSfMemory('probe_before_js_scan');
+          const jsScanSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalRawBytes: 0,
+            totalDecodedBytes: 0,
+            totalScanBytes: 0,
+            maxRawLength: 0,
+            maxDecodedLength: 0,
+            maxScanLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            sampleResults: []
+          };
+          try {
+            jsScanSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            const phoneRe = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
+            const zipRe = /〒?\d{3}-?\d{4}/g;
+            const socialHostRe = /https?:\/\/[^\s"'<>]+/g;
+            jsScanSummary.scriptCount = jsUrls.length;
+            jsScanSummary.stage = 'fetch_js_start';
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                rawLength: 0,
+                decodedLength: 0,
+                scanLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsScanSummary.attemptedCount += 1;
+              jsScanSummary.stage = 'fetch_js_each';
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const raw = await r.text();
+                row.rawLength = String(raw || '').length;
+                jsScanSummary.stage = 'decode_each';
+                const decoded = decodeUnicodeEscapes(raw);
+                row.decodedLength = String(decoded || '').length;
+                jsScanSummary.stage = 'scan_each';
+                const scan = String(raw || '') + '\n' + String(decoded || '');
+                row.scanLength = scan.length;
+                row.matchCounts = {
+                  phone: (scan.match(phoneRe) || []).length,
+                  zip: (scan.match(zipRe) || []).length,
+                  url: (scan.match(socialHostRe) || []).length
+                };
+                if (row.ok) jsScanSummary.okCount += 1;
+                jsScanSummary.totalRawBytes += row.rawLength;
+                jsScanSummary.totalDecodedBytes += row.decodedLength;
+                jsScanSummary.totalScanBytes += row.scanLength;
+                jsScanSummary.maxRawLength = Math.max(jsScanSummary.maxRawLength, row.rawLength);
+                jsScanSummary.maxDecodedLength = Math.max(jsScanSummary.maxDecodedLength, row.decodedLength);
+                jsScanSummary.maxScanLength = Math.max(jsScanSummary.maxScanLength, row.scanLength);
+              } catch (e) {
+                jsScanSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsScanSummary.totalElapsedMs += row.elapsedMs;
+                if (jsScanSummary.sampleResults.length < 10) jsScanSummary.sampleResults.push(row);
+              }
+            }
+            jsScanSummary.stage = 'done';
+          } catch (e) {
+            jsScanSummary.stage = 'error';
+            jsScanSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsScanSummary = jsScanSummary;
+          logSf('PROBE_AFTER_JS_SCAN', {
+            stage: jsScanSummary.stage,
+            scriptCount: jsScanSummary.scriptCount,
+            attemptedCount: jsScanSummary.attemptedCount,
+            okCount: jsScanSummary.okCount,
+            errorCount: jsScanSummary.errorCount,
+            totalRawBytes: jsScanSummary.totalRawBytes,
+            totalDecodedBytes: jsScanSummary.totalDecodedBytes,
+            totalScanBytes: jsScanSummary.totalScanBytes,
+            maxScanLength: jsScanSummary.maxScanLength,
+            totalElapsedMs: jsScanSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_js_scan');
+        } else if (probeMode === 'jschunk') {
+          logSf('PROBE_BEFORE_JS_CHUNK', { maxFetch: probeMaxFetch, maxChunkFetch: probeMaxChunkFetch });
+          logSfMemory('probe_before_js_chunk');
+          const jsChunkSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedScriptCount: 0,
+            chunkCandidateCount: 0,
+            attemptedChunkCount: 0,
+            okChunkCount: 0,
+            errorChunkCount: 0,
+            totalScriptScanBytes: 0,
+            totalChunkBytes: 0,
+            maxChunkBodyLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            maxChunkFetch: probeMaxChunkFetch,
+            sampleChunkUrls: [],
+            sampleResults: []
+          };
+          try {
+            jsChunkSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            const extraChunkUrls = new Set();
+            const phoneRe = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
+            const zipRe = /〒?\d{3}-?\d{4}/g;
+            const urlRe = /https?:\/\/[^\s"'<>]+/g;
+            jsChunkSummary.scriptCount = jsUrls.length;
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              jsChunkSummary.stage = 'fetch_js_each';
+              const eachStart = Date.now();
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                if (!r.ok()) continue;
+                const raw = await r.text();
+                const decoded = decodeUnicodeEscapes(raw);
+                const scan = String(raw || '') + '\n' + String(decoded || '');
+                jsChunkSummary.stage = 'scan_js_each';
+                jsChunkSummary.attemptedScriptCount += 1;
+                jsChunkSummary.totalScriptScanBytes += scan.length;
+                const matches = scan.match(/["'`](\/chunk-[A-Za-z0-9-]+\.js)["'`]/g) || [];
+                jsChunkSummary.stage = 'extract_chunk_urls';
+                for (const rawMatch of matches) {
+                  const rel = rawMatch.replace(/^["'`]|["'`]$/g, '');
+                  try {
+                    extraChunkUrls.add(new URL(rel, finalUrl || urlToFetch).toString());
+                  } catch (_) {}
+                }
+              } catch (_) {
+                jsChunkSummary.errorChunkCount += 0;
+              } finally {
+                jsChunkSummary.totalElapsedMs += Math.max(0, Date.now() - eachStart);
+              }
+            }
+            const chunkUrls = Array.from(extraChunkUrls);
+            jsChunkSummary.chunkCandidateCount = chunkUrls.length;
+            jsChunkSummary.sampleChunkUrls = chunkUrls.slice(0, 20);
+            for (const u of chunkUrls.slice(0, probeMaxChunkFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsChunkSummary.stage = 'fetch_chunk_each';
+              jsChunkSummary.attemptedChunkCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 15000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                row.matchCounts = {
+                  phone: ((body || '').match(phoneRe) || []).length,
+                  zip: ((body || '').match(zipRe) || []).length,
+                  url: ((body || '').match(urlRe) || []).length
+                };
+                if (row.ok) jsChunkSummary.okChunkCount += 1;
+                jsChunkSummary.totalChunkBytes += row.bodyLength;
+                jsChunkSummary.maxChunkBodyLength = Math.max(jsChunkSummary.maxChunkBodyLength, row.bodyLength);
+              } catch (e) {
+                jsChunkSummary.errorChunkCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsChunkSummary.totalElapsedMs += row.elapsedMs;
+                if (jsChunkSummary.sampleResults.length < 10) jsChunkSummary.sampleResults.push(row);
+              }
+            }
+            jsChunkSummary.stage = 'done';
+          } catch (e) {
+            jsChunkSummary.stage = 'error';
+            jsChunkSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsChunkSummary = jsChunkSummary;
+          logSf('PROBE_AFTER_JS_CHUNK', {
+            stage: jsChunkSummary.stage,
+            scriptCount: jsChunkSummary.scriptCount,
+            attemptedScriptCount: jsChunkSummary.attemptedScriptCount,
+            chunkCandidateCount: jsChunkSummary.chunkCandidateCount,
+            attemptedChunkCount: jsChunkSummary.attemptedChunkCount,
+            okChunkCount: jsChunkSummary.okChunkCount,
+            errorChunkCount: jsChunkSummary.errorChunkCount,
+            totalScriptScanBytes: jsChunkSummary.totalScriptScanBytes,
+            totalChunkBytes: jsChunkSummary.totalChunkBytes,
+            maxChunkBodyLength: jsChunkSummary.maxChunkBodyLength,
+            totalElapsedMs: jsChunkSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_js_chunk');
+        } else if (probeMode === 'subpages') {
+          logSf('PROBE_BEFORE_SUBPAGES', { maxSubpageFetch: probeMaxSubpageFetch });
+          logSfMemory('probe_before_subpages');
+          const subpagesSummary = {
+            stage: 'start',
+            internalLinkCount: 0,
+            candidateCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            maxBodyLength: 0,
+            totalElapsedMs: 0,
+            maxSubpageFetch: probeMaxSubpageFetch,
+            sampleCandidates: [],
+            sampleResults: []
+          };
+          try {
+            subpagesSummary.stage = 'collect_internal_links';
+            const targetOrigin = (() => {
+              try { return new URL(finalUrl || urlToFetch).origin; } catch (_) { return ''; }
+            })();
+            const probeLinks = await page.evaluate((origin) => {
+              try {
+                const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('a[href]')).map(a => {
+                  let href = '';
+                  try { href = new URL(a.getAttribute('href') || a.href || '', location.href).toString(); } catch (_) {}
+                  let sameOrigin = false;
+                  try { sameOrigin = !!href && new URL(href).origin === origin; } catch (_) {}
+                  return {
+                    text: norm(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || ''),
+                    href,
+                    sameOrigin
+                  };
+                }).filter(x => x && x.href && x.sameOrigin);
+              } catch (_) {
+                return [];
+              }
+            }, targetOrigin).catch(() => []);
+            const internalLinks = Array.isArray(probeLinks) ? probeLinks : [];
+            subpagesSummary.internalLinkCount = internalLinks.length;
+            subpagesSummary.stage = 'build_subpage_candidates';
+            const candidateRe = /about|company|service|services|business|contact|inquiry|faq|privacy|policy|terms|support|plan|plans|product|products|会社|企業|サービス|事業|問い合わせ|お問い合わせ|よくある質問|プライバシー|個人情報|規約|サポート|料金|プラン|製品/i;
+            const fixedCandidates = targetOrigin && typeof pickSubPageCandidatesVNext_ === 'function'
+              ? pickSubPageCandidatesVNext_(targetOrigin)
+              : [];
+            const candidateSeen = new Set();
+            const candidates = [];
+            const addCandidate = (u) => {
+              try {
+                const parsed = new URL(String(u || ''), finalUrl || urlToFetch);
+                if (!targetOrigin || parsed.origin !== targetOrigin) return;
+                parsed.hash = '';
+                const k = parsed.toString().replace(/\/+$/, '');
+                if (!k || candidateSeen.has(k)) return;
+                candidateSeen.add(k);
+                candidates.push(k);
+              } catch (_) {}
+            };
+            for (const link of internalLinks) {
+              const hay = `${link && link.text || ''} ${link && link.href || ''}`;
+              if (candidateRe.test(hay)) addCandidate(link && link.href);
+            }
+            for (const u of fixedCandidates) addCandidate(u);
+            subpagesSummary.candidateCount = candidates.length;
+            subpagesSummary.sampleCandidates = candidates.slice(0, 20);
+            for (const u of candidates.slice(0, probeMaxSubpageFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              subpagesSummary.stage = 'fetch_subpage_each';
+              subpagesSummary.attemptedCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 15000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                if (/text\/html|application\/xhtml/i.test(row.contentType)) {
+                  const html = String(body || '');
+                  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+                  if (titleMatch) {
+                    row.title = String(titleMatch[1] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+                  }
+                  row.h1Count = (html.match(/<h1\b/gi) || []).length;
+                  row.h2Count = (html.match(/<h2\b/gi) || []).length;
+                }
+                if (row.ok) subpagesSummary.okCount += 1;
+                subpagesSummary.totalBytes += row.bodyLength;
+                subpagesSummary.maxBodyLength = Math.max(subpagesSummary.maxBodyLength, row.bodyLength);
+              } catch (e) {
+                subpagesSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                subpagesSummary.totalElapsedMs += row.elapsedMs;
+                if (subpagesSummary.sampleResults.length < 10) subpagesSummary.sampleResults.push(row);
+              }
+            }
+            subpagesSummary.stage = 'done';
+          } catch (e) {
+            subpagesSummary.stage = 'error';
+            subpagesSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.subpagesSummary = subpagesSummary;
+          logSf('PROBE_AFTER_SUBPAGES', {
+            stage: subpagesSummary.stage,
+            internalLinkCount: subpagesSummary.internalLinkCount,
+            candidateCount: subpagesSummary.candidateCount,
+            attemptedCount: subpagesSummary.attemptedCount,
+            okCount: subpagesSummary.okCount,
+            errorCount: subpagesSummary.errorCount,
+            totalBytes: subpagesSummary.totalBytes,
+            maxBodyLength: subpagesSummary.maxBodyLength,
+            totalElapsedMs: subpagesSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_subpages');
         }
         logSf('PROBE_SEND', { probe: probeMode });
         logSfMemory('probe_send');
