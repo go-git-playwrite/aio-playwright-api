@@ -3902,35 +3902,49 @@ async function scrapeOnce(req, res) {
 
     // ---- 主要待機（軽め） ----
     const __timingInitialWaitStart = Date.now();
-    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await Promise.race([
-      page.waitForResponse(r => {
-        const u = r.url();
-        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
-      }, { timeout: 20_000 }).catch(()=>null),
-      page.waitForTimeout(20_000)
-    ]);
-    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
-    const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
-    await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
+    let resp = null;
+    try {
+      console.log('[PW][BEFORE_GOTO]');
+      resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      console.log('[PW][AFTER_GOTO]');
+      await Promise.race([
+        page.waitForResponse(r => {
+          const u = r.url();
+          return u.endsWith('.js') || u.includes('firestore.googleapis.com');
+        }, { timeout: 20_000 }).catch(()=>null),
+        page.waitForTimeout(20_000)
+      ]);
+      console.log('[PW][BEFORE_NETWORK_IDLE_WAIT]');
+      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
+      console.log('[PW][AFTER_NETWORK_IDLE_WAIT]');
+      const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
+      console.log('[PW][BEFORE_EXTRA_WAIT]');
+      await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
-    // === ここから追記（本文長しきい値で待機）===
-    await page.waitForFunction(() => {
-      const hasHeader = !!document.querySelector('header,[role="banner"]');
-      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
-      const hasMain   = !!document.querySelector('main,[role="main"]');
-      return hasHeader || hasFooter || hasMain;
-    }, { timeout: 8000 }).catch(()=>{});
+      // === ここから追記（本文長しきい値で待機）===
+      await page.waitForFunction(() => {
+        const hasHeader = !!document.querySelector('header,[role="banner"]');
+        const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+        const hasMain   = !!document.querySelector('main,[role="main"]');
+        return hasHeader || hasFooter || hasMain;
+      }, { timeout: 8000 }).catch(()=>{});
 
-    // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
-    await page.waitForFunction(() => {
-      const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
-      return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
-    }, { timeout: 8000 }).catch(()=>{});
+      // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
+      await page.waitForFunction(() => {
+        const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
+        return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
+      }, { timeout: 8000 }).catch(()=>{});
+      console.log('[PW][AFTER_EXTRA_WAIT]');
+    } catch (err) {
+      console.log('[PW][GOTO_OR_WAIT_ERR]', err && err.message ? err.message : String(err));
+      throw err;
+    }
     addScrapeSpan('initial_goto_and_waits', __timingInitialWaitStart);
 
     const __timingEnrichedStart = Date.now();
+    console.log('[PW][BEFORE_ENRICHED_OBS]');
     const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
+    console.log('[PW][AFTER_ENRICHED_OBS]');
     addScrapeSpan('collectEnrichedObservations', __timingEnrichedStart);
 
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
@@ -3938,6 +3952,7 @@ async function scrapeOnce(req, res) {
 
     // --- HTTP headers (main document only) ---
     const __timingDomTextStart = Date.now();
+    console.log('[PW][BEFORE_SHADOW_TEXT]');
     try{
       const h = (resp && typeof resp.allHeaders === 'function')
         ? await resp.allHeaders()
@@ -4096,6 +4111,7 @@ async function scrapeOnce(req, res) {
     // ここで obs を返却payloadに合流させる（下流が壊れない場所に）
 
     // ---- DOMテキスト（空でもOK）----
+    console.log('[PW][BEFORE_BODY_TEXT]');
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
       page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
@@ -4139,7 +4155,9 @@ async function scrapeOnce(req, res) {
   const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
     ? deepText
     : (innerText || docText || '');
+  console.log('[PW][AFTER_BODY_TEXT]');
   addScrapeSpan('dom_shadow_text_extract', __timingDomTextStart);
+  console.log('[PW][AFTER_SHADOW_TEXT]');
 
   // --- トップと /about の JSON-LD を比較 ---
   const __timingTopAboutSameStart = Date.now();
@@ -4174,6 +4192,7 @@ async function scrapeOnce(req, res) {
 
     // ---- HTMLソース（タグあり）----
     // === ここから追加 ===
+    console.log('[PW][BEFORE_CONTENT]');
     const htmlSource = await page.content().catch(() => '');
 
     const shadowNavHtml = await page.evaluate(() => {
@@ -4212,6 +4231,7 @@ async function scrapeOnce(req, res) {
     const payloadHtml = shadowNavHtml
       ? htmlSource + '\n<!-- shadow-nav-fragments -->\n' + shadowNavHtml
       : htmlSource;
+    console.log('[PW][AFTER_CONTENT]');
     // === ここまで追加 ===
 
     // ---- 設立（STRICT: DOM/HTML 構造のみ）----
@@ -4291,6 +4311,7 @@ async function scrapeOnce(req, res) {
     const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
 
     // --- ページで読み込まれたリソース一覧から JSON 系も拾う（電話/住所/同社SNSのみに使用）---
+    console.log('[PW][BEFORE_RESOURCE_TAPS]');
     const resourceUrls = await page.evaluate(() => {
       try {
         return performance.getEntriesByType('resource')
@@ -4444,6 +4465,7 @@ async function scrapeOnce(req, res) {
       } catch(_) {}
     }
     addScrapeSpan('resource_js_tap', __timingJsTapStart);
+    console.log('[PW][AFTER_RESOURCE_TAPS]');
 
     // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃（※設立は見ない）--------
     const __timingChunkTapStart = Date.now();
@@ -4555,6 +4577,7 @@ async function scrapeOnce(req, res) {
 
     // === JSON-LD の実出現をピンポイント待機（最大 20 秒に延長） ===
     const __timingJsonLdProbeStart = Date.now();
+    console.log('[PW][BEFORE_JSONLD_PROBE]');
     await page.waitForFunction(() => {
       return !!document.querySelector('script[type="application/ld+json" i]');
     }, { timeout: 20000 }).catch(()=>{}); // ← 12s→20s に延長
@@ -4604,6 +4627,7 @@ async function scrapeOnce(req, res) {
       }
     } catch (_) {}
     addScrapeSpan('jsonld_wait_probe', __timingJsonLdProbeStart);
+    console.log('[PW][AFTER_JSONLD_PROBE]');
 
     // === Fallback（コピーライト）：CSR前でも静的/レンダ済みから検知 ===
     try {
@@ -5336,6 +5360,7 @@ async function scrapeOnce(req, res) {
   }));
 
   const __timingResponseObjectAssemblyStart = Date.now();
+  console.log('[PW][BEFORE_PAYLOAD_BUILD]');
   const responsePayload = {
     url: urlToFetch,
     enrichedObservations,
@@ -5542,6 +5567,7 @@ async function scrapeOnce(req, res) {
     }
   }; // ← ここで必ず閉じる！
   addResponsePayloadSpan('response_object_assembly', __timingResponseObjectAssemblyStart);
+  console.log('[PW][AFTER_PAYLOAD_BUILD]');
   try {
     scrapeTiming.payload_size_summary = {
       htmlLength: safeLength(responsePayload.html),
@@ -5611,10 +5637,14 @@ async function scrapeOnce(req, res) {
   }));
 
   // 正常終了
-  return res.status(200).json(out);
+  console.log('[PW][BEFORE_RESPONSE_SEND]');
+  const __responseSendResult = res.status(200).json(out);
+  console.log('[PW][AFTER_RESPONSE_SEND]');
+  return __responseSendResult;
 
   } catch (err) {
     console.log('[PW][BOOTSTRAP_ERR]', err && err.message ? err.message : String(err));
+    console.log('[PW][SCRAPE_ERR]', err && err.message ? err.message : String(err));
     const elapsedMs = Date.now() - t0;
     return res.status(500).json({
       error: 'scrape failed',
@@ -5623,6 +5653,7 @@ async function scrapeOnce(req, res) {
       elapsedMs
     });
   } finally {
+    console.log('[PW][SCRAPE_FINALLY_ENTER]');
     try {
       console.log('[PW][SCRAPE_TIMING]', JSON.stringify({
         url: safeTimingUrl(),
@@ -5639,6 +5670,7 @@ async function scrapeOnce(req, res) {
     try { if (page)    await page.close(); } catch(_) {}
     try { if (context) await context.close(); } catch(_) {}
     try { if (browser) await browser.close(); } catch(_) {}
+    console.log('[PW][SCRAPE_FINALLY_EXIT]');
   }
 }
 
