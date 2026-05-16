@@ -3744,6 +3744,9 @@ async function scrapeOnce(req, res) {
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
+  const signalsMode = String(req.query.signalsMode || '').toLowerCase();
+  const responseMode = String(req.query.responseMode || '').toLowerCase();
+  const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
   const probeMode = (probeModeRaw === 'resource-json' || probeModeRaw === 'resourcetap')
     ? 'resourcejson'
@@ -3781,6 +3784,7 @@ async function scrapeOnce(req, res) {
     url: String(urlToFetch || '').slice(0, 180),
     nocache: noCache,
     signalsOnly,
+    signalsFirstLight,
     probe: probeMode || null
   });
   logSfMemory('scrape_enter');
@@ -3931,6 +3935,81 @@ async function scrapeOnce(req, res) {
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
     });
     logSfMemory('after_goto');
+    if (signalsFirstLight) {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      logSf('SIGNALS_FIRST_LIGHT_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180)
+      });
+      logSfMemory('signals_first_light_enter');
+      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+      const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
+      const linksObserved = observed.links || {};
+      const headingsObserved = observed.headings || {};
+      const structuredObserved = observed.structuredData || {};
+      const bodyObserved = observed.body || {};
+      const lightweightSummary = {
+        title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
+        metaDescription: observed.metaDescription && typeof observed.metaDescription.value === 'string' ? observed.metaDescription.value : null,
+        h1Count: observed.h1 && typeof observed.h1.count === 'number' ? observed.h1.count : 0,
+        h2Count: Array.isArray(headingsObserved.h2) ? headingsObserved.h2.length : 0,
+        navLinkCount: Array.isArray(linksObserved.navTextsSample) ? linksObserved.navTextsSample.length : 0,
+        internalLinkCount: Array.isArray(linksObserved.internalLinksSample) ? linksObserved.internalLinksSample.length : 0,
+        hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasCompanyLikeLink') ? linksObserved.hasCompanyLikeLink : null,
+        hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
+        hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
+        hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
+        bodyTextLength: typeof bodyObserved.textLength === 'number' ? bodyObserved.textLength : 0,
+        jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0
+      };
+      const diagnostics = {
+        evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
+          ? geoSignalsV1.diagnostics.evaluateCount
+          : null,
+        htmlSkipped: true,
+        scoringSkipped: true,
+        auditSigSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true
+      };
+      const memoryHints = {
+        avoidedHeavyBlocks: [
+          'html',
+          'scoring.html',
+          'auditSig',
+          'resource_js_tap',
+          'chunk_tap',
+          'multimodalSignals',
+          'productSpecComparisonSignals',
+          'responsePayloadHugeMerge'
+        ],
+        estimatedSavedBytes: null
+      };
+      try {
+        const htmlEstimate = await page.evaluate(() => {
+          try { return String((document.documentElement && document.documentElement.outerHTML) || '').length; } catch (_) { return 0; }
+        }).catch(() => 0);
+        memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
+      } catch (_) {}
+      logSf('SIGNALS_FIRST_LIGHT_SEND', {
+        h1Count: lightweightSummary.h1Count,
+        jsonldCount: lightweightSummary.jsonldCount,
+        navLinkCount: lightweightSummary.navLinkCount,
+        bodyTextLength: lightweightSummary.bodyTextLength
+      });
+      logSfMemory('signals_first_light_send');
+      return res.status(200).json({
+        ok: true,
+        mode: 'signalsFirstLight',
+        url: urlToFetch,
+        finalUrl,
+        status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        geoSignalsV1,
+        lightweightSummary,
+        diagnostics,
+        memoryHints
+      });
+    }
     if (signalsOnly) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       logSf('SIGNALS_ONLY_EARLY_ENTER', {
