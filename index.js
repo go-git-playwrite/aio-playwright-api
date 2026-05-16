@@ -3899,6 +3899,39 @@ async function scrapeOnce(req, res) {
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
     });
     logSfMemory('after_goto');
+    if (signalsOnly) {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      logSf('SIGNALS_ONLY_EARLY_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180)
+      });
+      logSfMemory('signals_only_early_enter');
+      logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
+      logSfMemory('signals_only_early_before_geo_signals');
+      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+      logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
+        hasGeoSignals: !!geoSignalsV1,
+        error: geoSignalsV1 && geoSignalsV1.error ? true : false
+      });
+      logSfMemory('signals_only_early_after_geo_signals');
+      logSf('SIGNALS_ONLY_EARLY_SEND');
+      logSfMemory('signals_only_early_send');
+      return res.status(200).json({
+        ok: true,
+        mode: 'signalsOnlyEarly',
+        url: urlToFetch,
+        finalUrl,
+        status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        geoSignalsV1,
+        debug: {
+          skippedHeavyPayload: true,
+          reason: 'signalsOnly=1',
+          evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics
+            ? geoSignalsV1.diagnostics.evaluateCount
+            : null
+        }
+      });
+    }
     await Promise.race([
       page.waitForResponse(r => {
         const u = r.url();
