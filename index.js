@@ -3266,25 +3266,35 @@ async function buildGeoSignalsV1(page, url) {
         try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
       };
       const nodeTypes = [];
-      const walkJsonLd = (node) => {
+      const walkJsonLd = (node, depth = 0) => {
+        if (depth > 8) return;
+        if (Array.isArray(node)) {
+          node.forEach((item) => walkJsonLd(item, depth + 1));
+          return;
+        }
         if (!node || typeof node !== 'object') return;
         const t = node['@type'];
         if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
         else if (t) nodeTypes.push(clean(t));
-        if (Array.isArray(node['@graph'])) node['@graph'].forEach(walkJsonLd);
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
       };
       const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
         .map((s) => clean(s.textContent || ''))
         .filter(Boolean);
+      let parseableJsonLdCount = 0;
+      let parseErrorsCount = 0;
       rawJsonLd.forEach((txt) => {
         try {
           const parsed = JSON.parse(txt);
-          if (Array.isArray(parsed)) parsed.forEach(walkJsonLd);
-          else walkJsonLd(parsed);
-        } catch (_) {}
+          parseableJsonLdCount += 1;
+          walkJsonLd(parsed);
+        } catch (_) {
+          parseErrorsCount += 1;
+        }
       });
       const typeList = limit(nodeTypes, 50);
       const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
+      const hasJsonLd = rawJsonLd.length > 0;
 
       const titleValue = clean(document.title || '');
       const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
@@ -3323,10 +3333,16 @@ async function buildGeoSignalsV1(page, url) {
         structuredData: {
           types: typeList,
           rawCount: rawJsonLd.length,
-          hasWebsite: rawJsonLd.length ? typeSet.has('website') : null,
-          hasOrganization: rawJsonLd.length ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
-          hasBreadcrumbList: rawJsonLd.length ? typeSet.has('breadcrumblist') : null,
-          hasFAQPage: rawJsonLd.length ? typeSet.has('faqpage') : null
+          parseableCount: parseableJsonLdCount,
+          hasJsonLd,
+          hasWebsite: hasJsonLd ? typeSet.has('website') : false,
+          hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
+          hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
+          hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+          source: 'rendered_dom_jsonld_light',
+          confidence: 'medium',
+          observationLimited: false,
+          parseErrorsCount
         },
         body: {
           textLength: bodyText.length,
@@ -3439,11 +3455,26 @@ async function buildGeoSignalsV1(page, url) {
       : (a11yHeadings.observed ? 'a11y' : 'not_observed');
     const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
     const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
+    const structuredDataLight = {
+      types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
+      rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
+      parseableCount: observed.structuredData && typeof observed.structuredData.parseableCount === 'number' ? observed.structuredData.parseableCount : 0,
+      hasJsonLd: observed.structuredData && typeof observed.structuredData.hasJsonLd === 'boolean' ? observed.structuredData.hasJsonLd : null,
+      hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
+      hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
+      hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
+      hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
+      source: observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light',
+      confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
+      observationLimited: observed.structuredData && typeof observed.structuredData.observationLimited === 'boolean' ? observed.structuredData.observationLimited : false,
+      parseErrorsCount: observed.structuredData && typeof observed.structuredData.parseErrorsCount === 'number' ? observed.structuredData.parseErrorsCount : 0
+    };
 
     const geoSignalsV1 = {
       version: 'geoSignalsV1',
       generatedAt,
       url: String(url || ''),
+      structuredData: structuredDataLight,
       headings: {
         h1Count: mergedH1.length,
         h2Count: mergedH2.length,
@@ -3512,14 +3543,18 @@ async function buildGeoSignalsV1(page, url) {
           confidence: 'medium'
         },
         structuredData: {
-          types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
-          hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
-          hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
-          hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
-          hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
-          rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
-          source: 'rendered_dom_jsonld',
-          confidence: 'medium'
+          types: structuredDataLight.types,
+          rawCount: structuredDataLight.rawCount,
+          parseableCount: structuredDataLight.parseableCount,
+          hasJsonLd: structuredDataLight.hasJsonLd,
+          hasWebsite: structuredDataLight.hasWebsite,
+          hasOrganization: structuredDataLight.hasOrganization,
+          hasBreadcrumbList: structuredDataLight.hasBreadcrumbList,
+          hasFAQPage: structuredDataLight.hasFAQPage,
+          source: structuredDataLight.source,
+          confidence: structuredDataLight.confidence,
+          observationLimited: structuredDataLight.observationLimited,
+          parseErrorsCount: structuredDataLight.parseErrorsCount
         },
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
@@ -3540,7 +3575,14 @@ async function buildGeoSignalsV1(page, url) {
         h1Source: geoSignalsV1.headings && geoSignalsV1.headings.h1Source,
         headingObservationLimited: geoSignalsV1.headings && geoSignalsV1.headings.headingObservationLimited,
         jsonldCount: geoSignalsV1.observed.structuredData.rawCount,
+        jsonldParseableCount: geoSignalsV1.observed.structuredData.parseableCount,
+        jsonldParseErrorsCount: geoSignalsV1.observed.structuredData.parseErrorsCount,
         jsonldTypes: geoSignalsV1.observed.structuredData.types,
+        hasJsonLd: geoSignalsV1.observed.structuredData.hasJsonLd,
+        hasWebsite: geoSignalsV1.observed.structuredData.hasWebsite,
+        hasOrganization: geoSignalsV1.observed.structuredData.hasOrganization,
+        hasBreadcrumbList: geoSignalsV1.observed.structuredData.hasBreadcrumbList,
+        hasFAQPage: geoSignalsV1.observed.structuredData.hasFAQPage,
         totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
         navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
         bodyTextCandidatesCount: 0,
@@ -4103,7 +4145,16 @@ async function scrapeOnce(req, res) {
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
         bodyTextLength: typeof bodyObserved.textLength === 'number' ? bodyObserved.textLength : 0,
-        jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0
+        jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0,
+        jsonldParseableCount: typeof structuredObserved.parseableCount === 'number' ? structuredObserved.parseableCount : 0,
+        jsonldParseErrorsCount: typeof structuredObserved.parseErrorsCount === 'number' ? structuredObserved.parseErrorsCount : 0,
+        jsonldTypes: Array.isArray(structuredObserved.types) ? structuredObserved.types.slice(0, 50) : [],
+        hasJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasJsonLd') ? structuredObserved.hasJsonLd : null,
+        hasWebsiteJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasWebsite') ? structuredObserved.hasWebsite : null,
+        hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
+        hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
+        hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
+        structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : null
       };
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
