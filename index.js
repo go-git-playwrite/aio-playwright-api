@@ -3744,12 +3744,15 @@ async function scrapeOnce(req, res) {
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
+  const probeModeRaw = String(req.query.probe || '').toLowerCase();
+  const probeMode = ['content', 'text', 'audit', 'data'].includes(probeModeRaw) ? probeModeRaw : '';
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
     url: String(urlToFetch || '').slice(0, 180),
     nocache: noCache,
-    signalsOnly
+    signalsOnly,
+    probe: probeMode || null
   });
   logSfMemory('scrape_enter');
 
@@ -3903,7 +3906,8 @@ async function scrapeOnce(req, res) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       logSf('SIGNALS_ONLY_EARLY_ENTER', {
         url: String(urlToFetch || '').slice(0, 180),
-        finalUrl: String(finalUrl || '').slice(0, 180)
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        probe: probeMode || null
       });
       logSfMemory('signals_only_early_enter');
       logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
@@ -3914,6 +3918,92 @@ async function scrapeOnce(req, res) {
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
       });
       logSfMemory('signals_only_early_after_geo_signals');
+      if (probeMode) {
+        const debug = {
+          skippedHeavyPayload: true,
+          reason: 'signalsOnly=1',
+          htmlLength: null,
+          renderedTextLength: null,
+          bodyTextLength: null,
+          auditSigSummary: null,
+          dataSummary: null,
+          evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics
+            ? geoSignalsV1.diagnostics.evaluateCount
+            : null
+        };
+        logSf('PROBE_ENTER', { probe: probeMode });
+        logSfMemory('probe_enter');
+        if (probeMode === 'content') {
+          logSf('PROBE_BEFORE_CONTENT');
+          logSfMemory('probe_before_content');
+          const probeHtml = await page.content().catch(() => '');
+          debug.htmlLength = String(probeHtml || '').length;
+          logSf('PROBE_AFTER_CONTENT', { htmlLength: debug.htmlLength });
+          logSfMemory('probe_after_content');
+        } else if (probeMode === 'text') {
+          logSf('PROBE_BEFORE_TEXT');
+          logSfMemory('probe_before_text');
+          const probeText = await page.evaluate(() => {
+            try {
+              const body = document.body;
+              return String((body && (body.innerText || body.textContent)) || '');
+            } catch (_) {
+              return '';
+            }
+          }).catch(() => '');
+          debug.renderedTextLength = String(probeText || '').length;
+          debug.bodyTextLength = debug.renderedTextLength;
+          logSf('PROBE_AFTER_TEXT', { renderedTextLength: debug.renderedTextLength });
+          logSfMemory('probe_after_text');
+        } else if (probeMode === 'audit') {
+          logSf('PROBE_BEFORE_AUDIT');
+          logSfMemory('probe_before_audit');
+          const probeAuditSig = await buildAuditSigFromPage(page).catch(() => null);
+          debug.auditSigSummary = {
+            exists: !!probeAuditSig,
+            keysCount: probeAuditSig && typeof probeAuditSig === 'object' ? Object.keys(probeAuditSig).length : 0,
+            jsonldCount: probeAuditSig && typeof probeAuditSig.jsonldCount === 'number' ? probeAuditSig.jsonldCount : null,
+            jsonldTypesCount: probeAuditSig && Array.isArray(probeAuditSig.jsonldTypes) ? probeAuditSig.jsonldTypes.length : null,
+            h1Count: probeAuditSig && typeof probeAuditSig.h1Count === 'number' ? probeAuditSig.h1Count : null
+          };
+          logSf('PROBE_AFTER_AUDIT', debug.auditSigSummary);
+          logSfMemory('probe_after_audit');
+        } else if (probeMode === 'data') {
+          logSf('PROBE_BEFORE_DATA');
+          logSfMemory('probe_before_data');
+          const probeBodySample = geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.body
+            ? String(geoSignalsV1.observed.body.sample || '')
+            : '';
+          const probeData = buildScoresFromScrape({
+            url: finalUrl || urlToFetch,
+            html: '',
+            bodyText: probeBodySample,
+            jsonld: [],
+            structured: {},
+            jsonldSynth: []
+          });
+          debug.dataSummary = {
+            exists: !!probeData,
+            keysCount: probeData && typeof probeData === 'object' ? Object.keys(probeData).length : 0,
+            hasBefore: !!(probeData && probeData.before),
+            hasAfter: !!(probeData && probeData.after)
+          };
+          logSf('PROBE_AFTER_DATA', debug.dataSummary);
+          logSfMemory('probe_after_data');
+        }
+        logSf('PROBE_SEND', { probe: probeMode });
+        logSfMemory('probe_send');
+        return res.status(200).json({
+          ok: true,
+          mode: 'signalsOnlyProbe',
+          probe: probeMode,
+          url: urlToFetch,
+          finalUrl,
+          status: resp && typeof resp.status === 'function' ? resp.status() : null,
+          geoSignalsV1,
+          debug
+        });
+      }
       logSf('SIGNALS_ONLY_EARLY_SEND');
       logSfMemory('signals_only_early_send');
       return res.status(200).json({
