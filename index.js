@@ -3234,6 +3234,178 @@ function flatTypesFromJsonLd(arr) {
 }
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
+async function buildGeoSignalsV1(page, url) {
+  const generatedAt = new Date().toISOString();
+  try {
+    const observed = await page.evaluate((inputUrl) => {
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
+      const limit = (arr, n) => uniq(arr).slice(0, n);
+      const absUrl = (href) => {
+        try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
+      };
+      const nodeTypes = [];
+      const walkJsonLd = (node) => {
+        if (!node || typeof node !== 'object') return;
+        const t = node['@type'];
+        if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+        else if (t) nodeTypes.push(clean(t));
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach(walkJsonLd);
+      };
+      const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+        .map((s) => clean(s.textContent || ''))
+        .filter(Boolean);
+      rawJsonLd.forEach((txt) => {
+        try {
+          const parsed = JSON.parse(txt);
+          if (Array.isArray(parsed)) parsed.forEach(walkJsonLd);
+          else walkJsonLd(parsed);
+        } catch (_) {}
+      });
+      const typeList = limit(nodeTypes, 50);
+      const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
+
+      const titleValue = clean(document.title || '');
+      const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
+      const metaValue = clean(metaEl && metaEl.getAttribute('content'));
+      const h1 = limit(Array.from(document.querySelectorAll('h1')).map((el) => clean(el.innerText || el.textContent)), 10);
+      const h2 = limit(Array.from(document.querySelectorAll('h2')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        href: absUrl(a.getAttribute('href') || ''),
+        navLike: !!a.closest('nav,[role="navigation"],header,footer')
+      })).filter((a) => a.href);
+      const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
+      const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+      const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
+      const internal = anchors.filter((a) => {
+        try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
+      }).map((a) => ({ text: a.text, href: a.href }));
+      const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+
+      return {
+        finalUrl: location.href,
+        title: titleValue,
+        metaDescription: metaValue,
+        h1,
+        h2,
+        h3,
+        links: {
+          navTextsSample: limit(navTexts, 50),
+          internalLinksSample: internal.slice(0, 50),
+          hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
+          hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
+          hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
+        },
+        structuredData: {
+          types: typeList,
+          rawCount: rawJsonLd.length,
+          hasWebsite: rawJsonLd.length ? typeSet.has('website') : null,
+          hasOrganization: rawJsonLd.length ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
+          hasBreadcrumbList: rawJsonLd.length ? typeSet.has('breadcrumblist') : null,
+          hasFAQPage: rawJsonLd.length ? typeSet.has('faqpage') : null
+        },
+        body: {
+          textLength: bodyText.length,
+          sample: bodyText.slice(0, 500)
+        }
+      };
+    }, String(url || ''));
+
+    const geoSignalsV1 = {
+      version: 'geoSignalsV1',
+      generatedAt,
+      url: String(url || ''),
+      observed: {
+        title: {
+          value: observed.title || null,
+          observed: !!observed.title,
+          source: 'rendered_dom',
+          confidence: observed.title ? 'high' : 'low'
+        },
+        metaDescription: {
+          value: observed.metaDescription || null,
+          observed: !!observed.metaDescription,
+          source: 'rendered_dom',
+          confidence: observed.metaDescription ? 'high' : 'low'
+        },
+        h1: {
+          values: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
+          count: Array.isArray(observed.h1) ? observed.h1.length : 0,
+          observed: Array.isArray(observed.h1),
+          source: 'rendered_dom',
+          confidence: 'high'
+        },
+        headings: {
+          h1: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
+          h2: Array.isArray(observed.h2) ? observed.h2.slice(0, 10) : [],
+          h3: Array.isArray(observed.h3) ? observed.h3.slice(0, 10) : [],
+          source: 'rendered_dom',
+          confidence: 'high'
+        },
+        links: {
+          navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
+          internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
+          hasCompanyLikeLink: observed.links ? observed.links.hasCompanyLikeLink : null,
+          hasServiceLikeLink: observed.links ? observed.links.hasServiceLikeLink : null,
+          hasContactLikeLink: observed.links ? observed.links.hasContactLikeLink : null,
+          hasPrivacyLikeLink: observed.links ? observed.links.hasPrivacyLikeLink : null,
+          source: 'rendered_dom',
+          confidence: 'medium'
+        },
+        structuredData: {
+          types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
+          hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
+          hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
+          hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
+          hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
+          rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
+          source: 'rendered_dom_jsonld',
+          confidence: 'medium'
+        },
+        body: {
+          textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
+          sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
+          source: 'rendered_dom',
+          confidence: 'medium'
+        }
+      },
+      diagnostics: {
+        evaluateCount: 1,
+        jsBundleAnalysis: false,
+        resourceChunkScan: false
+      }
+    };
+    try {
+      console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
+        h1Count: geoSignalsV1.observed.h1.count,
+        jsonldCount: geoSignalsV1.observed.structuredData.rawCount,
+        jsonldTypes: geoSignalsV1.observed.structuredData.types,
+        totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
+        navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
+        bodyTextCandidatesCount: 0,
+        renderedTextLength: geoSignalsV1.observed.body.textLength
+      }));
+    } catch (_) {}
+    return geoSignalsV1;
+  } catch (e) {
+    return {
+      version: 'geoSignalsV1',
+      generatedAt,
+      url: String(url || ''),
+      observed: {},
+      diagnostics: {
+        evaluateCount: 1,
+        jsBundleAnalysis: false,
+        resourceChunkScan: false
+      },
+      error: String(e && (e.message || e) || '')
+    };
+  }
+}
+
 function analyzeHtmlBasics(html) {
   const $ = cheerio.load(html || '');
   const title = $('head > title').text().trim();
@@ -5051,9 +5223,12 @@ async function scrapeOnce(req, res) {
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
   }));
 
+  const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+
   const __timingResponseObjectAssemblyStart = Date.now();
   const responsePayload = {
     url: urlToFetch,
+    geoSignalsV1,
     enrichedObservations,
     responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
       'strict-transport-security': null,
