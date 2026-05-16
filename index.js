@@ -3351,6 +3351,56 @@ async function buildGeoSignalsV1(page, url) {
     const domH1 = Array.isArray(observed.h1) ? observed.h1 : [];
     const domH2 = Array.isArray(observed.h2) ? observed.h2 : [];
     const domH3 = Array.isArray(observed.h3) ? observed.h3 : [];
+    const headingExclusions = [];
+    const normalizeHostname = (v) => String(v || '').toLowerCase().replace(/^www\./, '');
+    const getUrlParts = (v) => {
+      try {
+        const u = new URL(String(v || ''));
+        return {
+          protocol: u.protocol,
+          hostname: normalizeHostname(u.hostname)
+        };
+      } catch (_) {
+        return { protocol: '', hostname: '' };
+      }
+    };
+    const inputUrlParts = getUrlParts(url);
+    const finalUrlParts = getUrlParts(observed.finalUrl);
+    const browserErrorPageUrl = /^chrome-error:|^about:/i.test(String(observed.finalUrl || '')) ||
+      /^chrome-error:|^about:/i.test(String(page.url && page.url() || ''));
+    const finalUrlOriginMismatch = !!(
+      inputUrlParts.hostname &&
+      finalUrlParts.hostname &&
+      inputUrlParts.hostname !== finalUrlParts.hostname &&
+      !inputUrlParts.hostname.endsWith('.' + finalUrlParts.hostname) &&
+      !finalUrlParts.hostname.endsWith('.' + inputUrlParts.hostname)
+    );
+    const addHeadingExclusion = (text, reason) => {
+      headingExclusions.push({
+        reason,
+        text: normalizeHeadingText(text).slice(0, 160)
+      });
+    };
+    const isBrowserOrExtensionBlockHeading = (text) => {
+      const s = normalizeHeadingText(text);
+      if (!s) return false;
+      return /ERR_BLOCKED_BY_CLIENT|ブロックされています|拡張機能によってブロック|chrome-error:\/\/|about:blank/i.test(s);
+    };
+    const filterHeadingTexts = (arr) => {
+      const out = [];
+      for (const text of (Array.isArray(arr) ? arr : [])) {
+        if (browserErrorPageUrl || finalUrlOriginMismatch) {
+          addHeadingExclusion(text, browserErrorPageUrl ? 'browser_error_page_url' : 'page_origin_mismatch');
+          continue;
+        }
+        if (isBrowserOrExtensionBlockHeading(text)) {
+          addHeadingExclusion(text, 'browser_or_extension_block_page');
+          continue;
+        }
+        out.push(text);
+      }
+      return out;
+    };
     const a11yHeadings = {
       h1: [],
       h2: [],
@@ -3372,15 +3422,23 @@ async function buildGeoSignalsV1(page, url) {
     } catch (e) {
       a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
     }
-    const mergedH1 = domH1.length ? uniqueHeadingTexts(domH1, 10) : a11yHeadings.h1.slice(0, 10);
-    const mergedH2 = uniqueHeadingTexts(domH2.concat(a11yHeadings.h2), 20);
-    const mergedH3 = uniqueHeadingTexts(domH3.concat(a11yHeadings.h3), 20);
-    const h1Source = domH1.length ? 'dom' : (a11yHeadings.h1.length ? 'a11y' : 'not_observed');
-    const headingSource = domH1.length || domH2.length || domH3.length
+    const filteredDomH1 = filterHeadingTexts(domH1);
+    const filteredDomH2 = filterHeadingTexts(domH2);
+    const filteredDomH3 = filterHeadingTexts(domH3);
+    const filteredA11yH1 = filterHeadingTexts(a11yHeadings.h1);
+    const filteredA11yH2 = filterHeadingTexts(a11yHeadings.h2);
+    const filteredA11yH3 = filterHeadingTexts(a11yHeadings.h3);
+    const filteredA11yAll = filterHeadingTexts(a11yHeadings.all);
+    const excludedHeadingReasons = Array.from(new Set(headingExclusions.map(x => x.reason).filter(Boolean)));
+    const mergedH1 = filteredDomH1.length ? uniqueHeadingTexts(filteredDomH1, 10) : filteredA11yH1.slice(0, 10);
+    const mergedH2 = uniqueHeadingTexts(filteredDomH2.concat(filteredA11yH2), 20);
+    const mergedH3 = uniqueHeadingTexts(filteredDomH3.concat(filteredA11yH3), 20);
+    const h1Source = filteredDomH1.length ? 'dom' : (filteredA11yH1.length ? 'a11y' : 'not_observed');
+    const headingSource = filteredDomH1.length || filteredDomH2.length || filteredDomH3.length
       ? (a11yHeadings.observed ? 'dom+a11y' : 'dom')
       : (a11yHeadings.observed ? 'a11y' : 'not_observed');
-    const headingObservationLimited = !domH1.length && !a11yHeadings.h1.length;
-    const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(a11yHeadings.all), 30);
+    const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
+    const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
 
     const geoSignalsV1 = {
       version: 'geoSignalsV1',
@@ -3397,6 +3455,8 @@ async function buildGeoSignalsV1(page, url) {
         source: headingSource,
         h1Source,
         headingObservationLimited,
+        excludedHeadingCount: headingExclusions.length,
+        excludedHeadingReasons,
         a11yObserved: !!a11yHeadings.observed
       },
       observed: {
@@ -3431,12 +3491,14 @@ async function buildGeoSignalsV1(page, url) {
           h1Source,
           headingObservationLimited,
           a11y: {
-            h1: a11yHeadings.h1.slice(0, 5),
-            h2: a11yHeadings.h2.slice(0, 10),
-            h3: a11yHeadings.h3.slice(0, 10),
+            h1: filteredA11yH1.slice(0, 5),
+            h2: filteredA11yH2.slice(0, 10),
+            h3: filteredA11yH3.slice(0, 10),
             observed: !!a11yHeadings.observed,
             error: a11yHeadings.error
           },
+          excludedHeadingCount: headingExclusions.length,
+          excludedHeadingReasons,
           confidence: headingTextsMerged.length ? 'high' : 'low'
         },
         links: {
