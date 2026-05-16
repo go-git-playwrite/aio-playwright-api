@@ -3752,7 +3752,9 @@ async function scrapeOnce(req, res) {
       (probeModeRaw === 'js-scan' || probeModeRaw === 'jsdecode' || probeModeRaw === 'js-decode') ? 'jsscan' : (
       (probeModeRaw === 'js-chunk' || probeModeRaw === 'chunk' || probeModeRaw === 'chunktap' || probeModeRaw === 'chunk-tap') ? 'jschunk' : (
       (probeModeRaw === 'subpage' || probeModeRaw === 'linkedpages' || probeModeRaw === 'linked-pages') ? 'subpages' : (
-      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages'].includes(probeModeRaw) ? probeModeRaw : ''
+      (probeModeRaw === 'payload' || probeModeRaw === 'payload-assembly' || probeModeRaw === 'assembly') ? 'payloadassembly' : (
+      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly'].includes(probeModeRaw) ? probeModeRaw : ''
+      )
       )
       )
       )
@@ -4627,6 +4629,220 @@ async function scrapeOnce(req, res) {
             totalElapsedMs: subpagesSummary.totalElapsedMs
           });
           logSfMemory('probe_after_subpages');
+        } else if (probeMode === 'payloadassembly') {
+          logSf('PROBE_BEFORE_PAYLOAD_ASSEMBLY');
+          logSfMemory('probe_before_payload_assembly');
+          const payloadAssemblySummary = {
+            stage: 'start',
+            blocks: [],
+            totalEstimatedBytes: 0,
+            topHeavyBlocks: [],
+            blockCount: 0,
+            totalElapsedMs: 0
+          };
+          const estimateBlockBytes = (value) => {
+            try {
+              if (value == null) return 0;
+              if (typeof value === 'string') return Buffer.byteLength(value, 'utf8');
+              if (Buffer.isBuffer(value)) return value.length;
+              return Buffer.byteLength(JSON.stringify(value), 'utf8');
+            } catch (_) {
+              return 0;
+            }
+          };
+          const countBlockItems = (value) => {
+            try {
+              if (Array.isArray(value)) return value.length;
+              if (value && typeof value === 'object') return Object.keys(value).length;
+              if (typeof value === 'string') return value.length ? 1 : 0;
+              return value == null ? 0 : 1;
+            } catch (_) {
+              return 0;
+            }
+          };
+          const addPayloadBlock = (key, value, startedAt, extra) => {
+            try {
+              const row = {
+                key,
+                present: value != null && value !== '',
+                estimatedBytes: estimateBlockBytes(value),
+                itemCount: countBlockItems(value),
+                buildElapsedMs: Math.max(0, Date.now() - Number(startedAt || Date.now()))
+              };
+              if (extra && typeof extra === 'object') Object.assign(row, extra);
+              payloadAssemblySummary.blocks.push(row);
+              payloadAssemblySummary.totalEstimatedBytes += row.estimatedBytes;
+              payloadAssemblySummary.totalElapsedMs += row.buildElapsedMs;
+            } catch (_) {}
+          };
+          try {
+            payloadAssemblySummary.stage = 'collect_payload_blocks';
+            let started = Date.now();
+            addPayloadBlock('geoSignalsV1', geoSignalsV1, started, {
+              source: 'already_built',
+              observedKeys: geoSignalsV1 && geoSignalsV1.observed ? Object.keys(geoSignalsV1.observed).length : 0
+            });
+
+            started = Date.now();
+            logSf('PROBE_PAYLOAD_ASSEMBLY_BEFORE_HTML');
+            logSfMemory('probe_payload_assembly_before_html');
+            const probeHtml = await page.content().catch(() => '');
+            addPayloadBlock('html', probeHtml, started, { stringLength: String(probeHtml || '').length });
+            logSf('PROBE_PAYLOAD_ASSEMBLY_AFTER_HTML', { htmlLength: String(probeHtml || '').length });
+            logSfMemory('probe_payload_assembly_after_html');
+
+            started = Date.now();
+            logSf('PROBE_PAYLOAD_ASSEMBLY_BEFORE_TEXT');
+            const probeText = await page.evaluate(() => {
+              try {
+                const body = document.body;
+                return String((body && (body.innerText || body.textContent)) || '');
+              } catch (_) {
+                return '';
+              }
+            }).catch(() => '');
+            addPayloadBlock('renderedText', probeText, started, { stringLength: String(probeText || '').length });
+            addPayloadBlock('bodyText', probeText, started, { stringLength: String(probeText || '').length, aliasOf: 'renderedText' });
+            logSf('PROBE_PAYLOAD_ASSEMBLY_AFTER_TEXT', { renderedTextLength: String(probeText || '').length });
+
+            started = Date.now();
+            const probeBodyCandidates = [];
+            try {
+              const sample = geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.body
+                ? String(geoSignalsV1.observed.body.sample || '').trim()
+                : '';
+              if (sample) probeBodyCandidates.push(sample);
+              String(probeText || '').split(/[。！？\n]/).map(s => s.replace(/\s+/g, ' ').trim()).filter(s => s.length >= 20).slice(0, 4).forEach(s => {
+                if (!probeBodyCandidates.includes(s)) probeBodyCandidates.push(s);
+              });
+            } catch (_) {}
+            addPayloadBlock('bodyTextCandidates', probeBodyCandidates.slice(0, 5), started);
+
+            started = Date.now();
+            const probeJsonld = await page.evaluate(() => {
+              try {
+                return Array.from(document.querySelectorAll('script[type="application/ld+json"]')).slice(0, 20).map(s => {
+                  const raw = String(s.textContent || '').trim();
+                  if (!raw) return null;
+                  try { return JSON.parse(raw); } catch (_) { return { parseError: true, rawLength: raw.length }; }
+                }).filter(Boolean);
+              } catch (_) {
+                return [];
+              }
+            }).catch(() => []);
+            addPayloadBlock('jsonld', probeJsonld, started);
+
+            started = Date.now();
+            logSf('PROBE_PAYLOAD_ASSEMBLY_BEFORE_AUDITSIG');
+            logSfMemory('probe_payload_assembly_before_auditsig');
+            const probeAuditSig = await buildAuditSigFromPage(page).catch(() => null);
+            addPayloadBlock('auditSig', probeAuditSig, started, {
+              keysCount: probeAuditSig && typeof probeAuditSig === 'object' ? Object.keys(probeAuditSig).length : 0
+            });
+            logSf('PROBE_PAYLOAD_ASSEMBLY_AFTER_AUDITSIG', {
+              keysCount: probeAuditSig && typeof probeAuditSig === 'object' ? Object.keys(probeAuditSig).length : 0
+            });
+            logSfMemory('probe_payload_assembly_after_auditsig');
+
+            started = Date.now();
+            const probeScoring = {
+              html: probeHtml,
+              bodyText: probeText,
+              headingTexts: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.headings
+                ? [].concat(geoSignalsV1.observed.headings.h1 || []).concat(geoSignalsV1.observed.headings.h2 || [])
+                : []
+            };
+            addPayloadBlock('scoring', probeScoring, started, {
+              htmlLength: String(probeHtml || '').length,
+              bodyTextLength: String(probeText || '').length
+            });
+
+            started = Date.now();
+            logSf('PROBE_PAYLOAD_ASSEMBLY_BEFORE_DATA_BUILD');
+            logSfMemory('probe_payload_assembly_before_data_build');
+            const probeResponseLike = {
+              url: finalUrl || urlToFetch,
+              geoSignalsV1,
+              html: probeHtml,
+              bodyText: probeText,
+              renderedText: probeText,
+              bodyTextCandidates: probeBodyCandidates.slice(0, 5),
+              jsonld: probeJsonld,
+              structured: {},
+              jsonldSynth: [],
+              scoring: probeScoring,
+              auditSig: probeAuditSig || {}
+            };
+            const probeData = buildScoresFromScrape(probeResponseLike);
+            addPayloadBlock('data', probeData, started, {
+              keysCount: probeData && typeof probeData === 'object' ? Object.keys(probeData).length : 0
+            });
+            logSf('PROBE_PAYLOAD_ASSEMBLY_AFTER_DATA_BUILD', {
+              keysCount: probeData && typeof probeData === 'object' ? Object.keys(probeData).length : 0
+            });
+            logSfMemory('probe_payload_assembly_after_data_build');
+
+            started = Date.now();
+            addPayloadBlock('responsePayloadShell', {
+              url: finalUrl || urlToFetch,
+              geoSignalsV1: true,
+              html: true,
+              bodyText: true,
+              renderedText: true,
+              jsonld: Array.isArray(probeJsonld) ? probeJsonld.length : 0,
+              auditSig: !!probeAuditSig,
+              data: !!probeData
+            }, started, { note: 'shape_only_no_large_bodies' });
+
+            const skippedBlocks = [
+              'enrichedObservations',
+              'resource_json_tap',
+              'resource_js_tap',
+              'chunk_tap',
+              'tappedAppIndexBodies',
+              'subpages',
+              'multimodalSignals',
+              'productSpecComparisonSignals',
+              'screenshots'
+            ];
+            for (const key of skippedBlocks) {
+              payloadAssemblySummary.blocks.push({
+                key,
+                present: false,
+                estimatedBytes: 0,
+                itemCount: 0,
+                buildElapsedMs: 0,
+                skipped: true,
+                reason: 'not_built_in_payloadAssembly_probe'
+              });
+            }
+            payloadAssemblySummary.stage = 'estimate_sizes';
+            payloadAssemblySummary.blockCount = payloadAssemblySummary.blocks.length;
+            payloadAssemblySummary.topHeavyBlocks = payloadAssemblySummary.blocks
+              .filter(b => b && !b.skipped)
+              .slice()
+              .sort((a, b) => Number(b.estimatedBytes || 0) - Number(a.estimatedBytes || 0))
+              .slice(0, 10)
+              .map(b => ({
+                key: b.key,
+                estimatedBytes: b.estimatedBytes,
+                itemCount: b.itemCount,
+                buildElapsedMs: b.buildElapsedMs
+              }));
+            payloadAssemblySummary.stage = 'done';
+          } catch (e) {
+            payloadAssemblySummary.stage = 'error';
+            payloadAssemblySummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.payloadAssemblySummary = payloadAssemblySummary;
+          logSf('PROBE_AFTER_PAYLOAD_ASSEMBLY', {
+            stage: payloadAssemblySummary.stage,
+            blockCount: payloadAssemblySummary.blockCount,
+            totalEstimatedBytes: payloadAssemblySummary.totalEstimatedBytes,
+            totalElapsedMs: payloadAssemblySummary.totalElapsedMs,
+            topHeavyBlocks: payloadAssemblySummary.topHeavyBlocks
+          });
+          logSfMemory('probe_after_payload_assembly');
         }
         logSf('PROBE_SEND', { probe: probeMode });
         logSfMemory('probe_send');
