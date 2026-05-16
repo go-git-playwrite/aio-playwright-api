@@ -3341,7 +3341,12 @@ async function buildGeoSignalsV1(page, url) {
           hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
           source: 'rendered_dom_jsonld_light',
           confidence: 'medium',
-          observationLimited: false,
+          observationLimited: true,
+          observationScope: 'rendered_dom_only',
+          renderedDomObserved: true,
+          htmlScanSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
           parseErrorsCount
         },
         body: {
@@ -3466,7 +3471,12 @@ async function buildGeoSignalsV1(page, url) {
       hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
       source: observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light',
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
-      observationLimited: observed.structuredData && typeof observed.structuredData.observationLimited === 'boolean' ? observed.structuredData.observationLimited : false,
+      observationLimited: observed.structuredData && typeof observed.structuredData.observationLimited === 'boolean' ? observed.structuredData.observationLimited : true,
+      observationScope: observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only',
+      renderedDomObserved: observed.structuredData && typeof observed.structuredData.renderedDomObserved === 'boolean' ? observed.structuredData.renderedDomObserved : true,
+      htmlScanSkipped: observed.structuredData && typeof observed.structuredData.htmlScanSkipped === 'boolean' ? observed.structuredData.htmlScanSkipped : true,
+      jsScanSkipped: observed.structuredData && typeof observed.structuredData.jsScanSkipped === 'boolean' ? observed.structuredData.jsScanSkipped : true,
+      chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
       parseErrorsCount: observed.structuredData && typeof observed.structuredData.parseErrorsCount === 'number' ? observed.structuredData.parseErrorsCount : 0
     };
 
@@ -4154,7 +4164,12 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
         hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
-        structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : null
+        structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : true,
+        structuredDataObservationScope: structuredObserved.observationScope || 'rendered_dom_only',
+        structuredDataRenderedDomObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'renderedDomObserved') ? structuredObserved.renderedDomObserved : true,
+        structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
+        structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
+        structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true
       };
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
