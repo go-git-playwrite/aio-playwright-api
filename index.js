@@ -160,6 +160,27 @@ const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+function logSfMemory(label) {
+  try {
+    const m = process.memoryUsage();
+    console.log('[SF][MEMORY]', JSON.stringify({
+      label,
+      rssMB: Math.round(m.rss / 1024 / 1024),
+      heapUsedMB: Math.round(m.heapUsed / 1024 / 1024),
+      heapTotalMB: Math.round(m.heapTotal / 1024 / 1024),
+      externalMB: Math.round(m.external / 1024 / 1024)
+    }));
+  } catch (e) {}
+}
+
+function logSf(label, extra) {
+  try {
+    console.log('[SF][' + label + ']', JSON.stringify(extra || {}));
+  } catch (e) {
+    console.log('[SF][' + label + ']');
+  }
+}
+
 console.log('[BOOT][START]', JSON.stringify({
   build: BUILD_TAG,
   pid: process.pid,
@@ -2164,208 +2185,6 @@ async function collectMultimodalSignals(page, jsonldForFlags) {
   }
 }
 
-async function collectLiveDomLightweightSignals(page) {
-  try {
-    console.log('[PW][LIVE_DOM_ENTER]', page && typeof page.url === 'function' ? page.url() : '');
-    console.log('[PW][LIVE_DOM_BEFORE_EVAL]');
-    const result = await page.evaluate(() => {
-      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-      const abs = (u) => {
-        try { return u ? new URL(u, document.baseURI).toString() : ''; } catch (_) { return String(u || '').trim(); }
-      };
-      const uniqPush = (arr, value, limit) => {
-        const v = norm(value);
-        if (!v || arr.includes(v)) return;
-        if (arr.length < limit) arr.push(v);
-      };
-      const uniqPushUrl = (arr, value, limit) => {
-        const v = abs(value);
-        if (!v || arr.includes(v)) return;
-        if (arr.length < limit) arr.push(v);
-      };
-      const regionOf = (el) => {
-        try {
-          if (el.closest('nav')) return 'nav';
-          if (el.closest('[role="navigation"]')) return 'role-navigation';
-          if (el.closest('header,[role="banner"]')) return 'header';
-          if (el.closest('footer,[role="contentinfo"]')) return 'footer';
-          if (el.closest('main,[role="main"]')) return 'main';
-        } catch (_) {}
-        return 'body';
-      };
-      const anchorText = (a) => norm(
-        (a && (a.innerText || a.textContent)) ||
-        (a && a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title'))) ||
-        ''
-      );
-      const textFrom = (el) => norm(el && (el.innerText || el.textContent));
-      const looksUiOnly = (s) => /^(menu|close|open|ログイン|メニュー|閉じる|開く|お問い合わせ|アクセス|プライバシー|利用規約)$/i.test(norm(s));
-      const isTextCandidate = (s) => {
-        const t = norm(s);
-        if (t.length < 20 || t.length > 180) return false;
-        if (looksUiOnly(t)) return false;
-        if (/^(©|Copyright|All Rights Reserved)/i.test(t)) return false;
-        return true;
-      };
-      const splitCandidates = (text) => {
-        const out = [];
-        const parts = norm(text).split(/[。．.!?！？\n\r]+/);
-        for (const p of parts) {
-          const t = norm(p);
-          if (!isTextCandidate(t)) continue;
-          uniqPush(out, t, 5);
-          if (out.length >= 5) break;
-        }
-        return out;
-      };
-      const classifyCoverage = (hay) => {
-        const s = String(hay || '').toLowerCase();
-        return {
-          company: /(会社|企業|会社概要|企業情報|about|company|corporate)/i.test(s),
-          service: /(サービス|料金|プラン|事業|製品|service|business|product|plan|price)/i.test(s),
-          contact: /(お問い合わせ|問合せ|お問合せ|問い合わせ|連絡|contact|inquiry|support)/i.test(s),
-          faq: /(faq|よくある質問|q&a|q & a|help|ヘルプ|サポート)/i.test(s)
-        };
-      };
-      const classifyTrust = (hay) => {
-        const s = String(hay || '').toLowerCase();
-        return {
-          privacy: /(privacy|プライバシー|個人情報|個人データ)/i.test(s),
-          terms: /(terms|利用規約|規約|約款|legal|法務|特定商取引|ポリシー)/i.test(s),
-          legal: /(legal|法務|特定商取引|利用規約|規約|約款|policy|ポリシー)/i.test(s),
-          contact: /(お問い合わせ|問合せ|お問合せ|問い合わせ|連絡|contact|inquiry|support)/i.test(s)
-        };
-      };
-
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
-      const navLinkTexts = [];
-      const navAnchorsSample = [];
-      const coverageNav = {
-        hasCompanyNav: false,
-        hasServiceNav: false,
-        hasContactNav: false,
-        hasFaqNav: false,
-        matchedLabels: [],
-        matchedHrefs: []
-      };
-      const trustLinks = {
-        hasPrivacyPolicyLink: false,
-        hasLegalLink: false,
-        hasTermsLink: false,
-        hasContactLink: false,
-        privacyUrls: [],
-        legalUrls: [],
-        contactUrls: []
-      };
-
-      let headerAnchorCount = 0;
-      let footerAnchorCount = 0;
-      let navAnchorCount = 0;
-      let roleNavigationAnchorCount = 0;
-
-      anchors.forEach((a) => {
-        const href = abs(a.getAttribute('href') || a.href);
-        const text = anchorText(a);
-        if (!href || !text) return;
-        const region = regionOf(a);
-        const hay = href + ' ' + text;
-        if (region === 'header') headerAnchorCount++;
-        if (region === 'footer') footerAnchorCount++;
-        if (region === 'nav') navAnchorCount++;
-        if (region === 'role-navigation') roleNavigationAnchorCount++;
-        if (region === 'nav' || region === 'role-navigation' || region === 'header' || region === 'footer') {
-          uniqPush(navLinkTexts, text, 50);
-          if (navAnchorsSample.length < 20) navAnchorsSample.push({ text, href, region });
-        }
-
-        const cov = classifyCoverage(hay);
-        if (cov.company) {
-          coverageNav.hasCompanyNav = true;
-          uniqPush(coverageNav.matchedLabels, text, 20);
-          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
-        }
-        if (cov.service) {
-          coverageNav.hasServiceNav = true;
-          uniqPush(coverageNav.matchedLabels, text, 20);
-          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
-        }
-        if (cov.contact) {
-          coverageNav.hasContactNav = true;
-          uniqPush(coverageNav.matchedLabels, text, 20);
-          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
-        }
-        if (cov.faq) {
-          coverageNav.hasFaqNav = true;
-          uniqPush(coverageNav.matchedLabels, text, 20);
-          uniqPushUrl(coverageNav.matchedHrefs, href, 10);
-        }
-
-        const tr = classifyTrust(hay);
-        if (tr.privacy) {
-          trustLinks.hasPrivacyPolicyLink = true;
-          uniqPushUrl(trustLinks.privacyUrls, href, 10);
-        }
-        if (tr.terms) {
-          trustLinks.hasTermsLink = true;
-          uniqPushUrl(trustLinks.legalUrls, href, 10);
-        }
-        if (tr.legal) {
-          trustLinks.hasLegalLink = true;
-          uniqPushUrl(trustLinks.legalUrls, href, 10);
-        }
-        if (tr.contact) {
-          trustLinks.hasContactLink = true;
-          uniqPushUrl(trustLinks.contactUrls, href, 10);
-        }
-      });
-
-      const main = document.querySelector('main,[role="main"],article,#content,.content,.main');
-      const hero = document.querySelector('[class*="hero"],[class*="kv"],[class*="fv"],[id*="hero"],[id*="kv"],[id*="fv"]');
-      const mainText = textFrom(main);
-      const heroText = textFrom(hero);
-      const renderedText = textFrom(document.body);
-      let bodyTextCandidatesFallback = splitCandidates(mainText).concat(splitCandidates(heroText));
-      if (bodyTextCandidatesFallback.length < 5) {
-        bodyTextCandidatesFallback = bodyTextCandidatesFallback.concat(splitCandidates(renderedText));
-      }
-      const bodyUniq = [];
-      bodyTextCandidatesFallback.forEach((t) => uniqPush(bodyUniq, t, 5));
-
-      return {
-        checked: true,
-        source: 'live_dom_lightweight_v1',
-        allAnchorCount: anchors.length,
-        navLinkTexts: navLinkTexts.slice(0, 50),
-        navAnchorsSample: navAnchorsSample.slice(0, 20),
-        navCount: document.querySelectorAll('nav').length,
-        navAnchorCount,
-        headerAnchorCount,
-        footerAnchorCount,
-        roleNavigationCount: document.querySelectorAll('[role="navigation"]').length,
-        roleNavigationAnchorCount,
-        coverageNav,
-        trustLinks,
-        text: {
-          bodyTextCandidatesFallback: bodyUniq.slice(0, 5),
-          mainTextHead: mainText.slice(0, 500),
-          heroTextHead: heroText.slice(0, 300),
-          renderedTextLength: renderedText.length,
-          mainTextLength: mainText.length
-        }
-      };
-    });
-    console.log('[PW][LIVE_DOM_AFTER_EVAL]');
-    return result;
-  } catch (e) {
-    console.log('[PW][LIVE_DOM_ERR]', String(e && (e.message || e) || '').slice(0, 300));
-    return {
-      checked: false,
-      source: 'live_dom_lightweight_v1',
-      errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
-    };
-  }
-}
-
 // === [AIO][AUDIT_SIG v1] JSON-LD / コピーライト / head meta / ナビ導線 を集約するヘルパー ===
 async function buildAuditSigFromPage(page) {
   // === [AIO][JSONLD_WAIT v1] JSON-LDの出現待ち＋状態を付けて probe をラップ ===
@@ -3436,6 +3255,178 @@ function flatTypesFromJsonLd(arr) {
 }
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
+async function buildGeoSignalsV1(page, url) {
+  const generatedAt = new Date().toISOString();
+  try {
+    const observed = await page.evaluate((inputUrl) => {
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
+      const limit = (arr, n) => uniq(arr).slice(0, n);
+      const absUrl = (href) => {
+        try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
+      };
+      const nodeTypes = [];
+      const walkJsonLd = (node) => {
+        if (!node || typeof node !== 'object') return;
+        const t = node['@type'];
+        if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+        else if (t) nodeTypes.push(clean(t));
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach(walkJsonLd);
+      };
+      const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+        .map((s) => clean(s.textContent || ''))
+        .filter(Boolean);
+      rawJsonLd.forEach((txt) => {
+        try {
+          const parsed = JSON.parse(txt);
+          if (Array.isArray(parsed)) parsed.forEach(walkJsonLd);
+          else walkJsonLd(parsed);
+        } catch (_) {}
+      });
+      const typeList = limit(nodeTypes, 50);
+      const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
+
+      const titleValue = clean(document.title || '');
+      const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
+      const metaValue = clean(metaEl && metaEl.getAttribute('content'));
+      const h1 = limit(Array.from(document.querySelectorAll('h1')).map((el) => clean(el.innerText || el.textContent)), 10);
+      const h2 = limit(Array.from(document.querySelectorAll('h2')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+        text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+        href: absUrl(a.getAttribute('href') || ''),
+        navLike: !!a.closest('nav,[role="navigation"],header,footer')
+      })).filter((a) => a.href);
+      const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
+      const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+      const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
+      const internal = anchors.filter((a) => {
+        try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
+      }).map((a) => ({ text: a.text, href: a.href }));
+      const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+
+      return {
+        finalUrl: location.href,
+        title: titleValue,
+        metaDescription: metaValue,
+        h1,
+        h2,
+        h3,
+        links: {
+          navTextsSample: limit(navTexts, 50),
+          internalLinksSample: internal.slice(0, 50),
+          hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
+          hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
+          hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
+        },
+        structuredData: {
+          types: typeList,
+          rawCount: rawJsonLd.length,
+          hasWebsite: rawJsonLd.length ? typeSet.has('website') : null,
+          hasOrganization: rawJsonLd.length ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
+          hasBreadcrumbList: rawJsonLd.length ? typeSet.has('breadcrumblist') : null,
+          hasFAQPage: rawJsonLd.length ? typeSet.has('faqpage') : null
+        },
+        body: {
+          textLength: bodyText.length,
+          sample: bodyText.slice(0, 500)
+        }
+      };
+    }, String(url || ''));
+
+    const geoSignalsV1 = {
+      version: 'geoSignalsV1',
+      generatedAt,
+      url: String(url || ''),
+      observed: {
+        title: {
+          value: observed.title || null,
+          observed: !!observed.title,
+          source: 'rendered_dom',
+          confidence: observed.title ? 'high' : 'low'
+        },
+        metaDescription: {
+          value: observed.metaDescription || null,
+          observed: !!observed.metaDescription,
+          source: 'rendered_dom',
+          confidence: observed.metaDescription ? 'high' : 'low'
+        },
+        h1: {
+          values: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
+          count: Array.isArray(observed.h1) ? observed.h1.length : 0,
+          observed: Array.isArray(observed.h1),
+          source: 'rendered_dom',
+          confidence: 'high'
+        },
+        headings: {
+          h1: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
+          h2: Array.isArray(observed.h2) ? observed.h2.slice(0, 10) : [],
+          h3: Array.isArray(observed.h3) ? observed.h3.slice(0, 10) : [],
+          source: 'rendered_dom',
+          confidence: 'high'
+        },
+        links: {
+          navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
+          internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
+          hasCompanyLikeLink: observed.links ? observed.links.hasCompanyLikeLink : null,
+          hasServiceLikeLink: observed.links ? observed.links.hasServiceLikeLink : null,
+          hasContactLikeLink: observed.links ? observed.links.hasContactLikeLink : null,
+          hasPrivacyLikeLink: observed.links ? observed.links.hasPrivacyLikeLink : null,
+          source: 'rendered_dom',
+          confidence: 'medium'
+        },
+        structuredData: {
+          types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
+          hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
+          hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
+          hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
+          hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
+          rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
+          source: 'rendered_dom_jsonld',
+          confidence: 'medium'
+        },
+        body: {
+          textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
+          sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
+          source: 'rendered_dom',
+          confidence: 'medium'
+        }
+      },
+      diagnostics: {
+        evaluateCount: 1,
+        jsBundleAnalysis: false,
+        resourceChunkScan: false
+      }
+    };
+    try {
+      console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
+        h1Count: geoSignalsV1.observed.h1.count,
+        jsonldCount: geoSignalsV1.observed.structuredData.rawCount,
+        jsonldTypes: geoSignalsV1.observed.structuredData.types,
+        totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
+        navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
+        bodyTextCandidatesCount: 0,
+        renderedTextLength: geoSignalsV1.observed.body.textLength
+      }));
+    } catch (_) {}
+    return geoSignalsV1;
+  } catch (e) {
+    return {
+      version: 'geoSignalsV1',
+      generatedAt,
+      url: String(url || ''),
+      observed: {},
+      diagnostics: {
+        evaluateCount: 1,
+        jsBundleAnalysis: false,
+        resourceChunkScan: false
+      },
+      error: String(e && (e.message || e) || '')
+    };
+  }
+}
+
 function analyzeHtmlBasics(html) {
   const $ = cheerio.load(html || '');
   const title = $('head > title').text().trim();
@@ -3734,6 +3725,11 @@ console.log('[BOOT][MEMO]', JSON.stringify({
 
 app.get('/scrape', async (req, res) => {
   console.log('[TEST][SCRAPE_ENTRY] entered /scrape');
+  logSf('SCRAPE_ENTER', {
+    url: req && req.query ? String(req.query.url || '').slice(0, 180) : '',
+    nocache: req && req.query ? req.query.nocache || null : null
+  });
+  logSfMemory('scrape_enter_route');
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
   return queue.add(() => scrapeOnce(req, res)).catch(err => {
     if (!res.headersSent) {
@@ -3747,6 +3743,15 @@ async function scrapeOnce(req, res) {
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
+  const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
+
+  logSf('SCRAPE_ENTER', {
+    stage: 'scrapeOnce',
+    url: String(urlToFetch || '').slice(0, 180),
+    nocache: noCache,
+    signalsOnly
+  });
+  logSfMemory('scrape_enter');
 
   if (!urlToFetch) return res.status(400).json({ error: 'URL parameter "url" is required.' });
 
@@ -3846,34 +3851,21 @@ async function scrapeOnce(req, res) {
   };
 
   try {
-    console.log('[PW][BOOTSTRAP_ENTER]');
     const __timingBrowserStart = Date.now();
-    console.log('[PW][BEFORE_CHROMIUM_LAUNCH]');
-    const __chromiumLaunchStart = Date.now();
-    console.log('[PW][CHROMIUM_LAUNCH_START]');
-    try {
-      browser = await chromium.launch({
-        headless: true,
-        // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-software-rasterizer',
-          '--no-zygote',
-          '--no-first-run',
-          '--no-default-browser-check'
-        ]
-      });
-      console.log('[PW][CHROMIUM_LAUNCH_OK]');
-    } catch (err) {
-      console.log('[PW][CHROMIUM_LAUNCH_ERR]', err && err.message ? err.message : String(err));
-      throw err;
-    } finally {
-      console.log('[PW][CHROMIUM_LAUNCH_MS]', Date.now() - __chromiumLaunchStart);
-    }
-    console.log('[PW][AFTER_CHROMIUM_LAUNCH]');
+    browser = await chromium.launch({
+      headless: true,
+      // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
 
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -3885,10 +3877,8 @@ async function scrapeOnce(req, res) {
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
-    console.log('[PW][AFTER_CONTEXT]');
 
     page = await context.newPage();
-    console.log('[PW][AFTER_PAGE]');
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
@@ -3897,62 +3887,61 @@ async function scrapeOnce(req, res) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
-    console.log('[PW][AFTER_INIT_SCRIPT]');
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
 
     // ---- 主要待機（軽め） ----
     const __timingInitialWaitStart = Date.now();
-    let resp = null;
-    try {
-      console.log('[PW][BEFORE_GOTO]');
-      resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      console.log('[PW][AFTER_GOTO]');
-      await Promise.race([
-        page.waitForResponse(r => {
-          const u = r.url();
-          return u.endsWith('.js') || u.includes('firestore.googleapis.com');
-        }, { timeout: 20_000 }).catch(()=>null),
-        page.waitForTimeout(20_000)
-      ]);
-      console.log('[PW][BEFORE_NETWORK_IDLE_WAIT]');
-      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
-      console.log('[PW][AFTER_NETWORK_IDLE_WAIT]');
-      const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
-      console.log('[PW][BEFORE_EXTRA_WAIT]');
-      await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
+    logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
+    logSfMemory('before_goto');
+    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    logSf('AFTER_GOTO', {
+      status: resp && typeof resp.status === 'function' ? resp.status() : null,
+      finalUrl: page && typeof page.url === 'function' ? page.url() : null
+    });
+    logSfMemory('after_goto');
+    await Promise.race([
+      page.waitForResponse(r => {
+        const u = r.url();
+        return u.endsWith('.js') || u.includes('firestore.googleapis.com');
+      }, { timeout: 20_000 }).catch(()=>null),
+      page.waitForTimeout(20_000)
+    ]);
+    await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(()=>{});
+    const appSelector = 'main, #app, #__next, #__nuxt, [data-v-app], [data-reactroot], app-index';
+    await page.waitForSelector(appSelector, { state: 'attached', timeout: 10_000 }).catch(()=>{});
 
-      // === ここから追記（本文長しきい値で待機）===
-      await page.waitForFunction(() => {
-        const hasHeader = !!document.querySelector('header,[role="banner"]');
-        const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
-        const hasMain   = !!document.querySelector('main,[role="main"]');
-        return hasHeader || hasFooter || hasMain;
-      }, { timeout: 8000 }).catch(()=>{});
+    // === ここから追記（本文長しきい値で待機）===
+    await page.waitForFunction(() => {
+      const hasHeader = !!document.querySelector('header,[role="banner"]');
+      const hasFooter = !!document.querySelector('footer,[role="contentinfo"]');
+      const hasMain   = !!document.querySelector('main,[role="main"]');
+      return hasHeader || hasFooter || hasMain;
+    }, { timeout: 8000 }).catch(()=>{});
 
-      // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
-      await page.waitForFunction(() => {
-        const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
-        return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
-      }, { timeout: 8000 }).catch(()=>{});
-      console.log('[PW][AFTER_EXTRA_WAIT]');
-    } catch (err) {
-      console.log('[PW][GOTO_OR_WAIT_ERR]', err && err.message ? err.message : String(err));
-      throw err;
-    }
+    // ---- dt/th に「設立|創業」が現れるまで最大 8 秒待つ（柔らかく）----
+    await page.waitForFunction(() => {
+      const nodes = Array.from(document.querySelectorAll('dl dt, table th'));
+      return nodes.some(n => /設立|創業/.test((n.textContent || '').trim()));
+    }, { timeout: 8000 }).catch(()=>{});
     addScrapeSpan('initial_goto_and_waits', __timingInitialWaitStart);
 
     const __timingEnrichedStart = Date.now();
-    console.log('[PW][BEFORE_ENRICHED_OBS]');
+    logSf('BEFORE_COLLECT_ENRICHED');
+    logSfMemory('before_collect_enriched');
     const enrichedObservations = await collectEnrichedObservations(page, urlToFetch);
-    console.log('[PW][AFTER_ENRICHED_OBS]');
     addScrapeSpan('collectEnrichedObservations', __timingEnrichedStart);
+    logSf('AFTER_COLLECT_ENRICHED', {
+      keys: enrichedObservations && typeof enrichedObservations === 'object'
+        ? Object.keys(enrichedObservations).length
+        : 0
+    });
+    logSfMemory('after_collect_enriched');
 
     // === 観測拡張 v1（HTTPヘッダ / nav DOM / アンカーテキスト / 見出し） ===
     const obs = {};
 
     // --- HTTP headers (main document only) ---
     const __timingDomTextStart = Date.now();
-    console.log('[PW][BEFORE_SHADOW_TEXT]');
     try{
       const h = (resp && typeof resp.allHeaders === 'function')
         ? await resp.allHeaders()
@@ -4111,7 +4100,6 @@ async function scrapeOnce(req, res) {
     // ここで obs を返却payloadに合流させる（下流が壊れない場所に）
 
     // ---- DOMテキスト（空でもOK）----
-    console.log('[PW][BEFORE_BODY_TEXT]');
     const [innerText, docText] = await Promise.all([
       page.evaluate(() => document.body?.innerText || '').catch(()=> ''),
       page.evaluate(() => document.documentElement?.innerText || '').catch(()=> '')
@@ -4155,9 +4143,7 @@ async function scrapeOnce(req, res) {
   const renderedText = (deepText && deepText.replace(/\s+/g,'').length > 120)
     ? deepText
     : (innerText || docText || '');
-  console.log('[PW][AFTER_BODY_TEXT]');
   addScrapeSpan('dom_shadow_text_extract', __timingDomTextStart);
-  console.log('[PW][AFTER_SHADOW_TEXT]');
 
   // --- トップと /about の JSON-LD を比較 ---
   const __timingTopAboutSameStart = Date.now();
@@ -4192,8 +4178,11 @@ async function scrapeOnce(req, res) {
 
     // ---- HTMLソース（タグあり）----
     // === ここから追加 ===
-    console.log('[PW][BEFORE_CONTENT]');
+    logSf('BEFORE_CONTENT');
+    logSfMemory('before_content');
     const htmlSource = await page.content().catch(() => '');
+    logSf('AFTER_CONTENT', { htmlLength: typeof htmlSource === 'string' ? htmlSource.length : 0 });
+    logSfMemory('after_content');
 
     const shadowNavHtml = await page.evaluate(() => {
       const out = [];
@@ -4231,7 +4220,6 @@ async function scrapeOnce(req, res) {
     const payloadHtml = shadowNavHtml
       ? htmlSource + '\n<!-- shadow-nav-fragments -->\n' + shadowNavHtml
       : htmlSource;
-    console.log('[PW][AFTER_CONTENT]');
     // === ここまで追加 ===
 
     // ---- 設立（STRICT: DOM/HTML 構造のみ）----
@@ -4311,7 +4299,6 @@ async function scrapeOnce(req, res) {
     const jsUrls = uniq([...(scriptSrcs||[]), ...(preloadHrefs||[])]).map(abs).filter(Boolean);
 
     // --- ページで読み込まれたリソース一覧から JSON 系も拾う（電話/住所/同社SNSのみに使用）---
-    console.log('[PW][BEFORE_RESOURCE_TAPS]');
     const resourceUrls = await page.evaluate(() => {
       try {
         return performance.getEntriesByType('resource')
@@ -4349,6 +4336,8 @@ async function scrapeOnce(req, res) {
 
     // --- リソース由来の JSON（電話/住所/同社SNSのみに使用）---
     const __timingJsonTapStart = Date.now();
+    logSf('BEFORE_RESOURCE_TAP', { type: 'json', count: Array.isArray(jsonToTap) ? jsonToTap.length : 0 });
+    logSfMemory('before_resource_json_tap');
     for (const u of jsonToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 10000 });
@@ -4389,6 +4378,8 @@ async function scrapeOnce(req, res) {
       } catch {}
     }
     addScrapeSpan('resource_json_tap', __timingJsonTapStart);
+    logSf('AFTER_RESOURCE_TAP', { type: 'json' });
+    logSfMemory('after_resource_json_tap');
 
     // ページが教えてくれたJS候補 + 典型的なエントリ
     const jsToTap = uniq([
@@ -4398,6 +4389,8 @@ async function scrapeOnce(req, res) {
 
     // ---- JS/JSON 本文を取得して抽出（※設立は見ない）----
     const __timingJsTapStart = Date.now();
+    logSf('BEFORE_RESOURCE_JS_TAP', { count: Array.isArray(jsToTap) ? jsToTap.length : 0 });
+    logSfMemory('before_resource_js_tap');
     for (const u of jsToTap) {
       try {
         const resp = await page.request.get(u, { timeout: 20_000 });
@@ -4465,10 +4458,13 @@ async function scrapeOnce(req, res) {
       } catch(_) {}
     }
     addScrapeSpan('resource_js_tap', __timingJsTapStart);
-    console.log('[PW][AFTER_RESOURCE_TAPS]');
+    logSf('AFTER_RESOURCE_JS_TAP', { tappedCount: Array.isArray(tappedUrls) ? tappedUrls.length : 0 });
+    logSfMemory('after_resource_js_tap');
 
     // -------- 2nd pass: app-index.js が参照する chunk-*.js を最大 8 本だけ追撃（※設立は見ない）--------
     const __timingChunkTapStart = Date.now();
+    logSf('BEFORE_CHUNK_TAP');
+    logSfMemory('before_chunk_tap');
     try {
       const extraChunkUrls = new Set();
       for (const t of tappedAppIndexBodies) {
@@ -4529,6 +4525,8 @@ async function scrapeOnce(req, res) {
     } catch {}
     // -------- 2nd pass end --------
     addScrapeSpan('chunk_tap', __timingChunkTapStart);
+    logSf('AFTER_CHUNK_TAP');
+    logSfMemory('after_chunk_tap');
 
     // ---- 整理 & 採用値の決定 ----
     const phones = uniq(bundlePhones);
@@ -4577,7 +4575,6 @@ async function scrapeOnce(req, res) {
 
     // === JSON-LD の実出現をピンポイント待機（最大 20 秒に延長） ===
     const __timingJsonLdProbeStart = Date.now();
-    console.log('[PW][BEFORE_JSONLD_PROBE]');
     await page.waitForFunction(() => {
       return !!document.querySelector('script[type="application/ld+json" i]');
     }, { timeout: 20000 }).catch(()=>{}); // ← 12s→20s に延長
@@ -4627,7 +4624,6 @@ async function scrapeOnce(req, res) {
       }
     } catch (_) {}
     addScrapeSpan('jsonld_wait_probe', __timingJsonLdProbeStart);
-    console.log('[PW][AFTER_JSONLD_PROBE]');
 
     // === Fallback（コピーライト）：CSR前でも静的/レンダ済みから検知 ===
     try {
@@ -4683,6 +4679,8 @@ async function scrapeOnce(req, res) {
     let subPagesVNext = [];
     let publisherInfo = null;
     const __timingSubpagesStart = Date.now();
+    logSf('BEFORE_SUBPAGES', { enabled: !!ENABLE_SUBPAGES_VNEXT });
+    logSfMemory('before_subpages');
     if (ENABLE_SUBPAGES_VNEXT) {
       if (typeof buildSubPagesVNext_V1_ === 'function') {
         subPagesVNext = await buildSubPagesVNext_V1_(page, responseOrigin, scrapeTiming.subpagesVNextDecision);
@@ -4715,6 +4713,8 @@ async function scrapeOnce(req, res) {
       }));
     }
     addScrapeSpan('subpages_vnext', __timingSubpagesStart);
+    logSf('AFTER_SUBPAGES', { count: Array.isArray(subPagesVNext) ? subPagesVNext.length : 0 });
+    logSfMemory('after_subpages');
     try {
       if (scrapeTiming.subpagesVNextDecision && !scrapeTiming.subpagesVNextDecision.elapsedMs) {
         scrapeTiming.subpagesVNextDecision.elapsedMs = Math.max(0, Date.now() - __timingSubpagesStart);
@@ -4751,7 +4751,8 @@ async function scrapeOnce(req, res) {
       permissionsPolicy: !!(securityHeaders && securityHeaders.permissionsPolicy)
     }));
 
-    console.log('[PW][BEFORE_STRUCTURED_JSONLD]');
+    logSf('BEFORE_STRUCTURED_JSONLD');
+    logSfMemory('before_structured_jsonld');
     structured.jsonld = await page.evaluate(() => {
       var nodes = [];
 
@@ -4820,11 +4821,9 @@ async function scrapeOnce(req, res) {
       });
 
       return nodes;
-    }).catch((err) => {
-      console.log('[PW][STRUCTURED_JSONLD_ERR]', err && err.message ? err.message : String(err));
-      return [];
-    });
-    console.log('[PW][AFTER_STRUCTURED_JSONLD]');
+    }).catch(() => []);
+    logSf('AFTER_STRUCTURED_JSONLD', { count: Array.isArray(structured.jsonld) ? structured.jsonld.length : 0 });
+    logSfMemory('after_structured_jsonld');
 
     const jsonldSynth = [{
       "@context": "https://schema.org",
@@ -4872,24 +4871,32 @@ async function scrapeOnce(req, res) {
     let auditSig = null;
     const __timingAuditSigProbeStart = Date.now();
     try {
-      console.log('[PW][BEFORE_BUILD_AUDITSIG]');
+      logSf('BEFORE_AUDITSIG');
+      logSfMemory('before_auditsig');
       auditSig = await buildAuditSigFromPage(page);
-      console.log('[PW][AFTER_BUILD_AUDITSIG]');
-    } catch (e) {
-      console.log('[PW][BUILD_AUDITSIG_ERR]', e && e.message ? e.message : String(e));
+      logSf('AFTER_AUDITSIG', {
+        keys: auditSig && typeof auditSig === 'object' ? Object.keys(auditSig).length : 0
+      });
+      logSfMemory('after_auditsig');
+    } catch (_) {
       auditSig = null;  // 失敗しても全体は止めない
+      logSf('AFTER_AUDITSIG', { error: true });
+      logSfMemory('after_auditsig_error');
     }
     addScrapeSpan('jsonld_wait_probe', __timingAuditSigProbeStart);
 
     let productSpecComparisonSignals = null;
     try {
-      console.log('[PW][BEFORE_PRODUCT_SPEC]');
       console.log('[PW][PRODUCT_SPEC_SENTINEL]', JSON.stringify({
         phase: 'before_collect',
         hasAuditSig: !!auditSig,
         auditSigKeys: Object.keys(auditSig || {}).slice(0, 20)
       }));
+      logSf('BEFORE_PRODUCT_SPEC');
+      logSfMemory('before_product_spec');
       productSpecComparisonSignals = await collectProductSpecComparisonSignals(page, jsonldForFlags);
+      logSf('AFTER_PRODUCT_SPEC', { ok: !!productSpecComparisonSignals });
+      logSfMemory('after_product_spec');
       if (auditSig && typeof auditSig === 'object' && productSpecComparisonSignals) {
         auditSig.productSpecComparisonSignals = productSpecComparisonSignals;
       }
@@ -4901,27 +4908,30 @@ async function scrapeOnce(req, res) {
         hasComparisonReadyShape: productSpecComparisonSignals && productSpecComparisonSignals.hasComparisonReadyShape,
         evidenceSources: productSpecComparisonSignals && productSpecComparisonSignals.evidenceSources
       }));
-      console.log('[PW][AFTER_PRODUCT_SPEC]');
     } catch (e) {
       productSpecComparisonSignals = null;
-      console.log('[PW][PRODUCT_SPEC_ERR]', e && e.message ? e.message : String(e));
+      logSf('AFTER_PRODUCT_SPEC', { error: true, message: String(e && e.message || e).slice(0, 180) });
+      logSfMemory('after_product_spec_error');
       console.log('[PW][PRODUCT_SPEC_COMPARISON_SIGNALS][ERR]', String(e && (e.stack || e.message || e)));
     }
 
     let multimodalSignals = null;
     const __timingMultimodalSignalStart = Date.now();
     try {
-      console.log('[PW][BEFORE_MULTIMODAL]');
+      logSf('BEFORE_MULTIMODAL');
+      logSfMemory('before_multimodal');
       multimodalSignals = await collectMultimodalSignals(page, jsonldForFlags);
+      logSf('AFTER_MULTIMODAL', { checked: !!(multimodalSignals && multimodalSignals.checked) });
+      logSfMemory('after_multimodal');
       if (auditSig && typeof auditSig === 'object') {
         auditSig.multimodalSignals = multimodalSignals;
       }
       if (enrichedObservations && typeof enrichedObservations === 'object') {
         enrichedObservations.multimodalSignals = multimodalSignals;
       }
-      console.log('[PW][AFTER_MULTIMODAL]');
     } catch (e) {
-      console.log('[PW][MULTIMODAL_ERR]', e && e.message ? e.message : String(e));
+      logSf('AFTER_MULTIMODAL', { error: true, message: String(e && e.message || e).slice(0, 180) });
+      logSfMemory('after_multimodal_error');
       multimodalSignals = {
         checked: false,
         source: 'top_dom_head_meta_jsonld',
@@ -4963,11 +4973,15 @@ async function scrapeOnce(req, res) {
     }
 
   // ★ coverage ナビフラグ：/about やトップのHTMLを優先しつつ検出
-  console.log('[PW][BEFORE_COVERAGE_NAV]');
+  logSf('BEFORE_COVERAGE_NAV');
+  logSfMemory('before_coverage_nav');
   const coverageNav = detectCoverageNavFromHtmlNode(
     topHtml || htmlSource || scoringHtml || bodyText
   );
-  console.log('[PW][AFTER_COVERAGE_NAV]');
+  logSf('AFTER_COVERAGE_NAV', {
+    keys: coverageNav && typeof coverageNav === 'object' ? Object.keys(coverageNav).length : 0
+  });
+  logSfMemory('after_coverage_nav');
 
   // ★ 追加：auditSig にも載せる（GAS 側で auditSig.coverageNav を参照できるように）
   if (auditSig && typeof auditSig === 'object') auditSig.coverageNav = coverageNav;
@@ -4975,7 +4989,8 @@ async function scrapeOnce(req, res) {
   // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
   let hasSitemapXml = false;
   try {
-    console.log('[PW][BEFORE_SITEMAP_CHECK]');
+    logSf('BEFORE_SITEMAP_CHECK');
+    logSfMemory('before_sitemap_check');
     let origin = null;
     try {
       origin = new URL(urlToFetch).origin;
@@ -5007,15 +5022,18 @@ async function scrapeOnce(req, res) {
     if (auditSig && typeof auditSig === 'object') {
       auditSig.hasSitemapXml = hasSitemapXml;
     }
-    console.log('[PW][AFTER_SITEMAP_CHECK]');
-  } catch (e) {
-    console.log('[PW][SITEMAP_CHECK_ERR]', e && e.message ? e.message : String(e));
+    logSf('AFTER_SITEMAP_CHECK', { hasSitemapXml });
+    logSfMemory('after_sitemap_check');
+  } catch (_) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
+    logSf('AFTER_SITEMAP_CHECK', { error: true });
+    logSfMemory('after_sitemap_check_error');
   }
 
   const __timingResponsePayloadStart = Date.now();
   const __timingHeadingExtractStart = Date.now();
-  console.log('[PW][BEFORE_HEADING_EXTRACT]');
+  logSf('BEFORE_HEADING_EXTRACT');
+  logSfMemory('before_heading_extract');
   const headingTexts = await page.evaluate(() => {
     function collect(root) {
       const out = [];
@@ -5039,8 +5057,9 @@ async function scrapeOnce(req, res) {
       .map(n => (n.innerText || '').trim())
       .filter(t => t.length > 0);
   }).catch(() => []);
-  console.log('[PW][AFTER_HEADING_EXTRACT]');
   addResponsePayloadSpan('heading_extract', __timingHeadingExtractStart);
+  logSf('AFTER_HEADING_EXTRACT', { count: Array.isArray(headingTexts) ? headingTexts.length : 0 });
+  logSfMemory('after_heading_extract');
 
   console.log('[PW][HEADINGS_RAW]', {
     count: headingTexts ? headingTexts.length : null,
@@ -5048,7 +5067,8 @@ async function scrapeOnce(req, res) {
   });
 
   const __timingPrimaryHeadingExtractStart = Date.now();
-  console.log('[PW][BEFORE_PRIMARY_HEADING]');
+  logSf('BEFORE_PRIMARY_HEADING');
+  logSfMemory('before_primary_heading');
   const primaryHeadingText = await page.evaluate(() => {
     function textOf(el) {
       return String((el && (el.innerText || el.textContent)) || '').trim();
@@ -5106,8 +5126,9 @@ async function scrapeOnce(req, res) {
 
     return pickHeading(document);
   }).catch(() => '');
-  console.log('[PW][AFTER_PRIMARY_HEADING]');
   addResponsePayloadSpan('primary_heading_extract', __timingPrimaryHeadingExtractStart);
+  logSf('AFTER_PRIMARY_HEADING', { length: primaryHeadingText ? primaryHeadingText.length : 0 });
+  logSfMemory('after_primary_heading');
 
   console.log('[PW][PRIMARY_HEADING]', {
     text: primaryHeadingText || '',
@@ -5279,81 +5300,19 @@ async function scrapeOnce(req, res) {
   }
 
   const __timingBodyTextCandidatesExtractStart = Date.now();
-  console.log('[PW][BEFORE_BODY_CANDIDATES]');
-  let bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
-  console.log('[PW][AFTER_BODY_CANDIDATES]');
+  logSf('BEFORE_BODY_CANDIDATES');
+  logSfMemory('before_body_candidates');
+  const bodyTextCandidates = await getBodyTextCandidates(page).catch(() => []);
   addResponsePayloadSpan('body_text_candidates_extract', __timingBodyTextCandidatesExtractStart);
+  logSf('AFTER_BODY_CANDIDATES', { count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0 });
+  logSfMemory('after_body_candidates');
   const __timingPrimaryMessageExtractStart = Date.now();
-  console.log('[PW][BEFORE_PRIMARY_MESSAGE]');
+  logSf('BEFORE_PRIMARY_MESSAGE');
+  logSfMemory('before_primary_message');
   const primaryMessageText = await getPrimaryMessageText(page).catch(() => null);
-  console.log('[PW][AFTER_PRIMARY_MESSAGE]');
   addResponsePayloadSpan('primary_message_extract', __timingPrimaryMessageExtractStart);
-
-  const __timingLiveDomSignalsStart = Date.now();
-  const liveDomSignals = await collectLiveDomLightweightSignals(page).catch((e) => ({
-    checked: false,
-    source: 'live_dom_lightweight_v1',
-    errorMessage: String(e && (e.stack || e.message || e) || '').slice(0, 500)
-  }));
-  addScrapeSpan('live_dom_signal_collect', __timingLiveDomSignalsStart);
-
-  const liveTextFallback = liveDomSignals && liveDomSignals.text && Array.isArray(liveDomSignals.text.bodyTextCandidatesFallback)
-    ? liveDomSignals.text.bodyTextCandidatesFallback
-    : [];
-  if (Array.isArray(liveTextFallback) && liveTextFallback.length && (!Array.isArray(bodyTextCandidates) || bodyTextCandidates.length < 5)) {
-    const seenBody = new Set((Array.isArray(bodyTextCandidates) ? bodyTextCandidates : []).map(v => String(v || '').trim()).filter(Boolean));
-    const mergedBody = Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : [];
-    for (const cand of liveTextFallback) {
-      const t = String(cand || '').replace(/\s+/g, ' ').trim();
-      if (!t || seenBody.has(t)) continue;
-      seenBody.add(t);
-      mergedBody.push(t);
-      if (mergedBody.length >= 5) break;
-    }
-    bodyTextCandidates = mergedBody;
-  }
-
-  const liveCoverageNav = liveDomSignals && liveDomSignals.coverageNav && typeof liveDomSignals.coverageNav === 'object'
-    ? liveDomSignals.coverageNav
-    : null;
-  const liveTrustLinks = liveDomSignals && liveDomSignals.trustLinks && typeof liveDomSignals.trustLinks === 'object'
-    ? liveDomSignals.trustLinks
-    : null;
-  const liveNavLinkTexts = liveDomSignals && Array.isArray(liveDomSignals.navLinkTexts)
-    ? liveDomSignals.navLinkTexts.slice(0, 50)
-    : [];
-  const mergeCoverageFlag = (base, live) => {
-    if (base === true || live === true) return true;
-    if (base === false || live === false) return false;
-    return null;
-  };
-  const mergedCoverageNav = {
-    hasCompanyNav: mergeCoverageFlag(coverageNav && coverageNav.hasCompanyNav, liveCoverageNav && liveCoverageNav.hasCompanyNav),
-    hasServiceNav: mergeCoverageFlag(coverageNav && coverageNav.hasServiceNav, liveCoverageNav && liveCoverageNav.hasServiceNav),
-    hasContactNav: mergeCoverageFlag(coverageNav && coverageNav.hasContactNav, liveCoverageNav && liveCoverageNav.hasContactNav),
-    hasFaqNav: mergeCoverageFlag(coverageNav && coverageNav.hasFaqNav, liveCoverageNav && liveCoverageNav.hasFaqNav),
-    matchedLabels: liveCoverageNav && Array.isArray(liveCoverageNav.matchedLabels) ? liveCoverageNav.matchedLabels.slice(0, 20) : [],
-    matchedHrefs: liveCoverageNav && Array.isArray(liveCoverageNav.matchedHrefs) ? liveCoverageNav.matchedHrefs.slice(0, 10) : []
-  };
-
-  console.log('[PW][LIVE_DOM_SIGNALS]', JSON.stringify({
-    navLinkTextsCount: liveNavLinkTexts.length,
-    allAnchorCount: liveDomSignals && typeof liveDomSignals.allAnchorCount === 'number' ? liveDomSignals.allAnchorCount : null,
-    navAnchorCount: liveDomSignals && typeof liveDomSignals.navAnchorCount === 'number' ? liveDomSignals.navAnchorCount : null,
-    headerAnchorCount: liveDomSignals && typeof liveDomSignals.headerAnchorCount === 'number' ? liveDomSignals.headerAnchorCount : null,
-    footerAnchorCount: liveDomSignals && typeof liveDomSignals.footerAnchorCount === 'number' ? liveDomSignals.footerAnchorCount : null,
-    roleNavigationCount: liveDomSignals && typeof liveDomSignals.roleNavigationCount === 'number' ? liveDomSignals.roleNavigationCount : null,
-    coverageNav: mergedCoverageNav,
-    trustLinks: {
-      hasPrivacyPolicyLink: !!(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink),
-      hasLegalLink: !!(liveTrustLinks && liveTrustLinks.hasLegalLink),
-      hasTermsLink: !!(liveTrustLinks && liveTrustLinks.hasTermsLink),
-      hasContactLink: !!(liveTrustLinks && liveTrustLinks.hasContactLink)
-    },
-    bodyTextCandidatesFallbackCount: liveTextFallback.length,
-    renderedTextLength: liveDomSignals && liveDomSignals.text ? liveDomSignals.text.renderedTextLength : null,
-    mainTextLength: liveDomSignals && liveDomSignals.text ? liveDomSignals.text.mainTextLength : null
-  }));
+  logSf('AFTER_PRIMARY_MESSAGE', { length: primaryMessageText ? primaryMessageText.length : 0 });
+  logSfMemory('after_primary_message');
 
   console.log('[PW][BODY_TEXT_CANDIDATES]', JSON.stringify({
     count: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.length : 0,
@@ -5386,10 +5345,21 @@ async function scrapeOnce(req, res) {
     sample: Array.isArray(bodyTextCandidates) ? bodyTextCandidates.slice(0, 5) : []
   }));
 
+  logSf('BEFORE_GEO_SIGNALS');
+  logSfMemory('before_geo_signals');
+  const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+  logSf('AFTER_GEO_SIGNALS', {
+    hasGeoSignals: !!geoSignalsV1,
+    error: geoSignalsV1 && geoSignalsV1.error ? true : false
+  });
+  logSfMemory('after_geo_signals');
+
+  logSf('BEFORE_RESPONSE_PAYLOAD');
+  logSfMemory('before_response_payload');
   const __timingResponseObjectAssemblyStart = Date.now();
-  console.log('[PW][BEFORE_PAYLOAD_BUILD]');
   const responsePayload = {
     url: urlToFetch,
+    geoSignalsV1,
     enrichedObservations,
     responseHeaders: (obs.http && obs.http.responseHeaders) ? obs.http.responseHeaders : {
       'strict-transport-security': null,
@@ -5419,13 +5389,6 @@ async function scrapeOnce(req, res) {
     renderedText,
     headingTexts,
     bodyTextCandidates,
-    liveDomSignals,
-    navLinkTexts: liveNavLinkTexts,
-    coverageNav: mergedCoverageNav,
-    ...(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink === true ? { hasPrivacyPolicyLink: true } : {}),
-    ...(liveTrustLinks && liveTrustLinks.hasLegalLink === true ? { hasLegalLink: true } : {}),
-    ...(liveTrustLinks && liveTrustLinks.hasTermsLink === true ? { hasTermsLink: true } : {}),
-    ...(liveTrustLinks && liveTrustLinks.hasContactLink === true ? { hasContactLink: true } : {}),
 
     jsonld,
     structured,
@@ -5524,13 +5487,6 @@ async function scrapeOnce(req, res) {
       primaryHeadingText: primaryHeadingText,
       primaryMessageText: primaryMessageText,
       bodyTextCandidates: bodyTextCandidates,
-      navLinkTexts: liveNavLinkTexts,
-      coverageNav: mergedCoverageNav,
-      liveDomSignals,
-      ...(liveTrustLinks && liveTrustLinks.hasPrivacyPolicyLink === true ? { hasPrivacyPolicyLink: true } : {}),
-      ...(liveTrustLinks && liveTrustLinks.hasLegalLink === true ? { hasLegalLink: true } : {}),
-      ...(liveTrustLinks && liveTrustLinks.hasTermsLink === true ? { hasTermsLink: true } : {}),
-      ...(liveTrustLinks && liveTrustLinks.hasContactLink === true ? { hasContactLink: true } : {}),
       ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
       ...(multimodalSignals ? { multimodalSignals } : {})
     },
@@ -5594,7 +5550,6 @@ async function scrapeOnce(req, res) {
     }
   }; // ← ここで必ず閉じる！
   addResponsePayloadSpan('response_object_assembly', __timingResponseObjectAssemblyStart);
-  console.log('[PW][AFTER_PAYLOAD_BUILD]');
   try {
     scrapeTiming.payload_size_summary = {
       htmlLength: safeLength(responsePayload.html),
@@ -5624,8 +5579,12 @@ async function scrapeOnce(req, res) {
 
   // --- 追加: /scrape で採点も実施して返す ---
   const __timingBuildScoresStart = Date.now();
+  logSf('BEFORE_DATA_BUILD');
+  logSfMemory('before_data_build');
   const scoreBundle = buildScoresFromScrape(responsePayload); // 採点
   addResponsePayloadSpan('build_scores_from_scrape', __timingBuildScoresStart);
+  logSf('AFTER_DATA_BUILD', { hasScoreBundle: !!scoreBundle });
+  logSfMemory('after_data_build');
   const __timingOutputObjectAssemblyStart = Date.now();
   const out = { ...responsePayload, data: scoreBundle };      // data に採点結果を格納
   addResponsePayloadSpan('output_object_assembly', __timingOutputObjectAssemblyStart);
@@ -5664,14 +5623,43 @@ async function scrapeOnce(req, res) {
   }));
 
   // 正常終了
-  console.log('[PW][BEFORE_RESPONSE_SEND]');
-  const __responseSendResult = res.status(200).json(out);
-  console.log('[PW][AFTER_RESPONSE_SEND]');
-  return __responseSendResult;
+  logSf('BEFORE_RESPONSE_SEND', {
+    keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0
+  });
+  logSfMemory('before_response_send');
+  if (signalsOnly) {
+    logSf('SIGNALS_ONLY_RESPONSE', {
+      keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0
+    });
+    logSfMemory('signals_only_response');
+    return res.status(200).json({
+      ok: true,
+      mode: 'signalsOnly',
+      url: urlToFetch,
+      finalUrl: page && typeof page.url === 'function' ? page.url() : urlToFetch,
+      status: resp && typeof resp.status === 'function' ? resp.status() : null,
+      geoSignalsV1,
+      debug: {
+        keysCount: out && typeof out === 'object' ? Object.keys(out).length : 0,
+        hasHtml: Boolean(out && out.html),
+        htmlLength: String((out && out.html) || '').length,
+        hasBodyText: Boolean(out && out.bodyText),
+        bodyTextLength: String((out && out.bodyText) || '').length,
+        hasRenderedText: Boolean(out && out.renderedText),
+        renderedTextLength: String((out && out.renderedText) || '').length,
+        hasAuditSig: Boolean(out && out.auditSig),
+        hasData: Boolean(out && out.data)
+      }
+    });
+  }
+  return res.status(200).json(out);
 
   } catch (err) {
-    console.log('[PW][BOOTSTRAP_ERR]', err && err.message ? err.message : String(err));
-    console.log('[PW][SCRAPE_ERR]', err && err.message ? err.message : String(err));
+    logSf('SCRAPE_CATCH', {
+      name: err && err.name ? String(err.name).slice(0, 80) : '',
+      message: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240)
+    });
+    logSfMemory('scrape_catch');
     const elapsedMs = Date.now() - t0;
     return res.status(500).json({
       error: 'scrape failed',
@@ -5680,7 +5668,8 @@ async function scrapeOnce(req, res) {
       elapsedMs
     });
   } finally {
-    console.log('[PW][SCRAPE_FINALLY_ENTER]');
+    logSf('SCRAPE_FINALLY');
+    logSfMemory('scrape_finally');
     try {
       console.log('[PW][SCRAPE_TIMING]', JSON.stringify({
         url: safeTimingUrl(),
@@ -5697,7 +5686,6 @@ async function scrapeOnce(req, res) {
     try { if (page)    await page.close(); } catch(_) {}
     try { if (context) await context.close(); } catch(_) {}
     try { if (browser) await browser.close(); } catch(_) {}
-    console.log('[PW][SCRAPE_FINALLY_EXIT]');
   }
 }
 
