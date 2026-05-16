@@ -3745,7 +3745,9 @@ async function scrapeOnce(req, res) {
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
-  const probeMode = ['content', 'text', 'audit', 'data'].includes(probeModeRaw) ? probeModeRaw : '';
+  const probeMode = (probeModeRaw === 'resource-json' || probeModeRaw === 'resourcetap')
+    ? 'resourcejson'
+    : (['content', 'text', 'audit', 'data', 'resourcejson'].includes(probeModeRaw) ? probeModeRaw : '');
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
@@ -3990,6 +3992,77 @@ async function scrapeOnce(req, res) {
           };
           logSf('PROBE_AFTER_DATA', debug.dataSummary);
           logSfMemory('probe_after_data');
+        } else if (probeMode === 'resourcejson') {
+          logSf('PROBE_BEFORE_RESOURCE_JSON');
+          logSfMemory('probe_before_resource_json');
+          const resourceJsonSummary = {
+            stage: 'start',
+            candidateCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            sampleUrls: [],
+            sampleKeys: [],
+            maxBodyLength: 0
+          };
+          try {
+            resourceJsonSummary.stage = 'collect_resource_entries';
+            const probeResourceUrls = await page.evaluate(() => {
+              try {
+                return performance.getEntriesByType('resource')
+                  .map(e => e && e.name)
+                  .filter(Boolean);
+              } catch (_) {
+                return [];
+              }
+            }).catch(() => []);
+            const probeJsonUrls = uniq((Array.isArray(probeResourceUrls) ? probeResourceUrls : []).filter(u =>
+              /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(String(u || ''))
+            )).slice(0, 40);
+            resourceJsonSummary.candidateCount = probeJsonUrls.length;
+            resourceJsonSummary.sampleUrls = probeJsonUrls.slice(0, 10);
+            resourceJsonSummary.stage = 'fetch_json_candidates';
+            for (const u of probeJsonUrls) {
+              resourceJsonSummary.attemptedCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                if (!r.ok()) continue;
+                const body = await r.text();
+                const len = String(body || '').length;
+                resourceJsonSummary.okCount += 1;
+                resourceJsonSummary.totalBytes += len;
+                resourceJsonSummary.maxBodyLength = Math.max(resourceJsonSummary.maxBodyLength, len);
+                if (resourceJsonSummary.sampleKeys.length < 20) {
+                  try {
+                    const parsed = JSON.parse(body);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                      Object.keys(parsed).slice(0, 8).forEach(k => resourceJsonSummary.sampleKeys.push(k));
+                    } else if (Array.isArray(parsed)) {
+                      resourceJsonSummary.sampleKeys.push('[array]');
+                    }
+                  } catch (_) {}
+                }
+              } catch (_) {
+                resourceJsonSummary.errorCount += 1;
+              }
+            }
+            resourceJsonSummary.stage = 'done';
+          } catch (e) {
+            resourceJsonSummary.stage = 'error';
+            resourceJsonSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          resourceJsonSummary.sampleKeys = Array.from(new Set(resourceJsonSummary.sampleKeys)).slice(0, 20);
+          debug.resourceJsonSummary = resourceJsonSummary;
+          logSf('PROBE_AFTER_RESOURCE_JSON', {
+            stage: resourceJsonSummary.stage,
+            candidateCount: resourceJsonSummary.candidateCount,
+            attemptedCount: resourceJsonSummary.attemptedCount,
+            okCount: resourceJsonSummary.okCount,
+            totalBytes: resourceJsonSummary.totalBytes,
+            maxBodyLength: resourceJsonSummary.maxBodyLength
+          });
+          logSfMemory('probe_after_resource_json');
         }
         logSf('PROBE_SEND', { probe: probeMode });
         logSfMemory('probe_send');
