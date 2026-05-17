@@ -3688,6 +3688,55 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         };
         break;
       }
+      const mainLandmarkCandidate = {
+        mainLandmarkCandidateFound: false,
+        mainLandmarkCandidateSource: 'not_observed',
+        mainLandmarkCandidateConfidence: 'low',
+        mainLandmarkCandidateTextsSample: []
+      };
+      if (balancedMode && mainLandmark.hasMainLandmark !== true) {
+        const setMainCandidate = (source, confidence, nodes) => {
+          if (mainLandmarkCandidate.mainLandmarkCandidateFound) return;
+          const sample = limit((nodes || []).map((el) => clean(el && (el.innerText || el.textContent)).slice(0, 220)).filter((txt) => txt.length >= 40), 3);
+          if (!sample.length) return;
+          mainLandmarkCandidate.mainLandmarkCandidateFound = true;
+          mainLandmarkCandidate.mainLandmarkCandidateSource = source;
+          mainLandmarkCandidate.mainLandmarkCandidateConfidence = confidence;
+          mainLandmarkCandidate.mainLandmarkCandidateTextsSample = sample;
+        };
+        setMainCandidate('dom_app_root_candidate', 'medium', Array.from(document.querySelectorAll('#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]') || []));
+        if (!mainLandmarkCandidate.mainLandmarkCandidateFound) {
+          try {
+            const shadowCandidates = [];
+            const shadowRootTextSamples = [];
+            const walkShadowMain = (root, depth = 0) => {
+              if (!root || depth > 4 || shadowCandidates.length >= 8) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el || shadowCandidates.length >= 8) return;
+                if (el.matches && el.matches('main,[role="main"],#main,#content,#app,app-index,[id*="main" i],[id*="content" i]')) {
+                  shadowCandidates.push(el);
+                }
+                if (el.shadowRoot) {
+                  const rootText = clean(el.shadowRoot.textContent || '').slice(0, 220);
+                  if (rootText.length >= 80 && shadowRootTextSamples.length < 3) {
+                    shadowRootTextSamples.push(rootText);
+                  }
+                  walkShadowMain(el.shadowRoot, depth + 1);
+                }
+              });
+            };
+            walkShadowMain(document, 0);
+            setMainCandidate('open_shadow_dom_main_candidate', 'medium', shadowCandidates);
+            if (!mainLandmarkCandidate.mainLandmarkCandidateFound && shadowRootTextSamples.length) {
+              mainLandmarkCandidate.mainLandmarkCandidateFound = true;
+              mainLandmarkCandidate.mainLandmarkCandidateSource = 'open_shadow_dom_app_candidate';
+              mainLandmarkCandidate.mainLandmarkCandidateConfidence = 'low';
+              mainLandmarkCandidate.mainLandmarkCandidateTextsSample = shadowRootTextSamples;
+            }
+          } catch (_) {}
+        }
+      }
       const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
@@ -3845,7 +3894,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           chunkScanSkipped: true,
           parseErrorsCount
         },
-        landmarks: mainLandmark,
+        landmarks: Object.assign({}, mainLandmark, mainLandmarkCandidate),
         body: {
           textLength: bodyText.length,
           sample: bodyText.slice(0, 500)
@@ -3995,6 +4044,40 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const headingSource = headingSourceParts.length ? Array.from(new Set(headingSourceParts)).join('+') : 'not_observed';
     const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
     const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
+    const pickPrimaryHeadingCandidate = () => {
+      const sources = [
+        { texts: mergedH1, source: h1Source === 'not_observed' ? 'h1' : h1Source, confidence: 'high', h1Equivalent: false },
+        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium', h1Equivalent: true },
+        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium', h1Equivalent: true },
+        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium', h1Equivalent: true },
+        { texts: filteredShadowH2, source: 'open_shadow_dom_h2', confidence: 'medium', h1Equivalent: true },
+        { texts: filteredA11yH2, source: 'a11y_h2', confidence: 'medium', h1Equivalent: true },
+        { texts: filteredDomH2, source: 'dom_h2', confidence: 'low', h1Equivalent: true },
+        { texts: filteredShadowH3, source: 'open_shadow_dom_h3', confidence: 'low', h1Equivalent: true },
+        { texts: filteredA11yH3, source: 'a11y_h3', confidence: 'low', h1Equivalent: true },
+        { texts: filteredDomH3, source: 'dom_h3', confidence: 'low', h1Equivalent: true },
+        { texts: [observed.title], source: 'title', confidence: 'low', h1Equivalent: false },
+        { texts: [observed.metaDescription], source: 'meta_description', confidence: 'low', h1Equivalent: false }
+      ];
+      for (const item of sources) {
+        const text = uniqueHeadingTexts(item.texts, 1)[0];
+        if (!text || text.length < 2) continue;
+        return {
+          text,
+          source: item.source,
+          confidence: item.confidence,
+          h1Equivalent: !!item.h1Equivalent
+        };
+      }
+      return {
+        text: '',
+        source: 'not_observed',
+        confidence: 'low',
+        h1Equivalent: false
+      };
+    };
+    const primaryHeadingCandidate = pickPrimaryHeadingCandidate();
+    const h1EquivalentCandidateFound = mergedH1.length === 0 && !!(primaryHeadingCandidate.text && primaryHeadingCandidate.h1Equivalent);
     const domLandmarks = observed.landmarks && typeof observed.landmarks === 'object'
       ? observed.landmarks
       : {};
@@ -4024,6 +4107,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const mainLandmarkTextsSample = hasDomMain
       ? (Array.isArray(domLandmarks.mainLandmarkTextsSample) ? domLandmarks.mainLandmarkTextsSample.slice(0, 3) : [])
       : a11yMain.texts.slice(0, 3);
+    const mainLandmarkCandidateFound = domLandmarks.mainLandmarkCandidateFound === true;
+    const mainLandmarkCandidateSource = domLandmarks.mainLandmarkCandidateSource || 'not_observed';
+    const mainLandmarkCandidateConfidence = domLandmarks.mainLandmarkCandidateConfidence || 'low';
+    const mainLandmarkCandidateTextsSample = Array.isArray(domLandmarks.mainLandmarkCandidateTextsSample)
+      ? domLandmarks.mainLandmarkCandidateTextsSample.slice(0, 3)
+      : [];
     const hasMainLandmarkFinal = hasDomMain || hasA11yMain
       ? true
       : null;
@@ -4142,6 +4231,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasSingleH1: mergedH1.length === 1,
         h1Texts: mergedH1.slice(0, 5),
         headingTexts: headingTextsMerged,
+        primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+        primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+        primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+        h1EquivalentCandidateFound,
         source: headingSource,
         h1Source,
         headingObservationLimited,
@@ -4165,6 +4258,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         shadowH2Texts: filteredShadowH2.slice(0, 10),
         iframeSameOriginH1Texts: filteredIframeH1.slice(0, 5),
         iframeSameOriginH2Texts: filteredIframeH2.slice(0, 10),
+        primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+        primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+        primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+        h1EquivalentCandidateFound,
         boundedWaitMs: boundedHydrationWaitMs,
         hydration: {
           waitMs: Number(hydrationMetrics.waitMs || 0),
@@ -4221,6 +4318,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         mainLandmarkSource,
         mainLandmarkConfidence,
         mainLandmarkTextsSample,
+        mainLandmarkCandidateFound,
+        mainLandmarkCandidateSource,
+        mainLandmarkCandidateConfidence,
+        mainLandmarkCandidateTextsSample,
         mainLandmarkObservationLimited,
         a11yObserved: !!a11yMain.observed,
         a11yMainCount: a11yMain.count,
@@ -4261,6 +4362,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           h2: mergedH2.slice(0, 10),
           h3: mergedH3.slice(0, 10),
           headingTexts: headingTextsMerged,
+          primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+          primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+          primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+          h1EquivalentCandidateFound,
           source: headingSource,
           h1Source,
           headingObservationLimited,
@@ -4353,6 +4458,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           mainLandmarkSource,
           mainLandmarkConfidence,
           mainLandmarkTextsSample,
+          mainLandmarkCandidateFound,
+          mainLandmarkCandidateSource,
+          mainLandmarkCandidateConfidence,
+          mainLandmarkCandidateTextsSample,
           mainLandmarkObservationLimited,
           source: mainLandmarkSource,
           confidence: mainLandmarkConfidence
@@ -4384,6 +4493,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         appRootHeadingScan: !!balancedMode,
         heroHeadingScan: !!balancedMode,
         iframeHeadingScan: !!balancedMode,
+        primaryHeadingScan: !!balancedMode,
+        shadowPrimaryHeadingScan: !!balancedMode,
+        mainCandidateScan: !!balancedMode,
         htmlContentLdJsonScan: !!balancedMode
       }
     };
@@ -5925,12 +6037,20 @@ async function scrapeOnce(req, res) {
         h2Count: Array.isArray(headingsObserved.h2) ? headingsObserved.h2.length : 0,
         h1Source: topHeadingsObserved.h1Source || (observed.h1 && observed.h1.source) || null,
         headingSource: topHeadingsObserved.source || headingsObserved.source || null,
+        primaryHeadingCandidate: topHeadingsObserved.primaryHeadingCandidate || headingsObserved.primaryHeadingCandidate || null,
+        primaryHeadingCandidateSource: topHeadingsObserved.primaryHeadingCandidateSource || headingsObserved.primaryHeadingCandidateSource || null,
+        primaryHeadingConfidence: topHeadingsObserved.primaryHeadingConfidence || headingsObserved.primaryHeadingConfidence || null,
+        h1EquivalentCandidateFound: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'h1EquivalentCandidateFound')
+          ? topHeadingsObserved.h1EquivalentCandidateFound
+          : (Object.prototype.hasOwnProperty.call(headingsObserved, 'h1EquivalentCandidateFound') ? headingsObserved.h1EquivalentCandidateFound : null),
         headingObservationLimited: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'headingObservationLimited')
           ? topHeadingsObserved.headingObservationLimited
           : !!(observed.h1 && observed.h1.headingObservationLimited),
         hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark') ? landmarksObserved.hasMainLandmark : null,
         hasMainLandmarkFinal: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark_final') ? landmarksObserved.hasMainLandmark_final : null,
         mainLandmarkSource: landmarksObserved.mainLandmarkSource || null,
+        mainLandmarkCandidateFound: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkCandidateFound') ? landmarksObserved.mainLandmarkCandidateFound : null,
+        mainLandmarkCandidateSource: landmarksObserved.mainLandmarkCandidateSource || null,
         mainLandmarkObservationLimited: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkObservationLimited')
           ? landmarksObserved.mainLandmarkObservationLimited
           : true,
@@ -6005,6 +6125,9 @@ async function scrapeOnce(req, res) {
         appRootHeadingScan: !!signalsFirstBalanced,
         heroHeadingScan: !!signalsFirstBalanced,
         iframeHeadingScan: !!signalsFirstBalanced,
+        primaryHeadingScan: !!signalsFirstBalanced,
+        shadowPrimaryHeadingScan: !!signalsFirstBalanced,
+        mainCandidateScan: !!signalsFirstBalanced,
         htmlContentLdJsonScan: !!signalsFirstBalanced
       };
       const memoryHints = {
@@ -6031,6 +6154,10 @@ async function scrapeOnce(req, res) {
         hasMainLandmark: lightweightSummary.hasMainLandmarkFinal,
         h1Source: lightweightSummary.h1Source,
         headingObservationLimited: lightweightSummary.headingObservationLimited,
+        primaryHeadingCandidate: lightweightSummary.primaryHeadingCandidate,
+        primaryHeadingCandidateSource: lightweightSummary.primaryHeadingCandidateSource,
+        h1EquivalentCandidateFound: lightweightSummary.h1EquivalentCandidateFound,
+        mainLandmarkCandidateFound: lightweightSummary.mainLandmarkCandidateFound,
         jsonldCount: lightweightSummary.jsonldCount,
         navLinkCount: lightweightSummary.navLinkCount,
         bodyTextLength: lightweightSummary.bodyTextLength
