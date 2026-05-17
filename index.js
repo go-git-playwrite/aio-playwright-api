@@ -3373,6 +3373,12 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
     appIndexDetected: false,
     totalFetchedBytes: 0,
     maxScriptLength: 0,
+    contactPathFound: null,
+    contactPathSample: '',
+    companyPathFound: null,
+    companyPathSample: '',
+    privacyPathFound: null,
+    privacyPathSample: '',
     error: null
   };
   try {
@@ -3409,6 +3415,11 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
       appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || '')))
     });
     const types = [];
+    let scannedScriptForTrust = false;
+    const pickTrustSample = (text, re) => {
+      const match = String(text || '').match(re);
+      return match ? String(match[0] || '').replace(/^["']+|["']+$/g, '').slice(0, 120) : '';
+    };
     for (const scriptUrl of sameOriginScripts.slice(0, MAX_SCRIPTS)) {
       try {
         const r = await page.request.get(scriptUrl, { timeout: 10000 });
@@ -3427,6 +3438,19 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
           continue;
         }
         out.fetchedCount += 1;
+        scannedScriptForTrust = true;
+        if (out.contactPathFound !== true && /(?:\/|["'])?(contact|contacts|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート)(?:\/|["']|$)/i.test(text)) {
+          out.contactPathFound = true;
+          out.contactPathSample = out.contactPathSample || pickTrustSample(text, /(?:\/|["'])?(contact|contacts|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート)(?:\/|["']|$)/i);
+        }
+        if (out.companyPathFound !== true && /(?:\/|["'])?(company|about|corporate|profile|会社情報|会社概要|企業情報)(?:\/|["']|$)/i.test(text)) {
+          out.companyPathFound = true;
+          out.companyPathSample = out.companyPathSample || pickTrustSample(text, /(?:\/|["'])?(company|about|corporate|profile|会社情報|会社概要|企業情報)(?:\/|["']|$)/i);
+        }
+        if (out.privacyPathFound !== true && /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i.test(text)) {
+          out.privacyPathFound = true;
+          out.privacyPathSample = out.privacyPathSample || pickTrustSample(text, /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i);
+        }
         const hasContext = /@context|\\"@context\\"/.test(text);
         const hasType = /@type|\\"@type\\"/.test(text);
         const hasSchemaOrg = /schema\.org/i.test(text);
@@ -3445,6 +3469,11 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
     out.hasOrganization = out.hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false;
     out.hasBreadcrumbList = out.hasJsonLd ? typeSet.has('breadcrumblist') : false;
     out.hasFAQPage = out.hasJsonLd ? typeSet.has('faqpage') : false;
+    if (scannedScriptForTrust) {
+      if (out.contactPathFound !== true) out.contactPathFound = false;
+      if (out.companyPathFound !== true) out.companyPathFound = false;
+      if (out.privacyPathFound !== true) out.privacyPathFound = false;
+    }
     return out;
   } catch (e) {
     return Object.assign({}, empty, {
@@ -3466,6 +3495,29 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
       };
       const nodeTypes = [];
+      const firstJsonLdTextValue = (value, depth = 0) => {
+        if (depth > 5 || value == null) return '';
+        if (typeof value === 'string' || typeof value === 'number') return clean(value);
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const got = firstJsonLdTextValue(item, depth + 1);
+            if (got) return got;
+          }
+          return '';
+        }
+        if (typeof value === 'object') {
+          return firstJsonLdTextValue(value.url || value.contentUrl || value['@id'] || value.href || value.name, depth + 1);
+        }
+        return '';
+      };
+      const multimodalJsonLd = {
+        hasStructuredLogo: false,
+        structuredLogoUrl: '',
+        structuredImageCount: 0,
+        imageObjectCount: 0,
+        primaryImageOfPage: '',
+        structuredImageTypes: []
+      };
       const walkJsonLd = (node, depth = 0) => {
         if (depth > 8) return;
         if (Array.isArray(node)) {
@@ -3474,8 +3526,36 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         }
         if (!node || typeof node !== 'object') return;
         const t = node['@type'];
-        if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
-        else if (t) nodeTypes.push(clean(t));
+        const currentTypes = [];
+        if (Array.isArray(t)) t.forEach((x) => {
+          const type = clean(x);
+          if (type) {
+            nodeTypes.push(type);
+            currentTypes.push(type);
+          }
+        });
+        else if (t) {
+          const type = clean(t);
+          if (type) {
+            nodeTypes.push(type);
+            currentTypes.push(type);
+          }
+        }
+        const logoValue = firstJsonLdTextValue(node.logo);
+        const imageValue = firstJsonLdTextValue(node.image);
+        const primaryImageValue = firstJsonLdTextValue(node.primaryImageOfPage);
+        if (logoValue) {
+          multimodalJsonLd.hasStructuredLogo = true;
+          if (!multimodalJsonLd.structuredLogoUrl) multimodalJsonLd.structuredLogoUrl = absUrl(logoValue);
+        }
+        if (imageValue || logoValue || primaryImageValue) {
+          multimodalJsonLd.structuredImageCount += 1;
+          currentTypes.forEach((type) => multimodalJsonLd.structuredImageTypes.push(type));
+        }
+        if (currentTypes.some((type) => /^ImageObject$/i.test(type))) multimodalJsonLd.imageObjectCount += 1;
+        if (primaryImageValue && !multimodalJsonLd.primaryImageOfPage) {
+          multimodalJsonLd.primaryImageOfPage = absUrl(primaryImageValue);
+        }
         if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
       };
       const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
@@ -3612,10 +3692,81 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       })).filter((a) => a.href);
       const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
       const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+      const firstLikeLink = (re) => {
+        const hit = anchors.find((a) => re.test(textHref(a)));
+        return hit ? { text: hit.text, href: hit.href } : null;
+      };
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
+      const firstMetaContent = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const value = clean(el && el.getAttribute('content'));
+          if (value) return absUrl(value);
+        }
+        return '';
+      };
+      const firstLinkHref = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const value = clean(el && el.getAttribute('href'));
+          if (value) return absUrl(value);
+        }
+        return '';
+      };
+      const ogImageUrl = firstMetaContent([
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[property="og:image:secure_url"]'
+      ]);
+      const twitterImageUrl = firstMetaContent([
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]'
+      ]);
+      const faviconUrl = firstLinkHref([
+        'link[rel~="icon"][href]',
+        'link[rel="shortcut icon"][href]'
+      ]);
+      const appleTouchIconUrl = firstLinkHref([
+        'link[rel~="apple-touch-icon"][href]',
+        'link[rel="apple-touch-icon-precomposed"][href]'
+      ]);
+      const imgNodes = Array.from(document.querySelectorAll('img'));
+      const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
+        absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
+          (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
+          '');
+      const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
+      const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
+      const privacyRe = /privacy|policy|プライバシー|個人情報/;
+      const trustSignals = {
+        hasContactLink: hasLike(contactRe),
+        contactPathFound: hasLike(contactRe),
+        contactLinkSample: firstLikeLink(contactRe),
+        hasCompanyLink: hasLike(companyRe),
+        companyLinkSample: firstLikeLink(companyRe),
+        hasPrivacyPolicyLink: hasLike(privacyRe),
+        privacyLinkSample: firstLikeLink(privacyRe),
+        source: 'balanced_light'
+      };
+      const multimodalSignals = {
+        checked: true,
+        hasImage: !!(ogImageUrl || twitterImageUrl || faviconUrl || appleTouchIconUrl || imgNodes.length || multimodalJsonLd.structuredImageCount),
+        hasStructured: !!(multimodalJsonLd.hasStructuredLogo || multimodalJsonLd.structuredImageCount || multimodalJsonLd.imageObjectCount),
+        hasOgImage: !!ogImageUrl,
+        hasTwitterImage: !!twitterImageUrl,
+        hasFavicon: !!faviconUrl,
+        hasAppleTouchIcon: !!appleTouchIconUrl,
+        hasStructuredLogo: !!multimodalJsonLd.hasStructuredLogo,
+        imageObjectCount: multimodalJsonLd.imageObjectCount,
+        structuredImageCount: multimodalJsonLd.structuredImageCount,
+        imgCount: imgNodes.length,
+        primaryImageOfPage: primaryImageCandidate || '',
+        sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
+        source: 'balanced_light'
+      };
       const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
 
       return {
@@ -3641,6 +3792,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
           hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
         },
+        multimodalSignals,
+        trustSignals,
         structuredData: {
           types: typeList,
           rawCount: rawJsonLd.length,
@@ -3862,6 +4015,38 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const scriptSrcParseableCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.parseableCount === 'number' ? scriptSrcJsonLdSummary.parseableCount : 0;
     const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
     const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
+    const observedMultimodalSignals = observed.multimodalSignals && typeof observed.multimodalSignals === 'object'
+      ? observed.multimodalSignals
+      : null;
+    const observedTrustSignals = observed.trustSignals && typeof observed.trustSignals === 'object'
+      ? observed.trustSignals
+      : null;
+    const scriptTrustObserved = scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed;
+    const trustSignalsLight = {
+      hasContactLink: observedTrustSignals && observedTrustSignals.hasContactLink === true
+        ? true
+        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.contactPathFound === 'boolean' ? scriptSrcJsonLdSummary.contactPathFound : (observedTrustSignals ? observedTrustSignals.hasContactLink : null)),
+      contactPathFound: observedTrustSignals && observedTrustSignals.contactPathFound === true
+        ? true
+        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.contactPathFound === 'boolean' ? scriptSrcJsonLdSummary.contactPathFound : (observedTrustSignals ? observedTrustSignals.contactPathFound : null)),
+      contactLinkSample: observedTrustSignals && observedTrustSignals.contactLinkSample
+        ? observedTrustSignals.contactLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.contactPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.contactPathSample } : null),
+      hasCompanyLink: observedTrustSignals && observedTrustSignals.hasCompanyLink === true
+        ? true
+        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.companyPathFound === 'boolean' ? scriptSrcJsonLdSummary.companyPathFound : (observedTrustSignals ? observedTrustSignals.hasCompanyLink : null)),
+      companyLinkSample: observedTrustSignals && observedTrustSignals.companyLinkSample
+        ? observedTrustSignals.companyLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.companyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.companyPathSample } : null),
+      hasPrivacyPolicyLink: observedTrustSignals && observedTrustSignals.hasPrivacyPolicyLink === true
+        ? true
+        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.privacyPathFound === 'boolean' ? scriptSrcJsonLdSummary.privacyPathFound : (observedTrustSignals ? observedTrustSignals.hasPrivacyPolicyLink : null)),
+      privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
+        ? observedTrustSignals.privacyLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
+      scriptSrcTrustObserved: !!scriptTrustObserved,
+      source: scriptTrustObserved ? 'balanced_light_dom_plus_script_src' : 'balanced_light'
+    };
     const pickStructuredBool = (key) => {
       const renderedVal = typeof renderedStructured[key] === 'boolean' ? renderedStructured[key] : null;
       const htmlVal = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary[key] === 'boolean' ? htmlContentJsonLdSummary[key] : null;
@@ -3991,6 +4176,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         a11yMainCount: a11yMain.count,
         a11yError: a11yMain.error
       },
+      multimodalSignals: observedMultimodalSignals || {
+        checked: !!balancedMode,
+        hasImage: null,
+        hasStructured: null,
+        source: 'balanced_light'
+      },
+      trustSignals: trustSignalsLight,
       observed: {
         title: {
           value: observed.title || null,
@@ -4115,6 +4307,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           source: mainLandmarkSource,
           confidence: mainLandmarkConfidence
         },
+        multimodalSignals: observedMultimodalSignals || null,
+        trustSignals: trustSignalsLight,
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
@@ -4158,6 +4352,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         scriptSrcJsonLdObserved: geoSignalsV1.observed.structuredData.scriptSrcJsonLdObserved,
         scriptSrcJsonLdCandidateCount: geoSignalsV1.observed.structuredData.scriptSrcJsonLdCandidateCount,
         scriptSrcJsonLdTypes: geoSignalsV1.observed.structuredData.scriptSrcJsonLdTypes,
+        hasOgImage: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasOgImage,
+        hasFavicon: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasFavicon,
+        hasContactLink: geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.hasContactLink,
+        contactPathFound: geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.contactPathFound,
         totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
         navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
         bodyTextCandidatesCount: 0,
@@ -5518,6 +5716,8 @@ async function scrapeOnce(req, res) {
       const topHeadingsObserved = geoSignalsV1 && geoSignalsV1.headings ? geoSignalsV1.headings : {};
       const landmarksObserved = (geoSignalsV1 && geoSignalsV1.landmarks) || observed.landmarks || {};
       const structuredObserved = observed.structuredData || {};
+      const multimodalObserved = (geoSignalsV1 && geoSignalsV1.multimodalSignals) || observed.multimodalSignals || {};
+      const trustObserved = (geoSignalsV1 && geoSignalsV1.trustSignals) || observed.trustSignals || {};
       const bodyObserved = observed.body || {};
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
@@ -5568,7 +5768,14 @@ async function scrapeOnce(req, res) {
         structuredDataScriptSrcAppIndexDetected: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcAppIndexDetected') ? structuredObserved.scriptSrcAppIndexDetected : false,
         structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
         structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
-        structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true
+        structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true,
+        hasOgImage: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasOgImage') ? multimodalObserved.hasOgImage : null,
+        hasTwitterImage: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasTwitterImage') ? multimodalObserved.hasTwitterImage : null,
+        hasFavicon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasFavicon') ? multimodalObserved.hasFavicon : null,
+        hasAppleTouchIcon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasAppleTouchIcon') ? multimodalObserved.hasAppleTouchIcon : null,
+        hasStructuredLogo: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasStructuredLogo') ? multimodalObserved.hasStructuredLogo : null,
+        hasContactLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasContactLink') ? trustObserved.hasContactLink : null,
+        contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null
       };
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
@@ -5595,7 +5802,7 @@ async function scrapeOnce(req, res) {
           'auditSig',
           'resource_js_tap',
           'chunk_tap',
-          'multimodalSignals',
+          ...(signalsFirstBalanced ? [] : ['multimodalSignals']),
           'productSpecComparisonSignals',
           'responsePayloadHugeMerge'
         ],
