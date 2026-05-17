@@ -3302,6 +3302,34 @@ async function buildGeoSignalsV1(page, url) {
       const h1 = limit(Array.from(document.querySelectorAll('h1')).map((el) => clean(el.innerText || el.textContent)), 10);
       const h2 = limit(Array.from(document.querySelectorAll('h2')).map((el) => clean(el.innerText || el.textContent)), 20);
       const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const mainCandidates = [
+        { source: 'dom_main', selector: 'main', confidence: 'high' },
+        { source: 'dom_role_main', selector: '[role="main"]', confidence: 'high' },
+        { source: 'dom_id_main', selector: '#main,#main-content', confidence: 'medium' },
+        { source: 'dom_id_contains_main', selector: '[id*="main" i]', confidence: 'low' }
+      ];
+      let mainLandmark = {
+        hasMainLandmark: null,
+        hasMainLandmark_final: null,
+        mainLandmarkSource: 'not_observed',
+        mainLandmarkConfidence: 'low',
+        mainLandmarkTextsSample: [],
+        mainLandmarkObservationLimited: true
+      };
+      for (const candidate of mainCandidates) {
+        const nodes = Array.from(document.querySelectorAll(candidate.selector || '') || []);
+        if (!nodes.length) continue;
+        const sample = limit(nodes.map((el) => clean(el.innerText || el.textContent).slice(0, 220)), 3);
+        mainLandmark = {
+          hasMainLandmark: true,
+          hasMainLandmark_final: true,
+          mainLandmarkSource: candidate.source,
+          mainLandmarkConfidence: candidate.confidence,
+          mainLandmarkTextsSample: sample,
+          mainLandmarkObservationLimited: false
+        };
+        break;
+      }
       const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
@@ -3349,6 +3377,7 @@ async function buildGeoSignalsV1(page, url) {
           chunkScanSkipped: true,
           parseErrorsCount
         },
+        landmarks: mainLandmark,
         body: {
           textLength: bodyText.length,
           sample: bodyText.slice(0, 500)
@@ -3460,6 +3489,39 @@ async function buildGeoSignalsV1(page, url) {
       : (a11yHeadings.observed ? 'a11y' : 'not_observed');
     const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
     const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
+    const domLandmarks = observed.landmarks && typeof observed.landmarks === 'object'
+      ? observed.landmarks
+      : {};
+    const a11yMain = {
+      count: 0,
+      texts: [],
+      observed: false,
+      error: null
+    };
+    try {
+      const mainLocator = page.getByRole('main');
+      const mainTexts = await mainLocator.allTextContents().catch(() => []);
+      a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
+      a11yMain.count = a11yMain.texts.length;
+      a11yMain.observed = true;
+    } catch (e) {
+      a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+    }
+    const hasDomMain = domLandmarks.hasMainLandmark === true;
+    const hasA11yMain = a11yMain.count > 0;
+    const mainLandmarkSource = hasDomMain
+      ? (domLandmarks.mainLandmarkSource || 'dom_main')
+      : (hasA11yMain ? 'a11y_main' : 'not_observed');
+    const mainLandmarkConfidence = hasDomMain
+      ? (domLandmarks.mainLandmarkConfidence || 'high')
+      : (hasA11yMain ? 'medium' : 'low');
+    const mainLandmarkTextsSample = hasDomMain
+      ? (Array.isArray(domLandmarks.mainLandmarkTextsSample) ? domLandmarks.mainLandmarkTextsSample.slice(0, 3) : [])
+      : a11yMain.texts.slice(0, 3);
+    const hasMainLandmarkFinal = hasDomMain || hasA11yMain
+      ? true
+      : null;
+    const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
     const structuredDataLight = {
       types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
       rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
@@ -3499,6 +3561,17 @@ async function buildGeoSignalsV1(page, url) {
         excludedHeadingCount: headingExclusions.length,
         excludedHeadingReasons,
         a11yObserved: !!a11yHeadings.observed
+      },
+      landmarks: {
+        hasMainLandmark: hasMainLandmarkFinal,
+        hasMainLandmark_final: hasMainLandmarkFinal,
+        mainLandmarkSource,
+        mainLandmarkConfidence,
+        mainLandmarkTextsSample,
+        mainLandmarkObservationLimited,
+        a11yObserved: !!a11yMain.observed,
+        a11yMainCount: a11yMain.count,
+        a11yError: a11yMain.error
       },
       observed: {
         title: {
@@ -3566,6 +3639,16 @@ async function buildGeoSignalsV1(page, url) {
           observationLimited: structuredDataLight.observationLimited,
           parseErrorsCount: structuredDataLight.parseErrorsCount
         },
+        landmarks: {
+          hasMainLandmark: hasMainLandmarkFinal,
+          hasMainLandmark_final: hasMainLandmarkFinal,
+          mainLandmarkSource,
+          mainLandmarkConfidence,
+          mainLandmarkTextsSample,
+          mainLandmarkObservationLimited,
+          source: mainLandmarkSource,
+          confidence: mainLandmarkConfidence
+        },
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
@@ -3584,6 +3667,9 @@ async function buildGeoSignalsV1(page, url) {
         h1Count: geoSignalsV1.observed.h1.count,
         h1Source: geoSignalsV1.headings && geoSignalsV1.headings.h1Source,
         headingObservationLimited: geoSignalsV1.headings && geoSignalsV1.headings.headingObservationLimited,
+        hasMainLandmark: geoSignalsV1.landmarks && geoSignalsV1.landmarks.hasMainLandmark,
+        mainLandmarkSource: geoSignalsV1.landmarks && geoSignalsV1.landmarks.mainLandmarkSource,
+        mainLandmarkObservationLimited: geoSignalsV1.landmarks && geoSignalsV1.landmarks.mainLandmarkObservationLimited,
         jsonldCount: geoSignalsV1.observed.structuredData.rawCount,
         jsonldParseableCount: geoSignalsV1.observed.structuredData.parseableCount,
         jsonldParseErrorsCount: geoSignalsV1.observed.structuredData.parseErrorsCount,
@@ -4136,6 +4222,7 @@ async function scrapeOnce(req, res) {
       const linksObserved = observed.links || {};
       const headingsObserved = observed.headings || {};
       const topHeadingsObserved = geoSignalsV1 && geoSignalsV1.headings ? geoSignalsV1.headings : {};
+      const landmarksObserved = (geoSignalsV1 && geoSignalsV1.landmarks) || observed.landmarks || {};
       const structuredObserved = observed.structuredData || {};
       const bodyObserved = observed.body || {};
       const lightweightSummary = {
@@ -4148,6 +4235,12 @@ async function scrapeOnce(req, res) {
         headingObservationLimited: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'headingObservationLimited')
           ? topHeadingsObserved.headingObservationLimited
           : !!(observed.h1 && observed.h1.headingObservationLimited),
+        hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark') ? landmarksObserved.hasMainLandmark : null,
+        hasMainLandmarkFinal: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark_final') ? landmarksObserved.hasMainLandmark_final : null,
+        mainLandmarkSource: landmarksObserved.mainLandmarkSource || null,
+        mainLandmarkObservationLimited: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkObservationLimited')
+          ? landmarksObserved.mainLandmarkObservationLimited
+          : true,
         navLinkCount: Array.isArray(linksObserved.navTextsSample) ? linksObserved.navTextsSample.length : 0,
         internalLinkCount: Array.isArray(linksObserved.internalLinksSample) ? linksObserved.internalLinksSample.length : 0,
         hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasCompanyLikeLink') ? linksObserved.hasCompanyLikeLink : null,
@@ -4202,6 +4295,7 @@ async function scrapeOnce(req, res) {
       } catch (_) {}
       logSf('SIGNALS_FIRST_LIGHT_SEND', {
         h1Count: lightweightSummary.h1Count,
+        hasMainLandmark: lightweightSummary.hasMainLandmarkFinal,
         jsonldCount: lightweightSummary.jsonldCount,
         navLinkCount: lightweightSummary.navLinkCount,
         bodyTextLength: lightweightSummary.bodyTextLength
