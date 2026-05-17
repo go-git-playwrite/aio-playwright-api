@@ -3486,6 +3486,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const balancedMode = !!(opts && opts.balancedMode);
   const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
+  const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
+    ? opts.hydrationMetrics
+    : {};
   try {
     const observed = await page.evaluate(({ inputUrl, balancedMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -3688,8 +3691,35 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
-        navLike: !!a.closest('nav,[role="navigation"],header,footer')
+        navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+        source: 'dom'
       })).filter((a) => a.href);
+      const shadowTextParts = [];
+      if (balancedMode) {
+        try {
+          const collectShadowAnchors = (root, depth = 0) => {
+            if (!root || depth > 4 || anchors.length >= 300) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || anchors.length >= 300) return;
+              if (shadowTextParts.length < 80) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+              }
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                anchors.push({
+                  text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')),
+                  href: absUrl(el.getAttribute('href') || ''),
+                  navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  source: 'open_shadow_dom'
+                });
+              }
+              if (el.shadowRoot) collectShadowAnchors(el.shadowRoot, depth + 1);
+            });
+          };
+          collectShadowAnchors(document, 0);
+        } catch (_) {}
+      }
       const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
       const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
       const firstLikeLink = (re) => {
@@ -3744,6 +3774,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const trustSignals = {
         hasContactLink: hasLike(contactRe),
         contactPathFound: hasLike(contactRe),
+        contactObservedFromDom: hasLike(contactRe),
         contactLinkSample: firstLikeLink(contactRe),
         hasCompanyLink: hasLike(companyRe),
         companyLinkSample: firstLikeLink(companyRe),
@@ -3767,7 +3798,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
       };
-      const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      const bodyText = clean([domBodyText].concat(shadowTextParts).join(' ')).slice(0, 100000);
 
       return {
         finalUrl: location.href,
@@ -4022,25 +4054,30 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ? observed.trustSignals
       : null;
     const scriptTrustObserved = scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed;
+    const domContactObserved = observedTrustSignals && typeof observedTrustSignals.contactPathFound === 'boolean'
+      ? observedTrustSignals.contactPathFound
+      : (observedTrustSignals && typeof observedTrustSignals.hasContactLink === 'boolean' ? observedTrustSignals.hasContactLink : null);
+    const scriptContactHint = scriptTrustObserved && scriptSrcJsonLdSummary.contactPathFound === true;
     const trustSignalsLight = {
-      hasContactLink: observedTrustSignals && observedTrustSignals.hasContactLink === true
-        ? true
-        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.contactPathFound === 'boolean' ? scriptSrcJsonLdSummary.contactPathFound : (observedTrustSignals ? observedTrustSignals.hasContactLink : null)),
-      contactPathFound: observedTrustSignals && observedTrustSignals.contactPathFound === true
-        ? true
-        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.contactPathFound === 'boolean' ? scriptSrcJsonLdSummary.contactPathFound : (observedTrustSignals ? observedTrustSignals.contactPathFound : null)),
+      hasContactLink: domContactObserved,
+      contactPathFound: domContactObserved,
+      contactObservedFromDom: domContactObserved,
+      contactObservedFromScriptHint: !!scriptContactHint,
+      contactPathHintOnly: domContactObserved !== true && !!scriptContactHint,
       contactLinkSample: observedTrustSignals && observedTrustSignals.contactLinkSample
         ? observedTrustSignals.contactLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.contactPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.contactPathSample } : null),
       hasCompanyLink: observedTrustSignals && observedTrustSignals.hasCompanyLink === true
         ? true
-        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.companyPathFound === 'boolean' ? scriptSrcJsonLdSummary.companyPathFound : (observedTrustSignals ? observedTrustSignals.hasCompanyLink : null)),
+        : (observedTrustSignals && typeof observedTrustSignals.hasCompanyLink === 'boolean' ? observedTrustSignals.hasCompanyLink : null),
+      companyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true),
       companyLinkSample: observedTrustSignals && observedTrustSignals.companyLinkSample
         ? observedTrustSignals.companyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.companyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.companyPathSample } : null),
       hasPrivacyPolicyLink: observedTrustSignals && observedTrustSignals.hasPrivacyPolicyLink === true
         ? true
-        : (scriptTrustObserved && typeof scriptSrcJsonLdSummary.privacyPathFound === 'boolean' ? scriptSrcJsonLdSummary.privacyPathFound : (observedTrustSignals ? observedTrustSignals.hasPrivacyPolicyLink : null)),
+        : (observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean' ? observedTrustSignals.hasPrivacyPolicyLink : null),
+      privacyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.privacyPathFound === true),
       privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
         ? observedTrustSignals.privacyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
@@ -4129,6 +4166,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         iframeSameOriginH1Texts: filteredIframeH1.slice(0, 5),
         iframeSameOriginH2Texts: filteredIframeH2.slice(0, 10),
         boundedWaitMs: boundedHydrationWaitMs,
+        hydration: {
+          waitMs: Number(hydrationMetrics.waitMs || 0),
+          bodyTextBeforeWait: Number(hydrationMetrics.bodyTextBeforeWait || 0),
+          bodyTextAfterWait: Number(hydrationMetrics.bodyTextAfterWait || 0),
+          anchorCountBeforeWait: Number(hydrationMetrics.anchorCountBeforeWait || 0),
+          anchorCountAfterWait: Number(hydrationMetrics.anchorCountAfterWait || 0),
+          navLinkCountBeforeWait: Number(hydrationMetrics.navLinkCountBeforeWait || 0),
+          navLinkCountAfterWait: Number(hydrationMetrics.navLinkCountAfterWait || 0),
+          improvedBodyText: !!hydrationMetrics.improvedBodyText,
+          improvedLinks: !!hydrationMetrics.improvedLinks,
+          warningTextBeforeWait: !!hydrationMetrics.warningTextBeforeWait,
+          warningTextAfterWait: !!hydrationMetrics.warningTextAfterWait
+        },
         h1Attempts: {
           dom: { count: filteredDomH1.length, source: 'dom' },
           main: { count: filteredMainH1.length, source: 'main_dom' },
@@ -4320,6 +4370,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         evaluateCount: 1,
         balancedMode,
         boundedHydrationWaitMs,
+        hydrationWaitMs: Number(hydrationMetrics.waitMs || boundedHydrationWaitMs || 0),
+        bodyTextBeforeWait: Number(hydrationMetrics.bodyTextBeforeWait || 0),
+        bodyTextAfterWait: Number(hydrationMetrics.bodyTextAfterWait || 0),
+        hydrationImprovedBodyText: !!hydrationMetrics.improvedBodyText,
+        hydrationImprovedLinks: !!hydrationMetrics.improvedLinks,
+        warningTextBeforeWait: !!hydrationMetrics.warningTextBeforeWait,
+        warningTextAfterWait: !!hydrationMetrics.warningTextAfterWait,
         jsBundleAnalysis: false,
         resourceChunkScan: false,
         shadowHeadingScan: !!balancedMode,
@@ -4376,6 +4433,136 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       },
       error: String(e && (e.message || e) || '')
     };
+  }
+}
+
+async function collectBalancedHydrationMetrics(page, waitMs) {
+  const maxWaitMs = Math.max(0, Math.min(5000, Number(waitMs || 0)));
+  const empty = {
+    waitMs: 0,
+    bodyTextBeforeWait: 0,
+    bodyTextAfterWait: 0,
+    anchorCountBeforeWait: 0,
+    anchorCountAfterWait: 0,
+    navLinkCountBeforeWait: 0,
+    navLinkCountAfterWait: 0,
+    improvedBodyText: false,
+    improvedLinks: false,
+    warningTextBeforeWait: false,
+    warningTextAfterWait: false,
+    error: null
+  };
+  const measure = async () => {
+    return page.evaluate(() => {
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const shadowTextParts = [];
+      const shadowAnchors = [];
+      try {
+        const walkShadow = (root, depth = 0) => {
+          if (!root || depth > 4) return;
+          const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+          nodes.forEach((el) => {
+            if (!el) return;
+            if (shadowTextParts.length < 80) {
+              const text = clean(el.innerText || el.textContent);
+              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+            }
+            if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+              shadowAnchors.push(el);
+            }
+            if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+          });
+        };
+        walkShadow(document, 0);
+      } catch (_) {}
+      const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+      const anchors = Array.from(document.querySelectorAll('a[href]')).concat(shadowAnchors);
+      const navAnchors = anchors.filter((a) => !!a.closest('nav,[role="navigation"],header,footer'));
+      return {
+        bodyTextLength: bodyText.length,
+        anchorCount: anchors.length,
+        navLinkCount: navAnchors.length,
+        warningText: /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText)
+      };
+    }).catch(() => ({
+      bodyTextLength: 0,
+      anchorCount: 0,
+      navLinkCount: 0,
+      warningText: false
+    }));
+  };
+  try {
+    const before = await measure();
+    const sparseBefore = !!(
+      before.warningText ||
+      before.bodyTextLength < 800 ||
+      before.anchorCount === 0 ||
+      before.navLinkCount === 0
+    );
+    if (maxWaitMs > 0 && sparseBefore) {
+      const startedAt = Date.now();
+      try {
+        await page.waitForFunction(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const shadowTextParts = [];
+          let shadowAnchorCount = 0;
+          try {
+            const walkShadow = (root, depth = 0) => {
+              if (!root || depth > 4) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el) return;
+                if (shadowTextParts.length < 80) {
+                  const text = clean(el.innerText || el.textContent);
+                  if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+                }
+                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
+                if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+              });
+            };
+            walkShadow(document, 0);
+          } catch (_) {}
+          const bodyText = clean([clean(document.body && (document.body.innerText || document.body.textContent))].concat(shadowTextParts).join(' '));
+          const anchors = document.querySelectorAll('a[href]').length + shadowAnchorCount;
+          const navAnchors = document.querySelectorAll('nav a[href],[role="navigation"] a[href],header a[href],footer a[href]').length;
+          const warningText = /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText);
+          return (!warningText && bodyText.length >= 800) || anchors >= 5 || navAnchors >= 2;
+        }, { timeout: maxWaitMs, polling: 250 });
+      } catch (_) {
+        try { await page.waitForTimeout(Math.min(750, maxWaitMs)); } catch (_) {}
+      }
+      const after = await measure();
+      return {
+        waitMs: Math.min(maxWaitMs, Date.now() - startedAt),
+        bodyTextBeforeWait: before.bodyTextLength,
+        bodyTextAfterWait: after.bodyTextLength,
+        anchorCountBeforeWait: before.anchorCount,
+        anchorCountAfterWait: after.anchorCount,
+        navLinkCountBeforeWait: before.navLinkCount,
+        navLinkCountAfterWait: after.navLinkCount,
+        improvedBodyText: after.bodyTextLength > before.bodyTextLength,
+        improvedLinks: after.anchorCount > before.anchorCount || after.navLinkCount > before.navLinkCount,
+        warningTextBeforeWait: !!before.warningText,
+        warningTextAfterWait: !!after.warningText,
+        error: null
+      };
+    }
+    return Object.assign({}, empty, {
+      bodyTextBeforeWait: before.bodyTextLength,
+      bodyTextAfterWait: before.bodyTextLength,
+      anchorCountBeforeWait: before.anchorCount,
+      anchorCountAfterWait: before.anchorCount,
+      navLinkCountBeforeWait: before.navLinkCount,
+      navLinkCountAfterWait: before.navLinkCount,
+      warningTextBeforeWait: !!before.warningText,
+      warningTextAfterWait: !!before.warningText
+    });
+  } catch (e) {
+    return Object.assign({}, empty, {
+      waitMs: maxWaitMs,
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    });
   }
 }
 
@@ -5699,16 +5886,28 @@ async function scrapeOnce(req, res) {
         finalUrl: String(finalUrl || '').slice(0, 180)
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const boundedHydrationWaitMs = signalsFirstBalanced ? 1000 : 0;
-      if (boundedHydrationWaitMs > 0) {
-        try {
-          logSf('SIGNALS_FIRST_BALANCED_BOUNDED_WAIT', { waitMs: boundedHydrationWaitMs });
-          await page.waitForTimeout(boundedHydrationWaitMs);
-        } catch (_) {}
+      const boundedHydrationWaitMs = signalsFirstBalanced ? 3500 : 0;
+      const hydrationMetrics = signalsFirstBalanced
+        ? await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs)
+        : null;
+      if (signalsFirstBalanced) {
+        logSf('SIGNALS_FIRST_BALANCED_HYDRATION_WAIT', {
+          waitMs: hydrationMetrics && hydrationMetrics.waitMs,
+          bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
+          bodyTextAfterWait: hydrationMetrics && hydrationMetrics.bodyTextAfterWait,
+          anchorCountBeforeWait: hydrationMetrics && hydrationMetrics.anchorCountBeforeWait,
+          anchorCountAfterWait: hydrationMetrics && hydrationMetrics.anchorCountAfterWait,
+          navLinkCountBeforeWait: hydrationMetrics && hydrationMetrics.navLinkCountBeforeWait,
+          navLinkCountAfterWait: hydrationMetrics && hydrationMetrics.navLinkCountAfterWait,
+          improvedBodyText: hydrationMetrics && hydrationMetrics.improvedBodyText,
+          improvedLinks: hydrationMetrics && hydrationMetrics.improvedLinks,
+          warningTextAfterWait: hydrationMetrics && hydrationMetrics.warningTextAfterWait
+        });
       }
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
-        boundedHydrationWaitMs
+        boundedHydrationWaitMs,
+        hydrationMetrics
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
@@ -5735,6 +5934,11 @@ async function scrapeOnce(req, res) {
         mainLandmarkObservationLimited: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkObservationLimited')
           ? landmarksObserved.mainLandmarkObservationLimited
           : true,
+        hydrationWaitMs: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.hydrationWaitMs === 'number' ? geoSignalsV1.diagnostics.hydrationWaitMs : null,
+        bodyTextBeforeWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextBeforeWait === 'number' ? geoSignalsV1.diagnostics.bodyTextBeforeWait : null,
+        bodyTextAfterWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextAfterWait === 'number' ? geoSignalsV1.diagnostics.bodyTextAfterWait : null,
+        hydrationImprovedBodyText: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
         balancedMode: signalsFirstBalanced,
         headingShadowScan: !!(geoSignalsV1 && geoSignalsV1.balanced && geoSignalsV1.balanced.shadowHeadingScan),
         headingA11yScan: true,
@@ -5775,7 +5979,10 @@ async function scrapeOnce(req, res) {
         hasAppleTouchIcon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasAppleTouchIcon') ? multimodalObserved.hasAppleTouchIcon : null,
         hasStructuredLogo: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasStructuredLogo') ? multimodalObserved.hasStructuredLogo : null,
         hasContactLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasContactLink') ? trustObserved.hasContactLink : null,
-        contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null
+        contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null,
+        contactObservedFromDom: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromDom') ? trustObserved.contactObservedFromDom : null,
+        contactObservedFromScriptHint: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromScriptHint') ? trustObserved.contactObservedFromScriptHint : null,
+        contactPathHintOnly: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathHintOnly') ? trustObserved.contactPathHintOnly : null
       };
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
@@ -5788,6 +5995,11 @@ async function scrapeOnce(req, res) {
         chunkScanSkipped: true,
         balancedMode: signalsFirstBalanced,
         boundedHydrationWaitMs,
+        hydrationWaitMs: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.hydrationWaitMs === 'number' ? geoSignalsV1.diagnostics.hydrationWaitMs : null,
+        bodyTextBeforeWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextBeforeWait === 'number' ? geoSignalsV1.diagnostics.bodyTextBeforeWait : null,
+        bodyTextAfterWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextAfterWait === 'number' ? geoSignalsV1.diagnostics.bodyTextAfterWait : null,
+        hydrationImprovedBodyText: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
         shadowHeadingScan: !!signalsFirstBalanced,
         a11yHeadingScan: true,
         appRootHeadingScan: !!signalsFirstBalanced,
