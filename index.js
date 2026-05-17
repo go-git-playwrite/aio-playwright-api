@@ -4364,7 +4364,9 @@ async function scrapeOnce(req, res) {
       (probeModeRaw === 'js-chunk' || probeModeRaw === 'chunk' || probeModeRaw === 'chunktap' || probeModeRaw === 'chunk-tap') ? 'jschunk' : (
       (probeModeRaw === 'subpage' || probeModeRaw === 'linkedpages' || probeModeRaw === 'linked-pages') ? 'subpages' : (
       (probeModeRaw === 'payload' || probeModeRaw === 'payload-assembly' || probeModeRaw === 'assembly') ? 'payloadassembly' : (
-      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly'].includes(probeModeRaw) ? probeModeRaw : ''
+      (probeModeRaw === 'primary-risk' || probeModeRaw === 'primaryrisk' || probeModeRaw === 'risk' || probeModeRaw === 'signals-probe') ? 'primaryrisk' : (
+      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk'].includes(probeModeRaw) ? probeModeRaw : ''
+      )
       )
       )
       )
@@ -4544,6 +4546,201 @@ async function scrapeOnce(req, res) {
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
     });
     logSfMemory('after_goto');
+    if (probeMode === 'primaryrisk') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      logSf('PRIMARY_RISK_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('primary_risk_probe_enter');
+      const startedAt = Date.now();
+      let probe = null;
+      let probeError = null;
+      try {
+        probe = await page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const lower = (v) => clean(v).toLowerCase();
+          const title = clean(document.title || '');
+          const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+          const htmlLengthEstimate = String((document.documentElement && document.documentElement.outerHTML) || '').length;
+          const scripts = Array.from(document.querySelectorAll('script'));
+          const scriptsWithSrc = scripts
+            .map((s) => {
+              const src = s && s.getAttribute ? (s.getAttribute('src') || '') : '';
+              let href = '';
+              try { href = src ? new URL(src, location.href).toString() : ''; } catch (_) { href = src; }
+              return {
+                src: href,
+                type: clean(s && s.getAttribute ? s.getAttribute('type') : ''),
+                async: !!(s && s.async),
+                defer: !!(s && s.defer)
+              };
+            })
+            .filter((s) => s.src);
+          const perfScripts = (() => {
+            try {
+              return performance.getEntriesByType('resource')
+                .filter((r) => r && /script|javascript|ecmascript/i.test(String(r.initiatorType || '') + ' ' + String(r.name || '')))
+                .map((r) => ({
+                  name: String(r.name || ''),
+                  transferSize: Number(r.transferSize || 0),
+                  encodedBodySize: Number(r.encodedBodySize || 0),
+                  duration: Number(r.duration || 0)
+                }));
+            } catch (_) {
+              return [];
+            }
+          })();
+          const hasRoot = (sel) => !!document.querySelector(sel);
+          const rootIndicators = {
+            hasNextRoot: hasRoot('#__next'),
+            hasNuxtRoot: hasRoot('#__nuxt'),
+            hasAppRoot: hasRoot('#app,#root,[data-reactroot],[id*="app" i]'),
+            hasMain: hasRoot('main,[role="main"]')
+          };
+          const textAll = lower(`${title} ${bodyText.slice(0, 3000)} ${location.href}`);
+          const blockedPageIndications = {
+            errBlockedByClient: /err_blocked_by_client/i.test(textAll),
+            extensionBlocked: /拡張機能によってブロック|ブロックされています/i.test(textAll),
+            chromeError: /^chrome-error:/i.test(String(location.href || '')),
+            accessDenied: /access denied|forbidden|permission denied|アクセスできません|拒否されました/i.test(textAll),
+            ageGate: /年齢確認|age verification|生年月日|18歳以上/i.test(textAll)
+          };
+          const scriptUrls = scriptsWithSrc.map((s) => s.src);
+          const chunkLikeUrls = scriptUrls.filter((u) => /chunk|webpack|next\/static|_next\/static|app-|main-|runtime|vendor|bundle|\.m?js(?:\?|$)/i.test(u));
+          const scriptHosts = scriptUrls.map((u) => {
+            try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return ''; }
+          }).filter(Boolean);
+          const locationHost = String(location.hostname || '').replace(/^www\./, '');
+          const externalScriptHosts = Array.from(new Set(scriptHosts.filter((h) => h && h !== locationHost && !h.endsWith('.' + locationHost))));
+          const widgetScriptUrls = scriptUrls.filter((u) => /googletagmanager|google-analytics|youtube|probo|poplink|creativecdn|chat|karte|clarity|hotjar|doubleclick/i.test(u));
+          const moduleScriptCount = scriptsWithSrc.filter((s) => /module/i.test(s.type)).length;
+          const preloadScriptCount = Array.from(document.querySelectorAll('link[rel="preload"],link[rel="modulepreload"]'))
+            .filter((l) => /script|javascript|\.m?js/i.test(String(l.getAttribute('as') || '') + ' ' + String(l.getAttribute('href') || '')))
+            .length;
+          const perfTotalTransferSize = perfScripts.reduce((sum, r) => sum + Number(r.transferSize || r.encodedBodySize || 0), 0);
+          const perfMaxTransferSize = perfScripts.reduce((max, r) => Math.max(max, Number(r.transferSize || r.encodedBodySize || 0)), 0);
+          return {
+            title,
+            bodyTextLength: bodyText.length,
+            htmlLengthEstimate,
+            scriptCount: scriptsWithSrc.length,
+            inlineScriptCount: Math.max(0, scripts.length - scriptsWithSrc.length),
+            moduleScriptCount,
+            preloadScriptCount,
+            chunkLikeCount: chunkLikeUrls.length,
+            nextStaticCount: scriptUrls.filter((u) => /_next\/static|next\/static/i.test(u)).length,
+            externalScriptHostCount: externalScriptHosts.length,
+            widgetScriptCount: widgetScriptUrls.length,
+            sampleExternalScriptHosts: externalScriptHosts.slice(0, 10),
+            sampleWidgetScriptUrls: widgetScriptUrls.slice(0, 10),
+            sampleScriptUrls: scriptUrls.slice(0, 10),
+            sampleChunkUrls: chunkLikeUrls.slice(0, 10),
+            totalScriptUrlChars: scriptUrls.reduce((sum, u) => sum + String(u || '').length, 0),
+            perfScriptCount: perfScripts.length,
+            perfTotalTransferSize,
+            perfMaxTransferSize,
+            rootIndicators,
+            blockedPageIndications
+          };
+        });
+      } catch (e) {
+        probeError = String(e && (e.message || e) || 'primary_risk_probe_error').slice(0, 240);
+      }
+      const reasons = [];
+      const estimates = {
+        htmlLengthEstimate: probe && typeof probe.htmlLengthEstimate === 'number' ? probe.htmlLengthEstimate : null,
+        bodyTextLength: probe && typeof probe.bodyTextLength === 'number' ? probe.bodyTextLength : null,
+        scriptCount: probe && typeof probe.scriptCount === 'number' ? probe.scriptCount : null,
+        chunkLikeCount: probe && typeof probe.chunkLikeCount === 'number' ? probe.chunkLikeCount : null,
+        externalScriptHostCount: probe && typeof probe.externalScriptHostCount === 'number' ? probe.externalScriptHostCount : null,
+        widgetScriptCount: probe && typeof probe.widgetScriptCount === 'number' ? probe.widgetScriptCount : null,
+        perfScriptCount: probe && typeof probe.perfScriptCount === 'number' ? probe.perfScriptCount : null,
+        perfTotalTransferSize: probe && typeof probe.perfTotalTransferSize === 'number' ? probe.perfTotalTransferSize : null,
+        perfMaxTransferSize: probe && typeof probe.perfMaxTransferSize === 'number' ? probe.perfMaxTransferSize : null
+      };
+      const rootIndicators = probe && probe.rootIndicators ? probe.rootIndicators : {};
+      const blockedPageIndications = probe && probe.blockedPageIndications ? probe.blockedPageIndications : {};
+      if (probeError) reasons.push('probe_evaluate_failed');
+      if (status != null && status >= 500) reasons.push('status_5xx');
+      if (status != null && status >= 400 && status < 500) reasons.push('status_4xx');
+      if (estimates.htmlLengthEstimate != null && estimates.htmlLengthEstimate > 500000) reasons.push('large_rendered_html_estimate');
+      if (estimates.scriptCount != null && estimates.scriptCount >= 35) reasons.push('many_script_resources');
+      if (estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 15) reasons.push('many_chunk_like_scripts');
+      if (estimates.scriptCount != null && estimates.scriptCount >= 8 && estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 6) reasons.push('js_bundle_risk');
+      if (estimates.externalScriptHostCount != null && estimates.externalScriptHostCount >= 3) reasons.push('third_party_script_stack');
+      if (estimates.widgetScriptCount != null && estimates.widgetScriptCount >= 2) reasons.push('third_party_widget_scripts');
+      if (estimates.bodyTextLength != null && estimates.bodyTextLength < 2500 && estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 5) reasons.push('script_rendered_site_indicator');
+      if (estimates.perfTotalTransferSize != null && estimates.perfTotalTransferSize > 3000000) reasons.push('large_script_transfer_estimate');
+      if (estimates.perfMaxTransferSize != null && estimates.perfMaxTransferSize > 1000000) reasons.push('large_single_script_transfer_estimate');
+      if (rootIndicators.hasNextRoot || rootIndicators.hasNuxtRoot || rootIndicators.hasAppRoot) reasons.push('spa_root_indicator');
+      if (blockedPageIndications.errBlockedByClient || blockedPageIndications.extensionBlocked || blockedPageIndications.chromeError) reasons.push('browser_or_extension_block_page_indicator');
+      if (blockedPageIndications.accessDenied) reasons.push('access_denied_indicator');
+      if (blockedPageIndications.ageGate) reasons.push('age_gate_indicator');
+      const highReasons = reasons.filter((r) => [
+        'status_5xx',
+        'large_rendered_html_estimate',
+        'many_script_resources',
+        'many_chunk_like_scripts',
+        'js_bundle_risk',
+        'large_script_transfer_estimate',
+        'large_single_script_transfer_estimate',
+        'browser_or_extension_block_page_indicator'
+      ].includes(r));
+      const risk = highReasons.length ? 'high' : (reasons.length ? 'medium' : 'low');
+      const shouldUseBalanced = risk === 'high' || (
+        risk === 'medium' &&
+        (reasons.includes('spa_root_indicator') || reasons.includes('age_gate_indicator') || reasons.includes('access_denied_indicator'))
+      );
+      const elapsedMs = Date.now() - startedAt;
+      logSf('PRIMARY_RISK_PROBE_SEND', {
+        risk,
+        shouldUseBalanced,
+        reasons,
+        elapsedMs
+      });
+      logSfMemory('primary_risk_probe_send');
+      return res.status(200).json({
+        ok: !probeError,
+        mode: 'primaryRiskProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        risk,
+        shouldUseBalanced,
+        reasons,
+        estimates,
+        title: probe && probe.title ? probe.title : null,
+        rootIndicators,
+        blockedPageIndications,
+        scriptSummary: probe ? {
+          inlineScriptCount: probe.inlineScriptCount,
+          moduleScriptCount: probe.moduleScriptCount,
+          preloadScriptCount: probe.preloadScriptCount,
+          chunkLikeCount: probe.chunkLikeCount,
+          nextStaticCount: probe.nextStaticCount,
+          externalScriptHostCount: probe.externalScriptHostCount,
+          widgetScriptCount: probe.widgetScriptCount,
+          totalScriptUrlChars: probe.totalScriptUrlChars,
+          sampleExternalScriptHosts: Array.isArray(probe.sampleExternalScriptHosts) ? probe.sampleExternalScriptHosts : [],
+          sampleWidgetScriptUrls: Array.isArray(probe.sampleWidgetScriptUrls) ? probe.sampleWidgetScriptUrls : [],
+          sampleScriptUrls: Array.isArray(probe.sampleScriptUrls) ? probe.sampleScriptUrls : [],
+          sampleChunkUrls: Array.isArray(probe.sampleChunkUrls) ? probe.sampleChunkUrls : []
+        } : null,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          scoringSkipped: true,
+          auditSigSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
+          elapsedMs,
+          errorMessage: probeError
+        }
+      });
+    }
     if (signalsFirstLight || signalsFirstBalanced) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_ENTER' : 'SIGNALS_FIRST_LIGHT_ENTER', {
