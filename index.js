@@ -4044,24 +4044,55 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const headingSource = headingSourceParts.length ? Array.from(new Set(headingSourceParts)).join('+') : 'not_observed';
     const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
     const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
+    const titleTextForCandidate = normalizeHeadingText(observed.title);
+    const metaTextForCandidate = normalizeHeadingText(observed.metaDescription);
+    const isStrongPrimaryHeadingText = (text) => {
+      const s = normalizeHeadingText(text);
+      if (!s || s.length < 12) return false;
+      if (titleTextForCandidate && (titleTextForCandidate.indexOf(s) >= 0 || s.indexOf(titleTextForCandidate) >= 0)) return true;
+      if (metaTextForCandidate && metaTextForCandidate.indexOf(s) >= 0) return true;
+      return false;
+    };
+    const pickSectionHeadingCandidate = () => {
+      const sources = [
+        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium' },
+        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium' },
+        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium' },
+        { texts: filteredShadowH2, source: 'open_shadow_dom_h2', confidence: 'medium' },
+        { texts: filteredA11yH2, source: 'a11y_h2', confidence: 'medium' },
+        { texts: filteredDomH2, source: 'dom_h2', confidence: 'low' },
+        { texts: filteredShadowH3, source: 'open_shadow_dom_h3', confidence: 'low' },
+        { texts: filteredA11yH3, source: 'a11y_h3', confidence: 'low' },
+        { texts: filteredDomH3, source: 'dom_h3', confidence: 'low' }
+      ];
+      for (const item of sources) {
+        const text = uniqueHeadingTexts(item.texts, 1)[0];
+        if (!text || text.length < 2) continue;
+        return {
+          text,
+          source: item.source,
+          confidence: item.confidence
+        };
+      }
+      return {
+        text: '',
+        source: 'not_observed',
+        confidence: 'low'
+      };
+    };
     const pickPrimaryHeadingCandidate = () => {
       const sources = [
-        { texts: mergedH1, source: h1Source === 'not_observed' ? 'h1' : h1Source, confidence: 'high', h1Equivalent: false },
-        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium', h1Equivalent: true },
-        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium', h1Equivalent: true },
-        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium', h1Equivalent: true },
-        { texts: filteredShadowH2, source: 'open_shadow_dom_h2', confidence: 'medium', h1Equivalent: true },
-        { texts: filteredA11yH2, source: 'a11y_h2', confidence: 'medium', h1Equivalent: true },
-        { texts: filteredDomH2, source: 'dom_h2', confidence: 'low', h1Equivalent: true },
-        { texts: filteredShadowH3, source: 'open_shadow_dom_h3', confidence: 'low', h1Equivalent: true },
-        { texts: filteredA11yH3, source: 'a11y_h3', confidence: 'low', h1Equivalent: true },
-        { texts: filteredDomH3, source: 'dom_h3', confidence: 'low', h1Equivalent: true },
+        { texts: mergedH1, source: h1Source === 'not_observed' ? 'h1' : h1Source, confidence: 'high', h1Equivalent: true, requireStrong: false },
+        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
+        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
+        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
         { texts: [observed.title], source: 'title', confidence: 'low', h1Equivalent: false },
         { texts: [observed.metaDescription], source: 'meta_description', confidence: 'low', h1Equivalent: false }
       ];
       for (const item of sources) {
         const text = uniqueHeadingTexts(item.texts, 1)[0];
         if (!text || text.length < 2) continue;
+        if (item.requireStrong && !isStrongPrimaryHeadingText(text)) continue;
         return {
           text,
           source: item.source,
@@ -4076,6 +4107,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         h1Equivalent: false
       };
     };
+    const sectionHeadingCandidate = pickSectionHeadingCandidate();
     const primaryHeadingCandidate = pickPrimaryHeadingCandidate();
     const h1EquivalentCandidateFound = mergedH1.length === 0 && !!(primaryHeadingCandidate.text && primaryHeadingCandidate.h1Equivalent);
     const domLandmarks = observed.landmarks && typeof observed.landmarks === 'object'
@@ -4235,6 +4267,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         primaryHeadingCandidateSource: primaryHeadingCandidate.source,
         primaryHeadingConfidence: primaryHeadingCandidate.confidence,
         h1EquivalentCandidateFound,
+        sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+        sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+        sectionHeadingConfidence: sectionHeadingCandidate.confidence,
         source: headingSource,
         h1Source,
         headingObservationLimited,
@@ -4262,6 +4297,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         primaryHeadingCandidateSource: primaryHeadingCandidate.source,
         primaryHeadingConfidence: primaryHeadingCandidate.confidence,
         h1EquivalentCandidateFound,
+        sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+        sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+        sectionHeadingConfidence: sectionHeadingCandidate.confidence,
         boundedWaitMs: boundedHydrationWaitMs,
         hydration: {
           waitMs: Number(hydrationMetrics.waitMs || 0),
@@ -4366,6 +4404,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           primaryHeadingCandidateSource: primaryHeadingCandidate.source,
           primaryHeadingConfidence: primaryHeadingCandidate.confidence,
           h1EquivalentCandidateFound,
+          sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+          sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+          sectionHeadingConfidence: sectionHeadingCandidate.confidence,
           source: headingSource,
           h1Source,
           headingObservationLimited,
@@ -6043,6 +6084,9 @@ async function scrapeOnce(req, res) {
         h1EquivalentCandidateFound: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'h1EquivalentCandidateFound')
           ? topHeadingsObserved.h1EquivalentCandidateFound
           : (Object.prototype.hasOwnProperty.call(headingsObserved, 'h1EquivalentCandidateFound') ? headingsObserved.h1EquivalentCandidateFound : null),
+        sectionHeadingCandidate: topHeadingsObserved.sectionHeadingCandidate || headingsObserved.sectionHeadingCandidate || null,
+        sectionHeadingCandidateSource: topHeadingsObserved.sectionHeadingCandidateSource || headingsObserved.sectionHeadingCandidateSource || null,
+        sectionHeadingConfidence: topHeadingsObserved.sectionHeadingConfidence || headingsObserved.sectionHeadingConfidence || null,
         headingObservationLimited: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'headingObservationLimited')
           ? topHeadingsObserved.headingObservationLimited
           : !!(observed.h1 && observed.h1.headingObservationLimited),
@@ -6157,6 +6201,8 @@ async function scrapeOnce(req, res) {
         primaryHeadingCandidate: lightweightSummary.primaryHeadingCandidate,
         primaryHeadingCandidateSource: lightweightSummary.primaryHeadingCandidateSource,
         h1EquivalentCandidateFound: lightweightSummary.h1EquivalentCandidateFound,
+        sectionHeadingCandidate: lightweightSummary.sectionHeadingCandidate,
+        sectionHeadingCandidateSource: lightweightSummary.sectionHeadingCandidateSource,
         mainLandmarkCandidateFound: lightweightSummary.mainLandmarkCandidateFound,
         jsonldCount: lightweightSummary.jsonldCount,
         navLinkCount: lightweightSummary.navLinkCount,
