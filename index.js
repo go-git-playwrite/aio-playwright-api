@@ -3255,9 +3255,88 @@ function flatTypesFromJsonLd(arr) {
 }
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
+function summarizeJsonLdTextsLight(texts, source) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const nodeTypes = [];
+  const walkJsonLd = (node, depth = 0) => {
+    if (depth > 8) return;
+    if (Array.isArray(node)) {
+      node.forEach((item) => walkJsonLd(item, depth + 1));
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    const t = node['@type'];
+    if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+    else if (t) nodeTypes.push(clean(t));
+    if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
+  };
+  const rawTexts = (Array.isArray(texts) ? texts : []).map(clean).filter(Boolean);
+  let parseableCount = 0;
+  let parseErrorsCount = 0;
+  rawTexts.forEach((txt) => {
+    try {
+      const parsed = JSON.parse(txt);
+      parseableCount += 1;
+      walkJsonLd(parsed);
+    } catch (_) {
+      parseErrorsCount += 1;
+    }
+  });
+  const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
+  const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+  const hasJsonLd = rawTexts.length > 0;
+  return {
+    types,
+    rawCount: rawTexts.length,
+    parseableCount,
+    parseErrorsCount,
+    hasJsonLd,
+    hasWebsite: hasJsonLd ? typeSet.has('website') : false,
+    hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
+    hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
+    hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+    source: source || 'jsonld_light'
+  };
+}
+
+async function collectHtmlContentJsonLdSummaryLight(page) {
+  try {
+    const html = await page.content();
+    const $ = cheerio.load(html || '');
+    const texts = [];
+    $('script[type="application/ld+json"]').each((_, el) => {
+      if (texts.length >= 80) return;
+      const txt = String($(el).text() || '').trim();
+      if (!txt) return;
+      texts.push(txt.length > 300000 ? txt.slice(0, 300000) : txt);
+    });
+    const summary = summarizeJsonLdTextsLight(texts, 'html_content_ldjson_light');
+    summary.htmlLength = String(html || '').length;
+    summary.htmlContentLdJsonObserved = true;
+    return summary;
+  } catch (e) {
+    return {
+      types: [],
+      rawCount: 0,
+      parseableCount: 0,
+      parseErrorsCount: 0,
+      hasJsonLd: null,
+      hasWebsite: null,
+      hasOrganization: null,
+      hasBreadcrumbList: null,
+      hasFAQPage: null,
+      source: 'html_content_ldjson_light',
+      htmlLength: null,
+      htmlContentLdJsonObserved: false,
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    };
+  }
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const balancedMode = !!(opts && opts.balancedMode);
+  const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
   try {
     const observed = await page.evaluate(({ inputUrl, balancedMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -3305,6 +3384,52 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
       const mainH1 = limit(Array.from(document.querySelectorAll('main h1,[role="main"] h1,#main h1,#main-content h1')).map((el) => clean(el.innerText || el.textContent)), 10);
       const mainH2 = limit(Array.from(document.querySelectorAll('main h2,[role="main"] h2,#main h2,#main-content h2')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const collectHeadingsIn = (selector, h1Limit = 10, h2Limit = 20) => {
+        const roots = Array.from(document.querySelectorAll(selector || '') || []);
+        const h1Vals = [];
+        const h2Vals = [];
+        roots.forEach((root) => {
+          if (!root || !root.querySelectorAll) return;
+          Array.from(root.querySelectorAll('h1')).forEach((el) => h1Vals.push(clean(el.innerText || el.textContent)));
+          Array.from(root.querySelectorAll('h2')).forEach((el) => h2Vals.push(clean(el.innerText || el.textContent)));
+        });
+        return {
+          rootCount: roots.length,
+          h1: limit(h1Vals, h1Limit),
+          h2: limit(h2Vals, h2Limit)
+        };
+      };
+      const appRootHeadings = balancedMode
+        ? collectHeadingsIn('#app,#root,#__next,[data-reactroot],[id*="app" i]', 10, 20)
+        : { rootCount: 0, h1: [], h2: [] };
+      const heroHeadings = balancedMode
+        ? collectHeadingsIn('main [class*="hero" i],main [id*="hero" i],main [class*="kv" i],main [id*="kv" i],main [class*="mainvisual" i],main [id*="mainvisual" i],section[class*="hero" i],section[id*="hero" i],section[class*="kv" i],section[id*="kv" i],section[class*="mainvisual" i],section[id*="mainvisual" i]', 10, 20)
+        : { rootCount: 0, h1: [], h2: [] };
+      const iframeSameOriginHeadings = { iframeCount: 0, accessibleCount: 0, blockedCount: 0, h1: [], h2: [], error: null };
+      if (balancedMode) {
+        try {
+          const frames = Array.from(document.querySelectorAll('iframe'));
+          iframeSameOriginHeadings.iframeCount = frames.length;
+          frames.forEach((frame) => {
+            try {
+              const doc = frame && frame.contentDocument;
+              if (!doc) {
+                iframeSameOriginHeadings.blockedCount += 1;
+                return;
+              }
+              iframeSameOriginHeadings.accessibleCount += 1;
+              Array.from(doc.querySelectorAll('h1')).forEach((el) => iframeSameOriginHeadings.h1.push(clean(el.innerText || el.textContent)));
+              Array.from(doc.querySelectorAll('h2')).forEach((el) => iframeSameOriginHeadings.h2.push(clean(el.innerText || el.textContent)));
+            } catch (_) {
+              iframeSameOriginHeadings.blockedCount += 1;
+            }
+          });
+          iframeSameOriginHeadings.h1 = limit(iframeSameOriginHeadings.h1, 10);
+          iframeSameOriginHeadings.h2 = limit(iframeSameOriginHeadings.h2, 20);
+        } catch (e) {
+          iframeSameOriginHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+        }
+      }
       const shadowHeadings = { h1: [], h2: [], h3: [], hostCount: 0, observed: false, error: null };
       if (balancedMode) {
         try {
@@ -3384,6 +3509,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           h1: mainH1,
           h2: mainH2
         },
+        appRootHeadings,
+        heroHeadings,
+        iframeSameOriginHeadings,
         shadowHeadings,
         links: {
           navTextsSample: limit(navTexts, 50),
@@ -3437,6 +3565,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const domH2 = Array.isArray(observed.h2) ? observed.h2 : [];
     const domH3 = Array.isArray(observed.h3) ? observed.h3 : [];
     const mainHeadings = observed.mainHeadings && typeof observed.mainHeadings === 'object' ? observed.mainHeadings : {};
+    const appRootHeadings = observed.appRootHeadings && typeof observed.appRootHeadings === 'object' ? observed.appRootHeadings : {};
+    const heroHeadings = observed.heroHeadings && typeof observed.heroHeadings === 'object' ? observed.heroHeadings : {};
+    const iframeSameOriginHeadings = observed.iframeSameOriginHeadings && typeof observed.iframeSameOriginHeadings === 'object' ? observed.iframeSameOriginHeadings : {};
     const shadowHeadings = observed.shadowHeadings && typeof observed.shadowHeadings === 'object' ? observed.shadowHeadings : {};
     const headingExclusions = [];
     const normalizeHostname = (v) => String(v || '').toLowerCase().replace(/^www\./, '');
@@ -3514,6 +3645,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const filteredDomH3 = filterHeadingTexts(domH3);
     const filteredMainH1 = filterHeadingTexts(Array.isArray(mainHeadings.h1) ? mainHeadings.h1 : []);
     const filteredMainH2 = filterHeadingTexts(Array.isArray(mainHeadings.h2) ? mainHeadings.h2 : []);
+    const filteredAppRootH1 = filterHeadingTexts(Array.isArray(appRootHeadings.h1) ? appRootHeadings.h1 : []);
+    const filteredAppRootH2 = filterHeadingTexts(Array.isArray(appRootHeadings.h2) ? appRootHeadings.h2 : []);
+    const filteredHeroH1 = filterHeadingTexts(Array.isArray(heroHeadings.h1) ? heroHeadings.h1 : []);
+    const filteredHeroH2 = filterHeadingTexts(Array.isArray(heroHeadings.h2) ? heroHeadings.h2 : []);
+    const filteredIframeH1 = filterHeadingTexts(Array.isArray(iframeSameOriginHeadings.h1) ? iframeSameOriginHeadings.h1 : []);
+    const filteredIframeH2 = filterHeadingTexts(Array.isArray(iframeSameOriginHeadings.h2) ? iframeSameOriginHeadings.h2 : []);
     const filteredShadowH1 = filterHeadingTexts(Array.isArray(shadowHeadings.h1) ? shadowHeadings.h1 : []);
     const filteredShadowH2 = filterHeadingTexts(Array.isArray(shadowHeadings.h2) ? shadowHeadings.h2 : []);
     const filteredShadowH3 = filterHeadingTexts(Array.isArray(shadowHeadings.h3) ? shadowHeadings.h3 : []);
@@ -3524,19 +3661,31 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const excludedHeadingReasons = Array.from(new Set(headingExclusions.map(x => x.reason).filter(Boolean)));
     const mergedH1 = filteredMainH1.length
       ? uniqueHeadingTexts(filteredMainH1, 10)
-      : (filteredDomH1.length
-        ? uniqueHeadingTexts(filteredDomH1, 10)
-        : (filteredShadowH1.length ? uniqueHeadingTexts(filteredShadowH1, 10) : filteredA11yH1.slice(0, 10)));
-    const mergedH2 = uniqueHeadingTexts(filteredMainH2.concat(filteredDomH2).concat(filteredShadowH2).concat(filteredA11yH2), 20);
+      : (filteredAppRootH1.length
+        ? uniqueHeadingTexts(filteredAppRootH1, 10)
+        : (filteredHeroH1.length
+          ? uniqueHeadingTexts(filteredHeroH1, 10)
+          : (filteredDomH1.length
+            ? uniqueHeadingTexts(filteredDomH1, 10)
+            : (filteredShadowH1.length
+              ? uniqueHeadingTexts(filteredShadowH1, 10)
+              : (filteredIframeH1.length ? uniqueHeadingTexts(filteredIframeH1, 10) : filteredA11yH1.slice(0, 10))))));
+    const mergedH2 = uniqueHeadingTexts(filteredMainH2.concat(filteredAppRootH2).concat(filteredHeroH2).concat(filteredDomH2).concat(filteredShadowH2).concat(filteredIframeH2).concat(filteredA11yH2), 20);
     const mergedH3 = uniqueHeadingTexts(filteredDomH3.concat(filteredShadowH3).concat(filteredA11yH3), 20);
     const h1Source = filteredMainH1.length ? 'main_dom'
-      : (filteredDomH1.length ? 'dom'
-        : (filteredShadowH1.length ? 'open_shadow_dom'
-          : (filteredA11yH1.length ? 'a11y' : 'not_observed')));
+      : (filteredAppRootH1.length ? 'app_root_dom'
+        : (filteredHeroH1.length ? 'hero_dom'
+          : (filteredDomH1.length ? 'dom'
+            : (filteredShadowH1.length ? 'open_shadow_dom'
+              : (filteredIframeH1.length ? 'iframe_same_origin'
+                : (filteredA11yH1.length ? 'a11y' : 'not_observed'))))));
     const headingSourceParts = [];
     if (filteredDomH1.length || filteredDomH2.length || filteredDomH3.length) headingSourceParts.push('dom');
     if (filteredMainH1.length || filteredMainH2.length) headingSourceParts.push('main_dom');
+    if (filteredAppRootH1.length || filteredAppRootH2.length) headingSourceParts.push('app_root_dom');
+    if (filteredHeroH1.length || filteredHeroH2.length) headingSourceParts.push('hero_dom');
     if (filteredShadowH1.length || filteredShadowH2.length || filteredShadowH3.length) headingSourceParts.push('open_shadow_dom');
+    if (filteredIframeH1.length || filteredIframeH2.length) headingSourceParts.push('iframe_same_origin');
     if (a11yHeadings.observed) headingSourceParts.push('a11y');
     const headingSource = headingSourceParts.length ? Array.from(new Set(headingSourceParts)).join('+') : 'not_observed';
     const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
@@ -3574,24 +3723,52 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ? true
       : null;
     const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
+    const htmlContentJsonLdSummary = balancedMode
+      ? await collectHtmlContentJsonLdSummaryLight(page)
+      : null;
+    const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
+    const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
+    const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
+    const mergedJsonLdTypes = Array.from(new Set(renderedTypes.concat(htmlTypes).filter(Boolean))).slice(0, 50);
+    const renderedRawCount = typeof renderedStructured.rawCount === 'number' ? renderedStructured.rawCount : 0;
+    const htmlRawCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.rawCount === 'number' ? htmlContentJsonLdSummary.rawCount : 0;
+    const renderedParseableCount = typeof renderedStructured.parseableCount === 'number' ? renderedStructured.parseableCount : 0;
+    const htmlParseableCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseableCount === 'number' ? htmlContentJsonLdSummary.parseableCount : 0;
+    const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
+    const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
+    const pickStructuredBool = (key) => {
+      const renderedVal = typeof renderedStructured[key] === 'boolean' ? renderedStructured[key] : null;
+      const htmlVal = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary[key] === 'boolean' ? htmlContentJsonLdSummary[key] : null;
+      if (renderedVal === true || htmlVal === true) return true;
+      if (renderedVal === false && (htmlVal === false || htmlVal == null)) return false;
+      if (htmlVal === false && (renderedVal === false || renderedVal == null)) return false;
+      return null;
+    };
     const structuredDataLight = {
-      types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
-      rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
-      parseableCount: observed.structuredData && typeof observed.structuredData.parseableCount === 'number' ? observed.structuredData.parseableCount : 0,
-      hasJsonLd: observed.structuredData && typeof observed.structuredData.hasJsonLd === 'boolean' ? observed.structuredData.hasJsonLd : null,
-      hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
-      hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
-      hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
-      hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
-      source: observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light',
+      types: mergedJsonLdTypes,
+      rawCount: balancedMode ? Math.max(renderedRawCount, htmlRawCount) : renderedRawCount,
+      parseableCount: balancedMode ? Math.max(renderedParseableCount, htmlParseableCount) : renderedParseableCount,
+      hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : (typeof renderedStructured.hasJsonLd === 'boolean' ? renderedStructured.hasJsonLd : null),
+      hasWebsite: balancedMode ? pickStructuredBool('hasWebsite') : (observed.structuredData ? observed.structuredData.hasWebsite : null),
+      hasOrganization: balancedMode ? pickStructuredBool('hasOrganization') : (observed.structuredData ? observed.structuredData.hasOrganization : null),
+      hasBreadcrumbList: balancedMode ? pickStructuredBool('hasBreadcrumbList') : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
+      hasFAQPage: balancedMode ? pickStructuredBool('hasFAQPage') : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
+      source: balancedMode ? 'rendered_dom_plus_html_ldjson_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
-      observationLimited: observed.structuredData && typeof observed.structuredData.observationLimited === 'boolean' ? observed.structuredData.observationLimited : true,
-      observationScope: observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only',
+      observationLimited: true,
+      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_only' : (observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only'),
       renderedDomObserved: observed.structuredData && typeof observed.structuredData.renderedDomObserved === 'boolean' ? observed.structuredData.renderedDomObserved : true,
-      htmlScanSkipped: observed.structuredData && typeof observed.structuredData.htmlScanSkipped === 'boolean' ? observed.structuredData.htmlScanSkipped : true,
+      htmlContentLdJsonObserved: balancedMode ? !!(htmlContentJsonLdSummary && htmlContentJsonLdSummary.htmlContentLdJsonObserved) : false,
+      htmlContentRawCount: balancedMode ? htmlRawCount : 0,
+      htmlContentParseableCount: balancedMode ? htmlParseableCount : 0,
+      renderedDomRawCount: renderedRawCount,
+      renderedDomParseableCount: renderedParseableCount,
+      htmlScanSkipped: true,
       jsScanSkipped: observed.structuredData && typeof observed.structuredData.jsScanSkipped === 'boolean' ? observed.structuredData.jsScanSkipped : true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
-      parseErrorsCount: observed.structuredData && typeof observed.structuredData.parseErrorsCount === 'number' ? observed.structuredData.parseErrorsCount : 0
+      parseErrorsCount: balancedMode ? Math.max(renderedParseErrorsCount, htmlParseErrorsCount) : renderedParseErrorsCount,
+      htmlContentParseErrorsCount: balancedMode ? htmlParseErrorsCount : 0,
+      htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
 
     const geoSignalsV1 = {
@@ -3622,8 +3799,50 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         shadowHeadingError: shadowHeadings && shadowHeadings.error || null,
         mainH1Texts: filteredMainH1.slice(0, 5),
         mainH2Texts: filteredMainH2.slice(0, 10),
+        appRootH1Texts: filteredAppRootH1.slice(0, 5),
+        appRootH2Texts: filteredAppRootH2.slice(0, 10),
+        heroH1Texts: filteredHeroH1.slice(0, 5),
+        heroH2Texts: filteredHeroH2.slice(0, 10),
         shadowH1Texts: filteredShadowH1.slice(0, 5),
-        shadowH2Texts: filteredShadowH2.slice(0, 10)
+        shadowH2Texts: filteredShadowH2.slice(0, 10),
+        iframeSameOriginH1Texts: filteredIframeH1.slice(0, 5),
+        iframeSameOriginH2Texts: filteredIframeH2.slice(0, 10),
+        boundedWaitMs: boundedHydrationWaitMs,
+        h1Attempts: {
+          dom: { count: filteredDomH1.length, source: 'dom' },
+          main: { count: filteredMainH1.length, source: 'main_dom' },
+          appRoot: {
+            count: filteredAppRootH1.length,
+            rootCount: Number(appRootHeadings.rootCount || 0),
+            source: 'app_root_dom'
+          },
+          hero: {
+            count: filteredHeroH1.length,
+            rootCount: Number(heroHeadings.rootCount || 0),
+            source: 'hero_dom'
+          },
+          shadow: {
+            count: filteredShadowH1.length,
+            hostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
+            observed: !!(shadowHeadings && shadowHeadings.observed),
+            error: shadowHeadings && shadowHeadings.error || null,
+            source: 'open_shadow_dom'
+          },
+          a11y: {
+            count: filteredA11yH1.length,
+            observed: !!a11yHeadings.observed,
+            error: a11yHeadings.error,
+            source: 'a11y'
+          },
+          iframeSameOrigin: {
+            count: filteredIframeH1.length,
+            iframeCount: Number(iframeSameOriginHeadings.iframeCount || 0),
+            accessibleCount: Number(iframeSameOriginHeadings.accessibleCount || 0),
+            blockedCount: Number(iframeSameOriginHeadings.blockedCount || 0),
+            error: iframeSameOriginHeadings.error || null,
+            source: 'iframe_same_origin'
+          }
+        }
       },
       landmarks: {
         hasMainLandmark: hasMainLandmarkFinal,
@@ -3678,6 +3897,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             h1: filteredMainH1.slice(0, 5),
             h2: filteredMainH2.slice(0, 10)
           },
+          appRoot: {
+            h1: filteredAppRootH1.slice(0, 5),
+            h2: filteredAppRootH2.slice(0, 10),
+            rootCount: Number(appRootHeadings.rootCount || 0)
+          },
+          hero: {
+            h1: filteredHeroH1.slice(0, 5),
+            h2: filteredHeroH2.slice(0, 10),
+            rootCount: Number(heroHeadings.rootCount || 0)
+          },
           shadow: {
             h1: filteredShadowH1.slice(0, 5),
             h2: filteredShadowH2.slice(0, 10),
@@ -3685,6 +3914,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             observed: !!(shadowHeadings && shadowHeadings.observed),
             hostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
             error: shadowHeadings && shadowHeadings.error || null
+          },
+          iframeSameOrigin: {
+            h1: filteredIframeH1.slice(0, 5),
+            h2: filteredIframeH2.slice(0, 10),
+            iframeCount: Number(iframeSameOriginHeadings.iframeCount || 0),
+            accessibleCount: Number(iframeSameOriginHeadings.accessibleCount || 0),
+            blockedCount: Number(iframeSameOriginHeadings.blockedCount || 0),
+            error: iframeSameOriginHeadings.error || null
           },
           excludedHeadingCount: headingExclusions.length,
           excludedHeadingReasons,
@@ -3712,6 +3949,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           source: structuredDataLight.source,
           confidence: structuredDataLight.confidence,
           observationLimited: structuredDataLight.observationLimited,
+          observationScope: structuredDataLight.observationScope,
+          renderedDomObserved: structuredDataLight.renderedDomObserved,
+          htmlContentLdJsonObserved: structuredDataLight.htmlContentLdJsonObserved,
+          htmlContentRawCount: structuredDataLight.htmlContentRawCount,
+          htmlContentParseableCount: structuredDataLight.htmlContentParseableCount,
+          renderedDomRawCount: structuredDataLight.renderedDomRawCount,
+          renderedDomParseableCount: structuredDataLight.renderedDomParseableCount,
+          htmlScanSkipped: structuredDataLight.htmlScanSkipped,
+          jsScanSkipped: structuredDataLight.jsScanSkipped,
+          chunkScanSkipped: structuredDataLight.chunkScanSkipped,
           parseErrorsCount: structuredDataLight.parseErrorsCount
         },
         landmarks: {
@@ -3734,10 +3981,15 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       diagnostics: {
         evaluateCount: 1,
         balancedMode,
+        boundedHydrationWaitMs,
         jsBundleAnalysis: false,
         resourceChunkScan: false,
         shadowHeadingScan: !!balancedMode,
-        a11yHeadingScan: true
+        a11yHeadingScan: true,
+        appRootHeadingScan: !!balancedMode,
+        heroHeadingScan: !!balancedMode,
+        iframeHeadingScan: !!balancedMode,
+        htmlContentLdJsonScan: !!balancedMode
       }
     };
     try {
@@ -3757,6 +4009,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasOrganization: geoSignalsV1.observed.structuredData.hasOrganization,
         hasBreadcrumbList: geoSignalsV1.observed.structuredData.hasBreadcrumbList,
         hasFAQPage: geoSignalsV1.observed.structuredData.hasFAQPage,
+        observationScope: geoSignalsV1.observed.structuredData.observationScope,
+        htmlContentLdJsonObserved: geoSignalsV1.observed.structuredData.htmlContentLdJsonObserved,
         totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
         navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
         bodyTextCandidatesCount: 0,
@@ -4297,7 +4551,17 @@ async function scrapeOnce(req, res) {
         finalUrl: String(finalUrl || '').slice(0, 180)
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, { balancedMode: signalsFirstBalanced });
+      const boundedHydrationWaitMs = signalsFirstBalanced ? 1000 : 0;
+      if (boundedHydrationWaitMs > 0) {
+        try {
+          logSf('SIGNALS_FIRST_BALANCED_BOUNDED_WAIT', { waitMs: boundedHydrationWaitMs });
+          await page.waitForTimeout(boundedHydrationWaitMs);
+        } catch (_) {}
+      }
+      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
+        balancedMode: signalsFirstBalanced,
+        boundedHydrationWaitMs
+      });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
       const headingsObserved = observed.headings || {};
@@ -4343,6 +4607,9 @@ async function scrapeOnce(req, res) {
         structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : true,
         structuredDataObservationScope: structuredObserved.observationScope || 'rendered_dom_only',
         structuredDataRenderedDomObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'renderedDomObserved') ? structuredObserved.renderedDomObserved : true,
+        structuredDataHtmlContentLdJsonObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlContentLdJsonObserved') ? structuredObserved.htmlContentLdJsonObserved : false,
+        structuredDataHtmlContentRawCount: typeof structuredObserved.htmlContentRawCount === 'number' ? structuredObserved.htmlContentRawCount : 0,
+        structuredDataHtmlContentParseableCount: typeof structuredObserved.htmlContentParseableCount === 'number' ? structuredObserved.htmlContentParseableCount : 0,
         structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
         structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
         structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true
@@ -4357,8 +4624,13 @@ async function scrapeOnce(req, res) {
         jsScanSkipped: true,
         chunkScanSkipped: true,
         balancedMode: signalsFirstBalanced,
+        boundedHydrationWaitMs,
         shadowHeadingScan: !!signalsFirstBalanced,
-        a11yHeadingScan: true
+        a11yHeadingScan: true,
+        appRootHeadingScan: !!signalsFirstBalanced,
+        heroHeadingScan: !!signalsFirstBalanced,
+        iframeHeadingScan: !!signalsFirstBalanced,
+        htmlContentLdJsonScan: !!signalsFirstBalanced
       };
       const memoryHints = {
         avoidedHeavyBlocks: [
