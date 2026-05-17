@@ -3333,6 +3333,126 @@ async function collectHtmlContentJsonLdSummaryLight(page) {
   }
 }
 
+function extractSchemaTypesFromScriptTextLight(text) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const body = String(text || '');
+  const types = [];
+  const patterns = [
+    /["@]type["']?\s*:\s*["']([^"']{1,100})["']/gi,
+    /\\"@type\\"\s*:\s*\\"([^"\\]{1,100})\\"/gi,
+    /@type\\?["']?\s*[:=]\s*\\?["']([^"'\\]{1,100})/gi
+  ];
+  patterns.forEach((re) => {
+    let m;
+    while ((m = re.exec(body)) && types.length < 80) {
+      const t = clean(m[1]);
+      if (t) types.push(t);
+    }
+  });
+  return Array.from(new Set(types)).slice(0, 50);
+}
+
+async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
+  const MAX_SCRIPTS = 10;
+  const MAX_BYTES_PER_SCRIPT = 1000000;
+  const empty = {
+    types: [],
+    scriptSrcCount: 0,
+    sameOriginScriptCount: 0,
+    fetchedCount: 0,
+    skippedLargeCount: 0,
+    candidateCount: 0,
+    parseableCount: 0,
+    hasJsonLd: null,
+    hasWebsite: null,
+    hasOrganization: null,
+    hasBreadcrumbList: null,
+    hasFAQPage: null,
+    observed: false,
+    source: 'same_origin_script_src_jsonld_light',
+    appIndexDetected: false,
+    totalFetchedBytes: 0,
+    maxScriptLength: 0,
+    error: null
+  };
+  try {
+    const finalUrl = page && typeof page.url === 'function' ? page.url() : url;
+    const renderedScriptSrcs = await page.evaluate(() => {
+      const out = [];
+      Array.from(document.querySelectorAll('script[src]')).forEach((s) => {
+        const src = s && s.getAttribute && s.getAttribute('src');
+        if (!src) return;
+        try { out.push(new URL(src, location.href).toString()); } catch (_) {}
+      });
+      return out;
+    }).catch(() => []);
+    const html = await page.content().catch(() => '');
+    const htmlScriptSrcs = [];
+    try {
+      const $ = cheerio.load(html || '');
+      $('script[src]').each((_, el) => {
+        const src = String($(el).attr('src') || '').trim();
+        if (!src) return;
+        try { htmlScriptSrcs.push(new URL(src, finalUrl || url).toString()); } catch (_) {}
+      });
+    } catch (_) {}
+    const scriptSrcs = Array.from(new Set([].concat(renderedScriptSrcs || []).concat(htmlScriptSrcs || []).filter(Boolean)));
+    let origin = '';
+    try { origin = new URL(finalUrl || url).origin; } catch (_) {}
+    const sameOriginScripts = scriptSrcs.filter((u) => {
+      try { return new URL(u).origin === origin; } catch (_) { return false; }
+    });
+    const out = Object.assign({}, empty, {
+      scriptSrcCount: scriptSrcs.length,
+      sameOriginScriptCount: sameOriginScripts.length,
+      observed: true,
+      appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || '')))
+    });
+    const types = [];
+    for (const scriptUrl of sameOriginScripts.slice(0, MAX_SCRIPTS)) {
+      try {
+        const r = await page.request.get(scriptUrl, { timeout: 10000 });
+        const headers = typeof r.headers === 'function' ? r.headers() : {};
+        const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
+        if (contentLength > MAX_BYTES_PER_SCRIPT) {
+          out.skippedLargeCount += 1;
+          continue;
+        }
+        const text = await r.text();
+        const len = String(text || '').length;
+        out.totalFetchedBytes += len;
+        out.maxScriptLength = Math.max(out.maxScriptLength, len);
+        if (len > MAX_BYTES_PER_SCRIPT) {
+          out.skippedLargeCount += 1;
+          continue;
+        }
+        out.fetchedCount += 1;
+        const hasContext = /@context|\\"@context\\"/.test(text);
+        const hasType = /@type|\\"@type\\"/.test(text);
+        const hasSchemaOrg = /schema\.org/i.test(text);
+        const scriptTypes = extractSchemaTypesFromScriptTextLight(text);
+        if (hasContext || hasType || hasSchemaOrg || scriptTypes.length) {
+          out.candidateCount += 1;
+          scriptTypes.forEach((t) => types.push(t));
+        }
+      } catch (_) {}
+    }
+    out.types = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
+    out.parseableCount = 0;
+    out.hasJsonLd = out.candidateCount > 0;
+    const typeSet = new Set(out.types.map((t) => String(t || '').toLowerCase()));
+    out.hasWebsite = out.hasJsonLd ? typeSet.has('website') : false;
+    out.hasOrganization = out.hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false;
+    out.hasBreadcrumbList = out.hasJsonLd ? typeSet.has('breadcrumblist') : false;
+    out.hasFAQPage = out.hasJsonLd ? typeSet.has('faqpage') : false;
+    return out;
+  } catch (e) {
+    return Object.assign({}, empty, {
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    });
+  }
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const balancedMode = !!(opts && opts.balancedMode);
@@ -3726,48 +3846,64 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const htmlContentJsonLdSummary = balancedMode
       ? await collectHtmlContentJsonLdSummaryLight(page)
       : null;
+    const scriptSrcJsonLdSummary = balancedMode
+      ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url)
+      : null;
     const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
     const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
     const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
-    const mergedJsonLdTypes = Array.from(new Set(renderedTypes.concat(htmlTypes).filter(Boolean))).slice(0, 50);
+    const scriptSrcTypes = scriptSrcJsonLdSummary && Array.isArray(scriptSrcJsonLdSummary.types) ? scriptSrcJsonLdSummary.types : [];
+    const mergedJsonLdTypes = Array.from(new Set(renderedTypes.concat(htmlTypes).concat(scriptSrcTypes).filter(Boolean))).slice(0, 50);
     const renderedRawCount = typeof renderedStructured.rawCount === 'number' ? renderedStructured.rawCount : 0;
     const htmlRawCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.rawCount === 'number' ? htmlContentJsonLdSummary.rawCount : 0;
+    const scriptSrcCandidateCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.candidateCount === 'number' ? scriptSrcJsonLdSummary.candidateCount : 0;
     const renderedParseableCount = typeof renderedStructured.parseableCount === 'number' ? renderedStructured.parseableCount : 0;
     const htmlParseableCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseableCount === 'number' ? htmlContentJsonLdSummary.parseableCount : 0;
+    const scriptSrcParseableCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.parseableCount === 'number' ? scriptSrcJsonLdSummary.parseableCount : 0;
     const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
     const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
     const pickStructuredBool = (key) => {
       const renderedVal = typeof renderedStructured[key] === 'boolean' ? renderedStructured[key] : null;
       const htmlVal = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary[key] === 'boolean' ? htmlContentJsonLdSummary[key] : null;
-      if (renderedVal === true || htmlVal === true) return true;
-      if (renderedVal === false && (htmlVal === false || htmlVal == null)) return false;
-      if (htmlVal === false && (renderedVal === false || renderedVal == null)) return false;
+      const scriptVal = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary[key] === 'boolean' ? scriptSrcJsonLdSummary[key] : null;
+      if (renderedVal === true || htmlVal === true || scriptVal === true) return true;
+      if (renderedVal === false && (htmlVal === false || htmlVal == null) && (scriptVal === false || scriptVal == null)) return false;
+      if (htmlVal === false && (renderedVal === false || renderedVal == null) && (scriptVal === false || scriptVal == null)) return false;
+      if (scriptVal === false && (renderedVal === false || renderedVal == null) && (htmlVal === false || htmlVal == null)) return false;
       return null;
     };
     const structuredDataLight = {
       types: mergedJsonLdTypes,
-      rawCount: balancedMode ? Math.max(renderedRawCount, htmlRawCount) : renderedRawCount,
-      parseableCount: balancedMode ? Math.max(renderedParseableCount, htmlParseableCount) : renderedParseableCount,
+      rawCount: balancedMode ? (renderedRawCount + htmlRawCount + scriptSrcCandidateCount) : renderedRawCount,
+      parseableCount: balancedMode ? (renderedParseableCount + htmlParseableCount + scriptSrcParseableCount) : renderedParseableCount,
       hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : (typeof renderedStructured.hasJsonLd === 'boolean' ? renderedStructured.hasJsonLd : null),
       hasWebsite: balancedMode ? pickStructuredBool('hasWebsite') : (observed.structuredData ? observed.structuredData.hasWebsite : null),
       hasOrganization: balancedMode ? pickStructuredBool('hasOrganization') : (observed.structuredData ? observed.structuredData.hasOrganization : null),
       hasBreadcrumbList: balancedMode ? pickStructuredBool('hasBreadcrumbList') : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
       hasFAQPage: balancedMode ? pickStructuredBool('hasFAQPage') : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
-      source: balancedMode ? 'rendered_dom_plus_html_ldjson_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
+      source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
       observationLimited: true,
-      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_only' : (observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only'),
+      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only' : (observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only'),
       renderedDomObserved: observed.structuredData && typeof observed.structuredData.renderedDomObserved === 'boolean' ? observed.structuredData.renderedDomObserved : true,
       htmlContentLdJsonObserved: balancedMode ? !!(htmlContentJsonLdSummary && htmlContentJsonLdSummary.htmlContentLdJsonObserved) : false,
       htmlContentRawCount: balancedMode ? htmlRawCount : 0,
       htmlContentParseableCount: balancedMode ? htmlParseableCount : 0,
+      scriptSrcJsonLdObserved: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed) : false,
+      scriptSrcCandidateCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.sameOriginScriptCount || 0) : 0,
+      scriptSrcFetchedCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.fetchedCount || 0) : 0,
+      scriptSrcJsonLdCandidateCount: balancedMode ? scriptSrcCandidateCount : 0,
+      scriptSrcJsonLdTypes: balancedMode ? scriptSrcTypes.slice(0, 50) : [],
+      scriptSrcSkippedLargeCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.skippedLargeCount || 0) : 0,
+      scriptSrcAppIndexDetected: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.appIndexDetected) : false,
       renderedDomRawCount: renderedRawCount,
       renderedDomParseableCount: renderedParseableCount,
       htmlScanSkipped: true,
-      jsScanSkipped: observed.structuredData && typeof observed.structuredData.jsScanSkipped === 'boolean' ? observed.structuredData.jsScanSkipped : true,
+      jsScanSkipped: true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
       parseErrorsCount: balancedMode ? Math.max(renderedParseErrorsCount, htmlParseErrorsCount) : renderedParseErrorsCount,
       htmlContentParseErrorsCount: balancedMode ? htmlParseErrorsCount : 0,
+      scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
       htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
 
@@ -3954,12 +4090,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           htmlContentLdJsonObserved: structuredDataLight.htmlContentLdJsonObserved,
           htmlContentRawCount: structuredDataLight.htmlContentRawCount,
           htmlContentParseableCount: structuredDataLight.htmlContentParseableCount,
+          scriptSrcJsonLdObserved: structuredDataLight.scriptSrcJsonLdObserved,
+          scriptSrcCandidateCount: structuredDataLight.scriptSrcCandidateCount,
+          scriptSrcFetchedCount: structuredDataLight.scriptSrcFetchedCount,
+          scriptSrcJsonLdCandidateCount: structuredDataLight.scriptSrcJsonLdCandidateCount,
+          scriptSrcJsonLdTypes: structuredDataLight.scriptSrcJsonLdTypes,
+          scriptSrcSkippedLargeCount: structuredDataLight.scriptSrcSkippedLargeCount,
+          scriptSrcAppIndexDetected: structuredDataLight.scriptSrcAppIndexDetected,
           renderedDomRawCount: structuredDataLight.renderedDomRawCount,
           renderedDomParseableCount: structuredDataLight.renderedDomParseableCount,
           htmlScanSkipped: structuredDataLight.htmlScanSkipped,
           jsScanSkipped: structuredDataLight.jsScanSkipped,
           chunkScanSkipped: structuredDataLight.chunkScanSkipped,
-          parseErrorsCount: structuredDataLight.parseErrorsCount
+          parseErrorsCount: structuredDataLight.parseErrorsCount,
+          scriptSrcError: structuredDataLight.scriptSrcError
         },
         landmarks: {
           hasMainLandmark: hasMainLandmarkFinal,
@@ -4011,6 +4155,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasFAQPage: geoSignalsV1.observed.structuredData.hasFAQPage,
         observationScope: geoSignalsV1.observed.structuredData.observationScope,
         htmlContentLdJsonObserved: geoSignalsV1.observed.structuredData.htmlContentLdJsonObserved,
+        scriptSrcJsonLdObserved: geoSignalsV1.observed.structuredData.scriptSrcJsonLdObserved,
+        scriptSrcJsonLdCandidateCount: geoSignalsV1.observed.structuredData.scriptSrcJsonLdCandidateCount,
+        scriptSrcJsonLdTypes: geoSignalsV1.observed.structuredData.scriptSrcJsonLdTypes,
         totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
         navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
         bodyTextCandidatesCount: 0,
@@ -4356,23 +4503,45 @@ async function scrapeOnce(req, res) {
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
   const signalsFirstBalanced = signalsMode === 'balanced' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
-  const probeMode = (probeModeRaw === 'resource-json' || probeModeRaw === 'resourcetap')
-    ? 'resourcejson'
-    : ((probeModeRaw === 'js-tap' || probeModeRaw === 'js') ? 'jstap' : (
-      (probeModeRaw === 'js-fetch' || probeModeRaw === 'jsbody' || probeModeRaw === 'js-body') ? 'jsfetch' : (
-      (probeModeRaw === 'js-scan' || probeModeRaw === 'jsdecode' || probeModeRaw === 'js-decode') ? 'jsscan' : (
-      (probeModeRaw === 'js-chunk' || probeModeRaw === 'chunk' || probeModeRaw === 'chunktap' || probeModeRaw === 'chunk-tap') ? 'jschunk' : (
-      (probeModeRaw === 'subpage' || probeModeRaw === 'linkedpages' || probeModeRaw === 'linked-pages') ? 'subpages' : (
-      (probeModeRaw === 'payload' || probeModeRaw === 'payload-assembly' || probeModeRaw === 'assembly') ? 'payloadassembly' : (
-      (probeModeRaw === 'primary-risk' || probeModeRaw === 'primaryrisk' || probeModeRaw === 'risk' || probeModeRaw === 'signals-probe') ? 'primaryrisk' : (
-      ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk'].includes(probeModeRaw) ? probeModeRaw : ''
-      )
-      )
-      )
-      )
-      )
-      )
-    ));
+  const probeAliases = {
+    'resource-json': 'resourcejson',
+    resourcetap: 'resourcejson',
+    'js-tap': 'jstap',
+    js: 'jstap',
+    'js-fetch': 'jsfetch',
+    jsbody: 'jsfetch',
+    'js-body': 'jsfetch',
+    'js-scan': 'jsscan',
+    jsdecode: 'jsscan',
+    'js-decode': 'jsscan',
+    'js-chunk': 'jschunk',
+    chunk: 'jschunk',
+    chunktap: 'jschunk',
+    'chunk-tap': 'jschunk',
+    subpage: 'subpages',
+    linkedpages: 'subpages',
+    'linked-pages': 'subpages',
+    payload: 'payloadassembly',
+    'payload-assembly': 'payloadassembly',
+    assembly: 'payloadassembly',
+    'primary-risk': 'primaryrisk',
+    primaryrisk: 'primaryrisk',
+    risk: 'primaryrisk',
+    'signals-probe': 'primaryrisk',
+    'jsonld-balanced': 'jsonldbalanced',
+    jsonldbalanced: 'jsonldbalanced',
+    'balanced-jsonld': 'jsonldbalanced',
+    'jsonld-resource-tap': 'jsonldresourcetap',
+    jsonldresourcetap: 'jsonldresourcetap',
+    'jsonld-resource': 'jsonldresourcetap',
+    'resource-jsonld': 'jsonldresourcetap',
+    'jsonld-script-src': 'jsonldscriptsrc',
+    jsonldscriptsrc: 'jsonldscriptsrc',
+    'script-src-jsonld': 'jsonldscriptsrc',
+    'jsonld-script': 'jsonldscriptsrc'
+  };
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc'];
+  const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
   const probeMaxFetchRaw = Number(req.query.maxFetch);
   const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
     ? Math.floor(probeMaxFetchRaw)
@@ -4536,6 +4705,106 @@ async function scrapeOnce(req, res) {
     });
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
 
+    let jsonLdResourceTapState = null;
+    if (probeMode === 'jsonldresourcetap') {
+      jsonLdResourceTapState = {
+        startedAt: Date.now(),
+        promises: [],
+        candidates: [],
+        seen: new Set(),
+        skippedLargeCount: 0,
+        skippedNoHintCount: 0,
+        responseSeenCount: 0
+      };
+      const MAX_JSONLD_RESOURCE_CANDIDATES = 20;
+      const MAX_JSONLD_RESOURCE_BODY = 200000;
+      const cleanResourceJsonLdText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const walkResourceJsonLd = (node, out, depth = 0) => {
+        if (depth > 8) return;
+        if (Array.isArray(node)) {
+          node.forEach((item) => walkResourceJsonLd(item, out, depth + 1));
+          return;
+        }
+        if (!node || typeof node !== 'object') return;
+        const t = node['@type'];
+        if (Array.isArray(t)) t.forEach((x) => out.push(cleanResourceJsonLdText(x)));
+        else if (t) out.push(cleanResourceJsonLdText(t));
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkResourceJsonLd(item, out, depth + 1));
+      };
+      const regexTypesFromResourceText = (text) => {
+        const out = [];
+        const re = /["\\]?@type["\\]?\s*[:=]\s*(?:\\?["'])([^"'\\]{1,80})/g;
+        let m;
+        while ((m = re.exec(String(text || ''))) && out.length < 20) {
+          out.push(cleanResourceJsonLdText(m[1]));
+        }
+        return out;
+      };
+      page.on('response', (response) => {
+        try {
+          if (!jsonLdResourceTapState || jsonLdResourceTapState.candidates.length >= MAX_JSONLD_RESOURCE_CANDIDATES) return;
+          jsonLdResourceTapState.responseSeenCount += 1;
+          const responseUrl = String(response.url && response.url() || '');
+          if (!responseUrl || jsonLdResourceTapState.seen.has(responseUrl)) return;
+          const headers = response.headers ? response.headers() : {};
+          const contentType = String(headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
+          const contentLengthHeader = headers['content-length'] || headers['Content-Length'];
+          const contentLength = Number(contentLengthHeader || 0);
+          const urlLooksRelevant = /json|ld|schema|structured|wp-json|\/api\/|api[.-]/i.test(responseUrl);
+          const typeLooksRelevant = /application\/ld\+json|application\/json|text\/json|javascript|ecmascript/i.test(contentType);
+          if (!typeLooksRelevant && !urlLooksRelevant) return;
+          if (/javascript|ecmascript/i.test(contentType) && !urlLooksRelevant) return;
+          if (contentLength && contentLength > MAX_JSONLD_RESOURCE_BODY) {
+            jsonLdResourceTapState.skippedLargeCount += 1;
+            return;
+          }
+          jsonLdResourceTapState.seen.add(responseUrl);
+          const p = (async () => {
+            try {
+              const text = await response.text();
+              const approxLength = String(text || '').length;
+              if (approxLength > MAX_JSONLD_RESOURCE_BODY) {
+                jsonLdResourceTapState.skippedLargeCount += 1;
+                return;
+              }
+              const hasContext = /@context/.test(text);
+              const hasType = /@type/.test(text);
+              const hasSchemaOrg = /schema\.org/i.test(text);
+              if (!hasContext && !hasType && !hasSchemaOrg) {
+                jsonLdResourceTapState.skippedNoHintCount += 1;
+                return;
+              }
+              const types = [];
+              let parseable = false;
+              let parseError = '';
+              try {
+                const parsed = JSON.parse(text);
+                parseable = true;
+                walkResourceJsonLd(parsed, types, 0);
+              } catch (e) {
+                parseError = String(e && (e.message || e) || '').slice(0, 160);
+                regexTypesFromResourceText(text).forEach((t) => types.push(t));
+              }
+              if (jsonLdResourceTapState.candidates.length >= MAX_JSONLD_RESOURCE_CANDIDATES) return;
+              jsonLdResourceTapState.candidates.push({
+                urlSample: responseUrl.slice(0, 220),
+                contentType: contentType.slice(0, 120),
+                approxLength,
+                hasContext,
+                hasType,
+                hasSchemaOrg,
+                parseable,
+                typesSample: Array.from(new Set(types.filter(Boolean))).slice(0, 20),
+                textSample: cleanResourceJsonLdText(text).slice(0, 260),
+                parseError
+              });
+            } catch (_) {}
+          })();
+          jsonLdResourceTapState.promises.push(p);
+        } catch (_) {}
+      });
+    }
+
     // ---- 主要待機（軽め） ----
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
@@ -4546,6 +4815,490 @@ async function scrapeOnce(req, res) {
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
     });
     logSfMemory('after_goto');
+    if (probeMode === 'jsonldresourcetap') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      logSf('JSONLD_RESOURCE_TAP_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_resource_tap_probe_enter');
+      await page.waitForTimeout(1500).catch(() => {});
+      try {
+        await Promise.allSettled((jsonLdResourceTapState && jsonLdResourceTapState.promises || []).slice(0, 80));
+      } catch (_) {}
+      const candidates = (jsonLdResourceTapState && jsonLdResourceTapState.candidates || []).slice(0, 20);
+      const types = Array.from(new Set([].concat.apply([], candidates.map((c) => Array.isArray(c.typesSample) ? c.typesSample : [])).filter(Boolean))).slice(0, 50);
+      const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+      const parsedJsonLdCount = candidates.filter((c) => c && c.parseable && (c.hasContext || c.hasType || c.hasSchemaOrg)).length;
+      const out = {
+        ok: true,
+        mode: 'jsonLdResourceTapProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        candidateResponseCount: candidates.length,
+        parsedJsonLdCount,
+        types,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        candidates,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
+          rawBodyReturned: false,
+          responseSeenCount: jsonLdResourceTapState ? jsonLdResourceTapState.responseSeenCount : 0,
+          skippedLargeCount: jsonLdResourceTapState ? jsonLdResourceTapState.skippedLargeCount : 0,
+          skippedNoHintCount: jsonLdResourceTapState ? jsonLdResourceTapState.skippedNoHintCount : 0,
+          maxCandidateCount: 20,
+          maxBodyBytes: 200000,
+          elapsedMs: jsonLdResourceTapState ? (Date.now() - jsonLdResourceTapState.startedAt) : null
+        }
+      };
+      logSf('JSONLD_RESOURCE_TAP_PROBE_SEND', {
+        candidateResponseCount: out.candidateResponseCount,
+        parsedJsonLdCount: out.parsedJsonLdCount,
+        types: out.types,
+        skippedLargeCount: out.diagnostics.skippedLargeCount,
+        skippedNoHintCount: out.diagnostics.skippedNoHintCount
+      });
+      logSfMemory('jsonld_resource_tap_probe_send');
+      return res.status(200).json(out);
+    }
+    if (probeMode === 'jsonldbalanced') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const startedAt = Date.now();
+      logSf('JSONLD_BALANCED_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_balanced_probe_enter');
+
+      const summarizeTexts = (texts, source) => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const nodeTypes = [];
+        const samples = [];
+        const parseErrors = [];
+        const walkJsonLd = (node, depth = 0) => {
+          if (depth > 8) return;
+          if (Array.isArray(node)) {
+            node.forEach((item) => walkJsonLd(item, depth + 1));
+            return;
+          }
+          if (!node || typeof node !== 'object') return;
+          const t = node['@type'];
+          if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+          else if (t) nodeTypes.push(clean(t));
+          if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
+        };
+        let parseableCount = 0;
+        let parseErrorsCount = 0;
+        (Array.isArray(texts) ? texts : []).forEach((entry, idx) => {
+          const text = typeof entry === 'string' ? entry : String((entry && entry.text) || '');
+          const type = typeof entry === 'object' && entry ? String(entry.type || '') : '';
+          const id = typeof entry === 'object' && entry ? String(entry.id || '') : '';
+          const head = clean(text).slice(0, 220);
+          if (samples.length < 8) samples.push({ source, index: idx, type, id, length: text.length, head });
+          try {
+            const parsed = JSON.parse(text);
+            parseableCount += 1;
+            walkJsonLd(parsed);
+          } catch (e) {
+            parseErrorsCount += 1;
+            if (parseErrors.length < 5) {
+              parseErrors.push({
+                source,
+                index: idx,
+                message: String(e && (e.message || e) || '').slice(0, 180),
+                head
+              });
+            }
+          }
+        });
+        const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
+        return {
+          source,
+          rawCount: Array.isArray(texts) ? texts.length : 0,
+          parseableCount,
+          parseErrorsCount,
+          types,
+          samples,
+          parseErrors
+        };
+      };
+
+      const collectDomJsonLd = async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const jsonLdScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+          .map((s) => ({ type: s.getAttribute('type') || '', id: s.id || '', text: s.textContent || '' }))
+          .filter((s) => clean(s.text));
+        const alternateJsonScripts = Array.from(document.querySelectorAll('script[type]'))
+          .map((s) => ({ type: s.getAttribute('type') || '', id: s.id || '', text: s.textContent || '' }))
+          .filter((s) => {
+            const type = String(s.type || '').toLowerCase();
+            if (type === 'application/ld+json') return false;
+            if (!/json|x-json|javascript|ecmascript/i.test(type)) return false;
+            return clean(s.text);
+          });
+        const nextEl = document.querySelector('script#__NEXT_DATA__');
+        const nuxtEl = document.querySelector('script#__NUXT_DATA__');
+        const htmlText = document.documentElement ? String(document.documentElement.innerHTML || '') : '';
+        const dataAttrCount = Array.from(document.querySelectorAll('[data-json],[data-schema],[data-ld],[data-structured]')).length;
+        return {
+          jsonLdTexts: jsonLdScripts,
+          alternateJsonScripts: alternateJsonScripts.slice(0, 20).map((s) => ({
+            type: s.type,
+            id: s.id,
+            length: String(s.text || '').length,
+            text: String(s.text || '').slice(0, 20000)
+          })),
+          nextDataFound: !!nextEl,
+          nuxtDataFound: !!nuxtEl || /\bwindow\.__NUXT__\b/.test(htmlText),
+          nextDataLength: nextEl ? String(nextEl.textContent || '').length : 0,
+          nuxtDataLength: nuxtEl ? String(nuxtEl.textContent || '').length : 0,
+          dataAttributeJsonCandidateCount: dataAttrCount,
+          escapedLdJsonHint: /application\\?\/ld\+json|@type|@graph/.test(htmlText)
+        };
+      }).catch(() => ({
+        jsonLdTexts: [],
+        alternateJsonScripts: [],
+        nextDataFound: false,
+        nuxtDataFound: false,
+        nextDataLength: 0,
+        nuxtDataLength: 0,
+        dataAttributeJsonCandidateCount: 0,
+        escapedLdJsonHint: false
+      }));
+
+      const beforeWaitDom = await collectDomJsonLd();
+      await page.waitForTimeout(1000).catch(() => {});
+      const afterWaitDom = await collectDomJsonLd();
+
+      const html = await page.content().catch(() => '');
+      const $ = cheerio.load(html || '');
+      const htmlContentTexts = [];
+      $('script[type="application/ld+json"]').each((_, el) => {
+        if (htmlContentTexts.length >= 120) return;
+        const txt = String($(el).text() || '').trim();
+        if (!txt) return;
+        htmlContentTexts.push({
+          type: String($(el).attr('type') || ''),
+          id: String($(el).attr('id') || ''),
+          text: txt.length > 300000 ? txt.slice(0, 300000) : txt
+        });
+      });
+      const htmlAlternateJsonScripts = [];
+      $('script[type]').each((_, el) => {
+        if (htmlAlternateJsonScripts.length >= 20) return;
+        const type = String($(el).attr('type') || '').toLowerCase();
+        if (type === 'application/ld+json') return;
+        if (!/json|x-json|javascript|ecmascript/i.test(type)) return;
+        const txt = String($(el).text() || '').trim();
+        if (!txt) return;
+        htmlAlternateJsonScripts.push({
+          type: String($(el).attr('type') || ''),
+          id: String($(el).attr('id') || ''),
+          length: txt.length,
+          text: txt.slice(0, 20000)
+        });
+      });
+
+      const renderedBeforeSummary = summarizeTexts(beforeWaitDom.jsonLdTexts || [], 'rendered_dom_before_wait');
+      const renderedAfterSummary = summarizeTexts(afterWaitDom.jsonLdTexts || [], 'rendered_dom_after_wait');
+      const htmlSummary = summarizeTexts(htmlContentTexts, 'page_content_ldjson');
+      const alternateSummary = summarizeTexts(
+        (afterWaitDom.alternateJsonScripts || []).concat(htmlAlternateJsonScripts || []),
+        'alternate_json_scripts'
+      );
+      const types = Array.from(new Set(
+        []
+          .concat(renderedBeforeSummary.types || [])
+          .concat(renderedAfterSummary.types || [])
+          .concat(htmlSummary.types || [])
+          .concat(alternateSummary.types || [])
+          .filter(Boolean)
+      )).slice(0, 50);
+      const samples = []
+        .concat(renderedBeforeSummary.samples || [])
+        .concat(renderedAfterSummary.samples || [])
+        .concat(htmlSummary.samples || [])
+        .concat(alternateSummary.samples || [])
+        .slice(0, 16);
+      const parseErrors = []
+        .concat(renderedBeforeSummary.parseErrors || [])
+        .concat(renderedAfterSummary.parseErrors || [])
+        .concat(htmlSummary.parseErrors || [])
+        .concat(alternateSummary.parseErrors || [])
+        .slice(0, 10);
+      const parseableCount =
+        renderedAfterSummary.parseableCount +
+        htmlSummary.parseableCount +
+        alternateSummary.parseableCount;
+      const parseErrorsCount =
+        renderedAfterSummary.parseErrorsCount +
+        htmlSummary.parseErrorsCount +
+        alternateSummary.parseErrorsCount;
+
+      const out = {
+        ok: true,
+        mode: 'balancedJsonLdProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        renderedDomRawCount: renderedAfterSummary.rawCount,
+        renderedDomBeforeWaitRawCount: renderedBeforeSummary.rawCount,
+        renderedDomAfterWaitRawCount: renderedAfterSummary.rawCount,
+        htmlContentRawCount: htmlSummary.rawCount,
+        alternateJsonScriptCount: alternateSummary.rawCount,
+        nextDataFound: !!(afterWaitDom.nextDataFound),
+        nuxtDataFound: !!(afterWaitDom.nuxtDataFound),
+        nextDataLength: Number(afterWaitDom.nextDataLength || 0),
+        nuxtDataLength: Number(afterWaitDom.nuxtDataLength || 0),
+        dataAttributeJsonCandidateCount: Number(afterWaitDom.dataAttributeJsonCandidateCount || 0),
+        escapedLdJsonHint: !!(afterWaitDom.escapedLdJsonHint || /application\\?\/ld\+json|@type|@graph/.test(String(html || ''))),
+        parseableCount,
+        types,
+        parseErrorsCount,
+        samples,
+        parseErrors,
+        diagnostics: {
+          fullScrapeSkipped: true,
+          rawHtmlReturned: false,
+          rawJsonLdReturned: false,
+          boundedWaitMs: 1000,
+          htmlLength: String(html || '').length,
+          elapsedMs: Date.now() - startedAt
+        }
+      };
+      logSf('JSONLD_BALANCED_PROBE_SEND', {
+        renderedDomRawCount: out.renderedDomRawCount,
+        htmlContentRawCount: out.htmlContentRawCount,
+        alternateJsonScriptCount: out.alternateJsonScriptCount,
+        parseableCount: out.parseableCount,
+        types: out.types,
+        elapsedMs: out.diagnostics.elapsedMs
+      });
+      logSfMemory('jsonld_balanced_probe_send');
+      return res.status(200).json(out);
+    }
+    if (probeMode === 'jsonldscriptsrc') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const startedAt = Date.now();
+      const MAX_SCRIPTS = 10;
+      const MAX_BYTES_PER_SCRIPT = 1000000;
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const safeUrlSample = (v) => String(v || '').slice(0, 220);
+      const extractSchemaTypes = (text) => {
+        const body = String(text || '');
+        const types = [];
+        const patterns = [
+          /["@]type["']?\s*:\s*["']([^"']{1,100})["']/gi,
+          /\\"@type\\"\s*:\s*\\"([^"\\]{1,100})\\"/gi,
+          /@type\\?["']?\s*[:=]\s*\\?["']([^"'\\]{1,100})/gi
+        ];
+        patterns.forEach((re) => {
+          let m;
+          while ((m = re.exec(body)) && types.length < 80) {
+            const t = clean(m[1]);
+            if (t) types.push(t);
+          }
+        });
+        return Array.from(new Set(types)).slice(0, 50);
+      };
+      const makeTextSample = (text) => {
+        const body = String(text || '');
+        const idxs = [
+          body.indexOf('@context'),
+          body.indexOf('\\"@context\\"'),
+          body.indexOf('schema.org'),
+          body.indexOf('@type'),
+          body.indexOf('\\"@type\\"')
+        ].filter((n) => n >= 0);
+        const idx = idxs.length ? Math.min.apply(null, idxs) : 0;
+        return clean(body.slice(Math.max(0, idx - 80), idx + 260));
+      };
+      const parseWholeJsonTypes = (text) => {
+        const found = [];
+        const walk = (node, depth = 0) => {
+          if (depth > 10 || node == null) return;
+          if (Array.isArray(node)) {
+            node.forEach((item) => walk(item, depth + 1));
+            return;
+          }
+          if (typeof node !== 'object') return;
+          const t = node['@type'];
+          if (Array.isArray(t)) t.forEach((x) => found.push(clean(x)));
+          else if (t) found.push(clean(t));
+          Object.keys(node).forEach((k) => {
+            if (k === '@type') return;
+            if (k === '@context') return;
+            walk(node[k], depth + 1);
+          });
+        };
+        try {
+          walk(JSON.parse(String(text || '')));
+          return Array.from(new Set(found.filter(Boolean))).slice(0, 50);
+        } catch (_) {
+          return [];
+        }
+      };
+      logSf('JSONLD_SCRIPT_SRC_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_script_src_probe_enter');
+
+      let scriptSrcs = [];
+      let renderedScriptSrcs = [];
+      let htmlScriptSrcs = [];
+      let htmlLength = 0;
+      try {
+        renderedScriptSrcs = await page.evaluate(() => {
+          const out = [];
+          Array.from(document.querySelectorAll('script[src]')).forEach((s) => {
+            const src = s && s.getAttribute && s.getAttribute('src');
+            if (!src) return;
+            try {
+              out.push(new URL(src, location.href).toString());
+            } catch (_) {}
+          });
+          return out;
+        }).catch(() => []);
+        const html = await page.content().catch(() => '');
+        htmlLength = String(html || '').length;
+        const $ = cheerio.load(html || '');
+        $('script[src]').each((_, el) => {
+          const src = String($(el).attr('src') || '').trim();
+          if (!src) return;
+          try {
+            htmlScriptSrcs.push(new URL(src, finalUrl || urlToFetch).toString());
+          } catch (_) {}
+        });
+      } catch (_) {}
+
+      scriptSrcs = uniq([].concat(renderedScriptSrcs || []).concat(htmlScriptSrcs || []).filter(Boolean));
+      let origin = '';
+      try { origin = new URL(finalUrl || urlToFetch).origin; } catch (_) {}
+      const sameOriginScripts = scriptSrcs.filter((u) => {
+        try { return new URL(u).origin === origin; } catch (_) { return false; }
+      });
+      const targetScripts = sameOriginScripts.slice(0, MAX_SCRIPTS);
+      const candidates = [];
+      let fetchedScriptCount = 0;
+      let skippedLargeScriptCount = 0;
+      let parseableCount = 0;
+      let totalFetchedBytes = 0;
+      let maxScriptLength = 0;
+      for (const scriptUrl of targetScripts) {
+        const result = {
+          urlSample: safeUrlSample(scriptUrl),
+          approxLength: 0,
+          hasContext: false,
+          hasType: false,
+          hasSchemaOrg: false,
+          parseable: false,
+          typesSample: [],
+          textSample: ''
+        };
+        try {
+          const r = await page.request.get(scriptUrl, { timeout: 10000 });
+          const headers = typeof r.headers === 'function' ? r.headers() : {};
+          const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
+          if (contentLength > MAX_BYTES_PER_SCRIPT) {
+            skippedLargeScriptCount += 1;
+            result.approxLength = contentLength;
+            result.skippedReason = 'script_too_large_header';
+            if (candidates.length < 20) candidates.push(result);
+            continue;
+          }
+          const text = await r.text();
+          const len = String(text || '').length;
+          result.approxLength = len;
+          totalFetchedBytes += len;
+          maxScriptLength = Math.max(maxScriptLength, len);
+          if (len > MAX_BYTES_PER_SCRIPT) {
+            skippedLargeScriptCount += 1;
+            result.skippedReason = 'script_too_large_body';
+            if (candidates.length < 20) candidates.push(result);
+            continue;
+          }
+          fetchedScriptCount += 1;
+          result.hasContext = /@context|\\"@context\\"/.test(text);
+          result.hasType = /@type|\\"@type\\"/.test(text);
+          result.hasSchemaOrg = /schema\.org/i.test(text);
+          const parsedTypes = parseWholeJsonTypes(text);
+          const regexTypes = extractSchemaTypes(text);
+          result.parseable = parsedTypes.length > 0;
+          if (result.parseable) parseableCount += 1;
+          result.typesSample = Array.from(new Set([].concat(parsedTypes, regexTypes).filter(Boolean))).slice(0, 20);
+          result.textSample = (result.hasContext || result.hasType || result.hasSchemaOrg) ? makeTextSample(text).slice(0, 360) : '';
+          if ((result.hasContext || result.hasType || result.hasSchemaOrg || result.typesSample.length) && candidates.length < 20) {
+            candidates.push(result);
+          }
+        } catch (e) {
+          result.errorMessage = String(e && (e.message || e) || '').slice(0, 180);
+          if (candidates.length < 20) candidates.push(result);
+        }
+      }
+
+      const types = Array.from(new Set([].concat.apply([], candidates.map((c) => Array.isArray(c.typesSample) ? c.typesSample : [])).filter(Boolean))).slice(0, 50);
+      const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+      const out = {
+        ok: true,
+        mode: 'jsonLdScriptSrcProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        scriptSrcCount: scriptSrcs.length,
+        sameOriginScriptCount: sameOriginScripts.length,
+        fetchedScriptCount,
+        skippedLargeScriptCount,
+        jsonLdCandidateCount: candidates.filter((c) => c && (c.hasContext || c.hasType || c.hasSchemaOrg || (Array.isArray(c.typesSample) && c.typesSample.length))).length,
+        parseableCount,
+        types,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        candidates,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          rawJsReturned: false,
+          maxScripts: MAX_SCRIPTS,
+          maxBytesPerScript: MAX_BYTES_PER_SCRIPT,
+          htmlLength,
+          renderedScriptSrcCount: Array.isArray(renderedScriptSrcs) ? renderedScriptSrcs.length : 0,
+          htmlScriptSrcCount: Array.isArray(htmlScriptSrcs) ? htmlScriptSrcs.length : 0,
+          appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || ''))),
+          totalFetchedBytes,
+          maxScriptLength,
+          elapsedMs: Date.now() - startedAt
+        }
+      };
+      logSf('JSONLD_SCRIPT_SRC_PROBE_SEND', {
+        scriptSrcCount: out.scriptSrcCount,
+        sameOriginScriptCount: out.sameOriginScriptCount,
+        fetchedScriptCount: out.fetchedScriptCount,
+        skippedLargeScriptCount: out.skippedLargeScriptCount,
+        jsonLdCandidateCount: out.jsonLdCandidateCount,
+        parseableCount: out.parseableCount,
+        types: out.types,
+        appIndexDetected: out.diagnostics.appIndexDetected,
+        elapsedMs: out.diagnostics.elapsedMs
+      });
+      logSfMemory('jsonld_script_src_probe_send');
+      return res.status(200).json(out);
+    }
     if (probeMode === 'primaryrisk') {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       const status = resp && typeof resp.status === 'function' ? resp.status() : null;
@@ -4807,6 +5560,12 @@ async function scrapeOnce(req, res) {
         structuredDataHtmlContentLdJsonObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlContentLdJsonObserved') ? structuredObserved.htmlContentLdJsonObserved : false,
         structuredDataHtmlContentRawCount: typeof structuredObserved.htmlContentRawCount === 'number' ? structuredObserved.htmlContentRawCount : 0,
         structuredDataHtmlContentParseableCount: typeof structuredObserved.htmlContentParseableCount === 'number' ? structuredObserved.htmlContentParseableCount : 0,
+        structuredDataScriptSrcJsonLdObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcJsonLdObserved') ? structuredObserved.scriptSrcJsonLdObserved : false,
+        structuredDataScriptSrcCandidateCount: typeof structuredObserved.scriptSrcCandidateCount === 'number' ? structuredObserved.scriptSrcCandidateCount : 0,
+        structuredDataScriptSrcFetchedCount: typeof structuredObserved.scriptSrcFetchedCount === 'number' ? structuredObserved.scriptSrcFetchedCount : 0,
+        structuredDataScriptSrcJsonLdCandidateCount: typeof structuredObserved.scriptSrcJsonLdCandidateCount === 'number' ? structuredObserved.scriptSrcJsonLdCandidateCount : 0,
+        structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
+        structuredDataScriptSrcAppIndexDetected: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcAppIndexDetected') ? structuredObserved.scriptSrcAppIndexDetected : false,
         structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
         structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
         structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true
