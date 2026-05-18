@@ -5824,8 +5824,15 @@ async function scrapeOnce(req, res) {
         } catch (_) {}
         const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
         const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+        const metaEl =
+          document.querySelector('meta[name="description" i]') ||
+          document.querySelector('meta[property="og:description" i]') ||
+          document.querySelector('meta[name="twitter:description" i]');
+        const metaDescription = clean(metaEl && metaEl.getAttribute('content'));
         return {
           title: clean(document.title || '').slice(0, 180),
+          metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
+          metaDescriptionLength: metaDescription ? metaDescription.length : 0,
           bodyTextLength: bodyText.length,
           anchorCount: document.querySelectorAll('a[href]').length,
           scriptCount: document.querySelectorAll('script').length,
@@ -6299,10 +6306,11 @@ async function scrapeOnce(req, res) {
             confidence: basicDom.title ? 'high' : 'low'
           },
           metaDescription: {
-            value: null,
-            observed: false,
-            source: 'skipped_shortfast_phase_builder',
-            confidence: 'low'
+            value: basicDom.metaDescription || null,
+            observed: !!basicDom.metaDescription,
+            source: basicDom.metaDescription ? 'basic_dom_eval' : 'not_observed',
+            confidence: basicDom.metaDescription ? 'high' : 'low',
+            length: Number(basicDom.metaDescriptionLength || (basicDom.metaDescription ? basicDom.metaDescription.length : 0)) || 0
           },
           h1: {
             values: [],
@@ -6396,7 +6404,8 @@ async function scrapeOnce(req, res) {
       geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
       const lightweightSummary = {
         title: basicDom.title || null,
-        metaDescription: null,
+        metaDescription: basicDom.metaDescription || null,
+        metaDescriptionLen: Number(basicDom.metaDescriptionLength || (basicDom.metaDescription ? basicDom.metaDescription.length : 0)) || null,
         h1Count: Number(headingsLight.h1Count || 0),
         h2Count: Number(headingsLight.h2Count || 0),
         h1Source: headingsLight.h1Source || 'not_observed',
