@@ -5634,7 +5634,7 @@ async function scrapeOnce(req, res) {
       return res.status(200).json(out);
     }
 
-    if (probeMode === 'shortfastphases') {
+    if (probeMode === 'shortfastphases' || balancedShortFastResponse) {
       const probeStartedAt = Date.now();
       const phases = [];
       const blockedCounts = {
@@ -5715,11 +5715,28 @@ async function scrapeOnce(req, res) {
 
       await runPhase('basicDomEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const shadowTextParts = [];
+        try {
+          const walkShadow = (root, depth = 0) => {
+            if (!root || depth > 2 || shadowTextParts.length >= 30) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || shadowTextParts.length >= 30) return;
+              const text = clean(el.innerText || el.textContent);
+              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 220));
+              if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadow(document, 0);
+        } catch (_) {}
+        const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+        const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
         return {
           title: clean(document.title || '').slice(0, 180),
-          bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent)).length,
+          bodyTextLength: bodyText.length,
           anchorCount: document.querySelectorAll('a[href]').length,
-          scriptCount: document.querySelectorAll('script').length
+          scriptCount: document.querySelectorAll('script').length,
+          shadowTextPartsCount: shadowTextParts.length
         };
       }), 3000);
 
@@ -5771,7 +5788,7 @@ async function scrapeOnce(req, res) {
         const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
           maxScripts: 3,
           maxBytesPerScript: 512000,
-          requestTimeoutMs: 1500
+          requestTimeoutMs: 3000
         });
         return {
           scriptSrcCount: summary.scriptSrcCount,
@@ -5785,7 +5802,7 @@ async function scrapeOnce(req, res) {
           maxScriptLength: summary.maxScriptLength,
           error: summary.error || null
         };
-      }, 3500);
+      }, 5000);
 
       await runPhase('linksAndTrust', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -5795,8 +5812,28 @@ async function scrapeOnce(req, res) {
         const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
           text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
           href: absUrl(a.getAttribute('href') || '').slice(0, 180),
-          navLike: !!a.closest('nav,[role="navigation"],header,footer')
+          navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+          source: 'dom'
         })).filter((a) => a.href);
+        try {
+          const walkShadowAnchors = (root, depth = 0) => {
+            if (!root || depth > 2 || anchors.length >= 120) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || anchors.length >= 120) return;
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                anchors.push({
+                  text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')).slice(0, 80),
+                  href: absUrl(el.getAttribute('href') || '').slice(0, 180),
+                  navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  source: 'open_shadow_dom_light'
+                });
+              }
+              if (el.shadowRoot) walkShadowAnchors(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadowAnchors(document, 0);
+        } catch (_) {}
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
         return {
@@ -5809,7 +5846,8 @@ async function scrapeOnce(req, res) {
           hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
-          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
         };
       }), 3000);
 
@@ -5873,6 +5911,375 @@ async function scrapeOnce(req, res) {
         };
       }, 1000);
 
+      const phaseByName = (name) => phases.find((p) => p && p.name === name) || {};
+      const phaseResult = (name) => {
+        const phase = phaseByName(name);
+        return phase && phase.minimalResult && typeof phase.minimalResult === 'object' ? phase.minimalResult : {};
+      };
+      const basicDom = phaseResult('basicDomEval');
+      const structuredLight = phaseResult('structuredDataLight');
+      const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
+      const linksTrust = phaseResult('linksAndTrust');
+      const multimodal = phaseResult('multimodal');
+      const headingsLight = phaseResult('headingsLight');
+      const landmarksLight = phaseResult('landmarksLight');
+      const mergedTypes = Array.from(new Set([]
+        .concat(Array.isArray(structuredLight.types) ? structuredLight.types : [])
+        .concat(Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types : [])
+        .filter(Boolean)
+      )).slice(0, 50);
+      const typeSet = new Set(mergedTypes.map((t) => String(t || '').toLowerCase()));
+      const structuredDataLight = {
+        types: mergedTypes,
+        rawCount: Number(structuredLight.renderedDomRawCount || 0) + Number(structuredLight.htmlContentRawCount || 0) + Number(scriptJsonLd.candidateCount || 0),
+        parseableCount: Number(structuredLight.renderedDomParseableCount || 0) + Number(structuredLight.htmlContentParseableCount || 0),
+        hasJsonLd: mergedTypes.length > 0 || Number(structuredLight.renderedDomRawCount || 0) > 0 || Number(structuredLight.htmlContentRawCount || 0) > 0 || Number(scriptJsonLd.candidateCount || 0) > 0,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        source: 'shortfast_phase_builder',
+        confidence: 'medium',
+        observationLimited: true,
+        observationScope: 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only',
+        renderedDomObserved: true,
+        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
+        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
+        htmlContentLdJsonObserved: true,
+        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
+        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
+        scriptSrcJsonLdObserved: true,
+        scriptSrcCandidateCount: Number(scriptJsonLd.sameOriginScriptCount || 0),
+        scriptSrcFetchedCount: Number(scriptJsonLd.fetchedCount || 0),
+        scriptSrcJsonLdCandidateCount: Number(scriptJsonLd.candidateCount || 0),
+        scriptSrcJsonLdTypes: Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types.slice(0, 50) : [],
+        scriptSrcSkippedLargeCount: Number(scriptJsonLd.skippedLargeCount || 0),
+        scriptSrcAppIndexDetected: !!scriptJsonLd.appIndexDetected,
+        htmlScanSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true,
+        parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
+        scriptSrcError: scriptJsonLd.error || null
+      };
+      const geoSignalsV1 = {
+        version: 'geoSignalsV1',
+        generatedAt: new Date().toISOString(),
+        url: String(finalUrl || urlToFetch || ''),
+        structuredData: structuredDataLight,
+        headings: {
+          h1Count: Number(headingsLight.h1Count || 0),
+          h2Count: Number(headingsLight.h2Count || 0),
+          h3Count: Number(headingsLight.h3Count || 0),
+          hasH1: Number(headingsLight.h1Count || 0) > 0,
+          hasSingleH1: Number(headingsLight.h1Count || 0) === 1,
+          h1Texts: [],
+          headingTexts: Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample.slice(0, 10) : [],
+          primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
+          primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
+          primaryHeadingConfidence: headingsLight.primaryHeadingCandidate ? 'low' : 'low',
+          h1EquivalentCandidateFound: !!headingsLight.h1EquivalentCandidateFound,
+          sectionHeadingCandidate: '',
+          sectionHeadingCandidateSource: 'not_observed',
+          sectionHeadingConfidence: 'low',
+          source: Number(headingsLight.h1Count || 0) > 0 ? 'dom' : 'dom_light',
+          h1Source: headingsLight.h1Source || 'not_observed',
+          headingObservationLimited: Number(headingsLight.h1Count || 0) === 0,
+          excludedHeadingCount: 0,
+          excludedHeadingReasons: [],
+          a11yObserved: false
+        },
+        balanced: {
+          enabled: true,
+          shortFastDedicatedPath: true,
+          shadowHeadingScan: false,
+          shadowHeadingObserved: false,
+          shadowHostCount: 0,
+          primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
+          primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
+          primaryHeadingConfidence: 'low',
+          h1EquivalentCandidateFound: !!headingsLight.h1EquivalentCandidateFound,
+          boundedWaitMs: 0,
+          hydration: {
+            waitMs: 0,
+            bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+            bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+            anchorCountBeforeWait: Number(basicDom.anchorCount || 0),
+            anchorCountAfterWait: Number(basicDom.anchorCount || 0),
+            navLinkCountBeforeWait: Number(linksTrust.navLinkCount || 0),
+            navLinkCountAfterWait: Number(linksTrust.navLinkCount || 0),
+            improvedBodyText: false,
+            improvedLinks: false
+          },
+          h1Attempts: {
+            dom: { count: Number(headingsLight.h1Count || 0), source: 'dom_light' },
+            a11y: { count: 0, observed: false, error: 'skipped_shortfast_dedicated_path', source: 'a11y' },
+            iframeSameOrigin: { count: 0, iframeCount: 0, accessibleCount: 0, blockedCount: 0, source: 'iframe_same_origin' }
+          }
+        },
+        landmarks: {
+          hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ? landmarksLight.hasMainLandmark : null,
+          hasMainLandmark_final: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') ? landmarksLight.hasMainLandmark_final : null,
+          mainLandmarkSource: landmarksLight.mainLandmarkSource || 'not_observed',
+          mainLandmarkConfidence: landmarksLight.hasMainLandmark ? 'high' : 'low',
+          mainLandmarkTextsSample: [],
+          mainLandmarkCandidateFound: !!landmarksLight.mainLandmarkCandidateFound,
+          mainLandmarkCandidateSource: landmarksLight.mainLandmarkCandidateSource || 'not_observed',
+          mainLandmarkCandidateConfidence: landmarksLight.mainLandmarkCandidateFound ? 'low' : 'low',
+          mainLandmarkCandidateTextsSample: [],
+          mainLandmarkObservationLimited: !landmarksLight.hasMainLandmark,
+          a11yObserved: false,
+          a11yMainCount: 0
+        },
+        multimodalSignals: {
+          checked: true,
+          hasImage: !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0),
+          hasStructured: null,
+          hasOgImage: !!multimodal.hasOgImage,
+          hasTwitterImage: !!multimodal.hasTwitterImage,
+          hasFavicon: !!multimodal.hasFavicon,
+          hasAppleTouchIcon: !!multimodal.hasAppleTouchIcon,
+          hasStructuredLogo: null,
+          imageObjectCount: null,
+          structuredImageCount: null,
+          imgCount: Number(multimodal.imgCount || 0),
+          primaryImageOfPage: '',
+          sampleImageUrls: [],
+          source: 'shortfast_phase_builder'
+        },
+        trustSignals: {
+          hasContactLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactPathFound: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactObservedFromDom: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactObservedFromScriptHint: false,
+          contactPathHintOnly: false,
+          contactLinkSample: null,
+          hasCompanyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+          hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+          source: 'shortfast_phase_builder'
+        },
+        observed: {
+          title: {
+            value: basicDom.title || null,
+            observed: !!basicDom.title,
+            source: 'rendered_dom_light',
+            confidence: basicDom.title ? 'high' : 'low'
+          },
+          metaDescription: {
+            value: null,
+            observed: false,
+            source: 'skipped_shortfast_phase_builder',
+            confidence: 'low'
+          },
+          h1: {
+            values: [],
+            count: Number(headingsLight.h1Count || 0),
+            observed: true,
+            source: headingsLight.h1Source || 'not_observed',
+            confidence: Number(headingsLight.h1Count || 0) > 0 ? 'high' : 'low',
+            hasH1: Number(headingsLight.h1Count || 0) > 0,
+            hasSingleH1: Number(headingsLight.h1Count || 0) === 1,
+            headingObservationLimited: Number(headingsLight.h1Count || 0) === 0
+          },
+          headings: null,
+          links: {
+            navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 10) : [],
+            internalLinksSample: [],
+            hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+            hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
+            hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+            hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+            source: 'rendered_dom_light',
+            confidence: 'medium'
+          },
+          structuredData: structuredDataLight,
+          landmarks: null,
+          multimodalSignals: null,
+          trustSignals: null,
+          body: {
+            textLength: Number(basicDom.bodyTextLength || 0),
+            sample: '',
+            source: 'rendered_dom_light',
+            confidence: 'medium'
+          }
+        },
+        diagnostics: {
+          evaluateCount: phases.length,
+          balancedMode: true,
+          shortFastMode: true,
+          shortFastDedicatedPath: true,
+          reusedPhaseProbeBuilder: true,
+          skippedHeavyBalancedBuilder: true,
+          boundedHydrationWaitMs: 0,
+          hydrationWaitMs: 0,
+          bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+          bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+          hydrationImprovedBodyText: false,
+          hydrationImprovedLinks: false,
+          jsBundleAnalysis: false,
+          resourceChunkScan: false,
+          shadowHeadingScan: false,
+          a11yHeadingScan: false,
+          appRootHeadingScan: false,
+          heroHeadingScan: false,
+          iframeHeadingScan: false,
+          primaryHeadingScan: true,
+          shadowPrimaryHeadingScan: false,
+          mainCandidateScan: true,
+          htmlContentLdJsonScan: true,
+          skippedScans: ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder'],
+          phaseTimings: {
+            gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
+            basicDomMs: phaseByName('basicDomEval').elapsedMs || null,
+            structuredDataMs: phaseByName('structuredDataLight').elapsedMs || null,
+            sameOriginScriptJsonLdMs: phaseByName('sameOriginScriptJsonLd').elapsedMs || null,
+            linksMs: phaseByName('linksAndTrust').elapsedMs || null,
+            multimodalMs: phaseByName('multimodal').elapsedMs || null,
+            headingsMs: phaseByName('headingsLight').elapsedMs || null,
+            landmarksMs: phaseByName('landmarksLight').elapsedMs || null,
+            totalMs: Math.max(0, Date.now() - probeStartedAt)
+          }
+        }
+      };
+      geoSignalsV1.observed.headings = Object.assign({}, geoSignalsV1.headings, {
+        h1: [],
+        h2: [],
+        h3: [],
+        headingTexts: Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample.slice(0, 10) : [],
+        a11y: { observed: false, error: 'skipped_shortfast_dedicated_path' }
+      });
+      geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
+      geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
+      geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
+      const lightweightSummary = {
+        title: basicDom.title || null,
+        metaDescription: null,
+        h1Count: Number(headingsLight.h1Count || 0),
+        h2Count: Number(headingsLight.h2Count || 0),
+        h1Source: headingsLight.h1Source || 'not_observed',
+        headingSource: geoSignalsV1.headings.source,
+        primaryHeadingCandidate: geoSignalsV1.headings.primaryHeadingCandidate,
+        primaryHeadingCandidateSource: geoSignalsV1.headings.primaryHeadingCandidateSource,
+        primaryHeadingConfidence: geoSignalsV1.headings.primaryHeadingConfidence,
+        h1EquivalentCandidateFound: geoSignalsV1.headings.h1EquivalentCandidateFound,
+        headingObservationLimited: geoSignalsV1.headings.headingObservationLimited,
+        hasMainLandmark: geoSignalsV1.landmarks.hasMainLandmark,
+        hasMainLandmarkFinal: geoSignalsV1.landmarks.hasMainLandmark_final,
+        mainLandmarkSource: geoSignalsV1.landmarks.mainLandmarkSource,
+        mainLandmarkCandidateFound: geoSignalsV1.landmarks.mainLandmarkCandidateFound,
+        mainLandmarkCandidateSource: geoSignalsV1.landmarks.mainLandmarkCandidateSource,
+        mainLandmarkObservationLimited: geoSignalsV1.landmarks.mainLandmarkObservationLimited,
+        hydrationWaitMs: 0,
+        bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+        bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+        hydrationImprovedBodyText: false,
+        hydrationImprovedLinks: false,
+        balancedMode: true,
+        shortFastDedicatedPath: true,
+        headingShadowScan: false,
+        headingA11yScan: false,
+        navLinkCount: Number(linksTrust.navLinkCount || 0),
+        internalLinkCount: Number(linksTrust.internalLinkCount || 0),
+        hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+        hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
+        hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+        hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+        bodyTextLength: Number(basicDom.bodyTextLength || 0),
+        jsonldCount: structuredDataLight.rawCount,
+        jsonldParseableCount: structuredDataLight.parseableCount,
+        jsonldParseErrorsCount: structuredDataLight.parseErrorsCount,
+        jsonldTypes: structuredDataLight.types.slice(0, 50),
+        hasJsonLd: structuredDataLight.hasJsonLd,
+        hasWebsiteJsonLd: structuredDataLight.hasWebsite,
+        hasOrgJsonLd: structuredDataLight.hasOrganization,
+        hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
+        hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        structuredDataObservationLimited: structuredDataLight.observationLimited,
+        structuredDataObservationScope: structuredDataLight.observationScope,
+        structuredDataRenderedDomObserved: structuredDataLight.renderedDomObserved,
+        structuredDataHtmlContentLdJsonObserved: structuredDataLight.htmlContentLdJsonObserved,
+        structuredDataScriptSrcJsonLdObserved: structuredDataLight.scriptSrcJsonLdObserved,
+        structuredDataScriptSrcFetchedCount: structuredDataLight.scriptSrcFetchedCount,
+        structuredDataScriptSrcJsonLdCandidateCount: structuredDataLight.scriptSrcJsonLdCandidateCount,
+        structuredDataScriptSrcJsonLdTypes: structuredDataLight.scriptSrcJsonLdTypes.slice(0, 50),
+        hasOgImage: geoSignalsV1.multimodalSignals.hasOgImage,
+        hasTwitterImage: geoSignalsV1.multimodalSignals.hasTwitterImage,
+        hasFavicon: geoSignalsV1.multimodalSignals.hasFavicon,
+        hasAppleTouchIcon: geoSignalsV1.multimodalSignals.hasAppleTouchIcon,
+        hasStructuredLogo: geoSignalsV1.multimodalSignals.hasStructuredLogo,
+        hasContactLink: geoSignalsV1.trustSignals.hasContactLink,
+        contactPathFound: geoSignalsV1.trustSignals.contactPathFound,
+        contactObservedFromDom: geoSignalsV1.trustSignals.contactObservedFromDom,
+        contactObservedFromScriptHint: geoSignalsV1.trustSignals.contactObservedFromScriptHint,
+        contactPathHintOnly: geoSignalsV1.trustSignals.contactPathHintOnly
+      };
+      const diagnostics = {
+        probeOnly: false,
+        responseMode: 'shortFast',
+        shortFastMode: true,
+        shortFastDedicatedPath: true,
+        reusedPhaseProbeBuilder: true,
+        skippedHeavyBalancedBuilder: true,
+        balancedMode: true,
+        htmlSkipped: true,
+        scoringSkipped: true,
+        auditSigSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true,
+        phaseTimings: geoSignalsV1.diagnostics.phaseTimings,
+        phases: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage || '' })),
+        blockedCounts,
+        skippedScans: geoSignalsV1.diagnostics.skippedScans,
+        timeoutGuardMs: 60000
+      };
+      const memoryHints = {
+        avoidedHeavyBlocks: [
+          'html',
+          'scoring.html',
+          'auditSig',
+          'heavy_balanced_builder',
+          'deep_shadow_heading_scan',
+          'a11y_heading_scan',
+          'iframe_heading_scan',
+          'resource_js_tap',
+          'chunk_tap',
+          'productSpecComparisonSignals',
+          'responsePayloadHugeMerge'
+        ],
+        estimatedSavedBytes: null,
+        shortFastMode: true,
+        skippedScans: diagnostics.skippedScans
+      };
+      if (balancedShortFastResponse) {
+      const dedicatedPayload = {
+        ok: phases.every((p) => p.ok),
+        mode: 'signalsFirstBalanced',
+        responseMode: 'shortFast',
+        shortFastMode: true,
+        url: urlToFetch,
+        finalUrl,
+        status,
+        geoSignalsV1,
+        lightweightSummary,
+        diagnostics,
+        memoryHints
+      };
+      try {
+        dedicatedPayload.diagnostics.responseBytesApprox = Buffer.byteLength(JSON.stringify(dedicatedPayload), 'utf8');
+      } catch (_) {}
+      logSf('SIGNALS_FIRST_BALANCED_SHORTFAST_DEDICATED_SEND', {
+        ok: dedicatedPayload.ok,
+        status,
+        phaseTimings: diagnostics.phaseTimings,
+        navLinkCount: lightweightSummary.navLinkCount,
+        internalLinkCount: lightweightSummary.internalLinkCount,
+        h1Source: lightweightSummary.h1Source,
+        hasMainLandmark: lightweightSummary.hasMainLandmarkFinal,
+        jsonldCount: lightweightSummary.jsonldCount
+      });
+      logSfMemory('signals_first_balanced_shortfast_dedicated_send');
+      return res.status(200).json(dedicatedPayload);
+      }
+
       const out = {
         ok: phases.every((p) => p.ok),
         mode: 'shortFastPhaseProbe',
@@ -5897,7 +6304,7 @@ async function scrapeOnce(req, res) {
           rawHtmlReturned: false,
           rawJsReturned: false,
           phaseTimeoutMs: 3000,
-          sameOriginScriptFetchTimeoutMs: 1500,
+          sameOriginScriptFetchTimeoutMs: 3000,
           sameOriginScriptMaxScripts: 3,
           sameOriginScriptMaxBytes: 512000
         }
