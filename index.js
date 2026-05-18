@@ -6404,6 +6404,63 @@ async function scrapeOnce(req, res) {
         contactObservedFromScriptHint: geoSignalsV1.trustSignals.contactObservedFromScriptHint,
         contactPathHintOnly: geoSignalsV1.trustSignals.contactPathHintOnly
       };
+      const phaseFailed = (name) => {
+        const p = phaseByName(name);
+        return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
+      };
+      const fatalPhaseFailures = phaseStatuses
+        .filter((p) => !p.ok && ['goto', 'basicDomEval'].includes(p.name))
+        .map((p) => ({
+          phase: p.name,
+          errorMessage: p.errorMessage || 'core_phase_failed'
+        }));
+      const limitedPhaseNames = observationLimitedByPhase.map((p) => p.phase);
+      const coreSignalsReady = !phaseFailed('goto') && !phaseFailed('basicDomEval') &&
+        (!!basicDom.title || Number(basicDom.bodyTextLength || 0) > 0 || Number(linksTrust.anchorCount || 0) > 0 || Number(linksTrust.internalLinkCount || 0) > 0);
+      const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredDataLight.observationLimited === true;
+      const linksReady = !phaseFailed('linksAndTrust') && (
+        Number(linksTrust.navLinkCount || 0) > 0 ||
+        Number(linksTrust.internalLinkCount || 0) > 0 ||
+        Number(linksTrust.anchorCount || 0) > 0
+      );
+      const headingsReady = !phaseFailed('headingsLight') && Object.prototype.hasOwnProperty.call(headingsLight, 'h1Count');
+      const landmarksReady = !phaseFailed('landmarksLight') && (
+        Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ||
+        Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') ||
+        typeof optionalA11y.mainCount === 'number'
+      );
+      const trustReady = !phaseFailed('linksAndTrust') && (
+        typeof linksTrust.hasContactLikeLink === 'boolean' ||
+        typeof linksTrust.hasCompanyLikeLink === 'boolean' ||
+        typeof linksTrust.hasPrivacyLikeLink === 'boolean'
+      );
+      const multimodalReady = !phaseFailed('multimodal') && (
+        typeof multimodal.hasOgImage === 'boolean' ||
+        typeof multimodal.hasFavicon === 'boolean' ||
+        typeof multimodal.imgCount === 'number'
+      );
+      const corePhaseFailures = ['structuredDataLight', 'sameOriginScriptJsonLd', 'linksAndTrust', 'multimodal', 'headingsLight', 'landmarksLight']
+        .filter((name) => phaseFailed(name));
+      const qualityReasons = [];
+      if (!coreSignalsReady) qualityReasons.push('core_signals_not_ready');
+      if (!structuredDataLight.hasJsonLd) qualityReasons.push('structured_data_not_observed_or_limited');
+      if (!linksReady) qualityReasons.push('links_not_ready');
+      if (!headingsReady) qualityReasons.push('headings_not_ready');
+      if (!landmarksReady) qualityReasons.push('landmarks_not_ready');
+      if (observationLimitedByPhase.length) qualityReasons.push('phase_observation_limited');
+      if (corePhaseFailures.length) qualityReasons.push('core_phase_failures:' + corePhaseFailures.join(','));
+      let qualityStatus = 'ready';
+      if (fatalPhaseFailures.length || !coreSignalsReady) {
+        qualityStatus = 'failed';
+      } else if (corePhaseFailures.length >= 2 || (!linksReady && !structuredDataReady)) {
+        qualityStatus = 'degraded';
+      } else if (qualityReasons.length || !structuredDataLight.hasJsonLd) {
+        qualityStatus = 'limited';
+      }
+      if (!qualityReasons.length) qualityReasons.push('all_core_observer_phases_ready');
+      lightweightSummary.qualityStatus = qualityStatus;
+      lightweightSummary.coreSignalsReady = coreSignalsReady;
+      lightweightSummary.observationLimitedByPhaseCount = observationLimitedByPhase.length;
       const diagnostics = {
         probeOnly: false,
         responseMode: 'shortFast',
@@ -6424,6 +6481,17 @@ async function scrapeOnce(req, res) {
         phases: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage || '' })),
         phaseStatuses,
         observationLimitedByPhase,
+        qualityStatus,
+        qualityReasons,
+        fatalPhaseFailures,
+        limitedPhaseNames,
+        coreSignalsReady,
+        structuredDataReady,
+        linksReady,
+        headingsReady,
+        landmarksReady,
+        trustReady,
+        multimodalReady,
         blockedCounts,
         skippedScans: geoSignalsV1.diagnostics.skippedScans,
         timeoutGuardMs: 60000
@@ -6449,8 +6517,12 @@ async function scrapeOnce(req, res) {
       };
       if (unifiedBalancedObserverProbe) {
         const unifiedPayload = {
-          ok: phases.every((p) => p.ok || (p.minimalResult && p.minimalResult.skipped)),
+          ok: qualityStatus !== 'failed',
           mode: 'unifiedBalancedObserverProbe',
+          qualityStatus,
+          qualityReasons,
+          fatalPhaseFailures,
+          limitedPhaseNames,
           observer: 'unified',
           url: urlToFetch,
           finalUrl,
