@@ -5030,6 +5030,229 @@ app.get('/scrape', async (req, res) => {
   });
 });
 
+function buildBalancedShortResponsePayload(fullPayload) {
+  const trimmedFields = [];
+  const str = (value, max, path) => {
+    const text = value == null ? '' : String(value);
+    if (text.length > max) {
+      if (path) trimmedFields.push(path);
+      return text.slice(0, max);
+    }
+    return text;
+  };
+  const arr = (value, max, path, mapper) => {
+    const list = Array.isArray(value) ? value : [];
+    if (list.length > max && path) trimmedFields.push(path);
+    return list.slice(0, max).map(mapper || ((item) => item));
+  };
+  const linkSample = (item) => {
+    if (!item || typeof item !== 'object') return str(item, 160);
+    return {
+      text: str(item.text || item.label || '', 80),
+      href: str(item.href || item.url || '', 180)
+    };
+  };
+  const g = fullPayload && fullPayload.geoSignalsV1 ? fullPayload.geoSignalsV1 : {};
+  const observed = g.observed || {};
+  const headings = g.headings || observed.headings || {};
+  const landmarks = g.landmarks || observed.landmarks || {};
+  const structuredData = g.structuredData || observed.structuredData || {};
+  const links = observed.links || {};
+  const body = observed.body || {};
+  const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
+  const geoDiagnostics = g.diagnostics || {};
+  const balanced = g.balanced || {};
+  const shortStructuredData = {
+    types: arr(structuredData.types, 50, 'geoSignalsV1.structuredData.types'),
+    rawCount: structuredData.rawCount,
+    parseableCount: structuredData.parseableCount,
+    hasJsonLd: structuredData.hasJsonLd,
+    hasWebsite: structuredData.hasWebsite,
+    hasOrganization: structuredData.hasOrganization,
+    hasBreadcrumbList: structuredData.hasBreadcrumbList,
+    hasFAQPage: structuredData.hasFAQPage,
+    source: structuredData.source,
+    confidence: structuredData.confidence,
+    observationLimited: structuredData.observationLimited,
+    observationScope: structuredData.observationScope,
+    renderedDomObserved: structuredData.renderedDomObserved,
+    htmlContentLdJsonObserved: structuredData.htmlContentLdJsonObserved,
+    htmlContentRawCount: structuredData.htmlContentRawCount,
+    htmlContentParseableCount: structuredData.htmlContentParseableCount,
+    scriptSrcJsonLdObserved: structuredData.scriptSrcJsonLdObserved,
+    scriptSrcCandidateCount: structuredData.scriptSrcCandidateCount,
+    scriptSrcFetchedCount: structuredData.scriptSrcFetchedCount,
+    scriptSrcJsonLdCandidateCount: structuredData.scriptSrcJsonLdCandidateCount,
+    scriptSrcJsonLdTypes: arr(structuredData.scriptSrcJsonLdTypes, 50, 'geoSignalsV1.structuredData.scriptSrcJsonLdTypes'),
+    scriptSrcSkippedLargeCount: structuredData.scriptSrcSkippedLargeCount,
+    scriptSrcAppIndexDetected: structuredData.scriptSrcAppIndexDetected,
+    htmlScanSkipped: structuredData.htmlScanSkipped,
+    jsScanSkipped: structuredData.jsScanSkipped,
+    chunkScanSkipped: structuredData.chunkScanSkipped,
+    parseErrorsCount: structuredData.parseErrorsCount
+  };
+  const shortHeadings = {
+    h1Count: headings.h1Count,
+    h2Count: headings.h2Count,
+    h3Count: headings.h3Count,
+    hasH1: headings.hasH1,
+    hasSingleH1: headings.hasSingleH1,
+    h1Texts: arr(headings.h1Texts, 5, 'geoSignalsV1.headings.h1Texts', (v) => str(v, 160)),
+    headingTexts: arr(headings.headingTexts, 10, 'geoSignalsV1.headings.headingTexts', (v) => str(v, 160)),
+    primaryHeadingCandidate: str(headings.primaryHeadingCandidate, 180, 'geoSignalsV1.headings.primaryHeadingCandidate'),
+    primaryHeadingCandidateSource: headings.primaryHeadingCandidateSource,
+    primaryHeadingConfidence: headings.primaryHeadingConfidence,
+    h1EquivalentCandidateFound: headings.h1EquivalentCandidateFound,
+    sectionHeadingCandidate: str(headings.sectionHeadingCandidate, 160, 'geoSignalsV1.headings.sectionHeadingCandidate'),
+    sectionHeadingCandidateSource: headings.sectionHeadingCandidateSource,
+    sectionHeadingConfidence: headings.sectionHeadingConfidence,
+    source: headings.source,
+    h1Source: headings.h1Source,
+    headingObservationLimited: headings.headingObservationLimited,
+    excludedHeadingCount: headings.excludedHeadingCount,
+    excludedHeadingReasons: arr(headings.excludedHeadingReasons, 10, 'geoSignalsV1.headings.excludedHeadingReasons', (v) => str(v, 80)),
+    a11yObserved: headings.a11yObserved
+  };
+  const shortLandmarks = {
+    hasMainLandmark: landmarks.hasMainLandmark,
+    hasMainLandmark_final: landmarks.hasMainLandmark_final,
+    mainLandmarkSource: landmarks.mainLandmarkSource,
+    mainLandmarkConfidence: landmarks.mainLandmarkConfidence,
+    mainLandmarkTextsSample: arr(landmarks.mainLandmarkTextsSample, 3, 'geoSignalsV1.landmarks.mainLandmarkTextsSample', (v) => str(v, 160)),
+    mainLandmarkCandidateFound: landmarks.mainLandmarkCandidateFound,
+    mainLandmarkCandidateSource: landmarks.mainLandmarkCandidateSource,
+    mainLandmarkCandidateConfidence: landmarks.mainLandmarkCandidateConfidence,
+    mainLandmarkCandidateTextsSample: arr(landmarks.mainLandmarkCandidateTextsSample, 3, 'geoSignalsV1.landmarks.mainLandmarkCandidateTextsSample', (v) => str(v, 160)),
+    mainLandmarkObservationLimited: landmarks.mainLandmarkObservationLimited,
+    a11yObserved: landmarks.a11yObserved,
+    a11yMainCount: landmarks.a11yMainCount
+  };
+  const shortLinks = {
+    navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
+    internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
+    hasCompanyLikeLink: links.hasCompanyLikeLink,
+    hasServiceLikeLink: links.hasServiceLikeLink,
+    hasContactLikeLink: links.hasContactLikeLink,
+    hasPrivacyLikeLink: links.hasPrivacyLikeLink,
+    source: links.source,
+    confidence: links.confidence
+  };
+  const shortBalanced = {
+    enabled: !!balanced.enabled,
+    shadowHeadingScan: !!balanced.shadowHeadingScan,
+    shadowHeadingObserved: !!balanced.shadowHeadingObserved,
+    shadowHostCount: balanced.shadowHostCount,
+    mainH1Texts: arr(balanced.mainH1Texts, 3, 'geoSignalsV1.balanced.mainH1Texts', (v) => str(v, 140)),
+    mainH2Texts: arr(balanced.mainH2Texts, 5, 'geoSignalsV1.balanced.mainH2Texts', (v) => str(v, 140)),
+    appRootH1Texts: arr(balanced.appRootH1Texts, 3, 'geoSignalsV1.balanced.appRootH1Texts', (v) => str(v, 140)),
+    appRootH2Texts: arr(balanced.appRootH2Texts, 5, 'geoSignalsV1.balanced.appRootH2Texts', (v) => str(v, 140)),
+    heroH1Texts: arr(balanced.heroH1Texts, 3, 'geoSignalsV1.balanced.heroH1Texts', (v) => str(v, 140)),
+    heroH2Texts: arr(balanced.heroH2Texts, 5, 'geoSignalsV1.balanced.heroH2Texts', (v) => str(v, 140)),
+    shadowH1Texts: arr(balanced.shadowH1Texts, 3, 'geoSignalsV1.balanced.shadowH1Texts', (v) => str(v, 140)),
+    shadowH2Texts: arr(balanced.shadowH2Texts, 5, 'geoSignalsV1.balanced.shadowH2Texts', (v) => str(v, 140)),
+    iframeSameOriginH1Texts: arr(balanced.iframeSameOriginH1Texts, 3, 'geoSignalsV1.balanced.iframeSameOriginH1Texts', (v) => str(v, 140)),
+    iframeSameOriginH2Texts: arr(balanced.iframeSameOriginH2Texts, 5, 'geoSignalsV1.balanced.iframeSameOriginH2Texts', (v) => str(v, 140)),
+    primaryHeadingCandidate: str(balanced.primaryHeadingCandidate, 180, 'geoSignalsV1.balanced.primaryHeadingCandidate'),
+    primaryHeadingCandidateSource: balanced.primaryHeadingCandidateSource,
+    primaryHeadingConfidence: balanced.primaryHeadingConfidence,
+    h1EquivalentCandidateFound: balanced.h1EquivalentCandidateFound,
+    sectionHeadingCandidate: str(balanced.sectionHeadingCandidate, 160, 'geoSignalsV1.balanced.sectionHeadingCandidate'),
+    sectionHeadingCandidateSource: balanced.sectionHeadingCandidateSource,
+    sectionHeadingConfidence: balanced.sectionHeadingConfidence,
+    boundedWaitMs: balanced.boundedWaitMs,
+    hydration: balanced.hydration || null,
+    h1Attempts: balanced.h1Attempts || null
+  };
+  const shortGeoSignalsV1 = {
+    version: g.version,
+    generatedAt: g.generatedAt,
+    url: g.url,
+    structuredData: shortStructuredData,
+    headings: shortHeadings,
+    balanced: shortBalanced,
+    landmarks: shortLandmarks,
+    multimodalSignals: g.multimodalSignals || null,
+    trustSignals: g.trustSignals || null,
+    observed: {
+      title: observed.title || null,
+      metaDescription: observed.metaDescription || null,
+      h1: observed.h1 || null,
+      headings: Object.assign({}, shortHeadings, {
+        h1: arr(observed.headings && observed.headings.h1, 5, 'geoSignalsV1.observed.headings.h1', (v) => str(v, 160)),
+        h2: arr(observed.headings && observed.headings.h2, 10, 'geoSignalsV1.observed.headings.h2', (v) => str(v, 140)),
+        h3: arr(observed.headings && observed.headings.h3, 10, 'geoSignalsV1.observed.headings.h3', (v) => str(v, 140))
+      }),
+      links: shortLinks,
+      structuredData: shortStructuredData,
+      landmarks: shortLandmarks,
+      multimodalSignals: observed.multimodalSignals || g.multimodalSignals || null,
+      trustSignals: observed.trustSignals || g.trustSignals || null,
+      body: {
+        textLength: body.textLength,
+        sample: str(body.sample, 280, 'geoSignalsV1.observed.body.sample'),
+        source: body.source,
+        confidence: body.confidence
+      }
+    },
+    diagnostics: {
+      evaluateCount: geoDiagnostics.evaluateCount,
+      balancedMode: geoDiagnostics.balancedMode,
+      boundedHydrationWaitMs: geoDiagnostics.boundedHydrationWaitMs,
+      hydrationWaitMs: geoDiagnostics.hydrationWaitMs,
+      bodyTextBeforeWait: geoDiagnostics.bodyTextBeforeWait,
+      bodyTextAfterWait: geoDiagnostics.bodyTextAfterWait,
+      hydrationImprovedBodyText: geoDiagnostics.hydrationImprovedBodyText,
+      hydrationImprovedLinks: geoDiagnostics.hydrationImprovedLinks,
+      jsBundleAnalysis: geoDiagnostics.jsBundleAnalysis,
+      resourceChunkScan: geoDiagnostics.resourceChunkScan,
+      shadowHeadingScan: geoDiagnostics.shadowHeadingScan,
+      a11yHeadingScan: geoDiagnostics.a11yHeadingScan,
+      appRootHeadingScan: geoDiagnostics.appRootHeadingScan,
+      heroHeadingScan: geoDiagnostics.heroHeadingScan,
+      iframeHeadingScan: geoDiagnostics.iframeHeadingScan,
+      primaryHeadingScan: geoDiagnostics.primaryHeadingScan,
+      shadowPrimaryHeadingScan: geoDiagnostics.shadowPrimaryHeadingScan,
+      mainCandidateScan: geoDiagnostics.mainCandidateScan,
+      htmlContentLdJsonScan: geoDiagnostics.htmlContentLdJsonScan
+    }
+  };
+  const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
+  if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
+  if (Array.isArray(shortLightweightSummary.structuredDataScriptSrcJsonLdTypes)) shortLightweightSummary.structuredDataScriptSrcJsonLdTypes = shortLightweightSummary.structuredDataScriptSrcJsonLdTypes.slice(0, 50);
+  const shortDiagnostics = Object.assign({}, diagnostics, {
+    responseMode: 'short',
+    shortMode: true,
+    trimmedFields
+  });
+  const memoryHints = Object.assign({}, fullPayload.memoryHints || {});
+  memoryHints.trimmedFields = trimmedFields.slice(0, 80);
+  let estimatedOriginalBytes = null;
+  let responseBytesApprox = null;
+  try { estimatedOriginalBytes = Buffer.byteLength(JSON.stringify(fullPayload), 'utf8'); } catch (_) {}
+  const shortPayload = {
+    ok: true,
+    mode: fullPayload.mode,
+    responseMode: 'short',
+    shortMode: true,
+    url: fullPayload.url,
+    finalUrl: fullPayload.finalUrl,
+    status: fullPayload.status,
+    geoSignalsV1: shortGeoSignalsV1,
+    lightweightSummary: shortLightweightSummary,
+    diagnostics: shortDiagnostics,
+    memoryHints
+  };
+  shortPayload.diagnostics.estimatedOriginalBytes = estimatedOriginalBytes;
+  shortPayload.diagnostics.responseBytesApprox = null;
+  try {
+    responseBytesApprox = Buffer.byteLength(JSON.stringify(shortPayload), 'utf8');
+    shortPayload.diagnostics.responseBytesApprox = responseBytesApprox;
+  } catch (_) {}
+  shortPayload.memoryHints.estimatedOriginalBytes = estimatedOriginalBytes;
+  shortPayload.memoryHints.responseBytesApprox = responseBytesApprox;
+  return shortPayload;
+}
+
 async function scrapeOnce(req, res) {
   const urlToFetch = req.query.url;
 
@@ -5039,7 +5262,8 @@ async function scrapeOnce(req, res) {
   const signalsMode = String(req.query.signalsMode || '').toLowerCase();
   const responseMode = String(req.query.responseMode || '').toLowerCase();
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
-  const signalsFirstBalanced = signalsMode === 'balanced' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
+  const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
+  const balancedShortResponse = signalsFirstBalanced && (responseMode === 'short' || signalsMode === 'balancedshort');
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
   const probeAliases = {
     'resource-json': 'resourcejson',
@@ -6036,7 +6260,8 @@ async function scrapeOnce(req, res) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
       logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_ENTER' : 'SIGNALS_FIRST_LIGHT_ENTER', {
         url: String(urlToFetch || '').slice(0, 180),
-        finalUrl: String(finalUrl || '').slice(0, 180)
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        responseMode: balancedShortResponse ? 'short' : 'default'
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
       const boundedHydrationWaitMs = signalsFirstBalanced ? 3500 : 0;
@@ -6209,7 +6434,7 @@ async function scrapeOnce(req, res) {
         bodyTextLength: lightweightSummary.bodyTextLength
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_send' : 'signals_first_light_send');
-      return res.status(200).json({
+      const signalsResponsePayload = {
         ok: true,
         mode: signalsFirstBalanced ? 'signalsFirstBalanced' : 'signalsFirstLight',
         url: urlToFetch,
@@ -6219,7 +6444,21 @@ async function scrapeOnce(req, res) {
         lightweightSummary,
         diagnostics,
         memoryHints
-      });
+      };
+      if (balancedShortResponse) {
+        const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
+        logSf('SIGNALS_FIRST_BALANCED_SHORT_SEND', {
+          trimmedFieldsCount: shortPayload && shortPayload.diagnostics && Array.isArray(shortPayload.diagnostics.trimmedFields)
+            ? shortPayload.diagnostics.trimmedFields.length
+            : 0,
+          estimatedOriginalBytes: shortPayload && shortPayload.diagnostics && shortPayload.diagnostics.estimatedOriginalBytes,
+          responseBytesApprox: shortPayload && shortPayload.diagnostics && shortPayload.diagnostics.responseBytesApprox,
+          navLinkCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.navLinkCount,
+          jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
+        });
+        return res.status(200).json(shortPayload);
+      }
+      return res.status(200).json(signalsResponsePayload);
     }
     if (signalsOnly) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
