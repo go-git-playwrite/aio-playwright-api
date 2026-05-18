@@ -5311,6 +5311,7 @@ async function scrapeOnce(req, res) {
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
   const signalsMode = String(req.query.signalsMode || '').toLowerCase();
   const responseMode = String(req.query.responseMode || '').toLowerCase();
+  const observerMode = String(req.query.observer || '').toLowerCase();
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
   const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || signalsMode === 'balancedfast' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
   const balancedShortFastResponse = signalsFirstBalanced && (responseMode === 'shortfast' || responseMode === 'short-fast' || signalsMode === 'balancedfast');
@@ -5357,10 +5358,15 @@ async function scrapeOnce(req, res) {
     'goto-probe': 'gototiming',
     'shortfast-phases': 'shortfastphases',
     shortfastphases: 'shortfastphases',
-    'shortfast-phase': 'shortfastphases'
+    'shortfast-phase': 'shortfastphases',
+    'unified-balanced-observer': 'unifiedbalancedobserver',
+    unifiedbalancedobserver: 'unifiedbalancedobserver',
+    'balanced-observer': 'unifiedbalancedobserver',
+    'unified-observer': 'unifiedbalancedobserver'
   };
-  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases'];
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases', 'unifiedbalancedobserver'];
   const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
+  const observerProbeMode = signalsFirstBalanced && (observerMode === 'unifiedprobe' || observerMode === 'unified-probe' || observerMode === 'unified') ? 'unifiedbalancedobserver' : '';
   const probeMaxFetchRaw = Number(req.query.maxFetch);
   const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
     ? Math.floor(probeMaxFetchRaw)
@@ -5634,7 +5640,8 @@ async function scrapeOnce(req, res) {
       return res.status(200).json(out);
     }
 
-    if (probeMode === 'shortfastphases' || balancedShortFastResponse) {
+    if (probeMode === 'shortfastphases' || probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver' || balancedShortFastResponse) {
+      const unifiedBalancedObserverProbe = probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver';
       const probeStartedAt = Date.now();
       const phases = [];
       const blockedCounts = {
@@ -5713,6 +5720,82 @@ async function scrapeOnce(req, res) {
       finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
       status = resp && typeof resp.status === 'function' ? resp.status() : status;
 
+      await runPhase('hydrationGuardedWait', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        const before = await page.evaluate(() => ({
+          bodyTextLength: String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          shadowAnchorCount: (() => {
+            let count = 0;
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 2 || count >= 200) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el) return;
+                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) count += 1;
+                if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            try { walk(document, 0); } catch (_) {}
+            return count;
+          })()
+        })).catch(() => ({ bodyTextLength: 0, anchorCount: 0 }));
+        await page.waitForFunction(({ before }) => {
+          const bodyTextLength = String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length;
+          const anchorCount = document.querySelectorAll('a[href]').length;
+          let shadowAnchorCount = 0;
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 2 || shadowAnchorCount >= 200) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
+              if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          };
+          try { walk(document, 0); } catch (_) {}
+          return anchorCount > Math.max(0, before.anchorCount) || anchorCount >= 5 ||
+            shadowAnchorCount > Math.max(0, before.shadowAnchorCount) || shadowAnchorCount >= 5 ||
+            bodyTextLength > Math.max(1800, before.bodyTextLength + 400);
+        }, { before }, { timeout: 2500, polling: 250 }).catch(() => {});
+        const after = await page.evaluate(() => ({
+          bodyTextLength: String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          shadowAnchorCount: (() => {
+            let count = 0;
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 2 || count >= 200) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el) return;
+                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) count += 1;
+                if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            try { walk(document, 0); } catch (_) {}
+            return count;
+          })()
+        })).catch(() => ({ bodyTextLength: 0, anchorCount: 0, shadowAnchorCount: 0 }));
+        return {
+          skipped: false,
+          limited: true,
+          waitMs: 2500,
+          bodyTextBeforeWait: before.bodyTextLength,
+          bodyTextAfterWait: after.bodyTextLength,
+          anchorCountBeforeWait: before.anchorCount,
+          anchorCountAfterWait: after.anchorCount,
+          shadowAnchorCountBeforeWait: before.shadowAnchorCount,
+          shadowAnchorCountAfterWait: after.shadowAnchorCount,
+          hydrationImprovedBodyText: after.bodyTextLength > before.bodyTextLength,
+          hydrationImprovedLinks: after.anchorCount > before.anchorCount || after.shadowAnchorCount > before.shadowAnchorCount
+        };
+      }, 3000);
+
       await runPhase('basicDomEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
         const shadowTextParts = [];
@@ -5738,7 +5821,7 @@ async function scrapeOnce(req, res) {
           scriptCount: document.querySelectorAll('script').length,
           shadowTextPartsCount: shadowTextParts.length
         };
-      }), 3000);
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
 
       await runPhase('structuredDataLight', async () => {
         const rendered = await page.evaluate(() => {
@@ -5786,9 +5869,9 @@ async function scrapeOnce(req, res) {
 
       await runPhase('sameOriginScriptJsonLd', async () => {
         const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
-          maxScripts: 3,
-          maxBytesPerScript: 512000,
-          requestTimeoutMs: 3000
+          maxScripts: unifiedBalancedObserverProbe ? 10 : 3,
+          maxBytesPerScript: unifiedBalancedObserverProbe ? 1000000 : 512000,
+          requestTimeoutMs: unifiedBalancedObserverProbe ? 7000 : 3000
         });
         return {
           scriptSrcCount: summary.scriptSrcCount,
@@ -5802,7 +5885,7 @@ async function scrapeOnce(req, res) {
           maxScriptLength: summary.maxScriptLength,
           error: summary.error || null
         };
-      }, 5000);
+      }, unifiedBalancedObserverProbe ? 8000 : 5000);
 
       await runPhase('linksAndTrust', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -5860,7 +5943,7 @@ async function scrapeOnce(req, res) {
           hasAppleTouchIcon: has('link[rel~="apple-touch-icon"][href],link[rel="apple-touch-icon-precomposed"][href]'),
           imgCount: document.querySelectorAll('img').length
         };
-      }), 3000);
+      }), unifiedBalancedObserverProbe ? 1000 : 3000);
 
       await runPhase('headingsLight', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -5879,7 +5962,7 @@ async function scrapeOnce(req, res) {
           h1EquivalentCandidateFound: false,
           headingTextsSample: h1.concat(h2).concat(h3).slice(0, 10)
         };
-      }), 3000);
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
 
       await runPhase('landmarksLight', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -5893,7 +5976,79 @@ async function scrapeOnce(req, res) {
           mainLandmarkCandidateSource: !main && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
           mainLandmarkCandidateTextLength: appCandidate ? clean(appCandidate.innerText || appCandidate.textContent).length : 0
         };
-      }), 3000);
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
+
+      await runPhase('optionalEnhancedShadow', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        return page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const out = {
+            skipped: false,
+            limited: true,
+            shadowHostCount: 0,
+            shadowAnchorCount: 0,
+            shadowHeadingCount: 0,
+            shadowHeadingTexts: [],
+            shadowNavTextsSample: []
+          };
+          const seenNav = new Set();
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 2 || out.shadowHostCount > 80) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (el.shadowRoot) {
+                out.shadowHostCount += 1;
+                walk(el.shadowRoot, depth + 1);
+              }
+              const tag = String(el.tagName || '').toLowerCase();
+              if (/^h[1-3]$/.test(tag)) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && out.shadowHeadingTexts.length < 12) out.shadowHeadingTexts.push(text.slice(0, 160));
+                out.shadowHeadingCount += 1;
+              }
+              if (tag === 'a' && el.getAttribute && el.getAttribute('href')) {
+                out.shadowAnchorCount += 1;
+                const navLike = !!el.closest('nav,[role="navigation"],header,footer');
+                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+                if (navLike && text && !seenNav.has(text) && out.shadowNavTextsSample.length < 10) {
+                  seenNav.add(text);
+                  out.shadowNavTextsSample.push(text.slice(0, 100));
+                }
+              }
+            });
+          };
+          try { walk(document, 0); } catch (_) {}
+          return out;
+        });
+      }, 2000);
+
+      await runPhase('optionalA11y', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        const headings = await page.getByRole('heading').evaluateAll((els) => els.slice(0, 20).map((el) => ({
+          text: String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+          ariaLevel: el && el.getAttribute ? el.getAttribute('aria-level') : null,
+          tagName: String(el && el.tagName || '').toLowerCase()
+        }))).catch(() => []);
+        const mainCount = await page.getByRole('main').count().catch(() => null);
+        return {
+          skipped: false,
+          limited: true,
+          headingCount: Array.isArray(headings) ? headings.length : 0,
+          headings: Array.isArray(headings) ? headings.filter((h) => h && h.text).slice(0, 10) : [],
+          mainCount
+        };
+      }, 2000);
 
       await runPhase('buildShortPayload', async () => {
         const phaseSummary = {};
@@ -5916,6 +6071,7 @@ async function scrapeOnce(req, res) {
         const phase = phaseByName(name);
         return phase && phase.minimalResult && typeof phase.minimalResult === 'object' ? phase.minimalResult : {};
       };
+      const hydrationGuardedWait = phaseResult('hydrationGuardedWait');
       const basicDom = phaseResult('basicDomEval');
       const structuredLight = phaseResult('structuredDataLight');
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
@@ -5923,6 +6079,22 @@ async function scrapeOnce(req, res) {
       const multimodal = phaseResult('multimodal');
       const headingsLight = phaseResult('headingsLight');
       const landmarksLight = phaseResult('landmarksLight');
+      const enhancedShadow = phaseResult('optionalEnhancedShadow');
+      const optionalA11y = phaseResult('optionalA11y');
+      const phaseStatuses = phases.map((p) => ({
+        name: p.name,
+        ok: !!p.ok,
+        skipped: !!(p.minimalResult && p.minimalResult.skipped),
+        limited: !!(p.minimalResult && p.minimalResult.limited),
+        elapsedMs: p.elapsedMs,
+        errorMessage: p.errorMessage || ''
+      }));
+      const observationLimitedByPhase = phaseStatuses
+        .filter((p) => !p.ok || p.skipped || p.limited)
+        .map((p) => ({
+          phase: p.name,
+          reason: p.errorMessage || (p.skipped ? 'skipped' : (p.limited ? 'limited' : 'not_ok'))
+        }));
       const mergedTypes = Array.from(new Set([]
         .concat(Array.isArray(structuredLight.types) ? structuredLight.types : [])
         .concat(Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types : [])
@@ -5973,7 +6145,11 @@ async function scrapeOnce(req, res) {
           hasH1: Number(headingsLight.h1Count || 0) > 0,
           hasSingleH1: Number(headingsLight.h1Count || 0) === 1,
           h1Texts: [],
-          headingTexts: Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample.slice(0, 10) : [],
+          headingTexts: Array.from(new Set([]
+            .concat(Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample : [])
+            .concat(Array.isArray(enhancedShadow.shadowHeadingTexts) ? enhancedShadow.shadowHeadingTexts : [])
+            .concat(Array.isArray(optionalA11y.headings) ? optionalA11y.headings.map((h) => h && h.text).filter(Boolean) : [])
+          )).slice(0, 12),
           primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
           primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
           primaryHeadingConfidence: headingsLight.primaryHeadingCandidate ? 'low' : 'low',
@@ -5991,44 +6167,52 @@ async function scrapeOnce(req, res) {
         balanced: {
           enabled: true,
           shortFastDedicatedPath: true,
-          shadowHeadingScan: false,
-          shadowHeadingObserved: false,
-          shadowHostCount: 0,
+          observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+          phaseGuarded: !!unifiedBalancedObserverProbe,
+          shadowHeadingScan: !!unifiedBalancedObserverProbe,
+          shadowHeadingObserved: Number(enhancedShadow.shadowHeadingCount || 0) > 0,
+          shadowHostCount: Number(enhancedShadow.shadowHostCount || 0),
+          shadowH1Texts: [],
+          shadowH2Texts: Array.isArray(enhancedShadow.shadowHeadingTexts) ? enhancedShadow.shadowHeadingTexts.slice(0, 5) : [],
           primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
           primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
           primaryHeadingConfidence: 'low',
           h1EquivalentCandidateFound: !!headingsLight.h1EquivalentCandidateFound,
-          boundedWaitMs: 0,
+          boundedWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
           hydration: {
-            waitMs: 0,
-            bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+            waitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+            bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
             bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
-            anchorCountBeforeWait: Number(basicDom.anchorCount || 0),
+            anchorCountBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.anchorCountBeforeWait === 'number' ? hydrationGuardedWait.anchorCountBeforeWait : Number(basicDom.anchorCount || 0),
             anchorCountAfterWait: Number(basicDom.anchorCount || 0),
             navLinkCountBeforeWait: Number(linksTrust.navLinkCount || 0),
             navLinkCountAfterWait: Number(linksTrust.navLinkCount || 0),
-            improvedBodyText: false,
-            improvedLinks: false
+            improvedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+            improvedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks)
           },
           h1Attempts: {
             dom: { count: Number(headingsLight.h1Count || 0), source: 'dom_light' },
-            a11y: { count: 0, observed: false, error: 'skipped_shortfast_dedicated_path', source: 'a11y' },
+            a11y: unifiedBalancedObserverProbe
+              ? { count: Number(optionalA11y.headingCount || 0), observed: true, limited: !!optionalA11y.limited, source: 'a11y_role_heading_light' }
+              : { count: 0, observed: false, error: 'skipped_shortfast_dedicated_path', source: 'a11y' },
             iframeSameOrigin: { count: 0, iframeCount: 0, accessibleCount: 0, blockedCount: 0, source: 'iframe_same_origin' }
           }
         },
         landmarks: {
           hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ? landmarksLight.hasMainLandmark : null,
-          hasMainLandmark_final: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') ? landmarksLight.hasMainLandmark_final : null,
-          mainLandmarkSource: landmarksLight.mainLandmarkSource || 'not_observed',
+          hasMainLandmark_final: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
+            ? landmarksLight.hasMainLandmark_final
+            : (unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0 ? true : null),
+          mainLandmarkSource: landmarksLight.mainLandmarkSource || (unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0 ? 'a11y_main_light' : 'not_observed'),
           mainLandmarkConfidence: landmarksLight.hasMainLandmark ? 'high' : 'low',
           mainLandmarkTextsSample: [],
           mainLandmarkCandidateFound: !!landmarksLight.mainLandmarkCandidateFound,
           mainLandmarkCandidateSource: landmarksLight.mainLandmarkCandidateSource || 'not_observed',
           mainLandmarkCandidateConfidence: landmarksLight.mainLandmarkCandidateFound ? 'low' : 'low',
           mainLandmarkCandidateTextsSample: [],
-          mainLandmarkObservationLimited: !landmarksLight.hasMainLandmark,
-          a11yObserved: false,
-          a11yMainCount: 0
+          mainLandmarkObservationLimited: !landmarksLight.hasMainLandmark && !(unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0),
+          a11yObserved: !!unifiedBalancedObserverProbe,
+          a11yMainCount: unifiedBalancedObserverProbe && typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
         },
         multimodalSignals: {
           checked: true,
@@ -6107,18 +6291,21 @@ async function scrapeOnce(req, res) {
           balancedMode: true,
           shortFastMode: true,
           shortFastDedicatedPath: true,
+          observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+          unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+          phaseGuardedObserver: !!unifiedBalancedObserverProbe,
           reusedPhaseProbeBuilder: true,
           skippedHeavyBalancedBuilder: true,
-          boundedHydrationWaitMs: 0,
-          hydrationWaitMs: 0,
-          bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+          boundedHydrationWaitMs: unifiedBalancedObserverProbe ? 2500 : 0,
+          hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+          bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
           bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
-          hydrationImprovedBodyText: false,
-          hydrationImprovedLinks: false,
+          hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+          hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
           jsBundleAnalysis: false,
           resourceChunkScan: false,
-          shadowHeadingScan: false,
-          a11yHeadingScan: false,
+          shadowHeadingScan: !!unifiedBalancedObserverProbe,
+          a11yHeadingScan: !!unifiedBalancedObserverProbe,
           appRootHeadingScan: false,
           heroHeadingScan: false,
           iframeHeadingScan: false,
@@ -6126,9 +6313,14 @@ async function scrapeOnce(req, res) {
           shadowPrimaryHeadingScan: false,
           mainCandidateScan: true,
           htmlContentLdJsonScan: true,
-          skippedScans: ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder'],
+          skippedScans: unifiedBalancedObserverProbe
+            ? ['iframe_heading_scan', 'large_samples', 'heavy_balanced_builder', 'resource_chunk_scan']
+            : ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder'],
+          phaseStatuses,
+          observationLimitedByPhase,
           phaseTimings: {
             gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
+            hydrationGuardedWaitMs: phaseByName('hydrationGuardedWait').elapsedMs || null,
             basicDomMs: phaseByName('basicDomEval').elapsedMs || null,
             structuredDataMs: phaseByName('structuredDataLight').elapsedMs || null,
             sameOriginScriptJsonLdMs: phaseByName('sameOriginScriptJsonLd').elapsedMs || null,
@@ -6168,11 +6360,11 @@ async function scrapeOnce(req, res) {
         mainLandmarkCandidateFound: geoSignalsV1.landmarks.mainLandmarkCandidateFound,
         mainLandmarkCandidateSource: geoSignalsV1.landmarks.mainLandmarkCandidateSource,
         mainLandmarkObservationLimited: geoSignalsV1.landmarks.mainLandmarkObservationLimited,
-        hydrationWaitMs: 0,
-        bodyTextBeforeWait: Number(basicDom.bodyTextLength || 0),
+        hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+        bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
         bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
-        hydrationImprovedBodyText: false,
-        hydrationImprovedLinks: false,
+        hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
         balancedMode: true,
         shortFastDedicatedPath: true,
         headingShadowScan: false,
@@ -6217,6 +6409,9 @@ async function scrapeOnce(req, res) {
         responseMode: 'shortFast',
         shortFastMode: true,
         shortFastDedicatedPath: true,
+        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+        unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+        phaseGuardedObserver: !!unifiedBalancedObserverProbe,
         reusedPhaseProbeBuilder: true,
         skippedHeavyBalancedBuilder: true,
         balancedMode: true,
@@ -6227,6 +6422,8 @@ async function scrapeOnce(req, res) {
         chunkScanSkipped: true,
         phaseTimings: geoSignalsV1.diagnostics.phaseTimings,
         phases: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage || '' })),
+        phaseStatuses,
+        observationLimitedByPhase,
         blockedCounts,
         skippedScans: geoSignalsV1.diagnostics.skippedScans,
         timeoutGuardMs: 60000
@@ -6247,8 +6444,62 @@ async function scrapeOnce(req, res) {
         ],
         estimatedSavedBytes: null,
         shortFastMode: true,
+        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
         skippedScans: diagnostics.skippedScans
       };
+      if (unifiedBalancedObserverProbe) {
+        const unifiedPayload = {
+          ok: phases.every((p) => p.ok || (p.minimalResult && p.minimalResult.skipped)),
+          mode: 'unifiedBalancedObserverProbe',
+          observer: 'unified',
+          url: urlToFetch,
+          finalUrl,
+          status,
+          geoSignalsV1,
+          lightweightSummary,
+          diagnostics: Object.assign({}, diagnostics, {
+            probeOnly: true,
+            responseMode: undefined,
+            shortFastMode: false,
+            shortFastDedicatedPath: false,
+            fullScrapeSkipped: true,
+            balancedMainlineSkipped: true,
+            rawHtmlReturned: false,
+            rawJsReturned: false,
+            phaseTimeoutsMs: {
+              goto: 12000,
+              hydrationGuardedWait: 3000,
+              basicDom: 2000,
+              structuredDataLight: 3000,
+              sameOriginScriptJsonLd: 8000,
+              linksAndTrust: 3000,
+              multimodal: 1000,
+              headingsLight: 2000,
+              landmarksLight: 2000,
+              optionalEnhancedShadow: 2000,
+              optionalA11y: 2000
+            }
+          }),
+          memoryHints
+        };
+        try {
+          unifiedPayload.diagnostics.responseBytesApprox = Buffer.byteLength(JSON.stringify(unifiedPayload), 'utf8');
+        } catch (_) {}
+        logSf('UNIFIED_BALANCED_OBSERVER_PROBE_SEND', {
+          ok: unifiedPayload.ok,
+          status,
+          totalMs: unifiedPayload.diagnostics.phaseTimings && unifiedPayload.diagnostics.phaseTimings.totalMs,
+          phaseStatuses: unifiedPayload.diagnostics.phaseStatuses,
+          observationLimitedByPhase: unifiedPayload.diagnostics.observationLimitedByPhase,
+          jsonldTypes: lightweightSummary.jsonldTypes,
+          navLinkCount: lightweightSummary.navLinkCount,
+          internalLinkCount: lightweightSummary.internalLinkCount,
+          h1Count: lightweightSummary.h1Count,
+          hasMainLandmark: lightweightSummary.hasMainLandmarkFinal
+        });
+        logSfMemory('unified_balanced_observer_probe_send');
+        return res.status(200).json(unifiedPayload);
+      }
       if (balancedShortFastResponse) {
       const dedicatedPayload = {
         ok: phases.every((p) => p.ok),
