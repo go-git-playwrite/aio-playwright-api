@@ -3352,9 +3352,9 @@ function extractSchemaTypesFromScriptTextLight(text) {
   return Array.from(new Set(types)).slice(0, 50);
 }
 
-async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
-  const MAX_SCRIPTS = 10;
-  const MAX_BYTES_PER_SCRIPT = 1000000;
+async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}) {
+  const MAX_SCRIPTS = Math.max(1, Math.min(10, Number(opts && opts.maxScripts || 10)));
+  const MAX_BYTES_PER_SCRIPT = Math.max(100000, Math.min(1000000, Number(opts && opts.maxBytesPerScript || 1000000)));
   const empty = {
     types: [],
     scriptSrcCount: 0,
@@ -3484,16 +3484,28 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url) {
 
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
+  const startedAt = Date.now();
   const balancedMode = !!(opts && opts.balancedMode);
+  const shortFastMode = !!(opts && opts.shortFastMode);
   const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
   const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
     ? opts.hydrationMetrics
     : {};
+  const phaseTimings = {
+    gotoMs: typeof opts.gotoMs === 'number' ? opts.gotoMs : null,
+    basicDomMs: null,
+    structuredDataMs: null,
+    linksMs: null,
+    multimodalMs: null,
+    totalMs: null
+  };
   try {
-    const observed = await page.evaluate(({ inputUrl, balancedMode }) => {
+    const basicDomStart = Date.now();
+    const observed = await page.evaluate(({ inputUrl, balancedMode, shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
       const limit = (arr, n) => uniq(arr).slice(0, n);
+      const browserPhaseTimings = { linksMs: null, multimodalMs: null };
       const absUrl = (href) => {
         try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
       };
@@ -3609,7 +3621,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         ? collectHeadingsIn('main [class*="hero" i],main [id*="hero" i],main [class*="kv" i],main [id*="kv" i],main [class*="mainvisual" i],main [id*="mainvisual" i],section[class*="hero" i],section[id*="hero" i],section[class*="kv" i],section[id*="kv" i],section[class*="mainvisual" i],section[id*="mainvisual" i]', 10, 20)
         : { rootCount: 0, h1: [], h2: [] };
       const iframeSameOriginHeadings = { iframeCount: 0, accessibleCount: 0, blockedCount: 0, h1: [], h2: [], error: null };
-      if (balancedMode) {
+      if (balancedMode && !shortFastMode) {
         try {
           const frames = Array.from(document.querySelectorAll('iframe'));
           iframeSameOriginHeadings.iframeCount = frames.length;
@@ -3634,7 +3646,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         }
       }
       const shadowHeadings = { h1: [], h2: [], h3: [], hostCount: 0, observed: false, error: null };
-      if (balancedMode) {
+      if (balancedMode && !shortFastMode) {
         try {
           const walkShadow = (root, depth = 0) => {
             if (!root || depth > 4) return;
@@ -3705,7 +3717,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           mainLandmarkCandidate.mainLandmarkCandidateTextsSample = sample;
         };
         setMainCandidate('dom_app_root_candidate', 'medium', Array.from(document.querySelectorAll('#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]') || []));
-        if (!mainLandmarkCandidate.mainLandmarkCandidateFound) {
+        if (!mainLandmarkCandidate.mainLandmarkCandidateFound && !shortFastMode) {
           try {
             const shadowCandidates = [];
             const shadowRootTextSamples = [];
@@ -3744,16 +3756,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         source: 'dom'
       })).filter((a) => a.href);
       const shadowTextParts = [];
+      const linksPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       if (balancedMode) {
         try {
+          const maxDepth = shortFastMode ? 2 : 4;
+          const maxAnchors = shortFastMode ? 120 : 300;
+          const maxShadowTextParts = shortFastMode ? 30 : 80;
           const collectShadowAnchors = (root, depth = 0) => {
-            if (!root || depth > 4 || anchors.length >= 300) return;
+            if (!root || depth > maxDepth || anchors.length >= maxAnchors) return;
             const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
             nodes.forEach((el) => {
-              if (!el || anchors.length >= 300) return;
-              if (shadowTextParts.length < 80) {
+              if (!el || anchors.length >= maxAnchors) return;
+              if (shadowTextParts.length < maxShadowTextParts) {
                 const text = clean(el.innerText || el.textContent);
-                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, shortFastMode ? 220 : 500));
               }
               if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
                 anchors.push({
@@ -3779,6 +3795,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
+      browserPhaseTimings.linksMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - linksPhaseStart));
+      const multimodalPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       const firstMetaContent = (selectors) => {
         for (const sel of selectors) {
           const el = document.querySelector(sel);
@@ -3847,6 +3865,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
       };
+      browserPhaseTimings.multimodalMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - multimodalPhaseStart));
       const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
       const bodyText = clean([domBodyText].concat(shadowTextParts).join(' ')).slice(0, 100000);
 
@@ -3898,9 +3917,15 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         body: {
           textLength: bodyText.length,
           sample: bodyText.slice(0, 500)
-        }
+        },
+        phaseTimings: browserPhaseTimings
       };
-    }, { inputUrl: String(url || ''), balancedMode });
+    }, { inputUrl: String(url || ''), balancedMode, shortFastMode });
+    phaseTimings.basicDomMs = Math.max(0, Date.now() - basicDomStart);
+    if (observed && observed.phaseTimings) {
+      phaseTimings.linksMs = typeof observed.phaseTimings.linksMs === 'number' ? observed.phaseTimings.linksMs : null;
+      phaseTimings.multimodalMs = typeof observed.phaseTimings.multimodalMs === 'number' ? observed.phaseTimings.multimodalMs : null;
+    }
 
     const normalizeHeadingText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
     const uniqueHeadingTexts = (arr, limitCount) => {
@@ -3981,18 +4006,22 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       observed: false,
       error: null
     };
-    try {
-      const allText = await page.getByRole('heading').allTextContents().catch(() => []);
-      const h1Text = await page.getByRole('heading', { level: 1 }).allTextContents().catch(() => []);
-      const h2Text = await page.getByRole('heading', { level: 2 }).allTextContents().catch(() => []);
-      const h3Text = await page.getByRole('heading', { level: 3 }).allTextContents().catch(() => []);
-      a11yHeadings.all = uniqueHeadingTexts(allText, 30);
-      a11yHeadings.h1 = uniqueHeadingTexts(h1Text, 10);
-      a11yHeadings.h2 = uniqueHeadingTexts(h2Text, 20);
-      a11yHeadings.h3 = uniqueHeadingTexts(h3Text, 20);
-      a11yHeadings.observed = true;
-    } catch (e) {
-      a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+    if (shortFastMode) {
+      a11yHeadings.error = 'skipped_short_fast';
+    } else {
+      try {
+        const allText = await page.getByRole('heading').allTextContents().catch(() => []);
+        const h1Text = await page.getByRole('heading', { level: 1 }).allTextContents().catch(() => []);
+        const h2Text = await page.getByRole('heading', { level: 2 }).allTextContents().catch(() => []);
+        const h3Text = await page.getByRole('heading', { level: 3 }).allTextContents().catch(() => []);
+        a11yHeadings.all = uniqueHeadingTexts(allText, 30);
+        a11yHeadings.h1 = uniqueHeadingTexts(h1Text, 10);
+        a11yHeadings.h2 = uniqueHeadingTexts(h2Text, 20);
+        a11yHeadings.h3 = uniqueHeadingTexts(h3Text, 20);
+        a11yHeadings.observed = true;
+      } catch (e) {
+        a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+      }
     }
     const filteredDomH1 = filterHeadingTexts(domH1);
     const filteredDomH2 = filterHeadingTexts(domH2);
@@ -4119,14 +4148,18 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       observed: false,
       error: null
     };
-    try {
-      const mainLocator = page.getByRole('main');
-      const mainTexts = await mainLocator.allTextContents().catch(() => []);
-      a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
-      a11yMain.count = a11yMain.texts.length;
-      a11yMain.observed = true;
-    } catch (e) {
-      a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+    if (shortFastMode) {
+      a11yMain.error = 'skipped_short_fast';
+    } else {
+      try {
+        const mainLocator = page.getByRole('main');
+        const mainTexts = await mainLocator.allTextContents().catch(() => []);
+        a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
+        a11yMain.count = a11yMain.texts.length;
+        a11yMain.observed = true;
+      } catch (e) {
+        a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+      }
     }
     const hasDomMain = domLandmarks.hasMainLandmark === true;
     const hasA11yMain = a11yMain.count > 0;
@@ -4149,12 +4182,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ? true
       : null;
     const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
+    const structuredDataStart = Date.now();
     const htmlContentJsonLdSummary = balancedMode
       ? await collectHtmlContentJsonLdSummaryLight(page)
       : null;
     const scriptSrcJsonLdSummary = balancedMode
-      ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url)
+      ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, shortFastMode
+        ? { maxScripts: 3, maxBytesPerScript: 512000 }
+        : {})
       : null;
+    phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
     const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
     const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
     const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
@@ -4279,7 +4316,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       },
       balanced: {
         enabled: balancedMode,
-        shadowHeadingScan: !!balancedMode,
+        shadowHeadingScan: !!(balancedMode && !shortFastMode),
         shadowHeadingObserved: !!(shadowHeadings && shadowHeadings.observed),
         shadowHostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
         shadowHeadingError: shadowHeadings && shadowHeadings.error || null,
@@ -4519,6 +4556,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       diagnostics: {
         evaluateCount: 1,
         balancedMode,
+        shortFastMode,
         boundedHydrationWaitMs,
         hydrationWaitMs: Number(hydrationMetrics.waitMs || boundedHydrationWaitMs || 0),
         bodyTextBeforeWait: Number(hydrationMetrics.bodyTextBeforeWait || 0),
@@ -4529,15 +4567,21 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         warningTextAfterWait: !!hydrationMetrics.warningTextAfterWait,
         jsBundleAnalysis: false,
         resourceChunkScan: false,
-        shadowHeadingScan: !!balancedMode,
-        a11yHeadingScan: true,
+        shadowHeadingScan: !!(balancedMode && !shortFastMode),
+        a11yHeadingScan: !shortFastMode,
         appRootHeadingScan: !!balancedMode,
         heroHeadingScan: !!balancedMode,
-        iframeHeadingScan: !!balancedMode,
+        iframeHeadingScan: !!(balancedMode && !shortFastMode),
         primaryHeadingScan: !!balancedMode,
-        shadowPrimaryHeadingScan: !!balancedMode,
+        shadowPrimaryHeadingScan: !!(balancedMode && !shortFastMode),
         mainCandidateScan: !!balancedMode,
-        htmlContentLdJsonScan: !!balancedMode
+        htmlContentLdJsonScan: !!balancedMode,
+        skippedScans: shortFastMode
+          ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan']
+          : [],
+        phaseTimings: Object.assign({}, phaseTimings, {
+          totalMs: Math.max(0, Date.now() - startedAt)
+        })
       }
     };
     try {
@@ -4589,8 +4633,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
   }
 }
 
-async function collectBalancedHydrationMetrics(page, waitMs) {
+async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
   const maxWaitMs = Math.max(0, Math.min(5000, Number(waitMs || 0)));
+  const shortFastMode = !!(opts && opts.shortFastMode);
   const empty = {
     waitMs: 0,
     bodyTextBeforeWait: 0,
@@ -4606,28 +4651,30 @@ async function collectBalancedHydrationMetrics(page, waitMs) {
     error: null
   };
   const measure = async () => {
-    return page.evaluate(() => {
+    return page.evaluate(({ shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const shadowTextParts = [];
       const shadowAnchors = [];
-      try {
-        const walkShadow = (root, depth = 0) => {
-          if (!root || depth > 4) return;
-          const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
-          nodes.forEach((el) => {
-            if (!el) return;
-            if (shadowTextParts.length < 80) {
-              const text = clean(el.innerText || el.textContent);
-              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
-            }
-            if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
-              shadowAnchors.push(el);
-            }
-            if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
-          });
-        };
-        walkShadow(document, 0);
-      } catch (_) {}
+      if (!shortFastMode) {
+        try {
+          const walkShadow = (root, depth = 0) => {
+            if (!root || depth > 4) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (shadowTextParts.length < 80) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+              }
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                shadowAnchors.push(el);
+              }
+              if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadow(document, 0);
+        } catch (_) {}
+      }
       const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
       const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
       const anchors = Array.from(document.querySelectorAll('a[href]')).concat(shadowAnchors);
@@ -4638,7 +4685,7 @@ async function collectBalancedHydrationMetrics(page, waitMs) {
         navLinkCount: navAnchors.length,
         warningText: /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText)
       };
-    }).catch(() => ({
+    }, { shortFastMode }).catch(() => ({
       bodyTextLength: 0,
       anchorCount: 0,
       navLinkCount: 0,
@@ -4656,32 +4703,34 @@ async function collectBalancedHydrationMetrics(page, waitMs) {
     if (maxWaitMs > 0 && sparseBefore) {
       const startedAt = Date.now();
       try {
-        await page.waitForFunction(() => {
+        await page.waitForFunction(({ shortFastMode }) => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-          const shadowTextParts = [];
-          let shadowAnchorCount = 0;
-          try {
-            const walkShadow = (root, depth = 0) => {
-              if (!root || depth > 4) return;
-              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
-              nodes.forEach((el) => {
-                if (!el) return;
-                if (shadowTextParts.length < 80) {
-                  const text = clean(el.innerText || el.textContent);
-                  if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
-                }
-                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
-                if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
-              });
-            };
-            walkShadow(document, 0);
-          } catch (_) {}
+            const shadowTextParts = [];
+            let shadowAnchorCount = 0;
+            if (!shortFastMode) {
+              try {
+                const walkShadow = (root, depth = 0) => {
+                  if (!root || depth > 4) return;
+                  const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+                  nodes.forEach((el) => {
+                    if (!el) return;
+                    if (shadowTextParts.length < 80) {
+                      const text = clean(el.innerText || el.textContent);
+                      if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+                    }
+                    if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
+                    if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+                  });
+                };
+                walkShadow(document, 0);
+              } catch (_) {}
+            }
           const bodyText = clean([clean(document.body && (document.body.innerText || document.body.textContent))].concat(shadowTextParts).join(' '));
           const anchors = document.querySelectorAll('a[href]').length + shadowAnchorCount;
           const navAnchors = document.querySelectorAll('nav a[href],[role="navigation"] a[href],header a[href],footer a[href]').length;
           const warningText = /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText);
           return (!warningText && bodyText.length >= 800) || anchors >= 5 || navAnchors >= 2;
-        }, { timeout: maxWaitMs, polling: 250 });
+        }, { shortFastMode }, { timeout: maxWaitMs, polling: 250 });
       } catch (_) {
         try { await page.waitForTimeout(Math.min(750, maxWaitMs)); } catch (_) {}
       }
@@ -5262,8 +5311,9 @@ async function scrapeOnce(req, res) {
   const signalsMode = String(req.query.signalsMode || '').toLowerCase();
   const responseMode = String(req.query.responseMode || '').toLowerCase();
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
-  const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
-  const balancedShortResponse = signalsFirstBalanced && (responseMode === 'short' || signalsMode === 'balancedshort');
+  const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || signalsMode === 'balancedfast' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
+  const balancedShortFastResponse = signalsFirstBalanced && (responseMode === 'shortfast' || responseMode === 'short-fast' || signalsMode === 'balancedfast');
+  const balancedShortResponse = signalsFirstBalanced && (responseMode === 'short' || signalsMode === 'balancedshort' || balancedShortFastResponse);
   const probeModeRaw = String(req.query.probe || '').toLowerCase();
   const probeAliases = {
     'resource-json': 'resourcejson',
@@ -5572,6 +5622,7 @@ async function scrapeOnce(req, res) {
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
     logSf('AFTER_GOTO', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
@@ -6261,12 +6312,12 @@ async function scrapeOnce(req, res) {
       logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_ENTER' : 'SIGNALS_FIRST_LIGHT_ENTER', {
         url: String(urlToFetch || '').slice(0, 180),
         finalUrl: String(finalUrl || '').slice(0, 180),
-        responseMode: balancedShortResponse ? 'short' : 'default'
+        responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : 'default')
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const boundedHydrationWaitMs = signalsFirstBalanced ? 3500 : 0;
+      const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 0;
       const hydrationMetrics = signalsFirstBalanced
-        ? await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs)
+        ? await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse })
         : null;
       if (signalsFirstBalanced) {
         logSf('SIGNALS_FIRST_BALANCED_HYDRATION_WAIT', {
@@ -6284,8 +6335,12 @@ async function scrapeOnce(req, res) {
       }
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
+        shortFastMode: balancedShortFastResponse,
         boundedHydrationWaitMs,
-        hydrationMetrics
+        hydrationMetrics,
+        gotoMs: typeof scrapeTiming.gotoMs === 'number'
+          ? scrapeTiming.gotoMs
+          : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
@@ -6330,7 +6385,7 @@ async function scrapeOnce(req, res) {
         hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
         balancedMode: signalsFirstBalanced,
         headingShadowScan: !!(geoSignalsV1 && geoSignalsV1.balanced && geoSignalsV1.balanced.shadowHeadingScan),
-        headingA11yScan: true,
+        headingA11yScan: !balancedShortFastResponse,
         navLinkCount: Array.isArray(linksObserved.navTextsSample) ? linksObserved.navTextsSample.length : 0,
         internalLinkCount: Array.isArray(linksObserved.internalLinksSample) ? linksObserved.internalLinksSample.length : 0,
         hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasCompanyLikeLink') ? linksObserved.hasCompanyLikeLink : null,
@@ -6389,15 +6444,22 @@ async function scrapeOnce(req, res) {
         bodyTextAfterWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextAfterWait === 'number' ? geoSignalsV1.diagnostics.bodyTextAfterWait : null,
         hydrationImprovedBodyText: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedBodyText),
         hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
-        shadowHeadingScan: !!signalsFirstBalanced,
-        a11yHeadingScan: true,
+        shadowHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
+        a11yHeadingScan: !balancedShortFastResponse,
         appRootHeadingScan: !!signalsFirstBalanced,
         heroHeadingScan: !!signalsFirstBalanced,
-        iframeHeadingScan: !!signalsFirstBalanced,
+        iframeHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
         primaryHeadingScan: !!signalsFirstBalanced,
-        shadowPrimaryHeadingScan: !!signalsFirstBalanced,
+        shadowPrimaryHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
         mainCandidateScan: !!signalsFirstBalanced,
-        htmlContentLdJsonScan: !!signalsFirstBalanced
+        htmlContentLdJsonScan: !!signalsFirstBalanced,
+        responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : undefined),
+        shortFastMode: !!balancedShortFastResponse,
+        skippedScans: balancedShortFastResponse
+          ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples']
+          : [],
+        phaseTimings: geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.phaseTimings || null,
+        timeoutGuardMs: balancedShortFastResponse ? 60000 : null
       };
       const memoryHints = {
         avoidedHeavyBlocks: [
@@ -6447,7 +6509,25 @@ async function scrapeOnce(req, res) {
       };
       if (balancedShortResponse) {
         const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
+        if (balancedShortFastResponse) {
+          shortPayload.responseMode = 'shortFast';
+          shortPayload.shortFastMode = true;
+          if (shortPayload.diagnostics) {
+            shortPayload.diagnostics.responseMode = 'shortFast';
+            shortPayload.diagnostics.shortFastMode = true;
+            shortPayload.diagnostics.timeoutGuardMs = 60000;
+            shortPayload.diagnostics.skippedScans = Array.from(new Set([]
+              .concat(shortPayload.diagnostics.skippedScans || [])
+              .concat(['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples'])
+            ));
+          }
+          if (shortPayload.memoryHints) {
+            shortPayload.memoryHints.shortFastMode = true;
+            shortPayload.memoryHints.skippedScans = shortPayload.diagnostics && shortPayload.diagnostics.skippedScans || [];
+          }
+        }
         logSf('SIGNALS_FIRST_BALANCED_SHORT_SEND', {
+          responseMode: balancedShortFastResponse ? 'shortFast' : 'short',
           trimmedFieldsCount: shortPayload && shortPayload.diagnostics && Array.isArray(shortPayload.diagnostics.trimmedFields)
             ? shortPayload.diagnostics.trimmedFields.length
             : 0,
