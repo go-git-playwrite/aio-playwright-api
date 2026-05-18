@@ -3355,6 +3355,7 @@ function extractSchemaTypesFromScriptTextLight(text) {
 async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}) {
   const MAX_SCRIPTS = Math.max(1, Math.min(10, Number(opts && opts.maxScripts || 10)));
   const MAX_BYTES_PER_SCRIPT = Math.max(100000, Math.min(1000000, Number(opts && opts.maxBytesPerScript || 1000000)));
+  const REQUEST_TIMEOUT_MS = Math.max(500, Math.min(10000, Number(opts && opts.requestTimeoutMs || 10000)));
   const empty = {
     types: [],
     scriptSrcCount: 0,
@@ -3422,7 +3423,7 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     };
     for (const scriptUrl of sameOriginScripts.slice(0, MAX_SCRIPTS)) {
       try {
-        const r = await page.request.get(scriptUrl, { timeout: 10000 });
+        const r = await page.request.get(scriptUrl, { timeout: REQUEST_TIMEOUT_MS });
         const headers = typeof r.headers === 'function' ? r.headers() : {};
         const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
         if (contentLength > MAX_BYTES_PER_SCRIPT) {
@@ -5353,9 +5354,12 @@ async function scrapeOnce(req, res) {
     'jsonld-script': 'jsonldscriptsrc',
     'goto-timing': 'gototiming',
     gototiming: 'gototiming',
-    'goto-probe': 'gototiming'
+    'goto-probe': 'gototiming',
+    'shortfast-phases': 'shortfastphases',
+    shortfastphases: 'shortfastphases',
+    'shortfast-phase': 'shortfastphases'
   };
-  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming'];
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases'];
   const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
   const probeMaxFetchRaw = Number(req.query.maxFetch);
   const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
@@ -5627,6 +5631,285 @@ async function scrapeOnce(req, res) {
         pageSignals: out.pageSignals
       });
       logSfMemory('goto_timing_probe_send');
+      return res.status(200).json(out);
+    }
+
+    if (probeMode === 'shortfastphases') {
+      const probeStartedAt = Date.now();
+      const phases = [];
+      const blockedCounts = {
+        image: 0,
+        font: 0,
+        media: 0,
+        stylesheet: 0,
+        thirdPartyScript: 0,
+        total: 0
+      };
+      let targetOrigin = '';
+      try { targetOrigin = new URL(String(urlToFetch || '')).origin; } catch (_) {}
+      const routeSetupStart = Date.now();
+      try {
+        await page.route('**/*', async (route) => {
+          try {
+            const request = route.request();
+            const type = request.resourceType();
+            const requestUrl = request.url();
+            const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
+            let shouldBlockThirdPartyScript = false;
+            if (type === 'script' && targetOrigin) {
+              try { shouldBlockThirdPartyScript = new URL(requestUrl).origin !== targetOrigin; } catch (_) {}
+            }
+            if (shouldBlockType || shouldBlockThirdPartyScript) {
+              if (shouldBlockThirdPartyScript) blockedCounts.thirdPartyScript += 1;
+              else if (Object.prototype.hasOwnProperty.call(blockedCounts, type)) blockedCounts[type] += 1;
+              blockedCounts.total += 1;
+              return route.abort().catch(() => {});
+            }
+            return route.continue().catch(() => {});
+          } catch (_) {
+            return route.continue().catch(() => {});
+          }
+        });
+      } catch (_) {}
+      const routeSetupMs = Math.max(0, Date.now() - routeSetupStart);
+      const withTimeout = (promise, ms, label) => Promise.race([
+        Promise.resolve().then(() => promise),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
+      ]);
+      const runPhase = async (name, fn, timeoutMs = 3000) => {
+        const started = Date.now();
+        const phase = {
+          name,
+          ok: false,
+          elapsedMs: 0,
+          errorMessage: '',
+          minimalResult: null
+        };
+        try {
+          phase.minimalResult = await withTimeout(fn(), timeoutMs, name);
+          phase.ok = true;
+        } catch (e) {
+          phase.errorMessage = String(e && (e.message || e) || '').slice(0, 240);
+        }
+        phase.elapsedMs = Math.max(0, Date.now() - started);
+        phases.push(phase);
+        return phase;
+      };
+      let resp = null;
+      let gotoPhase = null;
+      let finalUrl = urlToFetch;
+      let status = null;
+      await runPhase('goto', async () => {
+        resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+        status = resp && typeof resp.status === 'function' ? resp.status() : null;
+        return {
+          status,
+          statusText: resp && typeof resp.statusText === 'function' ? resp.statusText() : null,
+          finalUrl
+        };
+      }, 13000);
+      gotoPhase = phases[phases.length - 1];
+      finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
+      status = resp && typeof resp.status === 'function' ? resp.status() : status;
+
+      await runPhase('basicDomEval', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        return {
+          title: clean(document.title || '').slice(0, 180),
+          bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent)).length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          scriptCount: document.querySelectorAll('script').length
+        };
+      }), 3000);
+
+      await runPhase('structuredDataLight', async () => {
+        const rendered = await page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const texts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+            .map((s) => clean(s.textContent || ''))
+            .filter(Boolean);
+          let parseableCount = 0;
+          let parseErrorsCount = 0;
+          const types = [];
+          const walk = (node, depth = 0) => {
+            if (depth > 8 || node == null) return;
+            if (Array.isArray(node)) return node.forEach((item) => walk(item, depth + 1));
+            if (typeof node !== 'object') return;
+            const t = node['@type'];
+            if (Array.isArray(t)) t.forEach((x) => types.push(clean(x)));
+            else if (t) types.push(clean(t));
+            if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walk(item, depth + 1));
+          };
+          texts.forEach((txt) => {
+            try {
+              walk(JSON.parse(txt), 0);
+              parseableCount += 1;
+            } catch (_) {
+              parseErrorsCount += 1;
+            }
+          });
+          return {
+            renderedDomRawCount: texts.length,
+            renderedDomParseableCount: parseableCount,
+            renderedDomParseErrorsCount: parseErrorsCount,
+            renderedDomTypes: Array.from(new Set(types.filter(Boolean))).slice(0, 20)
+          };
+        });
+        const htmlSummary = await collectHtmlContentJsonLdSummaryLight(page);
+        return {
+          renderedDomRawCount: rendered.renderedDomRawCount,
+          renderedDomParseableCount: rendered.renderedDomParseableCount,
+          htmlContentRawCount: htmlSummary && htmlSummary.rawCount,
+          htmlContentParseableCount: htmlSummary && htmlSummary.parseableCount,
+          types: Array.from(new Set([].concat(rendered.renderedDomTypes || [], htmlSummary && htmlSummary.types || []).filter(Boolean))).slice(0, 20),
+          parseErrorsCount: Number(rendered.renderedDomParseErrorsCount || 0) + Number(htmlSummary && htmlSummary.parseErrorsCount || 0)
+        };
+      }, 3000);
+
+      await runPhase('sameOriginScriptJsonLd', async () => {
+        const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
+          maxScripts: 3,
+          maxBytesPerScript: 512000,
+          requestTimeoutMs: 1500
+        });
+        return {
+          scriptSrcCount: summary.scriptSrcCount,
+          sameOriginScriptCount: summary.sameOriginScriptCount,
+          fetchedCount: summary.fetchedCount,
+          skippedLargeCount: summary.skippedLargeCount,
+          candidateCount: summary.candidateCount,
+          types: Array.isArray(summary.types) ? summary.types.slice(0, 20) : [],
+          appIndexDetected: !!summary.appIndexDetected,
+          totalFetchedBytes: summary.totalFetchedBytes,
+          maxScriptLength: summary.maxScriptLength,
+          error: summary.error || null
+        };
+      }, 3500);
+
+      await runPhase('linksAndTrust', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const absUrl = (href) => {
+          try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
+        };
+        const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+          text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
+          href: absUrl(a.getAttribute('href') || '').slice(0, 180),
+          navLike: !!a.closest('nav,[role="navigation"],header,footer')
+        })).filter((a) => a.href);
+        const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
+        const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+        return {
+          anchorCount: anchors.length,
+          navLinkCount: anchors.filter((a) => a.navLike).length,
+          internalLinkCount: anchors.filter((a) => {
+            try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
+          }).length,
+          navTextsSample: anchors.filter((a) => a.navLike && a.text).map((a) => a.text).slice(0, 10),
+          hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
+          hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
+          hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
+        };
+      }), 3000);
+
+      await runPhase('multimodal', async () => page.evaluate(() => {
+        const has = (sel) => !!document.querySelector(sel);
+        return {
+          hasOgImage: has('meta[property="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"]'),
+          hasTwitterImage: has('meta[name="twitter:image"],meta[name="twitter:image:src"]'),
+          hasFavicon: has('link[rel~="icon"][href],link[rel="shortcut icon"][href]'),
+          hasAppleTouchIcon: has('link[rel~="apple-touch-icon"][href],link[rel="apple-touch-icon-precomposed"][href]'),
+          imgCount: document.querySelectorAll('img').length
+        };
+      }), 3000);
+
+      await runPhase('headingsLight', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const texts = (sel, max) => Array.from(document.querySelectorAll(sel)).map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, max);
+        const h1 = texts('h1', 5);
+        const h2 = texts('h2', 10);
+        const h3 = texts('h3', 10);
+        const title = clean(document.title || '');
+        return {
+          h1Count: h1.length,
+          h2Count: h2.length,
+          h3Count: h3.length,
+          h1Source: h1.length ? 'dom' : 'not_observed',
+          primaryHeadingCandidate: h1[0] || title || '',
+          primaryHeadingCandidateSource: h1[0] ? 'dom_h1' : (title ? 'title' : 'not_observed'),
+          h1EquivalentCandidateFound: false,
+          headingTextsSample: h1.concat(h2).concat(h3).slice(0, 10)
+        };
+      }), 3000);
+
+      await runPhase('landmarksLight', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const main = document.querySelector('main,[role="main"],#main,#main-content');
+        const appCandidate = document.querySelector('#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]');
+        return {
+          hasMainLandmark: !!main,
+          hasMainLandmark_final: main ? true : null,
+          mainLandmarkSource: main ? 'dom_main_light' : 'not_observed',
+          mainLandmarkCandidateFound: !main && !!appCandidate,
+          mainLandmarkCandidateSource: !main && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
+          mainLandmarkCandidateTextLength: appCandidate ? clean(appCandidate.innerText || appCandidate.textContent).length : 0
+        };
+      }), 3000);
+
+      await runPhase('buildShortPayload', async () => {
+        const phaseSummary = {};
+        phases.forEach((p) => {
+          phaseSummary[p.name] = {
+            ok: p.ok,
+            elapsedMs: p.elapsedMs,
+            errorMessage: p.errorMessage || ''
+          };
+        });
+        return {
+          phaseCount: phases.length + 1,
+          failedPhaseNames: phases.filter((p) => !p.ok).map((p) => p.name),
+          phaseSummary
+        };
+      }, 1000);
+
+      const out = {
+        ok: phases.every((p) => p.ok),
+        mode: 'shortFastPhaseProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        timings: {
+          browserReadyMs: typeof scrapeTiming.browserReadyMs === 'number' ? scrapeTiming.browserReadyMs : null,
+          pageReadyMs: typeof scrapeTiming.pageReadyMs === 'number' ? scrapeTiming.pageReadyMs : null,
+          routeSetupMs,
+          gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
+          totalMs: Math.max(0, Date.now() - probeStartedAt)
+        },
+        phases,
+        blockedCounts,
+        diagnostics: {
+          probeOnly: true,
+          shortFastSkipped: true,
+          phaseProbe: true,
+          balancedSkipped: true,
+          fullScrapeSkipped: true,
+          rawHtmlReturned: false,
+          rawJsReturned: false,
+          phaseTimeoutMs: 3000,
+          sameOriginScriptFetchTimeoutMs: 1500,
+          sameOriginScriptMaxScripts: 3,
+          sameOriginScriptMaxBytes: 512000
+        }
+      };
+      logSf('SHORTFAST_PHASE_PROBE_SEND', {
+        ok: out.ok,
+        status: out.status,
+        timings: out.timings,
+        phaseTimings: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage })),
+        blockedCounts
+      });
+      logSfMemory('shortfast_phase_probe_send');
       return res.status(200).json(out);
     }
 
