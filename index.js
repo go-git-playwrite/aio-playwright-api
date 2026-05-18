@@ -5350,9 +5350,12 @@ async function scrapeOnce(req, res) {
     'jsonld-script-src': 'jsonldscriptsrc',
     jsonldscriptsrc: 'jsonldscriptsrc',
     'script-src-jsonld': 'jsonldscriptsrc',
-    'jsonld-script': 'jsonldscriptsrc'
+    'jsonld-script': 'jsonldscriptsrc',
+    'goto-timing': 'gototiming',
+    gototiming: 'gototiming',
+    'goto-probe': 'gototiming'
   };
-  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc'];
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming'];
   const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
   const probeMaxFetchRaw = Number(req.query.maxFetch);
   const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
@@ -5494,7 +5497,9 @@ async function scrapeOnce(req, res) {
         '--no-default-browser-check'
       ]
     });
+    scrapeTiming.browserReadyMs = Math.max(0, Date.now() - __timingBrowserStart);
 
+    const __timingPageReadyStart = Date.now();
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -5515,7 +5520,115 @@ async function scrapeOnce(req, res) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    scrapeTiming.pageReadyMs = Math.max(0, Date.now() - __timingPageReadyStart);
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
+
+    if (probeMode === 'gototiming') {
+      const probeStartedAt = Date.now();
+      const blockedCounts = {
+        image: 0,
+        font: 0,
+        media: 0,
+        stylesheet: 0,
+        thirdPartyScript: 0,
+        total: 0
+      };
+      let targetOrigin = '';
+      try { targetOrigin = new URL(String(urlToFetch || '')).origin; } catch (_) {}
+      const routeSetupStart = Date.now();
+      try {
+        await page.route('**/*', async (route) => {
+          try {
+            const request = route.request();
+            const type = request.resourceType();
+            const requestUrl = request.url();
+            const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
+            let shouldBlockThirdPartyScript = false;
+            if (type === 'script' && targetOrigin) {
+              try { shouldBlockThirdPartyScript = new URL(requestUrl).origin !== targetOrigin; } catch (_) {}
+            }
+            if (shouldBlockType || shouldBlockThirdPartyScript) {
+              if (shouldBlockThirdPartyScript) blockedCounts.thirdPartyScript += 1;
+              else if (Object.prototype.hasOwnProperty.call(blockedCounts, type)) blockedCounts[type] += 1;
+              blockedCounts.total += 1;
+              return route.abort().catch(() => {});
+            }
+            return route.continue().catch(() => {});
+          } catch (_) {
+            return route.continue().catch(() => {});
+          }
+        });
+      } catch (_) {}
+      const routeSetupMs = Math.max(0, Date.now() - routeSetupStart);
+      let resp = null;
+      let errorMessage = '';
+      const gotoStart = Date.now();
+      logSf('GOTO_TIMING_PROBE_BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
+      logSfMemory('goto_timing_probe_before_goto');
+      try {
+        resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      } catch (e) {
+        errorMessage = String(e && (e.message || e) || '').slice(0, 240);
+      }
+      const gotoMs = Math.max(0, Date.now() - gotoStart);
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const pageSignals = await page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        return {
+          title: clean(document.title || '').slice(0, 180),
+          bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent)).length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          scriptCount: document.querySelectorAll('script').length
+        };
+      }).catch(() => ({
+        title: '',
+        bodyTextLength: null,
+        anchorCount: null,
+        scriptCount: null
+      }));
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const statusText = resp && typeof resp.statusText === 'function' ? resp.statusText() : null;
+      const out = {
+        ok: !errorMessage,
+        mode: 'gotoTimingProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        errorMessage,
+        timings: {
+          browserReadyMs: typeof scrapeTiming.browserReadyMs === 'number' ? scrapeTiming.browserReadyMs : null,
+          pageReadyMs: typeof scrapeTiming.pageReadyMs === 'number' ? scrapeTiming.pageReadyMs : null,
+          routeSetupMs,
+          gotoMs,
+          totalMs: Math.max(0, Date.now() - probeStartedAt)
+        },
+        responseInfo: {
+          status,
+          statusText,
+          finalUrl
+        },
+        pageSignals,
+        blockedCounts,
+        diagnostics: {
+          probeOnly: true,
+          balancedSkipped: true,
+          fullScrapeSkipped: true,
+          evaluationSkipped: true,
+          gotoTimeoutMs: 12000,
+          blockedResourceTypes: ['image', 'font', 'media', 'stylesheet', 'thirdPartyScript']
+        }
+      };
+      logSf('GOTO_TIMING_PROBE_SEND', {
+        ok: out.ok,
+        status: out.status,
+        errorMessage: out.errorMessage,
+        timings: out.timings,
+        blockedCounts: out.blockedCounts,
+        pageSignals: out.pageSignals
+      });
+      logSfMemory('goto_timing_probe_send');
+      return res.status(200).json(out);
+    }
 
     let jsonLdResourceTapState = null;
     if (probeMode === 'jsonldresourcetap') {
