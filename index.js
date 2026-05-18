@@ -6408,15 +6408,7 @@ async function scrapeOnce(req, res) {
         const p = phaseByName(name);
         return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
       };
-      const fatalPhaseFailures = phaseStatuses
-        .filter((p) => !p.ok && ['goto', 'basicDomEval'].includes(p.name))
-        .map((p) => ({
-          phase: p.name,
-          errorMessage: p.errorMessage || 'core_phase_failed'
-        }));
       const limitedPhaseNames = observationLimitedByPhase.map((p) => p.phase);
-      const coreSignalsReady = !phaseFailed('goto') && !phaseFailed('basicDomEval') &&
-        (!!basicDom.title || Number(basicDom.bodyTextLength || 0) > 0 || Number(linksTrust.anchorCount || 0) > 0 || Number(linksTrust.internalLinkCount || 0) > 0);
       const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredDataLight.observationLimited === true;
       const linksReady = !phaseFailed('linksAndTrust') && (
         Number(linksTrust.navLinkCount || 0) > 0 ||
@@ -6439,9 +6431,42 @@ async function scrapeOnce(req, res) {
         typeof multimodal.hasFavicon === 'boolean' ||
         typeof multimodal.imgCount === 'number'
       );
+      const recoveredCoreSignals = [
+        structuredDataReady,
+        linksReady,
+        headingsReady,
+        landmarksReady,
+        trustReady,
+        multimodalReady
+      ];
+      const recoveredCoreSignalCount = recoveredCoreSignals.filter(Boolean).length;
+      const basicDomFailed = phaseFailed('basicDomEval');
+      const basicDomFatalSuppressed = basicDomFailed && !phaseFailed('goto') && recoveredCoreSignalCount >= 4;
+      const recoveredFromBasicDomTimeout = basicDomFatalSuppressed;
+      const coreSignalsReady = !phaseFailed('goto') && (
+        !basicDomFailed ||
+        basicDomFatalSuppressed ||
+        !!basicDom.title ||
+        Number(basicDom.bodyTextLength || 0) > 0 ||
+        Number(linksTrust.anchorCount || 0) > 0 ||
+        Number(linksTrust.internalLinkCount || 0) > 0
+      );
+      const fatalPhaseFailures = phaseStatuses
+        .filter((p) => {
+          if (!p.ok && p.name === 'goto') return true;
+          if (!p.ok && p.name === 'basicDomEval') return !basicDomFatalSuppressed;
+          return false;
+        })
+        .map((p) => ({
+          phase: p.name,
+          errorMessage: p.errorMessage || 'core_phase_failed'
+        }));
       const corePhaseFailures = ['structuredDataLight', 'sameOriginScriptJsonLd', 'linksAndTrust', 'multimodal', 'headingsLight', 'landmarksLight']
         .filter((name) => phaseFailed(name));
       const qualityReasons = [];
+      if (recoveredFromBasicDomTimeout) qualityReasons.push('basic_dom_timeout_but_core_signals_recovered');
+      if (!basicDom.title) qualityReasons.push('title_not_observed');
+      if (!Number(basicDom.bodyTextLength || 0)) qualityReasons.push('body_text_not_observed');
       if (!coreSignalsReady) qualityReasons.push('core_signals_not_ready');
       if (!structuredDataLight.hasJsonLd) qualityReasons.push('structured_data_not_observed_or_limited');
       if (!linksReady) qualityReasons.push('links_not_ready');
@@ -6486,6 +6511,9 @@ async function scrapeOnce(req, res) {
         fatalPhaseFailures,
         limitedPhaseNames,
         coreSignalsReady,
+        recoveredFromBasicDomTimeout,
+        recoveredCoreSignalCount,
+        basicDomFatalSuppressed,
         structuredDataReady,
         linksReady,
         headingsReady,
