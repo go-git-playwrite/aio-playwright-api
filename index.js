@@ -3380,7 +3380,9 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     companyPathSample: '',
     privacyPathFound: null,
     privacyPathSample: '',
-    error: null
+    error: null,
+    fetchErrorsCount: 0,
+    fetchErrorsSample: []
   };
   try {
     const finalUrl = page && typeof page.url === 'function' ? page.url() : url;
@@ -3460,7 +3462,15 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
           out.candidateCount += 1;
           scriptTypes.forEach((t) => types.push(t));
         }
-      } catch (_) {}
+      } catch (e) {
+        out.fetchErrorsCount += 1;
+        if (out.fetchErrorsSample.length < 5) {
+          out.fetchErrorsSample.push({
+            urlSample: String(scriptUrl || '').slice(0, 180),
+            errorMessage: String(e && (e.message || e) || '').slice(0, 180)
+          });
+        }
+      }
     }
     out.types = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
     out.parseableCount = 0;
@@ -6081,6 +6091,8 @@ async function scrapeOnce(req, res) {
       const landmarksLight = phaseResult('landmarksLight');
       const enhancedShadow = phaseResult('optionalEnhancedShadow');
       const optionalA11y = phaseResult('optionalA11y');
+      const structuredDataPhase = phaseByName('structuredDataLight');
+      const sameOriginScriptJsonLdPhase = phaseByName('sameOriginScriptJsonLd');
       const phaseStatuses = phases.map((p) => ({
         name: p.name,
         ok: !!p.ok,
@@ -6101,6 +6113,44 @@ async function scrapeOnce(req, res) {
         .filter(Boolean)
       )).slice(0, 50);
       const typeSet = new Set(mergedTypes.map((t) => String(t || '').toLowerCase()));
+      const structuredDataPhaseDebug = {
+        phaseOk: !!(structuredDataPhase && structuredDataPhase.ok),
+        phaseElapsedMs: structuredDataPhase && typeof structuredDataPhase.elapsedMs === 'number' ? structuredDataPhase.elapsedMs : null,
+        phaseErrorMessage: structuredDataPhase && structuredDataPhase.errorMessage ? structuredDataPhase.errorMessage : '',
+        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
+        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
+        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
+        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
+        jsonldTypes: Array.isArray(structuredLight.types) ? structuredLight.types.slice(0, 30) : [],
+        parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
+        timedOut: !!(structuredDataPhase && /timeout/i.test(String(structuredDataPhase.errorMessage || ''))),
+        resultWasEmpty: !structuredLight || (
+          Number(structuredLight.renderedDomRawCount || 0) === 0 &&
+          Number(structuredLight.htmlContentRawCount || 0) === 0 &&
+          !(Array.isArray(structuredLight.types) && structuredLight.types.length)
+        )
+      };
+      const sameOriginScriptJsonLdPhaseDebug = {
+        phaseOk: !!(sameOriginScriptJsonLdPhase && sameOriginScriptJsonLdPhase.ok),
+        phaseElapsedMs: sameOriginScriptJsonLdPhase && typeof sameOriginScriptJsonLdPhase.elapsedMs === 'number' ? sameOriginScriptJsonLdPhase.elapsedMs : null,
+        phaseErrorMessage: sameOriginScriptJsonLdPhase && sameOriginScriptJsonLdPhase.errorMessage ? sameOriginScriptJsonLdPhase.errorMessage : '',
+        scriptSrcCount: Number(scriptJsonLd.scriptSrcCount || 0),
+        sameOriginScriptCount: Number(scriptJsonLd.sameOriginScriptCount || 0),
+        fetchedCount: Number(scriptJsonLd.fetchedCount || 0),
+        skippedLargeCount: Number(scriptJsonLd.skippedLargeCount || 0),
+        candidateCount: Number(scriptJsonLd.candidateCount || 0),
+        jsonldTypes: Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types.slice(0, 30) : [],
+        appIndexDetected: !!scriptJsonLd.appIndexDetected,
+        totalFetchedBytes: Number(scriptJsonLd.totalFetchedBytes || 0),
+        maxScriptLength: Number(scriptJsonLd.maxScriptLength || 0),
+        timedOut: !!(sameOriginScriptJsonLdPhase && /timeout/i.test(String(sameOriginScriptJsonLdPhase.errorMessage || ''))),
+        resultWasEmpty: !scriptJsonLd || (
+          Number(scriptJsonLd.candidateCount || 0) === 0 &&
+          !(Array.isArray(scriptJsonLd.types) && scriptJsonLd.types.length)
+        ),
+        fetchErrorsCount: Number(scriptJsonLd.fetchErrorsCount || 0),
+        fetchErrorsSample: Array.isArray(scriptJsonLd.fetchErrorsSample) ? scriptJsonLd.fetchErrorsSample.slice(0, 5) : []
+      };
       const structuredDataLight = {
         types: mergedTypes,
         rawCount: Number(structuredLight.renderedDomRawCount || 0) + Number(structuredLight.htmlContentRawCount || 0) + Number(scriptJsonLd.candidateCount || 0),
@@ -6329,7 +6379,9 @@ async function scrapeOnce(req, res) {
             headingsMs: phaseByName('headingsLight').elapsedMs || null,
             landmarksMs: phaseByName('landmarksLight').elapsedMs || null,
             totalMs: Math.max(0, Date.now() - probeStartedAt)
-          }
+          },
+          structuredDataPhaseDebug,
+          sameOriginScriptJsonLdPhaseDebug
         }
       };
       geoSignalsV1.observed.headings = Object.assign({}, geoSignalsV1.headings, {
@@ -6510,6 +6562,8 @@ async function scrapeOnce(req, res) {
         qualityReasons,
         fatalPhaseFailures,
         limitedPhaseNames,
+        structuredDataPhaseDebug,
+        sameOriginScriptJsonLdPhaseDebug,
         coreSignalsReady,
         recoveredFromBasicDomTimeout,
         recoveredCoreSignalCount,
