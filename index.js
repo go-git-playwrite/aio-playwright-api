@@ -5716,19 +5716,96 @@ async function scrapeOnce(req, res) {
       let gotoPhase = null;
       let finalUrl = urlToFetch;
       let status = null;
+      let gotoPartialRecovery = null;
+      const quickDomProbe = async (label) => page.evaluate((sourceLabel) => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const metaEl =
+          document.querySelector('meta[name="description" i]') ||
+          document.querySelector('meta[property="og:description" i]') ||
+          document.querySelector('meta[name="twitter:description" i]');
+        const metaDescription = clean(metaEl && metaEl.getAttribute('content'));
+        return {
+          source: sourceLabel,
+          documentPresent: !!document,
+          readyState: document.readyState || '',
+          currentUrl: location.href || '',
+          title: clean(document.title || '').slice(0, 180),
+          metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
+          metaDescriptionLength: metaDescription ? metaDescription.length : null,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent) || '').length
+        };
+      }, label);
       await runPhase('goto', async () => {
-        resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        let gotoPartial = false;
+        let domContentLoaded = false;
+        let gotoErrorMessage = '';
+        if (unifiedBalancedObserverProbe) {
+          try {
+            resp = await page.goto(urlToFetch, { waitUntil: 'commit', timeout: 8000 });
+          } catch (e) {
+            gotoPartial = true;
+            gotoErrorMessage = String(e && (e.message || e) || '').slice(0, 180);
+            try {
+              resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 4000 });
+              domContentLoaded = true;
+              gotoPartial = false;
+            } catch (fallbackError) {
+              gotoErrorMessage = [gotoErrorMessage, String(fallbackError && (fallbackError.message || fallbackError) || '').slice(0, 180)]
+                .filter(Boolean)
+                .join(' | ');
+            }
+          }
+          if (resp && !domContentLoaded) {
+            try {
+              await page.waitForLoadState('domcontentloaded', { timeout: 10000 });
+              domContentLoaded = true;
+            } catch (e) {
+              gotoPartial = true;
+              gotoErrorMessage = String(e && (e.message || e) || '').slice(0, 180);
+            }
+          }
+        } else {
+          resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+          domContentLoaded = true;
+        }
         finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
         status = resp && typeof resp.status === 'function' ? resp.status() : null;
         return {
           status,
           statusText: resp && typeof resp.statusText === 'function' ? resp.statusText() : null,
-          finalUrl
+          finalUrl,
+          waitUntil: unifiedBalancedObserverProbe ? 'commit_then_domcontentloaded_guard' : 'domcontentloaded',
+          domContentLoaded,
+          partial: gotoPartial,
+          gotoPartial,
+          errorMessage: gotoErrorMessage || undefined
         };
       }, 13000);
       gotoPhase = phases[phases.length - 1];
       finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
       status = resp && typeof resp.status === 'function' ? resp.status() : status;
+      if (unifiedBalancedObserverProbe && gotoPhase && (!gotoPhase.ok || (gotoPhase.minimalResult && gotoPhase.minimalResult.gotoPartial))) {
+        gotoPartialRecovery = await withTimeout(quickDomProbe('goto_timeout_partial_probe'), 1200, 'goto_partial_probe')
+          .catch((e) => ({
+            source: 'goto_timeout_partial_probe',
+            errorMessage: String(e && (e.message || e) || '').slice(0, 180),
+            documentPresent: false,
+            readyState: '',
+            currentUrl: page && typeof page.url === 'function' ? page.url() : finalUrl
+          }));
+        if (gotoPartialRecovery && gotoPartialRecovery.documentPresent) {
+          gotoPhase.minimalResult = Object.assign({}, gotoPhase.minimalResult || {}, {
+            partial: true,
+            gotoPartial: true,
+            finalUrl: gotoPartialRecovery.currentUrl || finalUrl,
+            readyState: gotoPartialRecovery.readyState || '',
+            quickProbe: gotoPartialRecovery
+          });
+          finalUrl = gotoPartialRecovery.currentUrl || finalUrl;
+          gotoPhase.errorMessage = 'goto_timeout_partial_dom_recovered';
+        }
+      }
 
       await runPhase('hydrationGuardedWait', async () => {
         if (!unifiedBalancedObserverProbe) {
@@ -5772,7 +5849,7 @@ async function scrapeOnce(req, res) {
           return anchorCount > Math.max(0, before.anchorCount) || anchorCount >= 5 ||
             shadowAnchorCount > Math.max(0, before.shadowAnchorCount) || shadowAnchorCount >= 5 ||
             bodyTextLength > Math.max(1800, before.bodyTextLength + 400);
-        }, { before }, { timeout: 2500, polling: 250 }).catch(() => {});
+        }, { before }, { timeout: 4000, polling: 250 }).catch(() => {});
         const after = await page.evaluate(() => ({
           bodyTextLength: String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length,
           anchorCount: document.querySelectorAll('a[href]').length,
@@ -5794,7 +5871,7 @@ async function scrapeOnce(req, res) {
         return {
           skipped: false,
           limited: true,
-          waitMs: 2500,
+          waitMs: 4000,
           bodyTextBeforeWait: before.bodyTextLength,
           bodyTextAfterWait: after.bodyTextLength,
           anchorCountBeforeWait: before.anchorCount,
@@ -5804,7 +5881,7 @@ async function scrapeOnce(req, res) {
           hydrationImprovedBodyText: after.bodyTextLength > before.bodyTextLength,
           hydrationImprovedLinks: after.anchorCount > before.anchorCount || after.shadowAnchorCount > before.shadowAnchorCount
         };
-      }, 3000);
+      }, 4500);
 
       await runPhase('headMetaEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -6022,7 +6099,7 @@ async function scrapeOnce(req, res) {
         const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
           maxScripts: unifiedBalancedObserverProbe ? 5 : 3,
           maxBytesPerScript: unifiedBalancedObserverProbe ? 1000000 : 512000,
-          requestTimeoutMs: unifiedBalancedObserverProbe ? 1500 : 3000
+          requestTimeoutMs: unifiedBalancedObserverProbe ? 5000 : 3000
         });
         return {
           scriptSrcCount: summary.scriptSrcCount,
@@ -6253,10 +6330,17 @@ async function scrapeOnce(req, res) {
       const hydrationGuardedWait = phaseResult('hydrationGuardedWait');
       const headMeta = phaseResult('headMetaEval');
       const basicDomRaw = phaseResult('basicDomEval');
+      const gotoProbe = (gotoPartialRecovery && typeof gotoPartialRecovery === 'object') ? gotoPartialRecovery : {};
       const basicDom = Object.assign({}, basicDomRaw, {
-        title: basicDomRaw.title || headMeta.title || '',
-        metaDescription: basicDomRaw.metaDescription || headMeta.metaDescription || '',
-        metaDescriptionLength: Number(basicDomRaw.metaDescriptionLength || headMeta.metaDescriptionLength || 0)
+        title: basicDomRaw.title || headMeta.title || gotoProbe.title || '',
+        metaDescription: basicDomRaw.metaDescription || headMeta.metaDescription || gotoProbe.metaDescription || '',
+        metaDescriptionLength: Number(basicDomRaw.metaDescriptionLength || headMeta.metaDescriptionLength || gotoProbe.metaDescriptionLength || 0),
+        bodyTextLength: typeof basicDomRaw.bodyTextLength === 'number'
+          ? basicDomRaw.bodyTextLength
+          : (typeof gotoProbe.bodyTextLength === 'number' ? gotoProbe.bodyTextLength : basicDomRaw.bodyTextLength),
+        anchorCount: typeof basicDomRaw.anchorCount === 'number'
+          ? basicDomRaw.anchorCount
+          : (typeof gotoProbe.anchorCount === 'number' ? gotoProbe.anchorCount : basicDomRaw.anchorCount)
       });
       const structuredLight = phaseResult('structuredDataLight');
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
@@ -6673,6 +6757,7 @@ async function scrapeOnce(req, res) {
         const p = phaseByName(name);
         return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
       };
+      const gotoPartialRecovered = !!(gotoPhase && gotoPhase.minimalResult && gotoPhase.minimalResult.gotoPartial);
       const limitedPhaseNames = observationLimitedByPhase.map((p) => p.phase);
       const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredObserved || scriptObserved;
       const linksReady = !phaseFailed('linksAndTrust') && (
@@ -6708,7 +6793,7 @@ async function scrapeOnce(req, res) {
       const basicDomFailed = phaseFailed('basicDomEval');
       const basicDomFatalSuppressed = basicDomFailed && !phaseFailed('goto') && recoveredCoreSignalCount >= 4;
       const recoveredFromBasicDomTimeout = basicDomFatalSuppressed;
-      const coreSignalsReady = !phaseFailed('goto') && (
+      const coreSignalsReady = (!phaseFailed('goto') || gotoPartialRecovered) && (
         !basicDomFailed ||
         basicDomFatalSuppressed ||
         !!basicDom.title ||
@@ -6718,7 +6803,7 @@ async function scrapeOnce(req, res) {
       );
       const fatalPhaseFailures = phaseStatuses
         .filter((p) => {
-          if (!p.ok && p.name === 'goto') return true;
+          if (!p.ok && p.name === 'goto') return !gotoPartialRecovered;
           if (!p.ok && p.name === 'basicDomEval') return !basicDomFatalSuppressed;
           return false;
         })
@@ -6729,6 +6814,7 @@ async function scrapeOnce(req, res) {
       const corePhaseFailures = ['structuredDataLight', 'sameOriginScriptJsonLd', 'linksAndTrust', 'multimodal', 'headingsLight', 'landmarksLight']
         .filter((name) => phaseFailed(name));
       const qualityReasons = [];
+      if (gotoPartialRecovered) qualityReasons.push('goto_timeout_but_partial_dom_recovered');
       if (recoveredFromBasicDomTimeout) qualityReasons.push('basic_dom_timeout_but_core_signals_recovered');
       if (!basicDom.title) qualityReasons.push('title_not_observed');
       if (!unifiedBodyTextLength) qualityReasons.push('body_text_not_observed');
