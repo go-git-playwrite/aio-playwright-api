@@ -3429,6 +3429,8 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     contactPathSample: '',
     companyPathFound: null,
     companyPathSample: '',
+    servicePathFound: null,
+    servicePathSample: '',
     privacyPathFound: null,
     privacyPathSample: '',
     error: null,
@@ -3501,6 +3503,10 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
           out.companyPathFound = true;
           out.companyPathSample = out.companyPathSample || pickTrustSample(text, /(?:\/|["'])?(company|about|corporate|profile|会社情報|会社概要|企業情報)(?:\/|["']|$)/i);
         }
+        if (out.servicePathFound !== true && /(?:\/|["'])?(service|business|solution|plan|services|事業|サービス|料金|プラン)(?:\/|["']|$)/i.test(text)) {
+          out.servicePathFound = true;
+          out.servicePathSample = out.servicePathSample || pickTrustSample(text, /(?:\/|["'])?(service|business|solution|plan|services|事業|サービス|料金|プラン)(?:\/|["']|$)/i);
+        }
         if (out.privacyPathFound !== true && /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i.test(text)) {
           out.privacyPathFound = true;
           out.privacyPathSample = out.privacyPathSample || pickTrustSample(text, /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i);
@@ -3540,6 +3546,7 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     if (scannedScriptForTrust) {
       if (out.contactPathFound !== true) out.contactPathFound = false;
       if (out.companyPathFound !== true) out.companyPathFound = false;
+      if (out.servicePathFound !== true) out.servicePathFound = false;
       if (out.privacyPathFound !== true) out.privacyPathFound = false;
     }
     return out;
@@ -3905,15 +3912,25 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           '');
       const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
+      const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
       const privacyRe = /privacy|policy|プライバシー|個人情報/;
       const trustSignals = {
         hasContactLink: hasLike(contactRe),
         contactPathFound: hasLike(contactRe),
         contactObservedFromDom: hasLike(contactRe),
+        contactObservedFromScriptHint: false,
+        contactPathHintOnly: false,
+        contactConfidence: hasLike(contactRe) ? 'high' : 'unknown',
         contactLinkSample: firstLikeLink(contactRe),
+        contactLinkSource: hasLike(contactRe) ? 'dom' : 'not_observed',
         hasCompanyLink: hasLike(companyRe),
+        companyLinkSource: hasLike(companyRe) ? 'dom' : 'not_observed',
         companyLinkSample: firstLikeLink(companyRe),
+        hasServiceLink: hasLike(serviceRe),
+        serviceLinkSource: hasLike(serviceRe) ? 'dom' : 'not_observed',
+        serviceLinkSample: firstLikeLink(serviceRe),
         hasPrivacyPolicyLink: hasLike(privacyRe),
+        privacyLinkSource: hasLike(privacyRe) ? 'dom' : 'not_observed',
         privacyLinkSample: firstLikeLink(privacyRe),
         source: 'balanced_light'
       };
@@ -3958,7 +3975,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
-          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          contactLinkSource: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/) ? 'dom' : 'not_observed',
+          companyLinkSource: hasLike(/company|about|corporate|会社|企業|運営|概要/) ? 'dom' : 'not_observed',
+          serviceLinkSource: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/) ? 'dom' : 'not_observed',
+          privacyLinkSource: hasLike(/privacy|プライバシー|個人情報/) ? 'dom' : 'not_observed'
         },
         multimodalSignals,
         trustSignals,
@@ -4284,26 +4305,43 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ? observedTrustSignals.contactPathFound
       : (observedTrustSignals && typeof observedTrustSignals.hasContactLink === 'boolean' ? observedTrustSignals.hasContactLink : null);
     const scriptContactHint = scriptTrustObserved && scriptSrcJsonLdSummary.contactPathFound === true;
+    const domCompanyObserved = observedTrustSignals && typeof observedTrustSignals.hasCompanyLink === 'boolean'
+      ? observedTrustSignals.hasCompanyLink
+      : null;
+    const domPrivacyObserved = observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean'
+      ? observedTrustSignals.hasPrivacyPolicyLink
+      : null;
+    const scriptCompanyHint = scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true;
+    const scriptServiceHint = scriptTrustObserved && scriptSrcJsonLdSummary.servicePathFound === true;
+    const scriptPrivacyHint = scriptTrustObserved && scriptSrcJsonLdSummary.privacyPathFound === true;
     const trustSignalsLight = {
       hasContactLink: domContactObserved,
       contactPathFound: domContactObserved,
       contactObservedFromDom: domContactObserved,
       contactObservedFromScriptHint: !!scriptContactHint,
       contactPathHintOnly: domContactObserved !== true && !!scriptContactHint,
+      contactConfidence: domContactObserved === true ? 'high' : (scriptContactHint ? 'hint_only' : 'unknown'),
+      contactLinkSource: domContactObserved === true ? 'dom' : (scriptContactHint ? 'script_hint' : 'not_observed'),
       contactLinkSample: observedTrustSignals && observedTrustSignals.contactLinkSample
         ? observedTrustSignals.contactLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.contactPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.contactPathSample } : null),
-      hasCompanyLink: observedTrustSignals && observedTrustSignals.hasCompanyLink === true
-        ? true
-        : (observedTrustSignals && typeof observedTrustSignals.hasCompanyLink === 'boolean' ? observedTrustSignals.hasCompanyLink : null),
-      companyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true),
+      hasCompanyLink: domCompanyObserved,
+      companyObservedFromScriptHint: !!scriptCompanyHint,
+      companyLinkSource: domCompanyObserved === true ? 'dom' : (scriptCompanyHint ? 'script_hint' : 'not_observed'),
       companyLinkSample: observedTrustSignals && observedTrustSignals.companyLinkSample
         ? observedTrustSignals.companyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.companyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.companyPathSample } : null),
-      hasPrivacyPolicyLink: observedTrustSignals && observedTrustSignals.hasPrivacyPolicyLink === true
-        ? true
-        : (observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean' ? observedTrustSignals.hasPrivacyPolicyLink : null),
-      privacyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.privacyPathFound === true),
+      hasServiceLink: observedTrustSignals && typeof observedTrustSignals.hasServiceLink === 'boolean'
+        ? observedTrustSignals.hasServiceLink
+        : null,
+      serviceObservedFromScriptHint: !!scriptServiceHint,
+      serviceLinkSource: observedTrustSignals && observedTrustSignals.hasServiceLink === true ? 'dom' : (scriptServiceHint ? 'script_hint' : 'not_observed'),
+      serviceLinkSample: observedTrustSignals && observedTrustSignals.serviceLinkSample
+        ? observedTrustSignals.serviceLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.servicePathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.servicePathSample } : null),
+      hasPrivacyPolicyLink: domPrivacyObserved,
+      privacyObservedFromScriptHint: !!scriptPrivacyHint,
+      privacyLinkSource: domPrivacyObserved === true ? 'dom' : (scriptPrivacyHint ? 'script_hint' : 'not_observed'),
       privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
         ? observedTrustSignals.privacyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
@@ -5275,6 +5313,14 @@ function buildBalancedShortResponsePayload(fullPayload) {
     hasServiceLikeLink: links.hasServiceLikeLink,
     hasContactLikeLink: links.hasContactLikeLink,
     hasPrivacyLikeLink: links.hasPrivacyLikeLink,
+    contactLinkSource: links.contactLinkSource,
+    companyLinkSource: links.companyLinkSource,
+    serviceLinkSource: links.serviceLinkSource,
+    privacyLinkSource: links.privacyLinkSource,
+    contactLinkSample: links.contactLinkSample || null,
+    companyLinkSample: links.companyLinkSample || null,
+    serviceLinkSample: links.serviceLinkSample || null,
+    privacyLinkSample: links.privacyLinkSample || null,
     source: links.source,
     confidence: links.confidence
   };
@@ -6245,6 +6291,15 @@ async function scrapeOnce(req, res) {
         } catch (_) {}
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+        const firstLike = (re) => {
+          const hit = anchors.find((a) => re.test(textHref(a)));
+          return hit ? { text: hit.text, href: hit.href, source: hit.source } : null;
+        };
+        const sourceFor = (v) => v === true ? 'dom' : (v === false ? 'not_observed' : 'not_observed');
+        const companyLike = hasLike(/company|about|corporate|会社|企業|運営|概要/);
+        const serviceLike = hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/);
+        const contactLike = hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/);
+        const privacyLike = hasLike(/privacy|プライバシー|個人情報/);
         const navTextItems = uniqueBy(
           anchors.filter((a) => a.navLike && a.text),
           (a) => a.text,
@@ -6264,10 +6319,18 @@ async function scrapeOnce(req, res) {
           internalLinkCount: internalItems.length,
           navTextsSample: navTextItems.map((a) => a.text),
           internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
-          hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
-          hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
-          hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
-          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          hasCompanyLikeLink: companyLike,
+          hasServiceLikeLink: serviceLike,
+          hasContactLikeLink: contactLike,
+          hasPrivacyLikeLink: privacyLike,
+          contactLinkSource: sourceFor(contactLike),
+          companyLinkSource: sourceFor(companyLike),
+          serviceLinkSource: sourceFor(serviceLike),
+          privacyLinkSource: sourceFor(privacyLike),
+          contactLinkSample: firstLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
+          companyLinkSample: firstLike(/company|about|corporate|会社|企業|運営|概要/),
+          serviceLinkSample: firstLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
+          privacyLinkSample: firstLike(/privacy|プライバシー|個人情報/),
           shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
         };
       }), 3000);
@@ -6665,9 +6728,18 @@ async function scrapeOnce(req, res) {
           contactObservedFromDom: linkBoolean('hasContactLikeLink'),
           contactObservedFromScriptHint: false,
           contactPathHintOnly: false,
-          contactLinkSample: null,
+          contactConfidence: linkBoolean('hasContactLikeLink') === true ? 'high' : 'unknown',
+          contactLinkSource: linksTrust.contactLinkSource || (linkBoolean('hasContactLikeLink') === true ? 'dom' : 'not_observed'),
+          contactLinkSample: linksTrust.contactLinkSample || null,
           hasCompanyLink: linkBoolean('hasCompanyLikeLink'),
+          companyLinkSource: linksTrust.companyLinkSource || (linkBoolean('hasCompanyLikeLink') === true ? 'dom' : 'not_observed'),
+          companyLinkSample: linksTrust.companyLinkSample || null,
+          hasServiceLink: linkBoolean('hasServiceLikeLink'),
+          serviceLinkSource: linksTrust.serviceLinkSource || (linkBoolean('hasServiceLikeLink') === true ? 'dom' : 'not_observed'),
+          serviceLinkSample: linksTrust.serviceLinkSample || null,
           hasPrivacyPolicyLink: linkBoolean('hasPrivacyLikeLink'),
+          privacyLinkSource: linksTrust.privacyLinkSource || (linkBoolean('hasPrivacyLikeLink') === true ? 'dom' : 'not_observed'),
+          privacyLinkSample: linksTrust.privacyLinkSample || null,
           source: 'shortfast_phase_builder'
         },
         observed: {
@@ -6702,6 +6774,14 @@ async function scrapeOnce(req, res) {
             hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
             hasContactLikeLink: linkBoolean('hasContactLikeLink'),
             hasPrivacyLikeLink: linkBoolean('hasPrivacyLikeLink'),
+            contactLinkSource: linksTrust.contactLinkSource || (linkBoolean('hasContactLikeLink') === true ? 'dom' : 'not_observed'),
+            companyLinkSource: linksTrust.companyLinkSource || (linkBoolean('hasCompanyLikeLink') === true ? 'dom' : 'not_observed'),
+            serviceLinkSource: linksTrust.serviceLinkSource || (linkBoolean('hasServiceLikeLink') === true ? 'dom' : 'not_observed'),
+            privacyLinkSource: linksTrust.privacyLinkSource || (linkBoolean('hasPrivacyLikeLink') === true ? 'dom' : 'not_observed'),
+            contactLinkSample: linksTrust.contactLinkSample || null,
+            companyLinkSample: linksTrust.companyLinkSample || null,
+            serviceLinkSample: linksTrust.serviceLinkSample || null,
+            privacyLinkSample: linksTrust.privacyLinkSample || null,
             source: linksObserved ? 'rendered_dom_light' : 'phase_failed',
             confidence: linksObserved ? 'medium' : 'low',
             observed: linksObserved,
@@ -6848,7 +6928,12 @@ async function scrapeOnce(req, res) {
         contactPathFound: geoSignalsV1.trustSignals.contactPathFound,
         contactObservedFromDom: geoSignalsV1.trustSignals.contactObservedFromDom,
         contactObservedFromScriptHint: geoSignalsV1.trustSignals.contactObservedFromScriptHint,
-        contactPathHintOnly: geoSignalsV1.trustSignals.contactPathHintOnly
+        contactPathHintOnly: geoSignalsV1.trustSignals.contactPathHintOnly,
+        contactLinkSource: geoSignalsV1.trustSignals.contactLinkSource || null,
+        companyLinkSource: geoSignalsV1.trustSignals.companyLinkSource || null,
+        serviceLinkSource: geoSignalsV1.trustSignals.serviceLinkSource || null,
+        privacyLinkSource: geoSignalsV1.trustSignals.privacyLinkSource || null,
+        contactConfidence: geoSignalsV1.trustSignals.contactConfidence || null
       };
       const phaseFailed = (name) => {
         const p = phaseByName(name);
@@ -8037,7 +8122,12 @@ async function scrapeOnce(req, res) {
         contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null,
         contactObservedFromDom: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromDom') ? trustObserved.contactObservedFromDom : null,
         contactObservedFromScriptHint: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromScriptHint') ? trustObserved.contactObservedFromScriptHint : null,
-        contactPathHintOnly: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathHintOnly') ? trustObserved.contactPathHintOnly : null
+        contactPathHintOnly: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathHintOnly') ? trustObserved.contactPathHintOnly : null,
+        contactLinkSource: trustObserved.contactLinkSource || linksObserved.contactLinkSource || null,
+        companyLinkSource: trustObserved.companyLinkSource || linksObserved.companyLinkSource || null,
+        serviceLinkSource: trustObserved.serviceLinkSource || linksObserved.serviceLinkSource || null,
+        privacyLinkSource: trustObserved.privacyLinkSource || linksObserved.privacyLinkSource || null,
+        contactConfidence: trustObserved.contactConfidence || null
       };
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
