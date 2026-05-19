@@ -3302,6 +3302,29 @@ function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
 function summarizeJsonLdTextsLight(texts, source) {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const typeNames = (node) => {
+    const t = node && node['@type'];
+    const values = Array.isArray(t) ? t : (t ? [t] : []);
+    return values.map((x) => clean(x).toLowerCase().replace(/^https?:\/\/schema\.org\//i, '')).filter(Boolean);
+  };
+  const hasOwnMeaningful = (node, key) => {
+    if (!node || typeof node !== 'object' || !Object.prototype.hasOwnProperty.call(node, key)) return false;
+    const v = node[key];
+    if (Array.isArray(v)) return v.length > 0;
+    if (v && typeof v === 'object') return Object.keys(v).length > 0;
+    return clean(v).length > 0;
+  };
+  const sameAsValues = [];
+  const orgFieldPresence = {
+    name: false,
+    url: false,
+    logo: false,
+    sameAs: false,
+    address: false,
+    telephone: false
+  };
+  let orgNodeObserved = false;
+  let seoNodeObserved = false;
   const nodeTypes = [];
   const walkJsonLd = (node, depth = 0) => {
     if (depth > 8) return;
@@ -3313,6 +3336,22 @@ function summarizeJsonLdTextsLight(texts, source) {
     const t = node['@type'];
     if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
     else if (t) nodeTypes.push(clean(t));
+    const types = typeNames(node);
+    const isOrg = types.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
+    const isWebsite = types.includes('website');
+    if (isOrg || isWebsite || types.includes('person')) seoNodeObserved = true;
+    if (isOrg) {
+      orgNodeObserved = true;
+      Object.keys(orgFieldPresence).forEach((field) => {
+        if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
+      });
+    }
+    const sameAs = node.sameAs;
+    const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
+    sameAsList.forEach((v) => {
+      const s = clean(v);
+      if (/^https?:\/\//i.test(s)) sameAsValues.push(s);
+    });
     if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
   };
   const rawTexts = (Array.isArray(texts) ? texts : []).map(clean).filter(Boolean);
@@ -3330,6 +3369,10 @@ function summarizeJsonLdTextsLight(texts, source) {
   const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
   const typeClass = classifyJsonLdTypesForSeo(types);
   const hasJsonLd = rawTexts.length > 0;
+  const sameAsUnique = Array.from(new Set(sameAsValues)).slice(0, 20);
+  const orgMissingFields = orgNodeObserved
+    ? Object.keys(orgFieldPresence).filter((field) => orgFieldPresence[field] !== true)
+    : [];
   return {
     types,
     seoTypes: typeClass.seoTypes,
@@ -3346,6 +3389,21 @@ function summarizeJsonLdTextsLight(texts, source) {
     hasBreadcrumbList: hasJsonLd ? typeClass.hasBreadcrumbList : false,
     hasFAQPage: hasJsonLd ? typeClass.hasFAQPage : false,
     typeClassificationSource: typeClass.typeClassificationSource,
+    breadcrumbObserved: hasJsonLd,
+    breadcrumbMissing: hasJsonLd ? !typeClass.hasBreadcrumbList : null,
+    organizationSummary: {
+      observed: hasJsonLd,
+      hasOrganization: hasJsonLd ? typeClass.hasOrganization : null,
+      missingFields: orgMissingFields.slice(0, 12),
+      source: 'seo_jsonld'
+    },
+    sameAsSummary: {
+      observed: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd),
+      count: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsUnique.length : null,
+      externalCount: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsUnique.length : null,
+      valuesSample: sameAsUnique.slice(0, 8),
+      source: 'seo_jsonld'
+    },
     source: source || 'jsonld_light'
   };
 }
@@ -6176,12 +6234,28 @@ async function scrapeOnce(req, res) {
         };
         const rendered = await withTimeout(page.evaluate(() => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const typeNames = (node) => {
+            const t = node && node['@type'];
+            const values = Array.isArray(t) ? t : (t ? [t] : []);
+            return values.map((x) => clean(x).toLowerCase().replace(/^https?:\/\/schema\.org\//i, '')).filter(Boolean);
+          };
+          const hasOwnMeaningful = (node, key) => {
+            if (!node || typeof node !== 'object' || !Object.prototype.hasOwnProperty.call(node, key)) return false;
+            const v = node[key];
+            if (Array.isArray(v)) return v.length > 0;
+            if (v && typeof v === 'object') return Object.keys(v).length > 0;
+            return clean(v).length > 0;
+          };
           const texts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
             .map((s) => clean(s.textContent || ''))
             .filter(Boolean);
           let parseableCount = 0;
           let parseErrorsCount = 0;
           const types = [];
+          const orgFieldPresence = { name: false, url: false, logo: false, sameAs: false, address: false, telephone: false };
+          const sameAsValues = [];
+          let orgNodeObserved = false;
+          let seoNodeObserved = false;
           const walk = (node, depth = 0) => {
             if (depth > 8 || node == null) return;
             if (Array.isArray(node)) return node.forEach((item) => walk(item, depth + 1));
@@ -6189,6 +6263,22 @@ async function scrapeOnce(req, res) {
             const t = node['@type'];
             if (Array.isArray(t)) t.forEach((x) => types.push(clean(x)));
             else if (t) types.push(clean(t));
+            const names = typeNames(node);
+            const isOrg = names.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
+            const isWebsite = names.includes('website');
+            if (isOrg || isWebsite || names.includes('person')) seoNodeObserved = true;
+            if (isOrg) {
+              orgNodeObserved = true;
+              Object.keys(orgFieldPresence).forEach((field) => {
+                if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
+              });
+            }
+            const sameAs = node.sameAs;
+            const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
+            sameAsList.forEach((v) => {
+              const s = clean(v);
+              if (/^https?:\/\//i.test(s)) sameAsValues.push(s);
+            });
             if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walk(item, depth + 1));
           };
           texts.forEach((txt) => {
@@ -6204,6 +6294,19 @@ async function scrapeOnce(req, res) {
             renderedDomParseableCount: parseableCount,
             renderedDomParseErrorsCount: parseErrorsCount,
             renderedDomTypes: Array.from(new Set(types.filter(Boolean))).slice(0, 20),
+            organizationSummary: {
+              observed: texts.length > 0,
+              hasOrganization: orgNodeObserved,
+              missingFields: orgNodeObserved ? Object.keys(orgFieldPresence).filter((field) => orgFieldPresence[field] !== true) : [],
+              source: 'seo_jsonld'
+            },
+            sameAsSummary: {
+              observed: texts.length > 0 && seoNodeObserved,
+              count: Array.from(new Set(sameAsValues)).length,
+              externalCount: Array.from(new Set(sameAsValues)).length,
+              valuesSample: Array.from(new Set(sameAsValues)).slice(0, 8),
+              source: 'seo_jsonld'
+            },
             observed: true
           };
         }), 1200, 'structuredDataLight_renderedDom').catch((e) => Object.assign({}, emptyRendered, {
@@ -6221,6 +6324,10 @@ async function scrapeOnce(req, res) {
           parseErrorsCount: Number(rendered.renderedDomParseErrorsCount || 0) + Number(htmlSummary && htmlSummary.parseErrorsCount || 0),
           renderedDomObserved: rendered.observed === true,
           htmlContentObserved: !!(htmlSummary && htmlSummary.htmlContentLdJsonObserved),
+          renderedOrganizationSummary: rendered.organizationSummary || null,
+          htmlOrganizationSummary: htmlSummary && htmlSummary.organizationSummary || null,
+          renderedSameAsSummary: rendered.sameAsSummary || null,
+          htmlSameAsSummary: htmlSummary && htmlSummary.sameAsSummary || null,
           partialErrors: [rendered.error, htmlSummary && htmlSummary.error].filter(Boolean).slice(0, 4)
         };
       }, 3000);
@@ -6312,6 +6419,14 @@ async function scrapeOnce(req, res) {
           (a) => `${a.text} ${a.href}`,
           50
         );
+        const breadcrumbEl = document.querySelector([
+          '[aria-label*="breadcrumb" i]',
+          '[class*="breadcrumb" i]',
+          '[id*="breadcrumb" i]',
+          'nav[aria-label*="パンくず" i]',
+          '[class*="パンくず" i]'
+        ].join(','));
+        const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
         return {
           anchorCount: anchors.length,
           rawNavAnchorCount: anchors.filter((a) => a.navLike).length,
@@ -6331,6 +6446,10 @@ async function scrapeOnce(req, res) {
           companyLinkSample: firstLike(/company|about|corporate|会社|企業|運営|概要/),
           serviceLinkSample: firstLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           privacyLinkSample: firstLike(/privacy|プライバシー|個人情報/),
+          breadcrumbUiObserved: true,
+          hasBreadcrumbUi: !!breadcrumbEl,
+          breadcrumbUiSource: 'dom_scan',
+          breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
           shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
         };
       }), 3000);
@@ -6583,6 +6702,51 @@ async function scrapeOnce(req, res) {
       const jsonLdParseableCount = (typeof structuredLight.renderedDomParseableCount === 'number' ? structuredLight.renderedDomParseableCount : 0) +
         (typeof structuredLight.htmlContentParseableCount === 'number' ? structuredLight.htmlContentParseableCount : 0);
       const hasJsonLdObserved = structuredObserved || scriptObserved;
+      const mergeOrganizationSummary = (items, hasObserved) => {
+        const summaries = (Array.isArray(items) ? items : []).filter((s) => s && typeof s === 'object');
+        const hasOrganization = mergedTypeClass.hasOrganization === true || summaries.some((s) => s.hasOrganization === true);
+        const missing = [];
+        summaries.forEach((s) => {
+          if (Array.isArray(s.missingFields)) {
+            s.missingFields.forEach((field) => {
+              const v = String(field || '').trim();
+              if (v && !missing.includes(v)) missing.push(v);
+            });
+          }
+        });
+        return {
+          observed: hasObserved ? true : null,
+          hasOrganization: hasObserved ? hasOrganization : null,
+          missingFields: hasOrganization ? missing.slice(0, 12) : [],
+          source: 'seo_jsonld'
+        };
+      };
+      const mergeSameAsSummary = (items, hasObserved) => {
+        const values = [];
+        let observed = false;
+        (Array.isArray(items) ? items : []).forEach((s) => {
+          if (!s || typeof s !== 'object') return;
+          if (s.observed === true) observed = true;
+          if (Array.isArray(s.valuesSample)) s.valuesSample.forEach((v) => values.push(String(v || '').trim()));
+        });
+        const unique = Array.from(new Set(values.filter(Boolean))).slice(0, 20);
+        const canObserve = hasObserved && (observed || mergedTypeClass.hasSeoJsonLd === true);
+        return {
+          observed: canObserve ? true : null,
+          count: canObserve ? unique.length : null,
+          externalCount: canObserve ? unique.length : null,
+          valuesSample: unique.slice(0, 8),
+          source: 'seo_jsonld'
+        };
+      };
+      const organizationSummary = mergeOrganizationSummary([
+        structuredLight.renderedOrganizationSummary,
+        structuredLight.htmlOrganizationSummary
+      ], hasJsonLdObserved);
+      const sameAsSummary = mergeSameAsSummary([
+        structuredLight.renderedSameAsSummary,
+        structuredLight.htmlSameAsSummary
+      ], hasJsonLdObserved);
       const structuredDataLight = {
         types: mergedTypes,
         seoTypes: mergedTypeClass.seoTypes,
@@ -6597,6 +6761,10 @@ async function scrapeOnce(req, res) {
         hasOrganization: hasJsonLdObserved ? mergedTypeClass.hasOrganization : null,
         hasBreadcrumbList: hasJsonLdObserved ? mergedTypeClass.hasBreadcrumbList : null,
         hasFAQPage: hasJsonLdObserved ? mergedTypeClass.hasFAQPage : null,
+        breadcrumbObserved: hasJsonLdObserved ? true : null,
+        breadcrumbMissing: hasJsonLdObserved ? !mergedTypeClass.hasBreadcrumbList : null,
+        organizationSummary,
+        sameAsSummary,
         typeClassificationSource: mergedTypeClass.typeClassificationSource,
         source: 'shortfast_phase_builder',
         confidence: 'medium',
@@ -6742,6 +6910,13 @@ async function scrapeOnce(req, res) {
           privacyLinkSample: linksTrust.privacyLinkSample || null,
           source: 'shortfast_phase_builder'
         },
+        coverage: {
+          breadcrumbUiObserved: linksObserved ? (linksTrust.breadcrumbUiObserved === true) : null,
+          hasBreadcrumbUi: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasBreadcrumbUi') ? !!linksTrust.hasBreadcrumbUi : null,
+          breadcrumbUiSource: linksTrust.breadcrumbUiSource || (linksObserved ? 'dom_scan' : 'not_observed'),
+          breadcrumbUiTextSample: linksTrust.breadcrumbUiTextSample || '',
+          source: 'shortfast_phase_builder'
+        },
         observed: {
           title: {
             value: basicDom.title || null,
@@ -6788,6 +6963,7 @@ async function scrapeOnce(req, res) {
             phaseError: linksObserved ? '' : (phaseByName('linksAndTrust').errorMessage || 'not_observed')
           },
           structuredData: structuredDataLight,
+          coverage: null,
           landmarks: null,
           multimodalSignals: null,
           trustSignals: null,
@@ -6858,6 +7034,7 @@ async function scrapeOnce(req, res) {
       geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
       geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
       geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
+      geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
       const lightweightSummary = {
         title: basicDom.title || null,
         metaDescription: basicDom.metaDescription || null,
@@ -6909,6 +7086,22 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: structuredDataLight.hasOrganization,
         hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
         hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        structuredDataBreadcrumbObserved: structuredDataLight.breadcrumbObserved,
+        structuredDataBreadcrumbMissing: structuredDataLight.breadcrumbMissing,
+        organizationSummary: structuredDataLight.organizationSummary,
+        sameAsSummary: structuredDataLight.sameAsSummary,
+        orgMissingFields: structuredDataLight.organizationSummary && Array.isArray(structuredDataLight.organizationSummary.missingFields)
+          ? structuredDataLight.organizationSummary.missingFields.slice(0, 12)
+          : [],
+        sameAsObserved: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.observed : null,
+        sameAsCount: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.count : null,
+        sameAsExternalCount: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.externalCount : null,
+        sameAsValuesSample: structuredDataLight.sameAsSummary && Array.isArray(structuredDataLight.sameAsSummary.valuesSample)
+          ? structuredDataLight.sameAsSummary.valuesSample.slice(0, 8)
+          : [],
+        breadcrumbUiObserved: geoSignalsV1.coverage.breadcrumbUiObserved,
+        hasBreadcrumbUi: geoSignalsV1.coverage.hasBreadcrumbUi,
+        breadcrumbUiSource: geoSignalsV1.coverage.breadcrumbUiSource,
         structuredDataObservationLimited: structuredDataLight.observationLimited,
         structuredDataObservationScope: structuredDataLight.observationScope,
         structuredDataRenderedDomObserved: structuredDataLight.renderedDomObserved,
