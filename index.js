@@ -3320,6 +3320,11 @@ function summarizeJsonLdTextsLight(texts, source) {
     website: [],
     person: []
   };
+  const contactPointFieldPresence = {
+    telephone: false,
+    email: false,
+    contactType: false
+  };
   const orgFieldPresence = {
     name: false,
     url: false,
@@ -3345,11 +3350,17 @@ function summarizeJsonLdTextsLight(texts, source) {
     const isOrg = types.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
     const isWebsite = types.includes('website');
     const isPerson = types.includes('person');
+    const isContactPoint = types.includes('contactpoint');
     if (isOrg || isWebsite || types.includes('person')) seoNodeObserved = true;
     if (isOrg) {
       orgNodeObserved = true;
       Object.keys(orgFieldPresence).forEach((field) => {
         if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
+      });
+    }
+    if (isContactPoint) {
+      Object.keys(contactPointFieldPresence).forEach((field) => {
+        if (hasOwnMeaningful(node, field)) contactPointFieldPresence[field] = true;
       });
     }
     const sameAs = node.sameAs;
@@ -3388,6 +3399,11 @@ function summarizeJsonLdTextsLight(texts, source) {
   const orgMissingFields = orgNodeObserved
     ? Object.keys(orgFieldPresence).filter((field) => orgFieldPresence[field] !== true)
     : [];
+  const contactPointObserved = hasJsonLd && (typeClass.hasSeoJsonLd || seoNodeObserved);
+  const hasContactPoint = types.some((t) => clean(t).toLowerCase().replace(/^https?:\/\/schema\.org\//i, '') === 'contactpoint');
+  const contactPointMissingFields = contactPointObserved && hasContactPoint
+    ? Object.keys(contactPointFieldPresence).filter((field) => contactPointFieldPresence[field] !== true)
+    : [];
   return {
     types,
     seoTypes: typeClass.seoTypes,
@@ -3423,6 +3439,13 @@ function summarizeJsonLdTextsLight(texts, source) {
       valuesSample: sameAsUnique.slice(0, 8),
       source: 'seo_jsonld'
     },
+    addressObserved: hasJsonLd && typeClass.hasOrganization,
+    hasAddress: hasJsonLd && typeClass.hasOrganization ? orgFieldPresence.address === true : null,
+    addressSource: 'seo_jsonld',
+    contactPointObserved,
+    hasContactPoint: contactPointObserved ? hasContactPoint : null,
+    contactPointMissingFields: contactPointMissingFields.slice(0, 8),
+    contactPointSource: 'seo_jsonld',
     source: source || 'jsonld_light'
   };
 }
@@ -6272,6 +6295,7 @@ async function scrapeOnce(req, res) {
           let parseErrorsCount = 0;
           const types = [];
           const orgFieldPresence = { name: false, url: false, logo: false, sameAs: false, address: false, telephone: false };
+          const contactPointFieldPresence = { telephone: false, email: false, contactType: false };
           const sameAsValues = [];
           const sameAsValuesByType = { organization: [], website: [], person: [] };
           let orgNodeObserved = false;
@@ -6287,11 +6311,17 @@ async function scrapeOnce(req, res) {
             const isOrg = names.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
             const isWebsite = names.includes('website');
             const isPerson = names.includes('person');
+            const isContactPoint = names.includes('contactpoint');
             if (isOrg || isWebsite || isPerson) seoNodeObserved = true;
             if (isOrg) {
               orgNodeObserved = true;
               Object.keys(orgFieldPresence).forEach((field) => {
                 if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
+              });
+            }
+            if (isContactPoint) {
+              Object.keys(contactPointFieldPresence).forEach((field) => {
+                if (hasOwnMeaningful(node, field)) contactPointFieldPresence[field] = true;
               });
             }
             const sameAs = node.sameAs;
@@ -6340,6 +6370,15 @@ async function scrapeOnce(req, res) {
               valuesSample: Array.from(new Set(sameAsValues)).slice(0, 8),
               source: 'seo_jsonld'
             },
+            addressObserved: texts.length > 0 && orgNodeObserved,
+            hasAddress: texts.length > 0 && orgNodeObserved ? orgFieldPresence.address === true : null,
+            addressSource: 'seo_jsonld',
+            contactPointObserved: texts.length > 0 && seoNodeObserved,
+            hasContactPoint: types.some((x) => clean(x).toLowerCase().replace(/^https?:\/\/schema\.org\//i, '') === 'contactpoint'),
+            contactPointMissingFields: types.some((x) => clean(x).toLowerCase().replace(/^https?:\/\/schema\.org\//i, '') === 'contactpoint')
+              ? Object.keys(contactPointFieldPresence).filter((field) => contactPointFieldPresence[field] !== true)
+              : [],
+            contactPointSource: 'seo_jsonld',
             observed: true
           };
         }), 1200, 'structuredDataLight_renderedDom').catch((e) => Object.assign({}, emptyRendered, {
@@ -6361,6 +6400,24 @@ async function scrapeOnce(req, res) {
           htmlOrganizationSummary: htmlSummary && htmlSummary.organizationSummary || null,
           renderedSameAsSummary: rendered.sameAsSummary || null,
           htmlSameAsSummary: htmlSummary && htmlSummary.sameAsSummary || null,
+          renderedTrustSummary: {
+            addressObserved: rendered.addressObserved,
+            hasAddress: rendered.hasAddress,
+            addressSource: rendered.addressSource,
+            contactPointObserved: rendered.contactPointObserved,
+            hasContactPoint: rendered.hasContactPoint,
+            contactPointMissingFields: rendered.contactPointMissingFields,
+            contactPointSource: rendered.contactPointSource
+          },
+          htmlTrustSummary: htmlSummary ? {
+            addressObserved: htmlSummary.addressObserved,
+            hasAddress: htmlSummary.hasAddress,
+            addressSource: htmlSummary.addressSource,
+            contactPointObserved: htmlSummary.contactPointObserved,
+            hasContactPoint: htmlSummary.hasContactPoint,
+            contactPointMissingFields: htmlSummary.contactPointMissingFields,
+            contactPointSource: htmlSummary.contactPointSource
+          } : null,
           partialErrors: [rendered.error, htmlSummary && htmlSummary.error].filter(Boolean).slice(0, 4)
         };
       }, 3000);
@@ -6452,6 +6509,14 @@ async function scrapeOnce(req, res) {
           (a) => `${a.text} ${a.href}`,
           50
         );
+        const footer = document.querySelector('footer,[role="contentinfo"]');
+        const footerAnchors = footer
+          ? Array.from(footer.querySelectorAll('a[href]')).map((a) => ({
+              text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
+              href: absUrl(a.getAttribute('href') || '').slice(0, 180)
+            })).filter((a) => a.href)
+          : [];
+        const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
         const breadcrumbEl = document.querySelector([
           '[aria-label*="breadcrumb" i]',
           '[class*="breadcrumb" i]',
@@ -6483,6 +6548,16 @@ async function scrapeOnce(req, res) {
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
           breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
+          footerSignals: {
+            observed: !!footer,
+            linkCount: footer ? footerAnchors.length : null,
+            hasPrivacyLink: footer ? /privacy|プライバシー|個人情報/.test(footerHay) : null,
+            hasCompanyLink: footer ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
+            hasContactLink: footer ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
+            hasTermsLink: footer ? /terms|legal|law|特定商取引|利用規約|規約|法務/.test(footerHay) : null,
+            sampleTexts: footerAnchors.map((a) => a.text).filter(Boolean).slice(0, 8),
+            source: 'dom_footer_scan'
+          },
           shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
         };
       }), 3000);
@@ -6783,6 +6858,35 @@ async function scrapeOnce(req, res) {
           source: 'seo_jsonld'
         };
       };
+      const mergeTrustStructuredSummary = (items) => {
+        const summaries = (Array.isArray(items) ? items : []).filter((s) => s && typeof s === 'object');
+        const pickBool = (key) => {
+          for (const s of summaries) {
+            if (typeof s[key] === 'boolean') return s[key];
+          }
+          return null;
+        };
+        const missing = [];
+        summaries.forEach((s) => {
+          if (Array.isArray(s.contactPointMissingFields)) {
+            s.contactPointMissingFields.forEach((field) => {
+              const v = String(field || '').trim();
+              if (v && !missing.includes(v)) missing.push(v);
+            });
+          }
+        });
+        const addressObserved = pickBool('addressObserved');
+        const contactPointObserved = pickBool('contactPointObserved');
+        return {
+          addressObserved,
+          hasAddress: addressObserved === true ? pickBool('hasAddress') : null,
+          addressSource: 'seo_jsonld',
+          contactPointObserved,
+          hasContactPoint: contactPointObserved === true ? pickBool('hasContactPoint') : null,
+          contactPointMissingFields: missing.slice(0, 8),
+          contactPointSource: 'seo_jsonld'
+        };
+      };
       const organizationSummary = mergeOrganizationSummary([
         structuredLight.renderedOrganizationSummary,
         structuredLight.htmlOrganizationSummary
@@ -6791,6 +6895,10 @@ async function scrapeOnce(req, res) {
         structuredLight.renderedSameAsSummary,
         structuredLight.htmlSameAsSummary
       ], hasJsonLdObserved);
+      const structuredTrustSummary = mergeTrustStructuredSummary([
+        structuredLight.renderedTrustSummary,
+        structuredLight.htmlTrustSummary
+      ]);
       const structuredDataLight = {
         types: mergedTypes,
         seoTypes: mergedTypeClass.seoTypes,
@@ -6952,6 +7060,13 @@ async function scrapeOnce(req, res) {
           hasPrivacyPolicyLink: linkBoolean('hasPrivacyLikeLink'),
           privacyLinkSource: linksTrust.privacyLinkSource || (linkBoolean('hasPrivacyLikeLink') === true ? 'dom' : 'not_observed'),
           privacyLinkSample: linksTrust.privacyLinkSample || null,
+          addressObserved: structuredTrustSummary.addressObserved,
+          hasAddress: structuredTrustSummary.hasAddress,
+          addressSource: structuredTrustSummary.addressSource,
+          contactPointObserved: structuredTrustSummary.contactPointObserved,
+          hasContactPoint: structuredTrustSummary.hasContactPoint,
+          contactPointMissingFields: structuredTrustSummary.contactPointMissingFields,
+          contactPointSource: structuredTrustSummary.contactPointSource,
           source: 'shortfast_phase_builder'
         },
         coverage: {
@@ -6959,6 +7074,16 @@ async function scrapeOnce(req, res) {
           hasBreadcrumbUi: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasBreadcrumbUi') ? !!linksTrust.hasBreadcrumbUi : null,
           breadcrumbUiSource: linksTrust.breadcrumbUiSource || (linksObserved ? 'dom_scan' : 'not_observed'),
           breadcrumbUiTextSample: linksTrust.breadcrumbUiTextSample || '',
+          footerSignals: linksTrust.footerSignals || {
+            observed: linksObserved ? false : null,
+            linkCount: null,
+            hasPrivacyLink: null,
+            hasCompanyLink: null,
+            hasContactLink: null,
+            hasTermsLink: null,
+            sampleTexts: [],
+            source: 'dom_footer_scan'
+          },
           source: 'shortfast_phase_builder'
         },
         observed: {
@@ -7174,6 +7299,14 @@ async function scrapeOnce(req, res) {
         companyLinkSource: geoSignalsV1.trustSignals.companyLinkSource || null,
         serviceLinkSource: geoSignalsV1.trustSignals.serviceLinkSource || null,
         privacyLinkSource: geoSignalsV1.trustSignals.privacyLinkSource || null,
+        addressObserved: geoSignalsV1.trustSignals.addressObserved,
+        hasAddress: geoSignalsV1.trustSignals.hasAddress,
+        addressSource: geoSignalsV1.trustSignals.addressSource,
+        contactPointObserved: geoSignalsV1.trustSignals.contactPointObserved,
+        hasContactPoint: geoSignalsV1.trustSignals.hasContactPoint,
+        contactPointMissingFields: geoSignalsV1.trustSignals.contactPointMissingFields,
+        contactPointSource: geoSignalsV1.trustSignals.contactPointSource,
+        footerSignals: geoSignalsV1.coverage.footerSignals,
         contactConfidence: geoSignalsV1.trustSignals.contactConfidence || null
       };
       const phaseFailed = (name) => {
