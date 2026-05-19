@@ -3315,6 +3315,11 @@ function summarizeJsonLdTextsLight(texts, source) {
     return clean(v).length > 0;
   };
   const sameAsValues = [];
+  const sameAsValuesByType = {
+    organization: [],
+    website: [],
+    person: []
+  };
   const orgFieldPresence = {
     name: false,
     url: false,
@@ -3339,6 +3344,7 @@ function summarizeJsonLdTextsLight(texts, source) {
     const types = typeNames(node);
     const isOrg = types.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
     const isWebsite = types.includes('website');
+    const isPerson = types.includes('person');
     if (isOrg || isWebsite || types.includes('person')) seoNodeObserved = true;
     if (isOrg) {
       orgNodeObserved = true;
@@ -3350,7 +3356,11 @@ function summarizeJsonLdTextsLight(texts, source) {
     const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
     sameAsList.forEach((v) => {
       const s = clean(v);
-      if (/^https?:\/\//i.test(s)) sameAsValues.push(s);
+      if (!/^https?:\/\//i.test(s)) return;
+      sameAsValues.push(s);
+      if (isOrg) sameAsValuesByType.organization.push(s);
+      if (isWebsite) sameAsValuesByType.website.push(s);
+      if (isPerson) sameAsValuesByType.person.push(s);
     });
     if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
   };
@@ -3370,6 +3380,11 @@ function summarizeJsonLdTextsLight(texts, source) {
   const typeClass = classifyJsonLdTypesForSeo(types);
   const hasJsonLd = rawTexts.length > 0;
   const sameAsUnique = Array.from(new Set(sameAsValues)).slice(0, 20);
+  const sameAsCountByType = {
+    organization: Array.from(new Set(sameAsValuesByType.organization)).length,
+    website: Array.from(new Set(sameAsValuesByType.website)).length,
+    person: Array.from(new Set(sameAsValuesByType.person)).length
+  };
   const orgMissingFields = orgNodeObserved
     ? Object.keys(orgFieldPresence).filter((field) => orgFieldPresence[field] !== true)
     : [];
@@ -3401,6 +3416,10 @@ function summarizeJsonLdTextsLight(texts, source) {
       observed: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd),
       count: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsUnique.length : null,
       externalCount: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsUnique.length : null,
+      sameAsCountByType: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsCountByType : null,
+      hasOrganizationSameAs: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsCountByType.organization > 0 : null,
+      hasWebSiteSameAs: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsCountByType.website > 0 : null,
+      hasPersonSameAs: hasJsonLd && (seoNodeObserved || typeClass.hasSeoJsonLd) ? sameAsCountByType.person > 0 : null,
       valuesSample: sameAsUnique.slice(0, 8),
       source: 'seo_jsonld'
     },
@@ -6254,6 +6273,7 @@ async function scrapeOnce(req, res) {
           const types = [];
           const orgFieldPresence = { name: false, url: false, logo: false, sameAs: false, address: false, telephone: false };
           const sameAsValues = [];
+          const sameAsValuesByType = { organization: [], website: [], person: [] };
           let orgNodeObserved = false;
           let seoNodeObserved = false;
           const walk = (node, depth = 0) => {
@@ -6266,7 +6286,8 @@ async function scrapeOnce(req, res) {
             const names = typeNames(node);
             const isOrg = names.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
             const isWebsite = names.includes('website');
-            if (isOrg || isWebsite || names.includes('person')) seoNodeObserved = true;
+            const isPerson = names.includes('person');
+            if (isOrg || isWebsite || isPerson) seoNodeObserved = true;
             if (isOrg) {
               orgNodeObserved = true;
               Object.keys(orgFieldPresence).forEach((field) => {
@@ -6277,7 +6298,11 @@ async function scrapeOnce(req, res) {
             const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
             sameAsList.forEach((v) => {
               const s = clean(v);
-              if (/^https?:\/\//i.test(s)) sameAsValues.push(s);
+              if (!/^https?:\/\//i.test(s)) return;
+              sameAsValues.push(s);
+              if (isOrg) sameAsValuesByType.organization.push(s);
+              if (isWebsite) sameAsValuesByType.website.push(s);
+              if (isPerson) sameAsValuesByType.person.push(s);
             });
             if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walk(item, depth + 1));
           };
@@ -6304,6 +6329,14 @@ async function scrapeOnce(req, res) {
               observed: texts.length > 0 && seoNodeObserved,
               count: Array.from(new Set(sameAsValues)).length,
               externalCount: Array.from(new Set(sameAsValues)).length,
+              sameAsCountByType: {
+                organization: Array.from(new Set(sameAsValuesByType.organization)).length,
+                website: Array.from(new Set(sameAsValuesByType.website)).length,
+                person: Array.from(new Set(sameAsValuesByType.person)).length
+              },
+              hasOrganizationSameAs: Array.from(new Set(sameAsValuesByType.organization)).length > 0,
+              hasWebSiteSameAs: Array.from(new Set(sameAsValuesByType.website)).length > 0,
+              hasPersonSameAs: Array.from(new Set(sameAsValuesByType.person)).length > 0,
               valuesSample: Array.from(new Set(sameAsValues)).slice(0, 8),
               source: 'seo_jsonld'
             },
@@ -6730,11 +6763,22 @@ async function scrapeOnce(req, res) {
           if (Array.isArray(s.valuesSample)) s.valuesSample.forEach((v) => values.push(String(v || '').trim()));
         });
         const unique = Array.from(new Set(values.filter(Boolean))).slice(0, 20);
+        const countByType = { organization: 0, website: 0, person: 0 };
+        (Array.isArray(items) ? items : []).forEach((s) => {
+          if (!s || typeof s !== 'object' || !s.sameAsCountByType || typeof s.sameAsCountByType !== 'object') return;
+          countByType.organization = Math.max(countByType.organization, Number(s.sameAsCountByType.organization || 0));
+          countByType.website = Math.max(countByType.website, Number(s.sameAsCountByType.website || 0));
+          countByType.person = Math.max(countByType.person, Number(s.sameAsCountByType.person || 0));
+        });
         const canObserve = hasObserved && (observed || mergedTypeClass.hasSeoJsonLd === true);
         return {
           observed: canObserve ? true : null,
           count: canObserve ? unique.length : null,
           externalCount: canObserve ? unique.length : null,
+          sameAsCountByType: canObserve ? countByType : null,
+          hasOrganizationSameAs: canObserve ? countByType.organization > 0 : null,
+          hasWebSiteSameAs: canObserve ? countByType.website > 0 : null,
+          hasPersonSameAs: canObserve ? countByType.person > 0 : null,
           valuesSample: unique.slice(0, 8),
           source: 'seo_jsonld'
         };
@@ -7096,6 +7140,10 @@ async function scrapeOnce(req, res) {
         sameAsObserved: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.observed : null,
         sameAsCount: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.count : null,
         sameAsExternalCount: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.externalCount : null,
+        sameAsCountByType: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.sameAsCountByType : null,
+        hasOrganizationSameAs: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.hasOrganizationSameAs : null,
+        hasWebSiteSameAs: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.hasWebSiteSameAs : null,
+        hasPersonSameAs: structuredDataLight.sameAsSummary ? structuredDataLight.sameAsSummary.hasPersonSameAs : null,
         sameAsValuesSample: structuredDataLight.sameAsSummary && Array.isArray(structuredDataLight.sameAsSummary.valuesSample)
           ? structuredDataLight.sameAsSummary.valuesSample.slice(0, 8)
           : [],
