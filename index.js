@@ -3253,6 +3253,51 @@ function flatTypesFromJsonLd(arr) {
   }
   return Array.from(types);
 }
+function classifyJsonLdTypesForSeo(types) {
+  const rawTypes = Array.from(new Set((Array.isArray(types) ? types : [])
+    .map((t) => String(t || '').trim())
+    .filter(Boolean))).slice(0, 80);
+  const seoTypeAllowList = new Set([
+    'organization', 'website', 'webpage', 'breadcrumblist', 'faqpage',
+    'product', 'offer', 'aggregateoffer', 'article', 'newsarticle', 'blogposting',
+    'localbusiness', 'corporation', 'service', 'contactpoint', 'postaladdress',
+    'person', 'place', 'itemlist', 'imageobject', 'logo'
+  ]);
+  const telemetryTypes = [];
+  const nonSeoTypes = [];
+  const seoTypes = [];
+  const excludedFromSeoTypes = [];
+  rawTypes.forEach((type) => {
+    const lower = String(type || '').trim().toLowerCase();
+    const isTelemetry =
+      /^type\.googleapis\.com\//i.test(type) ||
+      /(^|[./])shopify\.event[./]/i.test(type) ||
+      /buyerevent/i.test(type) ||
+      /(analytics|telemetry|tracking|event)$/i.test(type);
+    const isSeo = !isTelemetry && (seoTypeAllowList.has(lower) || /^https?:\/\/schema\.org\//i.test(type));
+    if (isSeo) {
+      seoTypes.push(type);
+    } else {
+      nonSeoTypes.push(type);
+      excludedFromSeoTypes.push(type);
+      if (isTelemetry) telemetryTypes.push(type);
+    }
+  });
+  const seoSet = new Set(seoTypes.map((t) => String(t || '').toLowerCase().replace(/^https?:\/\/schema\.org\//i, '')));
+  return {
+    rawTypes,
+    seoTypes: Array.from(new Set(seoTypes)).slice(0, 50),
+    nonSeoTypes: Array.from(new Set(nonSeoTypes)).slice(0, 50),
+    telemetryTypes: Array.from(new Set(telemetryTypes)).slice(0, 50),
+    excludedFromSeoTypes: Array.from(new Set(excludedFromSeoTypes)).slice(0, 50),
+    hasSeoJsonLd: seoTypes.length > 0,
+    hasWebsite: seoSet.has('website'),
+    hasOrganization: seoSet.has('organization') || seoSet.has('corporation') || seoSet.has('localbusiness'),
+    hasBreadcrumbList: seoSet.has('breadcrumblist'),
+    hasFAQPage: seoSet.has('faqpage'),
+    typeClassificationSource: 'balanced_unified_schema_type_filter'
+  };
+}
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
 function summarizeJsonLdTextsLight(texts, source) {
@@ -3283,18 +3328,24 @@ function summarizeJsonLdTextsLight(texts, source) {
     }
   });
   const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
-  const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+  const typeClass = classifyJsonLdTypesForSeo(types);
   const hasJsonLd = rawTexts.length > 0;
   return {
     types,
+    seoTypes: typeClass.seoTypes,
+    nonSeoTypes: typeClass.nonSeoTypes,
+    telemetryTypes: typeClass.telemetryTypes,
+    excludedFromSeoTypes: typeClass.excludedFromSeoTypes,
     rawCount: rawTexts.length,
     parseableCount,
     parseErrorsCount,
     hasJsonLd,
-    hasWebsite: hasJsonLd ? typeSet.has('website') : false,
-    hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
-    hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
-    hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+    hasSeoJsonLd: hasJsonLd ? typeClass.hasSeoJsonLd : false,
+    hasWebsite: hasJsonLd ? typeClass.hasWebsite : false,
+    hasOrganization: hasJsonLd ? typeClass.hasOrganization : false,
+    hasBreadcrumbList: hasJsonLd ? typeClass.hasBreadcrumbList : false,
+    hasFAQPage: hasJsonLd ? typeClass.hasFAQPage : false,
+    typeClassificationSource: typeClass.typeClassificationSource,
     source: source || 'jsonld_light'
   };
 }
@@ -3475,11 +3526,17 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     out.types = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
     out.parseableCount = 0;
     out.hasJsonLd = out.candidateCount > 0;
-    const typeSet = new Set(out.types.map((t) => String(t || '').toLowerCase()));
-    out.hasWebsite = out.hasJsonLd ? typeSet.has('website') : false;
-    out.hasOrganization = out.hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false;
-    out.hasBreadcrumbList = out.hasJsonLd ? typeSet.has('breadcrumblist') : false;
-    out.hasFAQPage = out.hasJsonLd ? typeSet.has('faqpage') : false;
+    const typeClass = classifyJsonLdTypesForSeo(out.types);
+    out.seoTypes = typeClass.seoTypes;
+    out.nonSeoTypes = typeClass.nonSeoTypes;
+    out.telemetryTypes = typeClass.telemetryTypes;
+    out.excludedFromSeoTypes = typeClass.excludedFromSeoTypes;
+    out.hasSeoJsonLd = out.hasJsonLd ? typeClass.hasSeoJsonLd : false;
+    out.hasWebsite = out.hasJsonLd ? typeClass.hasWebsite : false;
+    out.hasOrganization = out.hasJsonLd ? typeClass.hasOrganization : false;
+    out.hasBreadcrumbList = out.hasJsonLd ? typeClass.hasBreadcrumbList : false;
+    out.hasFAQPage = out.hasJsonLd ? typeClass.hasFAQPage : false;
+    out.typeClassificationSource = typeClass.typeClassificationSource;
     if (scannedScriptForTrust) {
       if (out.contactPathFound !== true) out.contactPathFound = false;
       if (out.companyPathFound !== true) out.companyPathFound = false;
@@ -4263,15 +4320,22 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       if (scriptVal === false && (renderedVal === false || renderedVal == null) && (htmlVal === false || htmlVal == null)) return false;
       return null;
     };
+    const mergedJsonLdTypeClass = classifyJsonLdTypesForSeo(mergedJsonLdTypes);
     const structuredDataLight = {
       types: mergedJsonLdTypes,
+      seoTypes: mergedJsonLdTypeClass.seoTypes,
+      nonSeoTypes: mergedJsonLdTypeClass.nonSeoTypes,
+      telemetryTypes: mergedJsonLdTypeClass.telemetryTypes,
+      excludedFromSeoTypes: mergedJsonLdTypeClass.excludedFromSeoTypes,
       rawCount: balancedMode ? (renderedRawCount + htmlRawCount + scriptSrcCandidateCount) : renderedRawCount,
       parseableCount: balancedMode ? (renderedParseableCount + htmlParseableCount + scriptSrcParseableCount) : renderedParseableCount,
       hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : (typeof renderedStructured.hasJsonLd === 'boolean' ? renderedStructured.hasJsonLd : null),
-      hasWebsite: balancedMode ? pickStructuredBool('hasWebsite') : (observed.structuredData ? observed.structuredData.hasWebsite : null),
-      hasOrganization: balancedMode ? pickStructuredBool('hasOrganization') : (observed.structuredData ? observed.structuredData.hasOrganization : null),
-      hasBreadcrumbList: balancedMode ? pickStructuredBool('hasBreadcrumbList') : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
-      hasFAQPage: balancedMode ? pickStructuredBool('hasFAQPage') : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
+      hasSeoJsonLd: (balancedMode || renderedRawCount > 0) ? mergedJsonLdTypeClass.hasSeoJsonLd : null,
+      hasWebsite: balancedMode ? mergedJsonLdTypeClass.hasWebsite : (observed.structuredData ? observed.structuredData.hasWebsite : null),
+      hasOrganization: balancedMode ? mergedJsonLdTypeClass.hasOrganization : (observed.structuredData ? observed.structuredData.hasOrganization : null),
+      hasBreadcrumbList: balancedMode ? mergedJsonLdTypeClass.hasBreadcrumbList : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
+      hasFAQPage: balancedMode ? mergedJsonLdTypeClass.hasFAQPage : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
+      typeClassificationSource: mergedJsonLdTypeClass.typeClassificationSource,
       source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
       observationLimited: true,
@@ -4511,13 +4575,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         },
         structuredData: {
           types: structuredDataLight.types,
+          seoTypes: structuredDataLight.seoTypes,
+          nonSeoTypes: structuredDataLight.nonSeoTypes,
+          telemetryTypes: structuredDataLight.telemetryTypes,
+          excludedFromSeoTypes: structuredDataLight.excludedFromSeoTypes,
           rawCount: structuredDataLight.rawCount,
           parseableCount: structuredDataLight.parseableCount,
           hasJsonLd: structuredDataLight.hasJsonLd,
+          hasSeoJsonLd: structuredDataLight.hasSeoJsonLd,
           hasWebsite: structuredDataLight.hasWebsite,
           hasOrganization: structuredDataLight.hasOrganization,
           hasBreadcrumbList: structuredDataLight.hasBreadcrumbList,
           hasFAQPage: structuredDataLight.hasFAQPage,
+          typeClassificationSource: structuredDataLight.typeClassificationSource,
           source: structuredDataLight.source,
           confidence: structuredDataLight.confidence,
           observationLimited: structuredDataLight.observationLimited,
@@ -4607,7 +4677,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         jsonldParseableCount: geoSignalsV1.observed.structuredData.parseableCount,
         jsonldParseErrorsCount: geoSignalsV1.observed.structuredData.parseErrorsCount,
         jsonldTypes: geoSignalsV1.observed.structuredData.types,
+        seoJsonldTypes: geoSignalsV1.observed.structuredData.seoTypes,
+        nonSeoJsonldTypes: geoSignalsV1.observed.structuredData.nonSeoTypes,
+        telemetryJsonldTypes: geoSignalsV1.observed.structuredData.telemetryTypes,
         hasJsonLd: geoSignalsV1.observed.structuredData.hasJsonLd,
+        hasSeoJsonLd: geoSignalsV1.observed.structuredData.hasSeoJsonLd,
         hasWebsite: geoSignalsV1.observed.structuredData.hasWebsite,
         hasOrganization: geoSignalsV1.observed.structuredData.hasOrganization,
         hasBreadcrumbList: geoSignalsV1.observed.structuredData.hasBreadcrumbList,
@@ -4617,6 +4691,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         scriptSrcJsonLdObserved: geoSignalsV1.observed.structuredData.scriptSrcJsonLdObserved,
         scriptSrcJsonLdCandidateCount: geoSignalsV1.observed.structuredData.scriptSrcJsonLdCandidateCount,
         scriptSrcJsonLdTypes: geoSignalsV1.observed.structuredData.scriptSrcJsonLdTypes,
+        excludedFromSeoTypes: geoSignalsV1.observed.structuredData.excludedFromSeoTypes,
         hasOgImage: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasOgImage,
         hasFavicon: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasFavicon,
         hasContactLink: geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.hasContactLink,
@@ -5124,14 +5199,20 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const balanced = g.balanced || {};
   const shortStructuredData = {
     types: arr(structuredData.types, 50, 'geoSignalsV1.structuredData.types'),
+    seoTypes: arr(structuredData.seoTypes, 50, 'geoSignalsV1.structuredData.seoTypes'),
+    nonSeoTypes: arr(structuredData.nonSeoTypes, 50, 'geoSignalsV1.structuredData.nonSeoTypes'),
+    telemetryTypes: arr(structuredData.telemetryTypes, 50, 'geoSignalsV1.structuredData.telemetryTypes'),
+    excludedFromSeoTypes: arr(structuredData.excludedFromSeoTypes, 50, 'geoSignalsV1.structuredData.excludedFromSeoTypes'),
     rawCount: structuredData.rawCount,
     parseableCount: structuredData.parseableCount,
     hasJsonLd: structuredData.hasJsonLd,
+    hasSeoJsonLd: structuredData.hasSeoJsonLd,
     hasWebsite: structuredData.hasWebsite,
     hasOrganization: structuredData.hasOrganization,
     hasBreadcrumbList: structuredData.hasBreadcrumbList,
     hasFAQPage: structuredData.hasFAQPage,
     source: structuredData.source,
+    typeClassificationSource: structuredData.typeClassificationSource,
     confidence: structuredData.confidence,
     observationLimited: structuredData.observationLimited,
     observationScope: structuredData.observationScope,
@@ -5278,6 +5359,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   };
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
+  if (Array.isArray(shortLightweightSummary.seoJsonldTypes)) shortLightweightSummary.seoJsonldTypes = shortLightweightSummary.seoJsonldTypes.slice(0, 50);
+  if (Array.isArray(shortLightweightSummary.nonSeoJsonldTypes)) shortLightweightSummary.nonSeoJsonldTypes = shortLightweightSummary.nonSeoJsonldTypes.slice(0, 50);
+  if (Array.isArray(shortLightweightSummary.telemetryJsonldTypes)) shortLightweightSummary.telemetryJsonldTypes = shortLightweightSummary.telemetryJsonldTypes.slice(0, 50);
   if (Array.isArray(shortLightweightSummary.structuredDataScriptSrcJsonLdTypes)) shortLightweightSummary.structuredDataScriptSrcJsonLdTypes = shortLightweightSummary.structuredDataScriptSrcJsonLdTypes.slice(0, 50);
   const shortDiagnostics = Object.assign({}, diagnostics, {
     responseMode: 'short',
@@ -6388,7 +6472,7 @@ async function scrapeOnce(req, res) {
         .concat(Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types : [])
         .filter(Boolean)
       )).slice(0, 50);
-      const typeSet = new Set(mergedTypes.map((t) => String(t || '').toLowerCase()));
+      const mergedTypeClass = classifyJsonLdTypesForSeo(mergedTypes);
       const structuredDataPhaseDebug = {
         phaseOk: !!(structuredDataPhase && structuredDataPhase.ok),
         phaseElapsedMs: structuredDataPhase && typeof structuredDataPhase.elapsedMs === 'number' ? structuredDataPhase.elapsedMs : null,
@@ -6438,13 +6522,19 @@ async function scrapeOnce(req, res) {
       const hasJsonLdObserved = structuredObserved || scriptObserved;
       const structuredDataLight = {
         types: mergedTypes,
+        seoTypes: mergedTypeClass.seoTypes,
+        nonSeoTypes: mergedTypeClass.nonSeoTypes,
+        telemetryTypes: mergedTypeClass.telemetryTypes,
+        excludedFromSeoTypes: mergedTypeClass.excludedFromSeoTypes,
         rawCount: hasJsonLdObserved ? jsonLdRawCount : null,
         parseableCount: hasJsonLdObserved ? jsonLdParseableCount : null,
         hasJsonLd: hasJsonLdObserved ? (mergedTypes.length > 0 || jsonLdRawCount > 0) : null,
-        hasWebsite: hasJsonLdObserved ? typeSet.has('website') : null,
-        hasOrganization: hasJsonLdObserved ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
-        hasBreadcrumbList: hasJsonLdObserved ? typeSet.has('breadcrumblist') : null,
-        hasFAQPage: hasJsonLdObserved ? typeSet.has('faqpage') : null,
+        hasSeoJsonLd: hasJsonLdObserved ? mergedTypeClass.hasSeoJsonLd : null,
+        hasWebsite: hasJsonLdObserved ? mergedTypeClass.hasWebsite : null,
+        hasOrganization: hasJsonLdObserved ? mergedTypeClass.hasOrganization : null,
+        hasBreadcrumbList: hasJsonLdObserved ? mergedTypeClass.hasBreadcrumbList : null,
+        hasFAQPage: hasJsonLdObserved ? mergedTypeClass.hasFAQPage : null,
+        typeClassificationSource: mergedTypeClass.typeClassificationSource,
         source: 'shortfast_phase_builder',
         confidence: 'medium',
         observationLimited: true,
@@ -6729,7 +6819,12 @@ async function scrapeOnce(req, res) {
         jsonldParseableCount: structuredDataLight.parseableCount,
         jsonldParseErrorsCount: structuredDataLight.parseErrorsCount,
         jsonldTypes: structuredDataLight.types.slice(0, 50),
+        seoJsonldCount: structuredDataLight.hasSeoJsonLd === true ? structuredDataLight.seoTypes.length : 0,
+        seoJsonldTypes: structuredDataLight.seoTypes.slice(0, 50),
+        nonSeoJsonldTypes: structuredDataLight.nonSeoTypes.slice(0, 50),
+        telemetryJsonldTypes: structuredDataLight.telemetryTypes.slice(0, 50),
         hasJsonLd: structuredDataLight.hasJsonLd,
+        hasSeoJsonLd: structuredDataLight.hasSeoJsonLd,
         hasWebsiteJsonLd: structuredDataLight.hasWebsite,
         hasOrgJsonLd: structuredDataLight.hasOrganization,
         hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
@@ -6742,6 +6837,8 @@ async function scrapeOnce(req, res) {
         structuredDataScriptSrcFetchedCount: structuredDataLight.scriptSrcFetchedCount,
         structuredDataScriptSrcJsonLdCandidateCount: structuredDataLight.scriptSrcJsonLdCandidateCount,
         structuredDataScriptSrcJsonLdTypes: structuredDataLight.scriptSrcJsonLdTypes.slice(0, 50),
+        structuredDataExcludedFromSeoTypes: structuredDataLight.excludedFromSeoTypes.slice(0, 50),
+        structuredDataTypeClassificationSource: structuredDataLight.typeClassificationSource,
         hasOgImage: geoSignalsV1.multimodalSignals.hasOgImage,
         hasTwitterImage: geoSignalsV1.multimodalSignals.hasTwitterImage,
         hasFavicon: geoSignalsV1.multimodalSignals.hasFavicon,
@@ -7904,7 +8001,12 @@ async function scrapeOnce(req, res) {
         jsonldParseableCount: typeof structuredObserved.parseableCount === 'number' ? structuredObserved.parseableCount : 0,
         jsonldParseErrorsCount: typeof structuredObserved.parseErrorsCount === 'number' ? structuredObserved.parseErrorsCount : 0,
         jsonldTypes: Array.isArray(structuredObserved.types) ? structuredObserved.types.slice(0, 50) : [],
+        seoJsonldCount: Array.isArray(structuredObserved.seoTypes) ? structuredObserved.seoTypes.length : 0,
+        seoJsonldTypes: Array.isArray(structuredObserved.seoTypes) ? structuredObserved.seoTypes.slice(0, 50) : [],
+        nonSeoJsonldTypes: Array.isArray(structuredObserved.nonSeoTypes) ? structuredObserved.nonSeoTypes.slice(0, 50) : [],
+        telemetryJsonldTypes: Array.isArray(structuredObserved.telemetryTypes) ? structuredObserved.telemetryTypes.slice(0, 50) : [],
         hasJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasJsonLd') ? structuredObserved.hasJsonLd : null,
+        hasSeoJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasSeoJsonLd') ? structuredObserved.hasSeoJsonLd : null,
         hasWebsiteJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasWebsite') ? structuredObserved.hasWebsite : null,
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
@@ -7920,6 +8022,8 @@ async function scrapeOnce(req, res) {
         structuredDataScriptSrcFetchedCount: typeof structuredObserved.scriptSrcFetchedCount === 'number' ? structuredObserved.scriptSrcFetchedCount : 0,
         structuredDataScriptSrcJsonLdCandidateCount: typeof structuredObserved.scriptSrcJsonLdCandidateCount === 'number' ? structuredObserved.scriptSrcJsonLdCandidateCount : 0,
         structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
+        structuredDataExcludedFromSeoTypes: Array.isArray(structuredObserved.excludedFromSeoTypes) ? structuredObserved.excludedFromSeoTypes.slice(0, 50) : [],
+        structuredDataTypeClassificationSource: structuredObserved.typeClassificationSource || '',
         structuredDataScriptSrcAppIndexDetected: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcAppIndexDetected') ? structuredObserved.scriptSrcAppIndexDetected : false,
         structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
         structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
