@@ -6012,7 +6012,7 @@ async function scrapeOnce(req, res) {
         const confirmedMain = main || roleMain;
         const appCandidate = document.querySelector('#main,#main-content,#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]');
         return {
-          hasMainLandmark: !!confirmedMain,
+          hasMainLandmark: confirmedMain ? true : null,
           hasMainLandmark_final: confirmedMain ? true : null,
           mainLandmarkSource: main ? 'dom_main_light' : (roleMain ? 'dom_role_main_light' : 'not_observed'),
           mainLandmarkCandidateFound: !confirmedMain && !!appCandidate,
