@@ -5806,6 +5806,21 @@ async function scrapeOnce(req, res) {
         };
       }, 3000);
 
+      await runPhase('headMetaEval', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const metaEl =
+          document.querySelector('meta[name="description" i]') ||
+          document.querySelector('meta[property="og:description" i]') ||
+          document.querySelector('meta[name="twitter:description" i]');
+        const metaDescription = clean(metaEl && metaEl.getAttribute('content'));
+        return {
+          title: clean(document.title || '').slice(0, 180),
+          metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
+          metaDescriptionLength: metaDescription ? metaDescription.length : 0,
+          observed: true
+        };
+      }), 1200);
+
       await runPhase('basicDomEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
         const readableBodyText = () => {
@@ -5937,7 +5952,22 @@ async function scrapeOnce(req, res) {
       }), unifiedBalancedObserverProbe ? 2000 : 3000);
 
       await runPhase('structuredDataLight', async () => {
-        const rendered = await page.evaluate(() => {
+        const emptyRendered = {
+          renderedDomRawCount: null,
+          renderedDomParseableCount: null,
+          renderedDomParseErrorsCount: 0,
+          renderedDomTypes: [],
+          observed: false
+        };
+        const emptyHtml = {
+          rawCount: null,
+          parseableCount: null,
+          parseErrorsCount: 0,
+          types: [],
+          htmlContentLdJsonObserved: false,
+          error: null
+        };
+        const rendered = await withTimeout(page.evaluate(() => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
           const texts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
             .map((s) => clean(s.textContent || ''))
@@ -5966,25 +5996,33 @@ async function scrapeOnce(req, res) {
             renderedDomRawCount: texts.length,
             renderedDomParseableCount: parseableCount,
             renderedDomParseErrorsCount: parseErrorsCount,
-            renderedDomTypes: Array.from(new Set(types.filter(Boolean))).slice(0, 20)
+            renderedDomTypes: Array.from(new Set(types.filter(Boolean))).slice(0, 20),
+            observed: true
           };
-        });
-        const htmlSummary = await collectHtmlContentJsonLdSummaryLight(page);
+        }), 1200, 'structuredDataLight_renderedDom').catch((e) => Object.assign({}, emptyRendered, {
+          error: String(e && (e.message || e) || '').slice(0, 180)
+        }));
+        const htmlSummary = await withTimeout(collectHtmlContentJsonLdSummaryLight(page), 1500, 'structuredDataLight_htmlContent').catch((e) => Object.assign({}, emptyHtml, {
+          error: String(e && (e.message || e) || '').slice(0, 180)
+        }));
         return {
           renderedDomRawCount: rendered.renderedDomRawCount,
           renderedDomParseableCount: rendered.renderedDomParseableCount,
           htmlContentRawCount: htmlSummary && htmlSummary.rawCount,
           htmlContentParseableCount: htmlSummary && htmlSummary.parseableCount,
           types: Array.from(new Set([].concat(rendered.renderedDomTypes || [], htmlSummary && htmlSummary.types || []).filter(Boolean))).slice(0, 20),
-          parseErrorsCount: Number(rendered.renderedDomParseErrorsCount || 0) + Number(htmlSummary && htmlSummary.parseErrorsCount || 0)
+          parseErrorsCount: Number(rendered.renderedDomParseErrorsCount || 0) + Number(htmlSummary && htmlSummary.parseErrorsCount || 0),
+          renderedDomObserved: rendered.observed === true,
+          htmlContentObserved: !!(htmlSummary && htmlSummary.htmlContentLdJsonObserved),
+          partialErrors: [rendered.error, htmlSummary && htmlSummary.error].filter(Boolean).slice(0, 4)
         };
       }, 3000);
 
       await runPhase('sameOriginScriptJsonLd', async () => {
         const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
-          maxScripts: unifiedBalancedObserverProbe ? 10 : 3,
+          maxScripts: unifiedBalancedObserverProbe ? 5 : 3,
           maxBytesPerScript: unifiedBalancedObserverProbe ? 1000000 : 512000,
-          requestTimeoutMs: unifiedBalancedObserverProbe ? 7000 : 3000
+          requestTimeoutMs: unifiedBalancedObserverProbe ? 1500 : 3000
         });
         return {
           scriptSrcCount: summary.scriptSrcCount,
@@ -5996,9 +6034,11 @@ async function scrapeOnce(req, res) {
           appIndexDetected: !!summary.appIndexDetected,
           totalFetchedBytes: summary.totalFetchedBytes,
           maxScriptLength: summary.maxScriptLength,
-          error: summary.error || null
+          error: summary.error || null,
+          fetchErrorsCount: summary.fetchErrorsCount || 0,
+          fetchErrorsSample: Array.isArray(summary.fetchErrorsSample) ? summary.fetchErrorsSample.slice(0, 5) : []
         };
-      }, unifiedBalancedObserverProbe ? 8000 : 5000);
+      }, unifiedBalancedObserverProbe ? 10000 : 5000);
 
       await runPhase('linksAndTrust', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -6040,7 +6080,7 @@ async function scrapeOnce(req, res) {
               if (el.shadowRoot) walkShadowAnchors(el.shadowRoot, depth + 1);
             });
           };
-          walkShadowAnchors(document, 0);
+          if (anchors.length < 50) walkShadowAnchors(document, 0);
         } catch (_) {}
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
@@ -6211,7 +6251,13 @@ async function scrapeOnce(req, res) {
         return phase && phase.minimalResult && typeof phase.minimalResult === 'object' ? phase.minimalResult : {};
       };
       const hydrationGuardedWait = phaseResult('hydrationGuardedWait');
-      const basicDom = phaseResult('basicDomEval');
+      const headMeta = phaseResult('headMetaEval');
+      const basicDomRaw = phaseResult('basicDomEval');
+      const basicDom = Object.assign({}, basicDomRaw, {
+        title: basicDomRaw.title || headMeta.title || '',
+        metaDescription: basicDomRaw.metaDescription || headMeta.metaDescription || '',
+        metaDescriptionLength: Number(basicDomRaw.metaDescriptionLength || headMeta.metaDescriptionLength || 0)
+      });
       const structuredLight = phaseResult('structuredDataLight');
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
       const linksTrust = phaseResult('linksAndTrust');
@@ -6236,6 +6282,7 @@ async function scrapeOnce(req, res) {
           : 'not_observed')
         : (landmarksLight.mainLandmarkSource || 'not_observed');
       const mainLandmarkConfidence = mainLandmarkFinal === true ? 'high' : 'low';
+      const headMetaPhase = phaseByName('headMetaEval');
       const structuredDataPhase = phaseByName('structuredDataLight');
       const sameOriginScriptJsonLdPhase = phaseByName('sameOriginScriptJsonLd');
       const phaseStatuses = phases.map((p) => ({
@@ -6262,13 +6309,14 @@ async function scrapeOnce(req, res) {
         phaseOk: !!(structuredDataPhase && structuredDataPhase.ok),
         phaseElapsedMs: structuredDataPhase && typeof structuredDataPhase.elapsedMs === 'number' ? structuredDataPhase.elapsedMs : null,
         phaseErrorMessage: structuredDataPhase && structuredDataPhase.errorMessage ? structuredDataPhase.errorMessage : '',
-        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
-        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
-        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
-        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
+        renderedDomRawCount: typeof structuredLight.renderedDomRawCount === 'number' ? structuredLight.renderedDomRawCount : null,
+        renderedDomParseableCount: typeof structuredLight.renderedDomParseableCount === 'number' ? structuredLight.renderedDomParseableCount : null,
+        htmlContentRawCount: typeof structuredLight.htmlContentRawCount === 'number' ? structuredLight.htmlContentRawCount : null,
+        htmlContentParseableCount: typeof structuredLight.htmlContentParseableCount === 'number' ? structuredLight.htmlContentParseableCount : null,
         jsonldTypes: Array.isArray(structuredLight.types) ? structuredLight.types.slice(0, 30) : [],
         parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
         timedOut: !!(structuredDataPhase && /timeout/i.test(String(structuredDataPhase.errorMessage || ''))),
+        partialErrors: Array.isArray(structuredLight.partialErrors) ? structuredLight.partialErrors.slice(0, 4) : [],
         resultWasEmpty: !structuredLight || (
           Number(structuredLight.renderedDomRawCount || 0) === 0 &&
           Number(structuredLight.htmlContentRawCount || 0) === 0 &&
@@ -6296,29 +6344,37 @@ async function scrapeOnce(req, res) {
         fetchErrorsCount: Number(scriptJsonLd.fetchErrorsCount || 0),
         fetchErrorsSample: Array.isArray(scriptJsonLd.fetchErrorsSample) ? scriptJsonLd.fetchErrorsSample.slice(0, 5) : []
       };
+      const structuredObserved = structuredLight.renderedDomObserved === true || structuredLight.htmlContentObserved === true || !!(structuredDataPhase && structuredDataPhase.ok);
+      const scriptObserved = !!(sameOriginScriptJsonLdPhase && sameOriginScriptJsonLdPhase.ok) || typeof scriptJsonLd.sameOriginScriptCount === 'number';
+      const jsonLdRawCount = (typeof structuredLight.renderedDomRawCount === 'number' ? structuredLight.renderedDomRawCount : 0) +
+        (typeof structuredLight.htmlContentRawCount === 'number' ? structuredLight.htmlContentRawCount : 0) +
+        (typeof scriptJsonLd.candidateCount === 'number' ? scriptJsonLd.candidateCount : 0);
+      const jsonLdParseableCount = (typeof structuredLight.renderedDomParseableCount === 'number' ? structuredLight.renderedDomParseableCount : 0) +
+        (typeof structuredLight.htmlContentParseableCount === 'number' ? structuredLight.htmlContentParseableCount : 0);
+      const hasJsonLdObserved = structuredObserved || scriptObserved;
       const structuredDataLight = {
         types: mergedTypes,
-        rawCount: Number(structuredLight.renderedDomRawCount || 0) + Number(structuredLight.htmlContentRawCount || 0) + Number(scriptJsonLd.candidateCount || 0),
-        parseableCount: Number(structuredLight.renderedDomParseableCount || 0) + Number(structuredLight.htmlContentParseableCount || 0),
-        hasJsonLd: mergedTypes.length > 0 || Number(structuredLight.renderedDomRawCount || 0) > 0 || Number(structuredLight.htmlContentRawCount || 0) > 0 || Number(scriptJsonLd.candidateCount || 0) > 0,
-        hasWebsite: typeSet.has('website'),
-        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
-        hasBreadcrumbList: typeSet.has('breadcrumblist'),
-        hasFAQPage: typeSet.has('faqpage'),
+        rawCount: hasJsonLdObserved ? jsonLdRawCount : null,
+        parseableCount: hasJsonLdObserved ? jsonLdParseableCount : null,
+        hasJsonLd: hasJsonLdObserved ? (mergedTypes.length > 0 || jsonLdRawCount > 0) : null,
+        hasWebsite: hasJsonLdObserved ? typeSet.has('website') : null,
+        hasOrganization: hasJsonLdObserved ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
+        hasBreadcrumbList: hasJsonLdObserved ? typeSet.has('breadcrumblist') : null,
+        hasFAQPage: hasJsonLdObserved ? typeSet.has('faqpage') : null,
         source: 'shortfast_phase_builder',
         confidence: 'medium',
         observationLimited: true,
         observationScope: 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only',
-        renderedDomObserved: true,
-        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
-        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
-        htmlContentLdJsonObserved: true,
-        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
-        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
-        scriptSrcJsonLdObserved: true,
-        scriptSrcCandidateCount: Number(scriptJsonLd.sameOriginScriptCount || 0),
-        scriptSrcFetchedCount: Number(scriptJsonLd.fetchedCount || 0),
-        scriptSrcJsonLdCandidateCount: Number(scriptJsonLd.candidateCount || 0),
+        renderedDomObserved: structuredLight.renderedDomObserved === true,
+        renderedDomRawCount: typeof structuredLight.renderedDomRawCount === 'number' ? structuredLight.renderedDomRawCount : null,
+        renderedDomParseableCount: typeof structuredLight.renderedDomParseableCount === 'number' ? structuredLight.renderedDomParseableCount : null,
+        htmlContentLdJsonObserved: structuredLight.htmlContentObserved === true,
+        htmlContentRawCount: typeof structuredLight.htmlContentRawCount === 'number' ? structuredLight.htmlContentRawCount : null,
+        htmlContentParseableCount: typeof structuredLight.htmlContentParseableCount === 'number' ? structuredLight.htmlContentParseableCount : null,
+        scriptSrcJsonLdObserved: scriptObserved,
+        scriptSrcCandidateCount: typeof scriptJsonLd.sameOriginScriptCount === 'number' ? scriptJsonLd.sameOriginScriptCount : null,
+        scriptSrcFetchedCount: typeof scriptJsonLd.fetchedCount === 'number' ? scriptJsonLd.fetchedCount : null,
+        scriptSrcJsonLdCandidateCount: typeof scriptJsonLd.candidateCount === 'number' ? scriptJsonLd.candidateCount : null,
         scriptSrcJsonLdTypes: Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types.slice(0, 50) : [],
         scriptSrcSkippedLargeCount: Number(scriptJsonLd.skippedLargeCount || 0),
         scriptSrcAppIndexDetected: !!scriptJsonLd.appIndexDetected,
@@ -6328,6 +6384,12 @@ async function scrapeOnce(req, res) {
         parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
         scriptSrcError: scriptJsonLd.error || null
       };
+      const linksObserved = !!(phaseByName('linksAndTrust') && phaseByName('linksAndTrust').ok) || typeof linksTrust.anchorCount === 'number';
+      const multimodalObserved = !!(phaseByName('multimodal') && phaseByName('multimodal').ok) || typeof multimodal.imgCount === 'number';
+      const linkNumber = (key) => linksObserved && typeof linksTrust[key] === 'number' ? Number(linksTrust[key]) : null;
+      const linkBoolean = (key) => linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, key) ? linksTrust[key] : null;
+      const multimodalBoolean = (key) => multimodalObserved && Object.prototype.hasOwnProperty.call(multimodal, key) ? !!multimodal[key] : null;
+      const multimodalNumber = (key) => multimodalObserved && typeof multimodal[key] === 'number' ? Number(multimodal[key]) : null;
       const geoSignalsV1 = {
         version: 'geoSignalsV1',
         generatedAt: new Date().toISOString(),
@@ -6408,30 +6470,30 @@ async function scrapeOnce(req, res) {
           a11yMainCount: unifiedBalancedObserverProbe && typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
         },
         multimodalSignals: {
-          checked: true,
-          hasImage: !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0),
+          checked: multimodalObserved,
+          hasImage: multimodalObserved ? !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0) : null,
           hasStructured: null,
-          hasOgImage: !!multimodal.hasOgImage,
-          hasTwitterImage: !!multimodal.hasTwitterImage,
-          hasFavicon: !!multimodal.hasFavicon,
-          hasAppleTouchIcon: !!multimodal.hasAppleTouchIcon,
+          hasOgImage: multimodalBoolean('hasOgImage'),
+          hasTwitterImage: multimodalBoolean('hasTwitterImage'),
+          hasFavicon: multimodalBoolean('hasFavicon'),
+          hasAppleTouchIcon: multimodalBoolean('hasAppleTouchIcon'),
           hasStructuredLogo: null,
           imageObjectCount: null,
           structuredImageCount: null,
-          imgCount: Number(multimodal.imgCount || 0),
+          imgCount: multimodalNumber('imgCount'),
           primaryImageOfPage: '',
           sampleImageUrls: [],
           source: 'shortfast_phase_builder'
         },
         trustSignals: {
-          hasContactLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
-          contactPathFound: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
-          contactObservedFromDom: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          hasContactLink: linkBoolean('hasContactLikeLink'),
+          contactPathFound: linkBoolean('hasContactLikeLink'),
+          contactObservedFromDom: linkBoolean('hasContactLikeLink'),
           contactObservedFromScriptHint: false,
           contactPathHintOnly: false,
           contactLinkSample: null,
-          hasCompanyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
-          hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+          hasCompanyLink: linkBoolean('hasCompanyLikeLink'),
+          hasPrivacyPolicyLink: linkBoolean('hasPrivacyLikeLink'),
           source: 'shortfast_phase_builder'
         },
         observed: {
@@ -6462,12 +6524,14 @@ async function scrapeOnce(req, res) {
           links: {
             navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 50) : [],
             internalLinksSample: Array.isArray(linksTrust.internalLinksSample) ? linksTrust.internalLinksSample.slice(0, 50) : [],
-            hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
-            hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
-            hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
-            hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
-            source: 'rendered_dom_light',
-            confidence: 'medium'
+            hasCompanyLikeLink: linkBoolean('hasCompanyLikeLink'),
+            hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
+            hasContactLikeLink: linkBoolean('hasContactLikeLink'),
+            hasPrivacyLikeLink: linkBoolean('hasPrivacyLikeLink'),
+            source: linksObserved ? 'rendered_dom_light' : 'phase_failed',
+            confidence: linksObserved ? 'medium' : 'low',
+            observed: linksObserved,
+            phaseError: linksObserved ? '' : (phaseByName('linksAndTrust').errorMessage || 'not_observed')
           },
           structuredData: structuredDataLight,
           landmarks: null,
@@ -6516,6 +6580,7 @@ async function scrapeOnce(req, res) {
           phaseTimings: {
             gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
             hydrationGuardedWaitMs: phaseByName('hydrationGuardedWait').elapsedMs || null,
+            headMetaMs: headMetaPhase ? headMetaPhase.elapsedMs : null,
             basicDomMs: phaseByName('basicDomEval').elapsedMs || null,
             structuredDataMs: phaseByName('structuredDataLight').elapsedMs || null,
             sameOriginScriptJsonLdMs: phaseByName('sameOriginScriptJsonLd').elapsedMs || null,
@@ -6567,12 +6632,12 @@ async function scrapeOnce(req, res) {
         shortFastDedicatedPath: true,
         headingShadowScan: false,
         headingA11yScan: false,
-        navLinkCount: Number(linksTrust.navLinkCount || 0),
-        internalLinkCount: Number(linksTrust.internalLinkCount || 0),
-        hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
-        hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
-        hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
-        hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+        navLinkCount: linkNumber('navLinkCount'),
+        internalLinkCount: linkNumber('internalLinkCount'),
+        hasCompanyLikeLink: linkBoolean('hasCompanyLikeLink'),
+        hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
+        hasContactLikeLink: linkBoolean('hasContactLikeLink'),
+        hasPrivacyLikeLink: linkBoolean('hasPrivacyLikeLink'),
         bodyTextLength: unifiedBodyTextLength,
         bodyTextSample: unifiedBodyTextSample || null,
         mainTextHead: unifiedBodyTextSample || null,
@@ -6609,7 +6674,7 @@ async function scrapeOnce(req, res) {
         return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
       };
       const limitedPhaseNames = observationLimitedByPhase.map((p) => p.phase);
-      const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredDataLight.observationLimited === true;
+      const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredObserved || scriptObserved;
       const linksReady = !phaseFailed('linksAndTrust') && (
         Number(linksTrust.navLinkCount || 0) > 0 ||
         Number(linksTrust.internalLinkCount || 0) > 0 ||
