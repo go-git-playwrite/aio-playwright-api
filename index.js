@@ -3255,36 +3255,352 @@ function flatTypesFromJsonLd(arr) {
 }
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
-async function buildGeoSignalsV1(page, url) {
-  const generatedAt = new Date().toISOString();
+function summarizeJsonLdTextsLight(texts, source) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const nodeTypes = [];
+  const walkJsonLd = (node, depth = 0) => {
+    if (depth > 8) return;
+    if (Array.isArray(node)) {
+      node.forEach((item) => walkJsonLd(item, depth + 1));
+      return;
+    }
+    if (!node || typeof node !== 'object') return;
+    const t = node['@type'];
+    if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+    else if (t) nodeTypes.push(clean(t));
+    if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
+  };
+  const rawTexts = (Array.isArray(texts) ? texts : []).map(clean).filter(Boolean);
+  let parseableCount = 0;
+  let parseErrorsCount = 0;
+  rawTexts.forEach((txt) => {
+    try {
+      const parsed = JSON.parse(txt);
+      parseableCount += 1;
+      walkJsonLd(parsed);
+    } catch (_) {
+      parseErrorsCount += 1;
+    }
+  });
+  const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
+  const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+  const hasJsonLd = rawTexts.length > 0;
+  return {
+    types,
+    rawCount: rawTexts.length,
+    parseableCount,
+    parseErrorsCount,
+    hasJsonLd,
+    hasWebsite: hasJsonLd ? typeSet.has('website') : false,
+    hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
+    hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
+    hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+    source: source || 'jsonld_light'
+  };
+}
+
+async function collectHtmlContentJsonLdSummaryLight(page) {
   try {
-    const observed = await page.evaluate((inputUrl) => {
+    const html = await page.content();
+    const $ = cheerio.load(html || '');
+    const texts = [];
+    $('script[type="application/ld+json"]').each((_, el) => {
+      if (texts.length >= 80) return;
+      const txt = String($(el).text() || '').trim();
+      if (!txt) return;
+      texts.push(txt.length > 300000 ? txt.slice(0, 300000) : txt);
+    });
+    const summary = summarizeJsonLdTextsLight(texts, 'html_content_ldjson_light');
+    summary.htmlLength = String(html || '').length;
+    summary.htmlContentLdJsonObserved = true;
+    return summary;
+  } catch (e) {
+    return {
+      types: [],
+      rawCount: 0,
+      parseableCount: 0,
+      parseErrorsCount: 0,
+      hasJsonLd: null,
+      hasWebsite: null,
+      hasOrganization: null,
+      hasBreadcrumbList: null,
+      hasFAQPage: null,
+      source: 'html_content_ldjson_light',
+      htmlLength: null,
+      htmlContentLdJsonObserved: false,
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    };
+  }
+}
+
+function extractSchemaTypesFromScriptTextLight(text) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const body = String(text || '');
+  const types = [];
+  const patterns = [
+    /["@]type["']?\s*:\s*["']([^"']{1,100})["']/gi,
+    /\\"@type\\"\s*:\s*\\"([^"\\]{1,100})\\"/gi,
+    /@type\\?["']?\s*[:=]\s*\\?["']([^"'\\]{1,100})/gi
+  ];
+  patterns.forEach((re) => {
+    let m;
+    while ((m = re.exec(body)) && types.length < 80) {
+      const t = clean(m[1]);
+      if (t) types.push(t);
+    }
+  });
+  return Array.from(new Set(types)).slice(0, 50);
+}
+
+async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}) {
+  const MAX_SCRIPTS = Math.max(1, Math.min(10, Number(opts && opts.maxScripts || 10)));
+  const MAX_BYTES_PER_SCRIPT = Math.max(100000, Math.min(1000000, Number(opts && opts.maxBytesPerScript || 1000000)));
+  const REQUEST_TIMEOUT_MS = Math.max(500, Math.min(10000, Number(opts && opts.requestTimeoutMs || 10000)));
+  const empty = {
+    types: [],
+    scriptSrcCount: 0,
+    sameOriginScriptCount: 0,
+    fetchedCount: 0,
+    skippedLargeCount: 0,
+    candidateCount: 0,
+    parseableCount: 0,
+    hasJsonLd: null,
+    hasWebsite: null,
+    hasOrganization: null,
+    hasBreadcrumbList: null,
+    hasFAQPage: null,
+    observed: false,
+    source: 'same_origin_script_src_jsonld_light',
+    appIndexDetected: false,
+    totalFetchedBytes: 0,
+    maxScriptLength: 0,
+    contactPathFound: null,
+    contactPathSample: '',
+    companyPathFound: null,
+    companyPathSample: '',
+    privacyPathFound: null,
+    privacyPathSample: '',
+    error: null,
+    fetchErrorsCount: 0,
+    fetchErrorsSample: []
+  };
+  try {
+    const finalUrl = page && typeof page.url === 'function' ? page.url() : url;
+    const renderedScriptSrcs = await page.evaluate(() => {
+      const out = [];
+      Array.from(document.querySelectorAll('script[src]')).forEach((s) => {
+        const src = s && s.getAttribute && s.getAttribute('src');
+        if (!src) return;
+        try { out.push(new URL(src, location.href).toString()); } catch (_) {}
+      });
+      return out;
+    }).catch(() => []);
+    const html = await page.content().catch(() => '');
+    const htmlScriptSrcs = [];
+    try {
+      const $ = cheerio.load(html || '');
+      $('script[src]').each((_, el) => {
+        const src = String($(el).attr('src') || '').trim();
+        if (!src) return;
+        try { htmlScriptSrcs.push(new URL(src, finalUrl || url).toString()); } catch (_) {}
+      });
+    } catch (_) {}
+    const scriptSrcs = Array.from(new Set([].concat(renderedScriptSrcs || []).concat(htmlScriptSrcs || []).filter(Boolean)));
+    let origin = '';
+    try { origin = new URL(finalUrl || url).origin; } catch (_) {}
+    const sameOriginScripts = scriptSrcs.filter((u) => {
+      try { return new URL(u).origin === origin; } catch (_) { return false; }
+    });
+    const out = Object.assign({}, empty, {
+      scriptSrcCount: scriptSrcs.length,
+      sameOriginScriptCount: sameOriginScripts.length,
+      observed: true,
+      appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || '')))
+    });
+    const types = [];
+    let scannedScriptForTrust = false;
+    const pickTrustSample = (text, re) => {
+      const match = String(text || '').match(re);
+      return match ? String(match[0] || '').replace(/^["']+|["']+$/g, '').slice(0, 120) : '';
+    };
+    for (const scriptUrl of sameOriginScripts.slice(0, MAX_SCRIPTS)) {
+      try {
+        const r = await page.request.get(scriptUrl, { timeout: REQUEST_TIMEOUT_MS });
+        const headers = typeof r.headers === 'function' ? r.headers() : {};
+        const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
+        if (contentLength > MAX_BYTES_PER_SCRIPT) {
+          out.skippedLargeCount += 1;
+          continue;
+        }
+        const text = await r.text();
+        const len = String(text || '').length;
+        out.totalFetchedBytes += len;
+        out.maxScriptLength = Math.max(out.maxScriptLength, len);
+        if (len > MAX_BYTES_PER_SCRIPT) {
+          out.skippedLargeCount += 1;
+          continue;
+        }
+        out.fetchedCount += 1;
+        scannedScriptForTrust = true;
+        if (out.contactPathFound !== true && /(?:\/|["'])?(contact|contacts|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート)(?:\/|["']|$)/i.test(text)) {
+          out.contactPathFound = true;
+          out.contactPathSample = out.contactPathSample || pickTrustSample(text, /(?:\/|["'])?(contact|contacts|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート)(?:\/|["']|$)/i);
+        }
+        if (out.companyPathFound !== true && /(?:\/|["'])?(company|about|corporate|profile|会社情報|会社概要|企業情報)(?:\/|["']|$)/i.test(text)) {
+          out.companyPathFound = true;
+          out.companyPathSample = out.companyPathSample || pickTrustSample(text, /(?:\/|["'])?(company|about|corporate|profile|会社情報|会社概要|企業情報)(?:\/|["']|$)/i);
+        }
+        if (out.privacyPathFound !== true && /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i.test(text)) {
+          out.privacyPathFound = true;
+          out.privacyPathSample = out.privacyPathSample || pickTrustSample(text, /(?:\/|["'])?(privacy|privacy-policy|privacypolicy|policy|プライバシー|個人情報)(?:\/|["']|$)/i);
+        }
+        const hasContext = /@context|\\"@context\\"/.test(text);
+        const hasType = /@type|\\"@type\\"/.test(text);
+        const hasSchemaOrg = /schema\.org/i.test(text);
+        const scriptTypes = extractSchemaTypesFromScriptTextLight(text);
+        if (hasContext || hasType || hasSchemaOrg || scriptTypes.length) {
+          out.candidateCount += 1;
+          scriptTypes.forEach((t) => types.push(t));
+        }
+      } catch (e) {
+        out.fetchErrorsCount += 1;
+        if (out.fetchErrorsSample.length < 5) {
+          out.fetchErrorsSample.push({
+            urlSample: String(scriptUrl || '').slice(0, 180),
+            errorMessage: String(e && (e.message || e) || '').slice(0, 180)
+          });
+        }
+      }
+    }
+    out.types = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
+    out.parseableCount = 0;
+    out.hasJsonLd = out.candidateCount > 0;
+    const typeSet = new Set(out.types.map((t) => String(t || '').toLowerCase()));
+    out.hasWebsite = out.hasJsonLd ? typeSet.has('website') : false;
+    out.hasOrganization = out.hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false;
+    out.hasBreadcrumbList = out.hasJsonLd ? typeSet.has('breadcrumblist') : false;
+    out.hasFAQPage = out.hasJsonLd ? typeSet.has('faqpage') : false;
+    if (scannedScriptForTrust) {
+      if (out.contactPathFound !== true) out.contactPathFound = false;
+      if (out.companyPathFound !== true) out.companyPathFound = false;
+      if (out.privacyPathFound !== true) out.privacyPathFound = false;
+    }
+    return out;
+  } catch (e) {
+    return Object.assign({}, empty, {
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    });
+  }
+}
+
+async function buildGeoSignalsV1(page, url, opts = {}) {
+  const generatedAt = new Date().toISOString();
+  const startedAt = Date.now();
+  const balancedMode = !!(opts && opts.balancedMode);
+  const shortFastMode = !!(opts && opts.shortFastMode);
+  const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
+  const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
+    ? opts.hydrationMetrics
+    : {};
+  const phaseTimings = {
+    gotoMs: typeof opts.gotoMs === 'number' ? opts.gotoMs : null,
+    basicDomMs: null,
+    structuredDataMs: null,
+    linksMs: null,
+    multimodalMs: null,
+    totalMs: null
+  };
+  try {
+    const basicDomStart = Date.now();
+    const observed = await page.evaluate(({ inputUrl, balancedMode, shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
       const limit = (arr, n) => uniq(arr).slice(0, n);
+      const browserPhaseTimings = { linksMs: null, multimodalMs: null };
       const absUrl = (href) => {
         try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
       };
       const nodeTypes = [];
-      const walkJsonLd = (node) => {
+      const firstJsonLdTextValue = (value, depth = 0) => {
+        if (depth > 5 || value == null) return '';
+        if (typeof value === 'string' || typeof value === 'number') return clean(value);
+        if (Array.isArray(value)) {
+          for (const item of value) {
+            const got = firstJsonLdTextValue(item, depth + 1);
+            if (got) return got;
+          }
+          return '';
+        }
+        if (typeof value === 'object') {
+          return firstJsonLdTextValue(value.url || value.contentUrl || value['@id'] || value.href || value.name, depth + 1);
+        }
+        return '';
+      };
+      const multimodalJsonLd = {
+        hasStructuredLogo: false,
+        structuredLogoUrl: '',
+        structuredImageCount: 0,
+        imageObjectCount: 0,
+        primaryImageOfPage: '',
+        structuredImageTypes: []
+      };
+      const walkJsonLd = (node, depth = 0) => {
+        if (depth > 8) return;
+        if (Array.isArray(node)) {
+          node.forEach((item) => walkJsonLd(item, depth + 1));
+          return;
+        }
         if (!node || typeof node !== 'object') return;
         const t = node['@type'];
-        if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
-        else if (t) nodeTypes.push(clean(t));
-        if (Array.isArray(node['@graph'])) node['@graph'].forEach(walkJsonLd);
+        const currentTypes = [];
+        if (Array.isArray(t)) t.forEach((x) => {
+          const type = clean(x);
+          if (type) {
+            nodeTypes.push(type);
+            currentTypes.push(type);
+          }
+        });
+        else if (t) {
+          const type = clean(t);
+          if (type) {
+            nodeTypes.push(type);
+            currentTypes.push(type);
+          }
+        }
+        const logoValue = firstJsonLdTextValue(node.logo);
+        const imageValue = firstJsonLdTextValue(node.image);
+        const primaryImageValue = firstJsonLdTextValue(node.primaryImageOfPage);
+        if (logoValue) {
+          multimodalJsonLd.hasStructuredLogo = true;
+          if (!multimodalJsonLd.structuredLogoUrl) multimodalJsonLd.structuredLogoUrl = absUrl(logoValue);
+        }
+        if (imageValue || logoValue || primaryImageValue) {
+          multimodalJsonLd.structuredImageCount += 1;
+          currentTypes.forEach((type) => multimodalJsonLd.structuredImageTypes.push(type));
+        }
+        if (currentTypes.some((type) => /^ImageObject$/i.test(type))) multimodalJsonLd.imageObjectCount += 1;
+        if (primaryImageValue && !multimodalJsonLd.primaryImageOfPage) {
+          multimodalJsonLd.primaryImageOfPage = absUrl(primaryImageValue);
+        }
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
       };
       const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
         .map((s) => clean(s.textContent || ''))
         .filter(Boolean);
+      let parseableJsonLdCount = 0;
+      let parseErrorsCount = 0;
       rawJsonLd.forEach((txt) => {
         try {
           const parsed = JSON.parse(txt);
-          if (Array.isArray(parsed)) parsed.forEach(walkJsonLd);
-          else walkJsonLd(parsed);
-        } catch (_) {}
+          parseableJsonLdCount += 1;
+          walkJsonLd(parsed);
+        } catch (_) {
+          parseErrorsCount += 1;
+        }
       });
       const typeList = limit(nodeTypes, 50);
       const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
+      const hasJsonLd = rawJsonLd.length > 0;
 
       const titleValue = clean(document.title || '');
       const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
@@ -3292,18 +3608,277 @@ async function buildGeoSignalsV1(page, url) {
       const h1 = limit(Array.from(document.querySelectorAll('h1')).map((el) => clean(el.innerText || el.textContent)), 10);
       const h2 = limit(Array.from(document.querySelectorAll('h2')).map((el) => clean(el.innerText || el.textContent)), 20);
       const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const mainH1 = limit(Array.from(document.querySelectorAll('main h1,[role="main"] h1,#main h1,#main-content h1')).map((el) => clean(el.innerText || el.textContent)), 10);
+      const mainH2 = limit(Array.from(document.querySelectorAll('main h2,[role="main"] h2,#main h2,#main-content h2')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const collectHeadingsIn = (selector, h1Limit = 10, h2Limit = 20) => {
+        const roots = Array.from(document.querySelectorAll(selector || '') || []);
+        const h1Vals = [];
+        const h2Vals = [];
+        roots.forEach((root) => {
+          if (!root || !root.querySelectorAll) return;
+          Array.from(root.querySelectorAll('h1')).forEach((el) => h1Vals.push(clean(el.innerText || el.textContent)));
+          Array.from(root.querySelectorAll('h2')).forEach((el) => h2Vals.push(clean(el.innerText || el.textContent)));
+        });
+        return {
+          rootCount: roots.length,
+          h1: limit(h1Vals, h1Limit),
+          h2: limit(h2Vals, h2Limit)
+        };
+      };
+      const appRootHeadings = balancedMode
+        ? collectHeadingsIn('#app,#root,#__next,[data-reactroot],[id*="app" i]', 10, 20)
+        : { rootCount: 0, h1: [], h2: [] };
+      const heroHeadings = balancedMode
+        ? collectHeadingsIn('main [class*="hero" i],main [id*="hero" i],main [class*="kv" i],main [id*="kv" i],main [class*="mainvisual" i],main [id*="mainvisual" i],section[class*="hero" i],section[id*="hero" i],section[class*="kv" i],section[id*="kv" i],section[class*="mainvisual" i],section[id*="mainvisual" i]', 10, 20)
+        : { rootCount: 0, h1: [], h2: [] };
+      const iframeSameOriginHeadings = { iframeCount: 0, accessibleCount: 0, blockedCount: 0, h1: [], h2: [], error: null };
+      if (balancedMode && !shortFastMode) {
+        try {
+          const frames = Array.from(document.querySelectorAll('iframe'));
+          iframeSameOriginHeadings.iframeCount = frames.length;
+          frames.forEach((frame) => {
+            try {
+              const doc = frame && frame.contentDocument;
+              if (!doc) {
+                iframeSameOriginHeadings.blockedCount += 1;
+                return;
+              }
+              iframeSameOriginHeadings.accessibleCount += 1;
+              Array.from(doc.querySelectorAll('h1')).forEach((el) => iframeSameOriginHeadings.h1.push(clean(el.innerText || el.textContent)));
+              Array.from(doc.querySelectorAll('h2')).forEach((el) => iframeSameOriginHeadings.h2.push(clean(el.innerText || el.textContent)));
+            } catch (_) {
+              iframeSameOriginHeadings.blockedCount += 1;
+            }
+          });
+          iframeSameOriginHeadings.h1 = limit(iframeSameOriginHeadings.h1, 10);
+          iframeSameOriginHeadings.h2 = limit(iframeSameOriginHeadings.h2, 20);
+        } catch (e) {
+          iframeSameOriginHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+        }
+      }
+      const shadowHeadings = { h1: [], h2: [], h3: [], hostCount: 0, observed: false, error: null };
+      if (balancedMode && !shortFastMode) {
+        try {
+          const walkShadow = (root, depth = 0) => {
+            if (!root || depth > 4) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              const tag = String(el.tagName || '').toLowerCase();
+              if (tag === 'h1') shadowHeadings.h1.push(clean(el.innerText || el.textContent));
+              else if (tag === 'h2') shadowHeadings.h2.push(clean(el.innerText || el.textContent));
+              else if (tag === 'h3') shadowHeadings.h3.push(clean(el.innerText || el.textContent));
+              if (el.shadowRoot) {
+                shadowHeadings.hostCount += 1;
+                walkShadow(el.shadowRoot, depth + 1);
+              }
+            });
+          };
+          walkShadow(document, 0);
+          shadowHeadings.h1 = limit(shadowHeadings.h1, 10);
+          shadowHeadings.h2 = limit(shadowHeadings.h2, 20);
+          shadowHeadings.h3 = limit(shadowHeadings.h3, 20);
+          shadowHeadings.observed = true;
+        } catch (e) {
+          shadowHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+        }
+      }
+      const mainCandidates = [
+        { source: 'dom_main', selector: 'main', confidence: 'high' },
+        { source: 'dom_role_main', selector: '[role="main"]', confidence: 'high' },
+        { source: 'dom_id_main', selector: '#main,#main-content', confidence: 'medium' },
+        { source: 'dom_id_contains_main', selector: '[id*="main" i]', confidence: 'low' }
+      ];
+      let mainLandmark = {
+        hasMainLandmark: null,
+        hasMainLandmark_final: null,
+        mainLandmarkSource: 'not_observed',
+        mainLandmarkConfidence: 'low',
+        mainLandmarkTextsSample: [],
+        mainLandmarkObservationLimited: true
+      };
+      for (const candidate of mainCandidates) {
+        const nodes = Array.from(document.querySelectorAll(candidate.selector || '') || []);
+        if (!nodes.length) continue;
+        const sample = limit(nodes.map((el) => clean(el.innerText || el.textContent).slice(0, 220)), 3);
+        mainLandmark = {
+          hasMainLandmark: true,
+          hasMainLandmark_final: true,
+          mainLandmarkSource: candidate.source,
+          mainLandmarkConfidence: candidate.confidence,
+          mainLandmarkTextsSample: sample,
+          mainLandmarkObservationLimited: false
+        };
+        break;
+      }
+      const mainLandmarkCandidate = {
+        mainLandmarkCandidateFound: false,
+        mainLandmarkCandidateSource: 'not_observed',
+        mainLandmarkCandidateConfidence: 'low',
+        mainLandmarkCandidateTextsSample: []
+      };
+      if (balancedMode && mainLandmark.hasMainLandmark !== true) {
+        const setMainCandidate = (source, confidence, nodes) => {
+          if (mainLandmarkCandidate.mainLandmarkCandidateFound) return;
+          const sample = limit((nodes || []).map((el) => clean(el && (el.innerText || el.textContent)).slice(0, 220)).filter((txt) => txt.length >= 40), 3);
+          if (!sample.length) return;
+          mainLandmarkCandidate.mainLandmarkCandidateFound = true;
+          mainLandmarkCandidate.mainLandmarkCandidateSource = source;
+          mainLandmarkCandidate.mainLandmarkCandidateConfidence = confidence;
+          mainLandmarkCandidate.mainLandmarkCandidateTextsSample = sample;
+        };
+        setMainCandidate('dom_app_root_candidate', 'medium', Array.from(document.querySelectorAll('#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]') || []));
+        if (!mainLandmarkCandidate.mainLandmarkCandidateFound && !shortFastMode) {
+          try {
+            const shadowCandidates = [];
+            const shadowRootTextSamples = [];
+            const walkShadowMain = (root, depth = 0) => {
+              if (!root || depth > 4 || shadowCandidates.length >= 8) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el || shadowCandidates.length >= 8) return;
+                if (el.matches && el.matches('main,[role="main"],#main,#content,#app,app-index,[id*="main" i],[id*="content" i]')) {
+                  shadowCandidates.push(el);
+                }
+                if (el.shadowRoot) {
+                  const rootText = clean(el.shadowRoot.textContent || '').slice(0, 220);
+                  if (rootText.length >= 80 && shadowRootTextSamples.length < 3) {
+                    shadowRootTextSamples.push(rootText);
+                  }
+                  walkShadowMain(el.shadowRoot, depth + 1);
+                }
+              });
+            };
+            walkShadowMain(document, 0);
+            setMainCandidate('open_shadow_dom_main_candidate', 'medium', shadowCandidates);
+            if (!mainLandmarkCandidate.mainLandmarkCandidateFound && shadowRootTextSamples.length) {
+              mainLandmarkCandidate.mainLandmarkCandidateFound = true;
+              mainLandmarkCandidate.mainLandmarkCandidateSource = 'open_shadow_dom_app_candidate';
+              mainLandmarkCandidate.mainLandmarkCandidateConfidence = 'low';
+              mainLandmarkCandidate.mainLandmarkCandidateTextsSample = shadowRootTextSamples;
+            }
+          } catch (_) {}
+        }
+      }
       const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
-        navLike: !!a.closest('nav,[role="navigation"],header,footer')
+        navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+        source: 'dom'
       })).filter((a) => a.href);
+      const shadowTextParts = [];
+      const linksPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      if (balancedMode) {
+        try {
+          const maxDepth = shortFastMode ? 2 : 4;
+          const maxAnchors = shortFastMode ? 120 : 300;
+          const maxShadowTextParts = shortFastMode ? 30 : 80;
+          const collectShadowAnchors = (root, depth = 0) => {
+            if (!root || depth > maxDepth || anchors.length >= maxAnchors) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || anchors.length >= maxAnchors) return;
+              if (shadowTextParts.length < maxShadowTextParts) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, shortFastMode ? 220 : 500));
+              }
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                anchors.push({
+                  text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')),
+                  href: absUrl(el.getAttribute('href') || ''),
+                  navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  source: 'open_shadow_dom'
+                });
+              }
+              if (el.shadowRoot) collectShadowAnchors(el.shadowRoot, depth + 1);
+            });
+          };
+          collectShadowAnchors(document, 0);
+        } catch (_) {}
+      }
       const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
       const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+      const firstLikeLink = (re) => {
+        const hit = anchors.find((a) => re.test(textHref(a)));
+        return hit ? { text: hit.text, href: hit.href } : null;
+      };
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
-      const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      browserPhaseTimings.linksMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - linksPhaseStart));
+      const multimodalPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+      const firstMetaContent = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const value = clean(el && el.getAttribute('content'));
+          if (value) return absUrl(value);
+        }
+        return '';
+      };
+      const firstLinkHref = (selectors) => {
+        for (const sel of selectors) {
+          const el = document.querySelector(sel);
+          const value = clean(el && el.getAttribute('href'));
+          if (value) return absUrl(value);
+        }
+        return '';
+      };
+      const ogImageUrl = firstMetaContent([
+        'meta[property="og:image"]',
+        'meta[property="og:image:url"]',
+        'meta[property="og:image:secure_url"]'
+      ]);
+      const twitterImageUrl = firstMetaContent([
+        'meta[name="twitter:image"]',
+        'meta[name="twitter:image:src"]'
+      ]);
+      const faviconUrl = firstLinkHref([
+        'link[rel~="icon"][href]',
+        'link[rel="shortcut icon"][href]'
+      ]);
+      const appleTouchIconUrl = firstLinkHref([
+        'link[rel~="apple-touch-icon"][href]',
+        'link[rel="apple-touch-icon-precomposed"][href]'
+      ]);
+      const imgNodes = Array.from(document.querySelectorAll('img'));
+      const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
+        absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
+          (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
+          '');
+      const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
+      const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
+      const privacyRe = /privacy|policy|プライバシー|個人情報/;
+      const trustSignals = {
+        hasContactLink: hasLike(contactRe),
+        contactPathFound: hasLike(contactRe),
+        contactObservedFromDom: hasLike(contactRe),
+        contactLinkSample: firstLikeLink(contactRe),
+        hasCompanyLink: hasLike(companyRe),
+        companyLinkSample: firstLikeLink(companyRe),
+        hasPrivacyPolicyLink: hasLike(privacyRe),
+        privacyLinkSample: firstLikeLink(privacyRe),
+        source: 'balanced_light'
+      };
+      const multimodalSignals = {
+        checked: true,
+        hasImage: !!(ogImageUrl || twitterImageUrl || faviconUrl || appleTouchIconUrl || imgNodes.length || multimodalJsonLd.structuredImageCount),
+        hasStructured: !!(multimodalJsonLd.hasStructuredLogo || multimodalJsonLd.structuredImageCount || multimodalJsonLd.imageObjectCount),
+        hasOgImage: !!ogImageUrl,
+        hasTwitterImage: !!twitterImageUrl,
+        hasFavicon: !!faviconUrl,
+        hasAppleTouchIcon: !!appleTouchIconUrl,
+        hasStructuredLogo: !!multimodalJsonLd.hasStructuredLogo,
+        imageObjectCount: multimodalJsonLd.imageObjectCount,
+        structuredImageCount: multimodalJsonLd.structuredImageCount,
+        imgCount: imgNodes.length,
+        primaryImageOfPage: primaryImageCandidate || '',
+        sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
+        source: 'balanced_light'
+      };
+      browserPhaseTimings.multimodalMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - multimodalPhaseStart));
+      const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      const bodyText = clean([domBodyText].concat(shadowTextParts).join(' ')).slice(0, 100000);
 
       return {
         finalUrl: location.href,
@@ -3312,6 +3887,14 @@ async function buildGeoSignalsV1(page, url) {
         h1,
         h2,
         h3,
+        mainHeadings: {
+          h1: mainH1,
+          h2: mainH2
+        },
+        appRootHeadings,
+        heroHeadings,
+        iframeSameOriginHeadings,
+        shadowHeadings,
         links: {
           navTextsSample: limit(navTexts, 50),
           internalLinksSample: internal.slice(0, 50),
@@ -3320,25 +3903,523 @@ async function buildGeoSignalsV1(page, url) {
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
           hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/)
         },
+        multimodalSignals,
+        trustSignals,
         structuredData: {
           types: typeList,
           rawCount: rawJsonLd.length,
-          hasWebsite: rawJsonLd.length ? typeSet.has('website') : null,
-          hasOrganization: rawJsonLd.length ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
-          hasBreadcrumbList: rawJsonLd.length ? typeSet.has('breadcrumblist') : null,
-          hasFAQPage: rawJsonLd.length ? typeSet.has('faqpage') : null
+          parseableCount: parseableJsonLdCount,
+          hasJsonLd,
+          hasWebsite: hasJsonLd ? typeSet.has('website') : false,
+          hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
+          hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
+          hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+          source: 'rendered_dom_jsonld_light',
+          confidence: 'medium',
+          observationLimited: true,
+          observationScope: 'rendered_dom_only',
+          renderedDomObserved: true,
+          htmlScanSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
+          parseErrorsCount
         },
+        landmarks: Object.assign({}, mainLandmark, mainLandmarkCandidate),
         body: {
           textLength: bodyText.length,
           sample: bodyText.slice(0, 500)
-        }
+        },
+        phaseTimings: browserPhaseTimings
       };
-    }, String(url || ''));
+    }, { inputUrl: String(url || ''), balancedMode, shortFastMode });
+    phaseTimings.basicDomMs = Math.max(0, Date.now() - basicDomStart);
+    if (observed && observed.phaseTimings) {
+      phaseTimings.linksMs = typeof observed.phaseTimings.linksMs === 'number' ? observed.phaseTimings.linksMs : null;
+      phaseTimings.multimodalMs = typeof observed.phaseTimings.multimodalMs === 'number' ? observed.phaseTimings.multimodalMs : null;
+    }
+
+    const normalizeHeadingText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+    const uniqueHeadingTexts = (arr, limitCount) => {
+      const out = [];
+      const seen = new Set();
+      for (const v of (Array.isArray(arr) ? arr : [])) {
+        const s = normalizeHeadingText(v);
+        if (!s || seen.has(s)) continue;
+        seen.add(s);
+        out.push(s);
+        if (out.length >= limitCount) break;
+      }
+      return out;
+    };
+    const domH1 = Array.isArray(observed.h1) ? observed.h1 : [];
+    const domH2 = Array.isArray(observed.h2) ? observed.h2 : [];
+    const domH3 = Array.isArray(observed.h3) ? observed.h3 : [];
+    const mainHeadings = observed.mainHeadings && typeof observed.mainHeadings === 'object' ? observed.mainHeadings : {};
+    const appRootHeadings = observed.appRootHeadings && typeof observed.appRootHeadings === 'object' ? observed.appRootHeadings : {};
+    const heroHeadings = observed.heroHeadings && typeof observed.heroHeadings === 'object' ? observed.heroHeadings : {};
+    const iframeSameOriginHeadings = observed.iframeSameOriginHeadings && typeof observed.iframeSameOriginHeadings === 'object' ? observed.iframeSameOriginHeadings : {};
+    const shadowHeadings = observed.shadowHeadings && typeof observed.shadowHeadings === 'object' ? observed.shadowHeadings : {};
+    const headingExclusions = [];
+    const normalizeHostname = (v) => String(v || '').toLowerCase().replace(/^www\./, '');
+    const getUrlParts = (v) => {
+      try {
+        const u = new URL(String(v || ''));
+        return {
+          protocol: u.protocol,
+          hostname: normalizeHostname(u.hostname)
+        };
+      } catch (_) {
+        return { protocol: '', hostname: '' };
+      }
+    };
+    const inputUrlParts = getUrlParts(url);
+    const finalUrlParts = getUrlParts(observed.finalUrl);
+    const browserErrorPageUrl = /^chrome-error:|^about:/i.test(String(observed.finalUrl || '')) ||
+      /^chrome-error:|^about:/i.test(String(page.url && page.url() || ''));
+    const finalUrlOriginMismatch = !!(
+      inputUrlParts.hostname &&
+      finalUrlParts.hostname &&
+      inputUrlParts.hostname !== finalUrlParts.hostname &&
+      !inputUrlParts.hostname.endsWith('.' + finalUrlParts.hostname) &&
+      !finalUrlParts.hostname.endsWith('.' + inputUrlParts.hostname)
+    );
+    const addHeadingExclusion = (text, reason) => {
+      headingExclusions.push({
+        reason,
+        text: normalizeHeadingText(text).slice(0, 160)
+      });
+    };
+    const isBrowserOrExtensionBlockHeading = (text) => {
+      const s = normalizeHeadingText(text);
+      if (!s) return false;
+      return /ERR_BLOCKED_BY_CLIENT|ブロックされています|拡張機能によってブロック|chrome-error:\/\/|about:blank/i.test(s);
+    };
+    const filterHeadingTexts = (arr) => {
+      const out = [];
+      for (const text of (Array.isArray(arr) ? arr : [])) {
+        if (browserErrorPageUrl || finalUrlOriginMismatch) {
+          addHeadingExclusion(text, browserErrorPageUrl ? 'browser_error_page_url' : 'page_origin_mismatch');
+          continue;
+        }
+        if (isBrowserOrExtensionBlockHeading(text)) {
+          addHeadingExclusion(text, 'browser_or_extension_block_page');
+          continue;
+        }
+        out.push(text);
+      }
+      return out;
+    };
+    const a11yHeadings = {
+      h1: [],
+      h2: [],
+      h3: [],
+      all: [],
+      observed: false,
+      error: null
+    };
+    if (shortFastMode) {
+      a11yHeadings.error = 'skipped_short_fast';
+    } else {
+      try {
+        const allText = await page.getByRole('heading').allTextContents().catch(() => []);
+        const h1Text = await page.getByRole('heading', { level: 1 }).allTextContents().catch(() => []);
+        const h2Text = await page.getByRole('heading', { level: 2 }).allTextContents().catch(() => []);
+        const h3Text = await page.getByRole('heading', { level: 3 }).allTextContents().catch(() => []);
+        a11yHeadings.all = uniqueHeadingTexts(allText, 30);
+        a11yHeadings.h1 = uniqueHeadingTexts(h1Text, 10);
+        a11yHeadings.h2 = uniqueHeadingTexts(h2Text, 20);
+        a11yHeadings.h3 = uniqueHeadingTexts(h3Text, 20);
+        a11yHeadings.observed = true;
+      } catch (e) {
+        a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+      }
+    }
+    const filteredDomH1 = filterHeadingTexts(domH1);
+    const filteredDomH2 = filterHeadingTexts(domH2);
+    const filteredDomH3 = filterHeadingTexts(domH3);
+    const filteredMainH1 = filterHeadingTexts(Array.isArray(mainHeadings.h1) ? mainHeadings.h1 : []);
+    const filteredMainH2 = filterHeadingTexts(Array.isArray(mainHeadings.h2) ? mainHeadings.h2 : []);
+    const filteredAppRootH1 = filterHeadingTexts(Array.isArray(appRootHeadings.h1) ? appRootHeadings.h1 : []);
+    const filteredAppRootH2 = filterHeadingTexts(Array.isArray(appRootHeadings.h2) ? appRootHeadings.h2 : []);
+    const filteredHeroH1 = filterHeadingTexts(Array.isArray(heroHeadings.h1) ? heroHeadings.h1 : []);
+    const filteredHeroH2 = filterHeadingTexts(Array.isArray(heroHeadings.h2) ? heroHeadings.h2 : []);
+    const filteredIframeH1 = filterHeadingTexts(Array.isArray(iframeSameOriginHeadings.h1) ? iframeSameOriginHeadings.h1 : []);
+    const filteredIframeH2 = filterHeadingTexts(Array.isArray(iframeSameOriginHeadings.h2) ? iframeSameOriginHeadings.h2 : []);
+    const filteredShadowH1 = filterHeadingTexts(Array.isArray(shadowHeadings.h1) ? shadowHeadings.h1 : []);
+    const filteredShadowH2 = filterHeadingTexts(Array.isArray(shadowHeadings.h2) ? shadowHeadings.h2 : []);
+    const filteredShadowH3 = filterHeadingTexts(Array.isArray(shadowHeadings.h3) ? shadowHeadings.h3 : []);
+    const filteredA11yH1 = filterHeadingTexts(a11yHeadings.h1);
+    const filteredA11yH2 = filterHeadingTexts(a11yHeadings.h2);
+    const filteredA11yH3 = filterHeadingTexts(a11yHeadings.h3);
+    const filteredA11yAll = filterHeadingTexts(a11yHeadings.all);
+    const excludedHeadingReasons = Array.from(new Set(headingExclusions.map(x => x.reason).filter(Boolean)));
+    const mergedH1 = filteredMainH1.length
+      ? uniqueHeadingTexts(filteredMainH1, 10)
+      : (filteredAppRootH1.length
+        ? uniqueHeadingTexts(filteredAppRootH1, 10)
+        : (filteredHeroH1.length
+          ? uniqueHeadingTexts(filteredHeroH1, 10)
+          : (filteredDomH1.length
+            ? uniqueHeadingTexts(filteredDomH1, 10)
+            : (filteredShadowH1.length
+              ? uniqueHeadingTexts(filteredShadowH1, 10)
+              : (filteredIframeH1.length ? uniqueHeadingTexts(filteredIframeH1, 10) : filteredA11yH1.slice(0, 10))))));
+    const mergedH2 = uniqueHeadingTexts(filteredMainH2.concat(filteredAppRootH2).concat(filteredHeroH2).concat(filteredDomH2).concat(filteredShadowH2).concat(filteredIframeH2).concat(filteredA11yH2), 20);
+    const mergedH3 = uniqueHeadingTexts(filteredDomH3.concat(filteredShadowH3).concat(filteredA11yH3), 20);
+    const h1Source = filteredMainH1.length ? 'main_dom'
+      : (filteredAppRootH1.length ? 'app_root_dom'
+        : (filteredHeroH1.length ? 'hero_dom'
+          : (filteredDomH1.length ? 'dom'
+            : (filteredShadowH1.length ? 'open_shadow_dom'
+              : (filteredIframeH1.length ? 'iframe_same_origin'
+                : (filteredA11yH1.length ? 'a11y' : 'not_observed'))))));
+    const headingSourceParts = [];
+    if (filteredDomH1.length || filteredDomH2.length || filteredDomH3.length) headingSourceParts.push('dom');
+    if (filteredMainH1.length || filteredMainH2.length) headingSourceParts.push('main_dom');
+    if (filteredAppRootH1.length || filteredAppRootH2.length) headingSourceParts.push('app_root_dom');
+    if (filteredHeroH1.length || filteredHeroH2.length) headingSourceParts.push('hero_dom');
+    if (filteredShadowH1.length || filteredShadowH2.length || filteredShadowH3.length) headingSourceParts.push('open_shadow_dom');
+    if (filteredIframeH1.length || filteredIframeH2.length) headingSourceParts.push('iframe_same_origin');
+    if (a11yHeadings.observed) headingSourceParts.push('a11y');
+    const headingSource = headingSourceParts.length ? Array.from(new Set(headingSourceParts)).join('+') : 'not_observed';
+    const headingObservationLimited = !filteredDomH1.length && !filteredA11yH1.length;
+    const headingTextsMerged = uniqueHeadingTexts(mergedH1.concat(mergedH2).concat(mergedH3).concat(filteredA11yAll), 30);
+    const titleTextForCandidate = normalizeHeadingText(observed.title);
+    const metaTextForCandidate = normalizeHeadingText(observed.metaDescription);
+    const isStrongPrimaryHeadingText = (text) => {
+      const s = normalizeHeadingText(text);
+      if (!s || s.length < 12) return false;
+      if (titleTextForCandidate && (titleTextForCandidate.indexOf(s) >= 0 || s.indexOf(titleTextForCandidate) >= 0)) return true;
+      if (metaTextForCandidate && metaTextForCandidate.indexOf(s) >= 0) return true;
+      return false;
+    };
+    const pickSectionHeadingCandidate = () => {
+      const sources = [
+        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium' },
+        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium' },
+        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium' },
+        { texts: filteredShadowH2, source: 'open_shadow_dom_h2', confidence: 'medium' },
+        { texts: filteredA11yH2, source: 'a11y_h2', confidence: 'medium' },
+        { texts: filteredDomH2, source: 'dom_h2', confidence: 'low' },
+        { texts: filteredShadowH3, source: 'open_shadow_dom_h3', confidence: 'low' },
+        { texts: filteredA11yH3, source: 'a11y_h3', confidence: 'low' },
+        { texts: filteredDomH3, source: 'dom_h3', confidence: 'low' }
+      ];
+      for (const item of sources) {
+        const text = uniqueHeadingTexts(item.texts, 1)[0];
+        if (!text || text.length < 2) continue;
+        return {
+          text,
+          source: item.source,
+          confidence: item.confidence
+        };
+      }
+      return {
+        text: '',
+        source: 'not_observed',
+        confidence: 'low'
+      };
+    };
+    const pickPrimaryHeadingCandidate = () => {
+      const sources = [
+        { texts: mergedH1, source: h1Source === 'not_observed' ? 'h1' : h1Source, confidence: 'high', h1Equivalent: true, requireStrong: false },
+        { texts: filteredMainH2, source: 'main_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
+        { texts: filteredHeroH2, source: 'hero_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
+        { texts: filteredAppRootH2, source: 'app_root_h2', confidence: 'medium', h1Equivalent: true, requireStrong: true },
+        { texts: [observed.title], source: 'title', confidence: 'low', h1Equivalent: false },
+        { texts: [observed.metaDescription], source: 'meta_description', confidence: 'low', h1Equivalent: false }
+      ];
+      for (const item of sources) {
+        const text = uniqueHeadingTexts(item.texts, 1)[0];
+        if (!text || text.length < 2) continue;
+        if (item.requireStrong && !isStrongPrimaryHeadingText(text)) continue;
+        return {
+          text,
+          source: item.source,
+          confidence: item.confidence,
+          h1Equivalent: !!item.h1Equivalent
+        };
+      }
+      return {
+        text: '',
+        source: 'not_observed',
+        confidence: 'low',
+        h1Equivalent: false
+      };
+    };
+    const sectionHeadingCandidate = pickSectionHeadingCandidate();
+    const primaryHeadingCandidate = pickPrimaryHeadingCandidate();
+    const h1EquivalentCandidateFound = mergedH1.length === 0 && !!(primaryHeadingCandidate.text && primaryHeadingCandidate.h1Equivalent);
+    const domLandmarks = observed.landmarks && typeof observed.landmarks === 'object'
+      ? observed.landmarks
+      : {};
+    const a11yMain = {
+      count: 0,
+      texts: [],
+      observed: false,
+      error: null
+    };
+    if (shortFastMode) {
+      a11yMain.error = 'skipped_short_fast';
+    } else {
+      try {
+        const mainLocator = page.getByRole('main');
+        const mainTexts = await mainLocator.allTextContents().catch(() => []);
+        a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
+        a11yMain.count = a11yMain.texts.length;
+        a11yMain.observed = true;
+      } catch (e) {
+        a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+      }
+    }
+    const hasDomMain = domLandmarks.hasMainLandmark === true;
+    const hasA11yMain = a11yMain.count > 0;
+    const mainLandmarkSource = hasDomMain
+      ? (domLandmarks.mainLandmarkSource || 'dom_main')
+      : (hasA11yMain ? 'a11y_main' : 'not_observed');
+    const mainLandmarkConfidence = hasDomMain
+      ? (domLandmarks.mainLandmarkConfidence || 'high')
+      : (hasA11yMain ? 'medium' : 'low');
+    const mainLandmarkTextsSample = hasDomMain
+      ? (Array.isArray(domLandmarks.mainLandmarkTextsSample) ? domLandmarks.mainLandmarkTextsSample.slice(0, 3) : [])
+      : a11yMain.texts.slice(0, 3);
+    const mainLandmarkCandidateFound = domLandmarks.mainLandmarkCandidateFound === true;
+    const mainLandmarkCandidateSource = domLandmarks.mainLandmarkCandidateSource || 'not_observed';
+    const mainLandmarkCandidateConfidence = domLandmarks.mainLandmarkCandidateConfidence || 'low';
+    const mainLandmarkCandidateTextsSample = Array.isArray(domLandmarks.mainLandmarkCandidateTextsSample)
+      ? domLandmarks.mainLandmarkCandidateTextsSample.slice(0, 3)
+      : [];
+    const hasMainLandmarkFinal = hasDomMain || hasA11yMain
+      ? true
+      : null;
+    const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
+    const structuredDataStart = Date.now();
+    const htmlContentJsonLdSummary = balancedMode
+      ? await collectHtmlContentJsonLdSummaryLight(page)
+      : null;
+    const scriptSrcJsonLdSummary = balancedMode
+      ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, shortFastMode
+        ? { maxScripts: 3, maxBytesPerScript: 512000 }
+        : {})
+      : null;
+    phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
+    const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
+    const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
+    const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
+    const scriptSrcTypes = scriptSrcJsonLdSummary && Array.isArray(scriptSrcJsonLdSummary.types) ? scriptSrcJsonLdSummary.types : [];
+    const mergedJsonLdTypes = Array.from(new Set(renderedTypes.concat(htmlTypes).concat(scriptSrcTypes).filter(Boolean))).slice(0, 50);
+    const renderedRawCount = typeof renderedStructured.rawCount === 'number' ? renderedStructured.rawCount : 0;
+    const htmlRawCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.rawCount === 'number' ? htmlContentJsonLdSummary.rawCount : 0;
+    const scriptSrcCandidateCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.candidateCount === 'number' ? scriptSrcJsonLdSummary.candidateCount : 0;
+    const renderedParseableCount = typeof renderedStructured.parseableCount === 'number' ? renderedStructured.parseableCount : 0;
+    const htmlParseableCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseableCount === 'number' ? htmlContentJsonLdSummary.parseableCount : 0;
+    const scriptSrcParseableCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.parseableCount === 'number' ? scriptSrcJsonLdSummary.parseableCount : 0;
+    const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
+    const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
+    const observedMultimodalSignals = observed.multimodalSignals && typeof observed.multimodalSignals === 'object'
+      ? observed.multimodalSignals
+      : null;
+    const observedTrustSignals = observed.trustSignals && typeof observed.trustSignals === 'object'
+      ? observed.trustSignals
+      : null;
+    const scriptTrustObserved = scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed;
+    const domContactObserved = observedTrustSignals && typeof observedTrustSignals.contactPathFound === 'boolean'
+      ? observedTrustSignals.contactPathFound
+      : (observedTrustSignals && typeof observedTrustSignals.hasContactLink === 'boolean' ? observedTrustSignals.hasContactLink : null);
+    const scriptContactHint = scriptTrustObserved && scriptSrcJsonLdSummary.contactPathFound === true;
+    const trustSignalsLight = {
+      hasContactLink: domContactObserved,
+      contactPathFound: domContactObserved,
+      contactObservedFromDom: domContactObserved,
+      contactObservedFromScriptHint: !!scriptContactHint,
+      contactPathHintOnly: domContactObserved !== true && !!scriptContactHint,
+      contactLinkSample: observedTrustSignals && observedTrustSignals.contactLinkSample
+        ? observedTrustSignals.contactLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.contactPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.contactPathSample } : null),
+      hasCompanyLink: observedTrustSignals && observedTrustSignals.hasCompanyLink === true
+        ? true
+        : (observedTrustSignals && typeof observedTrustSignals.hasCompanyLink === 'boolean' ? observedTrustSignals.hasCompanyLink : null),
+      companyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true),
+      companyLinkSample: observedTrustSignals && observedTrustSignals.companyLinkSample
+        ? observedTrustSignals.companyLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.companyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.companyPathSample } : null),
+      hasPrivacyPolicyLink: observedTrustSignals && observedTrustSignals.hasPrivacyPolicyLink === true
+        ? true
+        : (observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean' ? observedTrustSignals.hasPrivacyPolicyLink : null),
+      privacyObservedFromScriptHint: !!(scriptTrustObserved && scriptSrcJsonLdSummary.privacyPathFound === true),
+      privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
+        ? observedTrustSignals.privacyLinkSample
+        : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
+      scriptSrcTrustObserved: !!scriptTrustObserved,
+      source: scriptTrustObserved ? 'balanced_light_dom_plus_script_src' : 'balanced_light'
+    };
+    const pickStructuredBool = (key) => {
+      const renderedVal = typeof renderedStructured[key] === 'boolean' ? renderedStructured[key] : null;
+      const htmlVal = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary[key] === 'boolean' ? htmlContentJsonLdSummary[key] : null;
+      const scriptVal = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary[key] === 'boolean' ? scriptSrcJsonLdSummary[key] : null;
+      if (renderedVal === true || htmlVal === true || scriptVal === true) return true;
+      if (renderedVal === false && (htmlVal === false || htmlVal == null) && (scriptVal === false || scriptVal == null)) return false;
+      if (htmlVal === false && (renderedVal === false || renderedVal == null) && (scriptVal === false || scriptVal == null)) return false;
+      if (scriptVal === false && (renderedVal === false || renderedVal == null) && (htmlVal === false || htmlVal == null)) return false;
+      return null;
+    };
+    const structuredDataLight = {
+      types: mergedJsonLdTypes,
+      rawCount: balancedMode ? (renderedRawCount + htmlRawCount + scriptSrcCandidateCount) : renderedRawCount,
+      parseableCount: balancedMode ? (renderedParseableCount + htmlParseableCount + scriptSrcParseableCount) : renderedParseableCount,
+      hasJsonLd: balancedMode ? pickStructuredBool('hasJsonLd') : (typeof renderedStructured.hasJsonLd === 'boolean' ? renderedStructured.hasJsonLd : null),
+      hasWebsite: balancedMode ? pickStructuredBool('hasWebsite') : (observed.structuredData ? observed.structuredData.hasWebsite : null),
+      hasOrganization: balancedMode ? pickStructuredBool('hasOrganization') : (observed.structuredData ? observed.structuredData.hasOrganization : null),
+      hasBreadcrumbList: balancedMode ? pickStructuredBool('hasBreadcrumbList') : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
+      hasFAQPage: balancedMode ? pickStructuredBool('hasFAQPage') : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
+      source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
+      confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
+      observationLimited: true,
+      observationScope: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only' : (observed.structuredData && observed.structuredData.observationScope ? observed.structuredData.observationScope : 'rendered_dom_only'),
+      renderedDomObserved: observed.structuredData && typeof observed.structuredData.renderedDomObserved === 'boolean' ? observed.structuredData.renderedDomObserved : true,
+      htmlContentLdJsonObserved: balancedMode ? !!(htmlContentJsonLdSummary && htmlContentJsonLdSummary.htmlContentLdJsonObserved) : false,
+      htmlContentRawCount: balancedMode ? htmlRawCount : 0,
+      htmlContentParseableCount: balancedMode ? htmlParseableCount : 0,
+      scriptSrcJsonLdObserved: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed) : false,
+      scriptSrcCandidateCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.sameOriginScriptCount || 0) : 0,
+      scriptSrcFetchedCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.fetchedCount || 0) : 0,
+      scriptSrcJsonLdCandidateCount: balancedMode ? scriptSrcCandidateCount : 0,
+      scriptSrcJsonLdTypes: balancedMode ? scriptSrcTypes.slice(0, 50) : [],
+      scriptSrcSkippedLargeCount: balancedMode ? Number(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.skippedLargeCount || 0) : 0,
+      scriptSrcAppIndexDetected: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.appIndexDetected) : false,
+      renderedDomRawCount: renderedRawCount,
+      renderedDomParseableCount: renderedParseableCount,
+      htmlScanSkipped: true,
+      jsScanSkipped: true,
+      chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
+      parseErrorsCount: balancedMode ? Math.max(renderedParseErrorsCount, htmlParseErrorsCount) : renderedParseErrorsCount,
+      htmlContentParseErrorsCount: balancedMode ? htmlParseErrorsCount : 0,
+      scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
+      htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
+    };
 
     const geoSignalsV1 = {
       version: 'geoSignalsV1',
       generatedAt,
       url: String(url || ''),
+      structuredData: structuredDataLight,
+      headings: {
+        h1Count: mergedH1.length,
+        h2Count: mergedH2.length,
+        h3Count: mergedH3.length,
+        hasH1: mergedH1.length > 0,
+        hasSingleH1: mergedH1.length === 1,
+        h1Texts: mergedH1.slice(0, 5),
+        headingTexts: headingTextsMerged,
+        primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+        primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+        primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+        h1EquivalentCandidateFound,
+        sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+        sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+        sectionHeadingConfidence: sectionHeadingCandidate.confidence,
+        source: headingSource,
+        h1Source,
+        headingObservationLimited,
+        excludedHeadingCount: headingExclusions.length,
+        excludedHeadingReasons,
+        a11yObserved: !!a11yHeadings.observed
+      },
+      balanced: {
+        enabled: balancedMode,
+        shadowHeadingScan: !!(balancedMode && !shortFastMode),
+        shadowHeadingObserved: !!(shadowHeadings && shadowHeadings.observed),
+        shadowHostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
+        shadowHeadingError: shadowHeadings && shadowHeadings.error || null,
+        mainH1Texts: filteredMainH1.slice(0, 5),
+        mainH2Texts: filteredMainH2.slice(0, 10),
+        appRootH1Texts: filteredAppRootH1.slice(0, 5),
+        appRootH2Texts: filteredAppRootH2.slice(0, 10),
+        heroH1Texts: filteredHeroH1.slice(0, 5),
+        heroH2Texts: filteredHeroH2.slice(0, 10),
+        shadowH1Texts: filteredShadowH1.slice(0, 5),
+        shadowH2Texts: filteredShadowH2.slice(0, 10),
+        iframeSameOriginH1Texts: filteredIframeH1.slice(0, 5),
+        iframeSameOriginH2Texts: filteredIframeH2.slice(0, 10),
+        primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+        primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+        primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+        h1EquivalentCandidateFound,
+        sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+        sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+        sectionHeadingConfidence: sectionHeadingCandidate.confidence,
+        boundedWaitMs: boundedHydrationWaitMs,
+        hydration: {
+          waitMs: Number(hydrationMetrics.waitMs || 0),
+          bodyTextBeforeWait: Number(hydrationMetrics.bodyTextBeforeWait || 0),
+          bodyTextAfterWait: Number(hydrationMetrics.bodyTextAfterWait || 0),
+          anchorCountBeforeWait: Number(hydrationMetrics.anchorCountBeforeWait || 0),
+          anchorCountAfterWait: Number(hydrationMetrics.anchorCountAfterWait || 0),
+          navLinkCountBeforeWait: Number(hydrationMetrics.navLinkCountBeforeWait || 0),
+          navLinkCountAfterWait: Number(hydrationMetrics.navLinkCountAfterWait || 0),
+          improvedBodyText: !!hydrationMetrics.improvedBodyText,
+          improvedLinks: !!hydrationMetrics.improvedLinks,
+          warningTextBeforeWait: !!hydrationMetrics.warningTextBeforeWait,
+          warningTextAfterWait: !!hydrationMetrics.warningTextAfterWait
+        },
+        h1Attempts: {
+          dom: { count: filteredDomH1.length, source: 'dom' },
+          main: { count: filteredMainH1.length, source: 'main_dom' },
+          appRoot: {
+            count: filteredAppRootH1.length,
+            rootCount: Number(appRootHeadings.rootCount || 0),
+            source: 'app_root_dom'
+          },
+          hero: {
+            count: filteredHeroH1.length,
+            rootCount: Number(heroHeadings.rootCount || 0),
+            source: 'hero_dom'
+          },
+          shadow: {
+            count: filteredShadowH1.length,
+            hostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
+            observed: !!(shadowHeadings && shadowHeadings.observed),
+            error: shadowHeadings && shadowHeadings.error || null,
+            source: 'open_shadow_dom'
+          },
+          a11y: {
+            count: filteredA11yH1.length,
+            observed: !!a11yHeadings.observed,
+            error: a11yHeadings.error,
+            source: 'a11y'
+          },
+          iframeSameOrigin: {
+            count: filteredIframeH1.length,
+            iframeCount: Number(iframeSameOriginHeadings.iframeCount || 0),
+            accessibleCount: Number(iframeSameOriginHeadings.accessibleCount || 0),
+            blockedCount: Number(iframeSameOriginHeadings.blockedCount || 0),
+            error: iframeSameOriginHeadings.error || null,
+            source: 'iframe_same_origin'
+          }
+        }
+      },
+      landmarks: {
+        hasMainLandmark: hasMainLandmarkFinal,
+        hasMainLandmark_final: hasMainLandmarkFinal,
+        mainLandmarkSource,
+        mainLandmarkConfidence,
+        mainLandmarkTextsSample,
+        mainLandmarkCandidateFound,
+        mainLandmarkCandidateSource,
+        mainLandmarkCandidateConfidence,
+        mainLandmarkCandidateTextsSample,
+        mainLandmarkObservationLimited,
+        a11yObserved: !!a11yMain.observed,
+        a11yMainCount: a11yMain.count,
+        a11yError: a11yMain.error
+      },
+      multimodalSignals: observedMultimodalSignals || {
+        checked: !!balancedMode,
+        hasImage: null,
+        hasStructured: null,
+        source: 'balanced_light'
+      },
+      trustSignals: trustSignalsLight,
       observed: {
         title: {
           value: observed.title || null,
@@ -3353,18 +4434,70 @@ async function buildGeoSignalsV1(page, url) {
           confidence: observed.metaDescription ? 'high' : 'low'
         },
         h1: {
-          values: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
-          count: Array.isArray(observed.h1) ? observed.h1.length : 0,
-          observed: Array.isArray(observed.h1),
-          source: 'rendered_dom',
-          confidence: 'high'
+          values: mergedH1.slice(0, 5),
+          count: mergedH1.length,
+          observed: domH1.length > 0 || a11yHeadings.observed,
+          source: h1Source,
+          confidence: mergedH1.length ? 'high' : (a11yHeadings.observed ? 'medium' : 'low'),
+          hasH1: mergedH1.length > 0,
+          hasSingleH1: mergedH1.length === 1,
+          headingObservationLimited
         },
         headings: {
-          h1: Array.isArray(observed.h1) ? observed.h1.slice(0, 5) : [],
-          h2: Array.isArray(observed.h2) ? observed.h2.slice(0, 10) : [],
-          h3: Array.isArray(observed.h3) ? observed.h3.slice(0, 10) : [],
-          source: 'rendered_dom',
-          confidence: 'high'
+          h1: mergedH1.slice(0, 5),
+          h2: mergedH2.slice(0, 10),
+          h3: mergedH3.slice(0, 10),
+          headingTexts: headingTextsMerged,
+          primaryHeadingCandidate: primaryHeadingCandidate.text || '',
+          primaryHeadingCandidateSource: primaryHeadingCandidate.source,
+          primaryHeadingConfidence: primaryHeadingCandidate.confidence,
+          h1EquivalentCandidateFound,
+          sectionHeadingCandidate: sectionHeadingCandidate.text || '',
+          sectionHeadingCandidateSource: sectionHeadingCandidate.source,
+          sectionHeadingConfidence: sectionHeadingCandidate.confidence,
+          source: headingSource,
+          h1Source,
+          headingObservationLimited,
+          a11y: {
+            h1: filteredA11yH1.slice(0, 5),
+            h2: filteredA11yH2.slice(0, 10),
+            h3: filteredA11yH3.slice(0, 10),
+            observed: !!a11yHeadings.observed,
+            error: a11yHeadings.error
+          },
+          main: {
+            h1: filteredMainH1.slice(0, 5),
+            h2: filteredMainH2.slice(0, 10)
+          },
+          appRoot: {
+            h1: filteredAppRootH1.slice(0, 5),
+            h2: filteredAppRootH2.slice(0, 10),
+            rootCount: Number(appRootHeadings.rootCount || 0)
+          },
+          hero: {
+            h1: filteredHeroH1.slice(0, 5),
+            h2: filteredHeroH2.slice(0, 10),
+            rootCount: Number(heroHeadings.rootCount || 0)
+          },
+          shadow: {
+            h1: filteredShadowH1.slice(0, 5),
+            h2: filteredShadowH2.slice(0, 10),
+            h3: filteredShadowH3.slice(0, 10),
+            observed: !!(shadowHeadings && shadowHeadings.observed),
+            hostCount: Number(shadowHeadings && shadowHeadings.hostCount || 0),
+            error: shadowHeadings && shadowHeadings.error || null
+          },
+          iframeSameOrigin: {
+            h1: filteredIframeH1.slice(0, 5),
+            h2: filteredIframeH2.slice(0, 10),
+            iframeCount: Number(iframeSameOriginHeadings.iframeCount || 0),
+            accessibleCount: Number(iframeSameOriginHeadings.accessibleCount || 0),
+            blockedCount: Number(iframeSameOriginHeadings.blockedCount || 0),
+            error: iframeSameOriginHeadings.error || null
+          },
+          excludedHeadingCount: headingExclusions.length,
+          excludedHeadingReasons,
+          confidence: headingTextsMerged.length ? 'high' : 'low'
         },
         links: {
           navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
@@ -3377,15 +4510,53 @@ async function buildGeoSignalsV1(page, url) {
           confidence: 'medium'
         },
         structuredData: {
-          types: observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.slice(0, 50) : [],
-          hasWebsite: observed.structuredData ? observed.structuredData.hasWebsite : null,
-          hasOrganization: observed.structuredData ? observed.structuredData.hasOrganization : null,
-          hasBreadcrumbList: observed.structuredData ? observed.structuredData.hasBreadcrumbList : null,
-          hasFAQPage: observed.structuredData ? observed.structuredData.hasFAQPage : null,
-          rawCount: observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : 0,
-          source: 'rendered_dom_jsonld',
-          confidence: 'medium'
+          types: structuredDataLight.types,
+          rawCount: structuredDataLight.rawCount,
+          parseableCount: structuredDataLight.parseableCount,
+          hasJsonLd: structuredDataLight.hasJsonLd,
+          hasWebsite: structuredDataLight.hasWebsite,
+          hasOrganization: structuredDataLight.hasOrganization,
+          hasBreadcrumbList: structuredDataLight.hasBreadcrumbList,
+          hasFAQPage: structuredDataLight.hasFAQPage,
+          source: structuredDataLight.source,
+          confidence: structuredDataLight.confidence,
+          observationLimited: structuredDataLight.observationLimited,
+          observationScope: structuredDataLight.observationScope,
+          renderedDomObserved: structuredDataLight.renderedDomObserved,
+          htmlContentLdJsonObserved: structuredDataLight.htmlContentLdJsonObserved,
+          htmlContentRawCount: structuredDataLight.htmlContentRawCount,
+          htmlContentParseableCount: structuredDataLight.htmlContentParseableCount,
+          scriptSrcJsonLdObserved: structuredDataLight.scriptSrcJsonLdObserved,
+          scriptSrcCandidateCount: structuredDataLight.scriptSrcCandidateCount,
+          scriptSrcFetchedCount: structuredDataLight.scriptSrcFetchedCount,
+          scriptSrcJsonLdCandidateCount: structuredDataLight.scriptSrcJsonLdCandidateCount,
+          scriptSrcJsonLdTypes: structuredDataLight.scriptSrcJsonLdTypes,
+          scriptSrcSkippedLargeCount: structuredDataLight.scriptSrcSkippedLargeCount,
+          scriptSrcAppIndexDetected: structuredDataLight.scriptSrcAppIndexDetected,
+          renderedDomRawCount: structuredDataLight.renderedDomRawCount,
+          renderedDomParseableCount: structuredDataLight.renderedDomParseableCount,
+          htmlScanSkipped: structuredDataLight.htmlScanSkipped,
+          jsScanSkipped: structuredDataLight.jsScanSkipped,
+          chunkScanSkipped: structuredDataLight.chunkScanSkipped,
+          parseErrorsCount: structuredDataLight.parseErrorsCount,
+          scriptSrcError: structuredDataLight.scriptSrcError
         },
+        landmarks: {
+          hasMainLandmark: hasMainLandmarkFinal,
+          hasMainLandmark_final: hasMainLandmarkFinal,
+          mainLandmarkSource,
+          mainLandmarkConfidence,
+          mainLandmarkTextsSample,
+          mainLandmarkCandidateFound,
+          mainLandmarkCandidateSource,
+          mainLandmarkCandidateConfidence,
+          mainLandmarkCandidateTextsSample,
+          mainLandmarkObservationLimited,
+          source: mainLandmarkSource,
+          confidence: mainLandmarkConfidence
+        },
+        multimodalSignals: observedMultimodalSignals || null,
+        trustSignals: trustSignalsLight,
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
@@ -3395,15 +4566,61 @@ async function buildGeoSignalsV1(page, url) {
       },
       diagnostics: {
         evaluateCount: 1,
+        balancedMode,
+        shortFastMode,
+        boundedHydrationWaitMs,
+        hydrationWaitMs: Number(hydrationMetrics.waitMs || boundedHydrationWaitMs || 0),
+        bodyTextBeforeWait: Number(hydrationMetrics.bodyTextBeforeWait || 0),
+        bodyTextAfterWait: Number(hydrationMetrics.bodyTextAfterWait || 0),
+        hydrationImprovedBodyText: !!hydrationMetrics.improvedBodyText,
+        hydrationImprovedLinks: !!hydrationMetrics.improvedLinks,
+        warningTextBeforeWait: !!hydrationMetrics.warningTextBeforeWait,
+        warningTextAfterWait: !!hydrationMetrics.warningTextAfterWait,
         jsBundleAnalysis: false,
-        resourceChunkScan: false
+        resourceChunkScan: false,
+        shadowHeadingScan: !!(balancedMode && !shortFastMode),
+        a11yHeadingScan: !shortFastMode,
+        appRootHeadingScan: !!balancedMode,
+        heroHeadingScan: !!balancedMode,
+        iframeHeadingScan: !!(balancedMode && !shortFastMode),
+        primaryHeadingScan: !!balancedMode,
+        shadowPrimaryHeadingScan: !!(balancedMode && !shortFastMode),
+        mainCandidateScan: !!balancedMode,
+        htmlContentLdJsonScan: !!balancedMode,
+        skippedScans: shortFastMode
+          ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan']
+          : [],
+        phaseTimings: Object.assign({}, phaseTimings, {
+          totalMs: Math.max(0, Date.now() - startedAt)
+        })
       }
     };
     try {
       console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
         h1Count: geoSignalsV1.observed.h1.count,
+        h1Source: geoSignalsV1.headings && geoSignalsV1.headings.h1Source,
+        headingObservationLimited: geoSignalsV1.headings && geoSignalsV1.headings.headingObservationLimited,
+        hasMainLandmark: geoSignalsV1.landmarks && geoSignalsV1.landmarks.hasMainLandmark,
+        mainLandmarkSource: geoSignalsV1.landmarks && geoSignalsV1.landmarks.mainLandmarkSource,
+        mainLandmarkObservationLimited: geoSignalsV1.landmarks && geoSignalsV1.landmarks.mainLandmarkObservationLimited,
         jsonldCount: geoSignalsV1.observed.structuredData.rawCount,
+        jsonldParseableCount: geoSignalsV1.observed.structuredData.parseableCount,
+        jsonldParseErrorsCount: geoSignalsV1.observed.structuredData.parseErrorsCount,
         jsonldTypes: geoSignalsV1.observed.structuredData.types,
+        hasJsonLd: geoSignalsV1.observed.structuredData.hasJsonLd,
+        hasWebsite: geoSignalsV1.observed.structuredData.hasWebsite,
+        hasOrganization: geoSignalsV1.observed.structuredData.hasOrganization,
+        hasBreadcrumbList: geoSignalsV1.observed.structuredData.hasBreadcrumbList,
+        hasFAQPage: geoSignalsV1.observed.structuredData.hasFAQPage,
+        observationScope: geoSignalsV1.observed.structuredData.observationScope,
+        htmlContentLdJsonObserved: geoSignalsV1.observed.structuredData.htmlContentLdJsonObserved,
+        scriptSrcJsonLdObserved: geoSignalsV1.observed.structuredData.scriptSrcJsonLdObserved,
+        scriptSrcJsonLdCandidateCount: geoSignalsV1.observed.structuredData.scriptSrcJsonLdCandidateCount,
+        scriptSrcJsonLdTypes: geoSignalsV1.observed.structuredData.scriptSrcJsonLdTypes,
+        hasOgImage: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasOgImage,
+        hasFavicon: geoSignalsV1.multimodalSignals && geoSignalsV1.multimodalSignals.hasFavicon,
+        hasContactLink: geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.hasContactLink,
+        contactPathFound: geoSignalsV1.trustSignals && geoSignalsV1.trustSignals.contactPathFound,
         totalAnchors: geoSignalsV1.observed.links.internalLinksSample.length,
         navLinkTextsCount: geoSignalsV1.observed.links.navTextsSample.length,
         bodyTextCandidatesCount: 0,
@@ -3424,6 +4641,141 @@ async function buildGeoSignalsV1(page, url) {
       },
       error: String(e && (e.message || e) || '')
     };
+  }
+}
+
+async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
+  const maxWaitMs = Math.max(0, Math.min(5000, Number(waitMs || 0)));
+  const shortFastMode = !!(opts && opts.shortFastMode);
+  const empty = {
+    waitMs: 0,
+    bodyTextBeforeWait: 0,
+    bodyTextAfterWait: 0,
+    anchorCountBeforeWait: 0,
+    anchorCountAfterWait: 0,
+    navLinkCountBeforeWait: 0,
+    navLinkCountAfterWait: 0,
+    improvedBodyText: false,
+    improvedLinks: false,
+    warningTextBeforeWait: false,
+    warningTextAfterWait: false,
+    error: null
+  };
+  const measure = async () => {
+    return page.evaluate(({ shortFastMode }) => {
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const shadowTextParts = [];
+      const shadowAnchors = [];
+      if (!shortFastMode) {
+        try {
+          const walkShadow = (root, depth = 0) => {
+            if (!root || depth > 4) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (shadowTextParts.length < 80) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+              }
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                shadowAnchors.push(el);
+              }
+              if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadow(document, 0);
+        } catch (_) {}
+      }
+      const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+      const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+      const anchors = Array.from(document.querySelectorAll('a[href]')).concat(shadowAnchors);
+      const navAnchors = anchors.filter((a) => !!a.closest('nav,[role="navigation"],header,footer'));
+      return {
+        bodyTextLength: bodyText.length,
+        anchorCount: anchors.length,
+        navLinkCount: navAnchors.length,
+        warningText: /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText)
+      };
+    }, { shortFastMode }).catch(() => ({
+      bodyTextLength: 0,
+      anchorCount: 0,
+      navLinkCount: 0,
+      warningText: false
+    }));
+  };
+  try {
+    const before = await measure();
+    const sparseBefore = !!(
+      before.warningText ||
+      before.bodyTextLength < 800 ||
+      before.anchorCount === 0 ||
+      before.navLinkCount === 0
+    );
+    if (maxWaitMs > 0 && sparseBefore) {
+      const startedAt = Date.now();
+      try {
+        await page.waitForFunction(({ shortFastMode }) => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const shadowTextParts = [];
+            let shadowAnchorCount = 0;
+            if (!shortFastMode) {
+              try {
+                const walkShadow = (root, depth = 0) => {
+                  if (!root || depth > 4) return;
+                  const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+                  nodes.forEach((el) => {
+                    if (!el) return;
+                    if (shadowTextParts.length < 80) {
+                      const text = clean(el.innerText || el.textContent);
+                      if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
+                    }
+                    if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
+                    if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+                  });
+                };
+                walkShadow(document, 0);
+              } catch (_) {}
+            }
+          const bodyText = clean([clean(document.body && (document.body.innerText || document.body.textContent))].concat(shadowTextParts).join(' '));
+          const anchors = document.querySelectorAll('a[href]').length + shadowAnchorCount;
+          const navAnchors = document.querySelectorAll('nav a[href],[role="navigation"] a[href],header a[href],footer a[href]').length;
+          const warningText = /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText);
+          return (!warningText && bodyText.length >= 800) || anchors >= 5 || navAnchors >= 2;
+        }, { shortFastMode }, { timeout: maxWaitMs, polling: 250 });
+      } catch (_) {
+        try { await page.waitForTimeout(Math.min(750, maxWaitMs)); } catch (_) {}
+      }
+      const after = await measure();
+      return {
+        waitMs: Math.min(maxWaitMs, Date.now() - startedAt),
+        bodyTextBeforeWait: before.bodyTextLength,
+        bodyTextAfterWait: after.bodyTextLength,
+        anchorCountBeforeWait: before.anchorCount,
+        anchorCountAfterWait: after.anchorCount,
+        navLinkCountBeforeWait: before.navLinkCount,
+        navLinkCountAfterWait: after.navLinkCount,
+        improvedBodyText: after.bodyTextLength > before.bodyTextLength,
+        improvedLinks: after.anchorCount > before.anchorCount || after.navLinkCount > before.navLinkCount,
+        warningTextBeforeWait: !!before.warningText,
+        warningTextAfterWait: !!after.warningText,
+        error: null
+      };
+    }
+    return Object.assign({}, empty, {
+      bodyTextBeforeWait: before.bodyTextLength,
+      bodyTextAfterWait: before.bodyTextLength,
+      anchorCountBeforeWait: before.anchorCount,
+      anchorCountAfterWait: before.anchorCount,
+      navLinkCountBeforeWait: before.navLinkCount,
+      navLinkCountAfterWait: before.navLinkCount,
+      warningTextBeforeWait: !!before.warningText,
+      warningTextAfterWait: !!before.warningText
+    });
+  } catch (e) {
+    return Object.assign({}, empty, {
+      waitMs: maxWaitMs,
+      error: String(e && (e.message || e) || '').slice(0, 180)
+    });
   }
 }
 
@@ -3738,18 +5090,317 @@ app.get('/scrape', async (req, res) => {
   });
 });
 
+function buildBalancedShortResponsePayload(fullPayload) {
+  const trimmedFields = [];
+  const str = (value, max, path) => {
+    const text = value == null ? '' : String(value);
+    if (text.length > max) {
+      if (path) trimmedFields.push(path);
+      return text.slice(0, max);
+    }
+    return text;
+  };
+  const arr = (value, max, path, mapper) => {
+    const list = Array.isArray(value) ? value : [];
+    if (list.length > max && path) trimmedFields.push(path);
+    return list.slice(0, max).map(mapper || ((item) => item));
+  };
+  const linkSample = (item) => {
+    if (!item || typeof item !== 'object') return str(item, 160);
+    return {
+      text: str(item.text || item.label || '', 80),
+      href: str(item.href || item.url || '', 180)
+    };
+  };
+  const g = fullPayload && fullPayload.geoSignalsV1 ? fullPayload.geoSignalsV1 : {};
+  const observed = g.observed || {};
+  const headings = g.headings || observed.headings || {};
+  const landmarks = g.landmarks || observed.landmarks || {};
+  const structuredData = g.structuredData || observed.structuredData || {};
+  const links = observed.links || {};
+  const body = observed.body || {};
+  const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
+  const geoDiagnostics = g.diagnostics || {};
+  const balanced = g.balanced || {};
+  const shortStructuredData = {
+    types: arr(structuredData.types, 50, 'geoSignalsV1.structuredData.types'),
+    rawCount: structuredData.rawCount,
+    parseableCount: structuredData.parseableCount,
+    hasJsonLd: structuredData.hasJsonLd,
+    hasWebsite: structuredData.hasWebsite,
+    hasOrganization: structuredData.hasOrganization,
+    hasBreadcrumbList: structuredData.hasBreadcrumbList,
+    hasFAQPage: structuredData.hasFAQPage,
+    source: structuredData.source,
+    confidence: structuredData.confidence,
+    observationLimited: structuredData.observationLimited,
+    observationScope: structuredData.observationScope,
+    renderedDomObserved: structuredData.renderedDomObserved,
+    htmlContentLdJsonObserved: structuredData.htmlContentLdJsonObserved,
+    htmlContentRawCount: structuredData.htmlContentRawCount,
+    htmlContentParseableCount: structuredData.htmlContentParseableCount,
+    scriptSrcJsonLdObserved: structuredData.scriptSrcJsonLdObserved,
+    scriptSrcCandidateCount: structuredData.scriptSrcCandidateCount,
+    scriptSrcFetchedCount: structuredData.scriptSrcFetchedCount,
+    scriptSrcJsonLdCandidateCount: structuredData.scriptSrcJsonLdCandidateCount,
+    scriptSrcJsonLdTypes: arr(structuredData.scriptSrcJsonLdTypes, 50, 'geoSignalsV1.structuredData.scriptSrcJsonLdTypes'),
+    scriptSrcSkippedLargeCount: structuredData.scriptSrcSkippedLargeCount,
+    scriptSrcAppIndexDetected: structuredData.scriptSrcAppIndexDetected,
+    htmlScanSkipped: structuredData.htmlScanSkipped,
+    jsScanSkipped: structuredData.jsScanSkipped,
+    chunkScanSkipped: structuredData.chunkScanSkipped,
+    parseErrorsCount: structuredData.parseErrorsCount
+  };
+  const shortHeadings = {
+    h1Count: headings.h1Count,
+    h2Count: headings.h2Count,
+    h3Count: headings.h3Count,
+    hasH1: headings.hasH1,
+    hasSingleH1: headings.hasSingleH1,
+    h1Texts: arr(headings.h1Texts, 5, 'geoSignalsV1.headings.h1Texts', (v) => str(v, 160)),
+    headingTexts: arr(headings.headingTexts, 10, 'geoSignalsV1.headings.headingTexts', (v) => str(v, 160)),
+    primaryHeadingCandidate: str(headings.primaryHeadingCandidate, 180, 'geoSignalsV1.headings.primaryHeadingCandidate'),
+    primaryHeadingCandidateSource: headings.primaryHeadingCandidateSource,
+    primaryHeadingConfidence: headings.primaryHeadingConfidence,
+    h1EquivalentCandidateFound: headings.h1EquivalentCandidateFound,
+    sectionHeadingCandidate: str(headings.sectionHeadingCandidate, 160, 'geoSignalsV1.headings.sectionHeadingCandidate'),
+    sectionHeadingCandidateSource: headings.sectionHeadingCandidateSource,
+    sectionHeadingConfidence: headings.sectionHeadingConfidence,
+    source: headings.source,
+    h1Source: headings.h1Source,
+    headingObservationLimited: headings.headingObservationLimited,
+    excludedHeadingCount: headings.excludedHeadingCount,
+    excludedHeadingReasons: arr(headings.excludedHeadingReasons, 10, 'geoSignalsV1.headings.excludedHeadingReasons', (v) => str(v, 80)),
+    a11yObserved: headings.a11yObserved
+  };
+  const shortLandmarks = {
+    hasMainLandmark: landmarks.hasMainLandmark,
+    hasMainLandmark_final: landmarks.hasMainLandmark_final,
+    mainLandmarkSource: landmarks.mainLandmarkSource,
+    mainLandmarkConfidence: landmarks.mainLandmarkConfidence,
+    mainLandmarkTextsSample: arr(landmarks.mainLandmarkTextsSample, 3, 'geoSignalsV1.landmarks.mainLandmarkTextsSample', (v) => str(v, 160)),
+    mainLandmarkCandidateFound: landmarks.mainLandmarkCandidateFound,
+    mainLandmarkCandidateSource: landmarks.mainLandmarkCandidateSource,
+    mainLandmarkCandidateConfidence: landmarks.mainLandmarkCandidateConfidence,
+    mainLandmarkCandidateTextsSample: arr(landmarks.mainLandmarkCandidateTextsSample, 3, 'geoSignalsV1.landmarks.mainLandmarkCandidateTextsSample', (v) => str(v, 160)),
+    mainLandmarkObservationLimited: landmarks.mainLandmarkObservationLimited,
+    a11yObserved: landmarks.a11yObserved,
+    a11yMainCount: landmarks.a11yMainCount
+  };
+  const shortLinks = {
+    navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
+    internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
+    hasCompanyLikeLink: links.hasCompanyLikeLink,
+    hasServiceLikeLink: links.hasServiceLikeLink,
+    hasContactLikeLink: links.hasContactLikeLink,
+    hasPrivacyLikeLink: links.hasPrivacyLikeLink,
+    source: links.source,
+    confidence: links.confidence
+  };
+  const shortBalanced = {
+    enabled: !!balanced.enabled,
+    shadowHeadingScan: !!balanced.shadowHeadingScan,
+    shadowHeadingObserved: !!balanced.shadowHeadingObserved,
+    shadowHostCount: balanced.shadowHostCount,
+    mainH1Texts: arr(balanced.mainH1Texts, 3, 'geoSignalsV1.balanced.mainH1Texts', (v) => str(v, 140)),
+    mainH2Texts: arr(balanced.mainH2Texts, 5, 'geoSignalsV1.balanced.mainH2Texts', (v) => str(v, 140)),
+    appRootH1Texts: arr(balanced.appRootH1Texts, 3, 'geoSignalsV1.balanced.appRootH1Texts', (v) => str(v, 140)),
+    appRootH2Texts: arr(balanced.appRootH2Texts, 5, 'geoSignalsV1.balanced.appRootH2Texts', (v) => str(v, 140)),
+    heroH1Texts: arr(balanced.heroH1Texts, 3, 'geoSignalsV1.balanced.heroH1Texts', (v) => str(v, 140)),
+    heroH2Texts: arr(balanced.heroH2Texts, 5, 'geoSignalsV1.balanced.heroH2Texts', (v) => str(v, 140)),
+    shadowH1Texts: arr(balanced.shadowH1Texts, 3, 'geoSignalsV1.balanced.shadowH1Texts', (v) => str(v, 140)),
+    shadowH2Texts: arr(balanced.shadowH2Texts, 5, 'geoSignalsV1.balanced.shadowH2Texts', (v) => str(v, 140)),
+    iframeSameOriginH1Texts: arr(balanced.iframeSameOriginH1Texts, 3, 'geoSignalsV1.balanced.iframeSameOriginH1Texts', (v) => str(v, 140)),
+    iframeSameOriginH2Texts: arr(balanced.iframeSameOriginH2Texts, 5, 'geoSignalsV1.balanced.iframeSameOriginH2Texts', (v) => str(v, 140)),
+    primaryHeadingCandidate: str(balanced.primaryHeadingCandidate, 180, 'geoSignalsV1.balanced.primaryHeadingCandidate'),
+    primaryHeadingCandidateSource: balanced.primaryHeadingCandidateSource,
+    primaryHeadingConfidence: balanced.primaryHeadingConfidence,
+    h1EquivalentCandidateFound: balanced.h1EquivalentCandidateFound,
+    sectionHeadingCandidate: str(balanced.sectionHeadingCandidate, 160, 'geoSignalsV1.balanced.sectionHeadingCandidate'),
+    sectionHeadingCandidateSource: balanced.sectionHeadingCandidateSource,
+    sectionHeadingConfidence: balanced.sectionHeadingConfidence,
+    boundedWaitMs: balanced.boundedWaitMs,
+    hydration: balanced.hydration || null,
+    h1Attempts: balanced.h1Attempts || null
+  };
+  const shortGeoSignalsV1 = {
+    version: g.version,
+    generatedAt: g.generatedAt,
+    url: g.url,
+    structuredData: shortStructuredData,
+    headings: shortHeadings,
+    balanced: shortBalanced,
+    landmarks: shortLandmarks,
+    multimodalSignals: g.multimodalSignals || null,
+    trustSignals: g.trustSignals || null,
+    observed: {
+      title: observed.title || null,
+      metaDescription: observed.metaDescription || null,
+      h1: observed.h1 || null,
+      headings: Object.assign({}, shortHeadings, {
+        h1: arr(observed.headings && observed.headings.h1, 5, 'geoSignalsV1.observed.headings.h1', (v) => str(v, 160)),
+        h2: arr(observed.headings && observed.headings.h2, 10, 'geoSignalsV1.observed.headings.h2', (v) => str(v, 140)),
+        h3: arr(observed.headings && observed.headings.h3, 10, 'geoSignalsV1.observed.headings.h3', (v) => str(v, 140))
+      }),
+      links: shortLinks,
+      structuredData: shortStructuredData,
+      landmarks: shortLandmarks,
+      multimodalSignals: observed.multimodalSignals || g.multimodalSignals || null,
+      trustSignals: observed.trustSignals || g.trustSignals || null,
+      body: {
+        textLength: body.textLength,
+        sample: str(body.sample, 280, 'geoSignalsV1.observed.body.sample'),
+        source: body.source,
+        confidence: body.confidence
+      }
+    },
+    diagnostics: {
+      evaluateCount: geoDiagnostics.evaluateCount,
+      balancedMode: geoDiagnostics.balancedMode,
+      boundedHydrationWaitMs: geoDiagnostics.boundedHydrationWaitMs,
+      hydrationWaitMs: geoDiagnostics.hydrationWaitMs,
+      bodyTextBeforeWait: geoDiagnostics.bodyTextBeforeWait,
+      bodyTextAfterWait: geoDiagnostics.bodyTextAfterWait,
+      hydrationImprovedBodyText: geoDiagnostics.hydrationImprovedBodyText,
+      hydrationImprovedLinks: geoDiagnostics.hydrationImprovedLinks,
+      jsBundleAnalysis: geoDiagnostics.jsBundleAnalysis,
+      resourceChunkScan: geoDiagnostics.resourceChunkScan,
+      shadowHeadingScan: geoDiagnostics.shadowHeadingScan,
+      a11yHeadingScan: geoDiagnostics.a11yHeadingScan,
+      appRootHeadingScan: geoDiagnostics.appRootHeadingScan,
+      heroHeadingScan: geoDiagnostics.heroHeadingScan,
+      iframeHeadingScan: geoDiagnostics.iframeHeadingScan,
+      primaryHeadingScan: geoDiagnostics.primaryHeadingScan,
+      shadowPrimaryHeadingScan: geoDiagnostics.shadowPrimaryHeadingScan,
+      mainCandidateScan: geoDiagnostics.mainCandidateScan,
+      htmlContentLdJsonScan: geoDiagnostics.htmlContentLdJsonScan
+    }
+  };
+  const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
+  if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
+  if (Array.isArray(shortLightweightSummary.structuredDataScriptSrcJsonLdTypes)) shortLightweightSummary.structuredDataScriptSrcJsonLdTypes = shortLightweightSummary.structuredDataScriptSrcJsonLdTypes.slice(0, 50);
+  const shortDiagnostics = Object.assign({}, diagnostics, {
+    responseMode: 'short',
+    shortMode: true,
+    trimmedFields
+  });
+  const memoryHints = Object.assign({}, fullPayload.memoryHints || {});
+  memoryHints.trimmedFields = trimmedFields.slice(0, 80);
+  let estimatedOriginalBytes = null;
+  let responseBytesApprox = null;
+  try { estimatedOriginalBytes = Buffer.byteLength(JSON.stringify(fullPayload), 'utf8'); } catch (_) {}
+  const shortPayload = {
+    ok: true,
+    mode: fullPayload.mode,
+    responseMode: 'short',
+    shortMode: true,
+    url: fullPayload.url,
+    finalUrl: fullPayload.finalUrl,
+    status: fullPayload.status,
+    geoSignalsV1: shortGeoSignalsV1,
+    lightweightSummary: shortLightweightSummary,
+    diagnostics: shortDiagnostics,
+    memoryHints
+  };
+  shortPayload.diagnostics.estimatedOriginalBytes = estimatedOriginalBytes;
+  shortPayload.diagnostics.responseBytesApprox = null;
+  try {
+    responseBytesApprox = Buffer.byteLength(JSON.stringify(shortPayload), 'utf8');
+    shortPayload.diagnostics.responseBytesApprox = responseBytesApprox;
+  } catch (_) {}
+  shortPayload.memoryHints.estimatedOriginalBytes = estimatedOriginalBytes;
+  shortPayload.memoryHints.responseBytesApprox = responseBytesApprox;
+  return shortPayload;
+}
+
 async function scrapeOnce(req, res) {
   const urlToFetch = req.query.url;
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
   const noCache = String(req.query.nocache || '').toLowerCase() === '1';
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
+  const signalsMode = String(req.query.signalsMode || '').toLowerCase();
+  const responseMode = String(req.query.responseMode || '').toLowerCase();
+  const observerMode = String(req.query.observer || '').toLowerCase();
+  const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
+  const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || signalsMode === 'balancedfast' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
+  const balancedShortFastResponse = signalsFirstBalanced && (responseMode === 'shortfast' || responseMode === 'short-fast' || signalsMode === 'balancedfast');
+  const balancedShortResponse = signalsFirstBalanced && (responseMode === 'short' || signalsMode === 'balancedshort' || balancedShortFastResponse);
+  const probeModeRaw = String(req.query.probe || '').toLowerCase();
+  const probeAliases = {
+    'resource-json': 'resourcejson',
+    resourcetap: 'resourcejson',
+    'js-tap': 'jstap',
+    js: 'jstap',
+    'js-fetch': 'jsfetch',
+    jsbody: 'jsfetch',
+    'js-body': 'jsfetch',
+    'js-scan': 'jsscan',
+    jsdecode: 'jsscan',
+    'js-decode': 'jsscan',
+    'js-chunk': 'jschunk',
+    chunk: 'jschunk',
+    chunktap: 'jschunk',
+    'chunk-tap': 'jschunk',
+    subpage: 'subpages',
+    linkedpages: 'subpages',
+    'linked-pages': 'subpages',
+    payload: 'payloadassembly',
+    'payload-assembly': 'payloadassembly',
+    assembly: 'payloadassembly',
+    'primary-risk': 'primaryrisk',
+    primaryrisk: 'primaryrisk',
+    risk: 'primaryrisk',
+    'signals-probe': 'primaryrisk',
+    'jsonld-balanced': 'jsonldbalanced',
+    jsonldbalanced: 'jsonldbalanced',
+    'balanced-jsonld': 'jsonldbalanced',
+    'jsonld-resource-tap': 'jsonldresourcetap',
+    jsonldresourcetap: 'jsonldresourcetap',
+    'jsonld-resource': 'jsonldresourcetap',
+    'resource-jsonld': 'jsonldresourcetap',
+    'jsonld-script-src': 'jsonldscriptsrc',
+    jsonldscriptsrc: 'jsonldscriptsrc',
+    'script-src-jsonld': 'jsonldscriptsrc',
+    'jsonld-script': 'jsonldscriptsrc',
+    'goto-timing': 'gototiming',
+    gototiming: 'gototiming',
+    'goto-probe': 'gototiming',
+    'shortfast-phases': 'shortfastphases',
+    shortfastphases: 'shortfastphases',
+    'shortfast-phase': 'shortfastphases',
+    'unified-balanced-observer': 'unifiedbalancedobserver',
+    unifiedbalancedobserver: 'unifiedbalancedobserver',
+    'balanced-observer': 'unifiedbalancedobserver',
+    'unified-observer': 'unifiedbalancedobserver'
+  };
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases', 'unifiedbalancedobserver'];
+  const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
+  const observerProbeMode = signalsFirstBalanced && (observerMode === 'unifiedprobe' || observerMode === 'unified-probe' || observerMode === 'unified') ? 'unifiedbalancedobserver' : '';
+  const probeMaxFetchRaw = Number(req.query.maxFetch);
+  const probeMaxFetch = Math.max(1, Math.min(20, Number.isFinite(probeMaxFetchRaw) && probeMaxFetchRaw > 0
+    ? Math.floor(probeMaxFetchRaw)
+    : 8
+  ));
+  const probeMaxChunkFetchRaw = Number(req.query.maxChunkFetch);
+  const probeMaxChunkFetch = Math.max(0, Math.min(30, Number.isFinite(probeMaxChunkFetchRaw) && probeMaxChunkFetchRaw >= 0
+    ? Math.floor(probeMaxChunkFetchRaw)
+    : 10
+  ));
+  const probeMaxSubpageFetchRaw = Number(req.query.maxSubpageFetch);
+  const probeMaxSubpageFetch = Math.max(0, Math.min(10, Number.isFinite(probeMaxSubpageFetchRaw) && probeMaxSubpageFetchRaw >= 0
+    ? Math.floor(probeMaxSubpageFetchRaw)
+    : 3
+  ));
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
     url: String(urlToFetch || '').slice(0, 180),
     nocache: noCache,
-    signalsOnly
+    signalsOnly,
+    signalsFirstLight,
+    signalsFirstBalanced,
+    probe: probeMode || null
   });
   logSfMemory('scrape_enter');
 
@@ -3866,7 +5517,9 @@ async function scrapeOnce(req, res) {
         '--no-default-browser-check'
       ]
     });
+    scrapeTiming.browserReadyMs = Math.max(0, Date.now() - __timingBrowserStart);
 
+    const __timingPageReadyStart = Date.now();
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -3887,18 +5540,3134 @@ async function scrapeOnce(req, res) {
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    scrapeTiming.pageReadyMs = Math.max(0, Date.now() - __timingPageReadyStart);
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
+
+    if (probeMode === 'gototiming') {
+      const probeStartedAt = Date.now();
+      const blockedCounts = {
+        image: 0,
+        font: 0,
+        media: 0,
+        stylesheet: 0,
+        thirdPartyScript: 0,
+        total: 0
+      };
+      let targetOrigin = '';
+      try { targetOrigin = new URL(String(urlToFetch || '')).origin; } catch (_) {}
+      const routeSetupStart = Date.now();
+      try {
+        await page.route('**/*', async (route) => {
+          try {
+            const request = route.request();
+            const type = request.resourceType();
+            const requestUrl = request.url();
+            const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
+            let shouldBlockThirdPartyScript = false;
+            if (type === 'script' && targetOrigin) {
+              try { shouldBlockThirdPartyScript = new URL(requestUrl).origin !== targetOrigin; } catch (_) {}
+            }
+            if (shouldBlockType || shouldBlockThirdPartyScript) {
+              if (shouldBlockThirdPartyScript) blockedCounts.thirdPartyScript += 1;
+              else if (Object.prototype.hasOwnProperty.call(blockedCounts, type)) blockedCounts[type] += 1;
+              blockedCounts.total += 1;
+              return route.abort().catch(() => {});
+            }
+            return route.continue().catch(() => {});
+          } catch (_) {
+            return route.continue().catch(() => {});
+          }
+        });
+      } catch (_) {}
+      const routeSetupMs = Math.max(0, Date.now() - routeSetupStart);
+      let resp = null;
+      let errorMessage = '';
+      const gotoStart = Date.now();
+      logSf('GOTO_TIMING_PROBE_BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
+      logSfMemory('goto_timing_probe_before_goto');
+      try {
+        resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+      } catch (e) {
+        errorMessage = String(e && (e.message || e) || '').slice(0, 240);
+      }
+      const gotoMs = Math.max(0, Date.now() - gotoStart);
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const pageSignals = await page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        return {
+          title: clean(document.title || '').slice(0, 180),
+          bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent)).length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          scriptCount: document.querySelectorAll('script').length
+        };
+      }).catch(() => ({
+        title: '',
+        bodyTextLength: null,
+        anchorCount: null,
+        scriptCount: null
+      }));
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const statusText = resp && typeof resp.statusText === 'function' ? resp.statusText() : null;
+      const out = {
+        ok: !errorMessage,
+        mode: 'gotoTimingProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        errorMessage,
+        timings: {
+          browserReadyMs: typeof scrapeTiming.browserReadyMs === 'number' ? scrapeTiming.browserReadyMs : null,
+          pageReadyMs: typeof scrapeTiming.pageReadyMs === 'number' ? scrapeTiming.pageReadyMs : null,
+          routeSetupMs,
+          gotoMs,
+          totalMs: Math.max(0, Date.now() - probeStartedAt)
+        },
+        responseInfo: {
+          status,
+          statusText,
+          finalUrl
+        },
+        pageSignals,
+        blockedCounts,
+        diagnostics: {
+          probeOnly: true,
+          balancedSkipped: true,
+          fullScrapeSkipped: true,
+          evaluationSkipped: true,
+          gotoTimeoutMs: 12000,
+          blockedResourceTypes: ['image', 'font', 'media', 'stylesheet', 'thirdPartyScript']
+        }
+      };
+      logSf('GOTO_TIMING_PROBE_SEND', {
+        ok: out.ok,
+        status: out.status,
+        errorMessage: out.errorMessage,
+        timings: out.timings,
+        blockedCounts: out.blockedCounts,
+        pageSignals: out.pageSignals
+      });
+      logSfMemory('goto_timing_probe_send');
+      return res.status(200).json(out);
+    }
+
+    if (probeMode === 'shortfastphases' || probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver' || balancedShortFastResponse) {
+      const unifiedBalancedObserverProbe = probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver';
+      const probeStartedAt = Date.now();
+      const phases = [];
+      const blockedCounts = {
+        image: 0,
+        font: 0,
+        media: 0,
+        stylesheet: 0,
+        thirdPartyScript: 0,
+        total: 0
+      };
+      let targetOrigin = '';
+      try { targetOrigin = new URL(String(urlToFetch || '')).origin; } catch (_) {}
+      const routeSetupStart = Date.now();
+      try {
+        await page.route('**/*', async (route) => {
+          try {
+            const request = route.request();
+            const type = request.resourceType();
+            const requestUrl = request.url();
+            const shouldBlockType = ['image', 'font', 'media', 'stylesheet'].includes(type);
+            let shouldBlockThirdPartyScript = false;
+            if (type === 'script' && targetOrigin) {
+              try { shouldBlockThirdPartyScript = new URL(requestUrl).origin !== targetOrigin; } catch (_) {}
+            }
+            if (shouldBlockType || shouldBlockThirdPartyScript) {
+              if (shouldBlockThirdPartyScript) blockedCounts.thirdPartyScript += 1;
+              else if (Object.prototype.hasOwnProperty.call(blockedCounts, type)) blockedCounts[type] += 1;
+              blockedCounts.total += 1;
+              return route.abort().catch(() => {});
+            }
+            return route.continue().catch(() => {});
+          } catch (_) {
+            return route.continue().catch(() => {});
+          }
+        });
+      } catch (_) {}
+      const routeSetupMs = Math.max(0, Date.now() - routeSetupStart);
+      const withTimeout = (promise, ms, label) => Promise.race([
+        Promise.resolve().then(() => promise),
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
+      ]);
+      const runPhase = async (name, fn, timeoutMs = 3000) => {
+        const started = Date.now();
+        const phase = {
+          name,
+          ok: false,
+          elapsedMs: 0,
+          errorMessage: '',
+          minimalResult: null
+        };
+        try {
+          phase.minimalResult = await withTimeout(fn(), timeoutMs, name);
+          phase.ok = true;
+        } catch (e) {
+          phase.errorMessage = String(e && (e.message || e) || '').slice(0, 240);
+        }
+        phase.elapsedMs = Math.max(0, Date.now() - started);
+        phases.push(phase);
+        return phase;
+      };
+      let resp = null;
+      let gotoPhase = null;
+      let finalUrl = urlToFetch;
+      let status = null;
+      await runPhase('goto', async () => {
+        resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 12000 });
+        finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+        status = resp && typeof resp.status === 'function' ? resp.status() : null;
+        return {
+          status,
+          statusText: resp && typeof resp.statusText === 'function' ? resp.statusText() : null,
+          finalUrl
+        };
+      }, 13000);
+      gotoPhase = phases[phases.length - 1];
+      finalUrl = page && typeof page.url === 'function' ? page.url() : finalUrl;
+      status = resp && typeof resp.status === 'function' ? resp.status() : status;
+
+      await runPhase('hydrationGuardedWait', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        const before = await page.evaluate(() => ({
+          bodyTextLength: String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          shadowAnchorCount: (() => {
+            let count = 0;
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 2 || count >= 200) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el) return;
+                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) count += 1;
+                if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            try { walk(document, 0); } catch (_) {}
+            return count;
+          })()
+        })).catch(() => ({ bodyTextLength: 0, anchorCount: 0 }));
+        await page.waitForFunction(({ before }) => {
+          const bodyTextLength = String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length;
+          const anchorCount = document.querySelectorAll('a[href]').length;
+          let shadowAnchorCount = 0;
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 2 || shadowAnchorCount >= 200) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
+              if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          };
+          try { walk(document, 0); } catch (_) {}
+          return anchorCount > Math.max(0, before.anchorCount) || anchorCount >= 5 ||
+            shadowAnchorCount > Math.max(0, before.shadowAnchorCount) || shadowAnchorCount >= 5 ||
+            bodyTextLength > Math.max(1800, before.bodyTextLength + 400);
+        }, { before }, { timeout: 2500, polling: 250 }).catch(() => {});
+        const after = await page.evaluate(() => ({
+          bodyTextLength: String(document.body && (document.body.innerText || document.body.textContent) || '').replace(/\s+/g, ' ').trim().length,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          shadowAnchorCount: (() => {
+            let count = 0;
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 2 || count >= 200) return;
+              const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+              nodes.forEach((el) => {
+                if (!el) return;
+                if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) count += 1;
+                if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            try { walk(document, 0); } catch (_) {}
+            return count;
+          })()
+        })).catch(() => ({ bodyTextLength: 0, anchorCount: 0, shadowAnchorCount: 0 }));
+        return {
+          skipped: false,
+          limited: true,
+          waitMs: 2500,
+          bodyTextBeforeWait: before.bodyTextLength,
+          bodyTextAfterWait: after.bodyTextLength,
+          anchorCountBeforeWait: before.anchorCount,
+          anchorCountAfterWait: after.anchorCount,
+          shadowAnchorCountBeforeWait: before.shadowAnchorCount,
+          shadowAnchorCountAfterWait: after.shadowAnchorCount,
+          hydrationImprovedBodyText: after.bodyTextLength > before.bodyTextLength,
+          hydrationImprovedLinks: after.anchorCount > before.anchorCount || after.shadowAnchorCount > before.shadowAnchorCount
+        };
+      }, 3000);
+
+      await runPhase('basicDomEval', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const readableBodyText = () => {
+          try {
+            const clone = document.body && document.body.cloneNode(true);
+            if (!clone) return '';
+            clone.querySelectorAll('script,style,noscript,template,svg').forEach((el) => el.remove());
+            return clean(clone.innerText || clone.textContent);
+          } catch (_) {
+            return clean(document.body && document.body.innerText);
+          }
+        };
+        const looksLikeScriptOrWarning = (text) => {
+          const t = clean(text).slice(0, 500);
+          if (!t) return true;
+          if (/window\.fetch|document\.|function\s*\(|<script|<\/?[a-z][^>]*>/i.test(t)) return true;
+          if (/JavaScriptを有効にしてください|javascript is required/i.test(t) && t.length < 220) return true;
+          return false;
+        };
+        const normalizeBodySample = (text) => clean(String(text || '')
+          .replace(/<[^>]*>/g, ' ')
+          .replace(/[^{}]{0,120}\{[^{}]*\}/g, ' ')
+          .replace(/if\s*\(!window\.fetch\)[\s\S]*/i, ' ')
+          .replace(/JavaScriptを有効にしてください/gi, ' ')
+        );
+        const shadowTextParts = [];
+        try {
+          const walkShadow = (root, depth = 0) => {
+            if (!root || depth > 4 || shadowTextParts.length >= 50) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || shadowTextParts.length >= 50) return;
+              const tag = String(el.tagName || '').toLowerCase();
+              if (['script', 'style', 'noscript', 'template', 'svg'].includes(tag)) return;
+              const text = clean(el.innerText || el.textContent);
+              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 300));
+              if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadow(document, 0);
+        } catch (_) {}
+        const domBodyText = readableBodyText();
+        const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+        const sampleCandidates = [
+          clean(shadowTextParts.join(' ')),
+          domBodyText,
+          bodyText
+        ].map(normalizeBodySample).filter(Boolean);
+        const bodyTextSample = (sampleCandidates.find((text) => !looksLikeScriptOrWarning(text)) || bodyText || '').slice(0, 800);
+        const metaEl =
+          document.querySelector('meta[name="description" i]') ||
+          document.querySelector('meta[property="og:description" i]') ||
+          document.querySelector('meta[name="twitter:description" i]');
+        const metaDescription = clean(metaEl && metaEl.getAttribute('content'));
+        return {
+          title: clean(document.title || '').slice(0, 180),
+          metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
+          metaDescriptionLength: metaDescription ? metaDescription.length : 0,
+          bodyTextLength: bodyText.length,
+          bodyTextSample,
+          anchorCount: document.querySelectorAll('a[href]').length,
+          scriptCount: document.querySelectorAll('script').length,
+          shadowTextPartsCount: shadowTextParts.length
+        };
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
+
+      await runPhase('structuredDataLight', async () => {
+        const rendered = await page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const texts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+            .map((s) => clean(s.textContent || ''))
+            .filter(Boolean);
+          let parseableCount = 0;
+          let parseErrorsCount = 0;
+          const types = [];
+          const walk = (node, depth = 0) => {
+            if (depth > 8 || node == null) return;
+            if (Array.isArray(node)) return node.forEach((item) => walk(item, depth + 1));
+            if (typeof node !== 'object') return;
+            const t = node['@type'];
+            if (Array.isArray(t)) t.forEach((x) => types.push(clean(x)));
+            else if (t) types.push(clean(t));
+            if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walk(item, depth + 1));
+          };
+          texts.forEach((txt) => {
+            try {
+              walk(JSON.parse(txt), 0);
+              parseableCount += 1;
+            } catch (_) {
+              parseErrorsCount += 1;
+            }
+          });
+          return {
+            renderedDomRawCount: texts.length,
+            renderedDomParseableCount: parseableCount,
+            renderedDomParseErrorsCount: parseErrorsCount,
+            renderedDomTypes: Array.from(new Set(types.filter(Boolean))).slice(0, 20)
+          };
+        });
+        const htmlSummary = await collectHtmlContentJsonLdSummaryLight(page);
+        return {
+          renderedDomRawCount: rendered.renderedDomRawCount,
+          renderedDomParseableCount: rendered.renderedDomParseableCount,
+          htmlContentRawCount: htmlSummary && htmlSummary.rawCount,
+          htmlContentParseableCount: htmlSummary && htmlSummary.parseableCount,
+          types: Array.from(new Set([].concat(rendered.renderedDomTypes || [], htmlSummary && htmlSummary.types || []).filter(Boolean))).slice(0, 20),
+          parseErrorsCount: Number(rendered.renderedDomParseErrorsCount || 0) + Number(htmlSummary && htmlSummary.parseErrorsCount || 0)
+        };
+      }, 3000);
+
+      await runPhase('sameOriginScriptJsonLd', async () => {
+        const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
+          maxScripts: unifiedBalancedObserverProbe ? 10 : 3,
+          maxBytesPerScript: unifiedBalancedObserverProbe ? 1000000 : 512000,
+          requestTimeoutMs: unifiedBalancedObserverProbe ? 7000 : 3000
+        });
+        return {
+          scriptSrcCount: summary.scriptSrcCount,
+          sameOriginScriptCount: summary.sameOriginScriptCount,
+          fetchedCount: summary.fetchedCount,
+          skippedLargeCount: summary.skippedLargeCount,
+          candidateCount: summary.candidateCount,
+          types: Array.isArray(summary.types) ? summary.types.slice(0, 20) : [],
+          appIndexDetected: !!summary.appIndexDetected,
+          totalFetchedBytes: summary.totalFetchedBytes,
+          maxScriptLength: summary.maxScriptLength,
+          error: summary.error || null
+        };
+      }, unifiedBalancedObserverProbe ? 8000 : 5000);
+
+      await runPhase('linksAndTrust', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const absUrl = (href) => {
+          try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
+        };
+        const uniqueBy = (items, keyFn, max) => {
+          const out = [];
+          const seen = new Set();
+          (items || []).forEach((item) => {
+            if (out.length >= max) return;
+            const key = clean(keyFn(item)).toLowerCase();
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            out.push(item);
+          });
+          return out;
+        };
+        const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+          text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
+          href: absUrl(a.getAttribute('href') || '').slice(0, 180),
+          navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+          source: 'dom'
+        })).filter((a) => a.href);
+        try {
+          const walkShadowAnchors = (root, depth = 0) => {
+            if (!root || depth > 2 || anchors.length >= 120) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el || anchors.length >= 120) return;
+              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
+                anchors.push({
+                  text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')).slice(0, 80),
+                  href: absUrl(el.getAttribute('href') || '').slice(0, 180),
+                  navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  source: 'open_shadow_dom_light'
+                });
+              }
+              if (el.shadowRoot) walkShadowAnchors(el.shadowRoot, depth + 1);
+            });
+          };
+          walkShadowAnchors(document, 0);
+        } catch (_) {}
+        const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
+        const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+        const navTextItems = uniqueBy(
+          anchors.filter((a) => a.navLike && a.text),
+          (a) => a.text,
+          50
+        );
+        const internalItems = uniqueBy(
+          anchors.filter((a) => {
+            try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
+          }),
+          (a) => `${a.text} ${a.href}`,
+          50
+        );
+        return {
+          anchorCount: anchors.length,
+          rawNavAnchorCount: anchors.filter((a) => a.navLike).length,
+          navLinkCount: navTextItems.length,
+          internalLinkCount: internalItems.length,
+          navTextsSample: navTextItems.map((a) => a.text),
+          internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
+          hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
+          hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
+          hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
+          hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
+        };
+      }), 3000);
+
+      await runPhase('multimodal', async () => page.evaluate(() => {
+        const has = (sel) => !!document.querySelector(sel);
+        return {
+          hasOgImage: has('meta[property="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"]'),
+          hasTwitterImage: has('meta[name="twitter:image"],meta[name="twitter:image:src"]'),
+          hasFavicon: has('link[rel~="icon"][href],link[rel="shortcut icon"][href]'),
+          hasAppleTouchIcon: has('link[rel~="apple-touch-icon"][href],link[rel="apple-touch-icon-precomposed"][href]'),
+          imgCount: document.querySelectorAll('img').length
+        };
+      }), unifiedBalancedObserverProbe ? 1000 : 3000);
+
+      await runPhase('headingsLight', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const texts = (sel, max) => Array.from(document.querySelectorAll(sel)).map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, max);
+        const h1 = texts('h1', 5);
+        const h2 = texts('h2', 10);
+        const h3 = texts('h3', 10);
+        const title = clean(document.title || '');
+        return {
+          h1Count: h1.length,
+          h2Count: h2.length,
+          h3Count: h3.length,
+          h1Source: h1.length ? 'dom' : 'not_observed',
+          primaryHeadingCandidate: h1[0] || title || '',
+          primaryHeadingCandidateSource: h1[0] ? 'dom_h1' : (title ? 'title' : 'not_observed'),
+          h1EquivalentCandidateFound: false,
+          headingTextsSample: h1.concat(h2).concat(h3).slice(0, 10)
+        };
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
+
+      await runPhase('landmarksLight', async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const main = document.querySelector('main');
+        const roleMain = !main ? document.querySelector('[role="main"]') : null;
+        const confirmedMain = main || roleMain;
+        const appCandidate = document.querySelector('#main,#main-content,#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]');
+        return {
+          hasMainLandmark: confirmedMain ? true : null,
+          hasMainLandmark_final: confirmedMain ? true : null,
+          mainLandmarkSource: main ? 'dom_main_light' : (roleMain ? 'dom_role_main_light' : 'not_observed'),
+          mainLandmarkCandidateFound: !confirmedMain && !!appCandidate,
+          mainLandmarkCandidateSource: !confirmedMain && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
+          mainLandmarkCandidateTextLength: appCandidate ? clean(appCandidate.innerText || appCandidate.textContent).length : 0
+        };
+      }), unifiedBalancedObserverProbe ? 2000 : 3000);
+
+      await runPhase('optionalEnhancedShadow', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        return page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const out = {
+            skipped: false,
+            limited: true,
+            shadowHostCount: 0,
+            shadowAnchorCount: 0,
+            shadowHeadingCount: 0,
+            shadowHeadingTexts: [],
+            shadowNavTextsSample: []
+          };
+          const seenNav = new Set();
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 2 || out.shadowHostCount > 80) return;
+            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+            nodes.forEach((el) => {
+              if (!el) return;
+              if (el.shadowRoot) {
+                out.shadowHostCount += 1;
+                walk(el.shadowRoot, depth + 1);
+              }
+              const tag = String(el.tagName || '').toLowerCase();
+              if (/^h[1-3]$/.test(tag)) {
+                const text = clean(el.innerText || el.textContent);
+                if (text && out.shadowHeadingTexts.length < 12) out.shadowHeadingTexts.push(text.slice(0, 160));
+                out.shadowHeadingCount += 1;
+              }
+              if (tag === 'a' && el.getAttribute && el.getAttribute('href')) {
+                out.shadowAnchorCount += 1;
+                const navLike = !!el.closest('nav,[role="navigation"],header,footer');
+                const text = clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+                if (navLike && text && !seenNav.has(text) && out.shadowNavTextsSample.length < 10) {
+                  seenNav.add(text);
+                  out.shadowNavTextsSample.push(text.slice(0, 100));
+                }
+              }
+            });
+          };
+          try { walk(document, 0); } catch (_) {}
+          return out;
+        });
+      }, 2000);
+
+      await runPhase('optionalA11y', async () => {
+        if (!unifiedBalancedObserverProbe) {
+          return {
+            skipped: true,
+            reason: 'not_unified_balanced_observer_probe'
+          };
+        }
+        const headings = await page.getByRole('heading').evaluateAll((els) => els.slice(0, 20).map((el) => ({
+          text: String(el && (el.innerText || el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+          ariaLevel: el && el.getAttribute ? el.getAttribute('aria-level') : null,
+          tagName: String(el && el.tagName || '').toLowerCase()
+        }))).catch(() => []);
+        const mainCount = await page.getByRole('main').count().catch(() => null);
+        return {
+          skipped: false,
+          limited: true,
+          headingCount: Array.isArray(headings) ? headings.length : 0,
+          headings: Array.isArray(headings) ? headings.filter((h) => h && h.text).slice(0, 10) : [],
+          mainCount
+        };
+      }, 2000);
+
+      await runPhase('buildShortPayload', async () => {
+        const phaseSummary = {};
+        phases.forEach((p) => {
+          phaseSummary[p.name] = {
+            ok: p.ok,
+            elapsedMs: p.elapsedMs,
+            errorMessage: p.errorMessage || ''
+          };
+        });
+        return {
+          phaseCount: phases.length + 1,
+          failedPhaseNames: phases.filter((p) => !p.ok).map((p) => p.name),
+          phaseSummary
+        };
+      }, 1000);
+
+      const phaseByName = (name) => phases.find((p) => p && p.name === name) || {};
+      const phaseResult = (name) => {
+        const phase = phaseByName(name);
+        return phase && phase.minimalResult && typeof phase.minimalResult === 'object' ? phase.minimalResult : {};
+      };
+      const hydrationGuardedWait = phaseResult('hydrationGuardedWait');
+      const basicDom = phaseResult('basicDomEval');
+      const structuredLight = phaseResult('structuredDataLight');
+      const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
+      const linksTrust = phaseResult('linksAndTrust');
+      const multimodal = phaseResult('multimodal');
+      const headingsLight = phaseResult('headingsLight');
+      const landmarksLight = phaseResult('landmarksLight');
+      const enhancedShadow = phaseResult('optionalEnhancedShadow');
+      const optionalA11y = phaseResult('optionalA11y');
+      const unifiedBodyTextLength = Math.max(
+        Number(basicDom.bodyTextLength || 0),
+        Number(hydrationGuardedWait.bodyTextAfterWait || 0)
+      );
+      const unifiedBodyTextSample = typeof basicDom.bodyTextSample === 'string' && basicDom.bodyTextSample.trim()
+        ? basicDom.bodyTextSample.replace(/\s+/g, ' ').trim().slice(0, 800)
+        : '';
+      const mainLandmarkFinal = Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
+        ? landmarksLight.hasMainLandmark_final
+        : null;
+      const mainLandmarkSource = mainLandmarkFinal === true
+        ? (landmarksLight.mainLandmarkSource && landmarksLight.mainLandmarkSource !== 'not_observed'
+          ? landmarksLight.mainLandmarkSource
+          : 'not_observed')
+        : (landmarksLight.mainLandmarkSource || 'not_observed');
+      const mainLandmarkConfidence = mainLandmarkFinal === true ? 'high' : 'low';
+      const structuredDataPhase = phaseByName('structuredDataLight');
+      const sameOriginScriptJsonLdPhase = phaseByName('sameOriginScriptJsonLd');
+      const phaseStatuses = phases.map((p) => ({
+        name: p.name,
+        ok: !!p.ok,
+        skipped: !!(p.minimalResult && p.minimalResult.skipped),
+        limited: !!(p.minimalResult && p.minimalResult.limited),
+        elapsedMs: p.elapsedMs,
+        errorMessage: p.errorMessage || ''
+      }));
+      const observationLimitedByPhase = phaseStatuses
+        .filter((p) => !p.ok || p.skipped || p.limited)
+        .map((p) => ({
+          phase: p.name,
+          reason: p.errorMessage || (p.skipped ? 'skipped' : (p.limited ? 'limited' : 'not_ok'))
+        }));
+      const mergedTypes = Array.from(new Set([]
+        .concat(Array.isArray(structuredLight.types) ? structuredLight.types : [])
+        .concat(Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types : [])
+        .filter(Boolean)
+      )).slice(0, 50);
+      const typeSet = new Set(mergedTypes.map((t) => String(t || '').toLowerCase()));
+      const structuredDataPhaseDebug = {
+        phaseOk: !!(structuredDataPhase && structuredDataPhase.ok),
+        phaseElapsedMs: structuredDataPhase && typeof structuredDataPhase.elapsedMs === 'number' ? structuredDataPhase.elapsedMs : null,
+        phaseErrorMessage: structuredDataPhase && structuredDataPhase.errorMessage ? structuredDataPhase.errorMessage : '',
+        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
+        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
+        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
+        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
+        jsonldTypes: Array.isArray(structuredLight.types) ? structuredLight.types.slice(0, 30) : [],
+        parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
+        timedOut: !!(structuredDataPhase && /timeout/i.test(String(structuredDataPhase.errorMessage || ''))),
+        resultWasEmpty: !structuredLight || (
+          Number(structuredLight.renderedDomRawCount || 0) === 0 &&
+          Number(structuredLight.htmlContentRawCount || 0) === 0 &&
+          !(Array.isArray(structuredLight.types) && structuredLight.types.length)
+        )
+      };
+      const sameOriginScriptJsonLdPhaseDebug = {
+        phaseOk: !!(sameOriginScriptJsonLdPhase && sameOriginScriptJsonLdPhase.ok),
+        phaseElapsedMs: sameOriginScriptJsonLdPhase && typeof sameOriginScriptJsonLdPhase.elapsedMs === 'number' ? sameOriginScriptJsonLdPhase.elapsedMs : null,
+        phaseErrorMessage: sameOriginScriptJsonLdPhase && sameOriginScriptJsonLdPhase.errorMessage ? sameOriginScriptJsonLdPhase.errorMessage : '',
+        scriptSrcCount: Number(scriptJsonLd.scriptSrcCount || 0),
+        sameOriginScriptCount: Number(scriptJsonLd.sameOriginScriptCount || 0),
+        fetchedCount: Number(scriptJsonLd.fetchedCount || 0),
+        skippedLargeCount: Number(scriptJsonLd.skippedLargeCount || 0),
+        candidateCount: Number(scriptJsonLd.candidateCount || 0),
+        jsonldTypes: Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types.slice(0, 30) : [],
+        appIndexDetected: !!scriptJsonLd.appIndexDetected,
+        totalFetchedBytes: Number(scriptJsonLd.totalFetchedBytes || 0),
+        maxScriptLength: Number(scriptJsonLd.maxScriptLength || 0),
+        timedOut: !!(sameOriginScriptJsonLdPhase && /timeout/i.test(String(sameOriginScriptJsonLdPhase.errorMessage || ''))),
+        resultWasEmpty: !scriptJsonLd || (
+          Number(scriptJsonLd.candidateCount || 0) === 0 &&
+          !(Array.isArray(scriptJsonLd.types) && scriptJsonLd.types.length)
+        ),
+        fetchErrorsCount: Number(scriptJsonLd.fetchErrorsCount || 0),
+        fetchErrorsSample: Array.isArray(scriptJsonLd.fetchErrorsSample) ? scriptJsonLd.fetchErrorsSample.slice(0, 5) : []
+      };
+      const structuredDataLight = {
+        types: mergedTypes,
+        rawCount: Number(structuredLight.renderedDomRawCount || 0) + Number(structuredLight.htmlContentRawCount || 0) + Number(scriptJsonLd.candidateCount || 0),
+        parseableCount: Number(structuredLight.renderedDomParseableCount || 0) + Number(structuredLight.htmlContentParseableCount || 0),
+        hasJsonLd: mergedTypes.length > 0 || Number(structuredLight.renderedDomRawCount || 0) > 0 || Number(structuredLight.htmlContentRawCount || 0) > 0 || Number(scriptJsonLd.candidateCount || 0) > 0,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        source: 'shortfast_phase_builder',
+        confidence: 'medium',
+        observationLimited: true,
+        observationScope: 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_only',
+        renderedDomObserved: true,
+        renderedDomRawCount: Number(structuredLight.renderedDomRawCount || 0),
+        renderedDomParseableCount: Number(structuredLight.renderedDomParseableCount || 0),
+        htmlContentLdJsonObserved: true,
+        htmlContentRawCount: Number(structuredLight.htmlContentRawCount || 0),
+        htmlContentParseableCount: Number(structuredLight.htmlContentParseableCount || 0),
+        scriptSrcJsonLdObserved: true,
+        scriptSrcCandidateCount: Number(scriptJsonLd.sameOriginScriptCount || 0),
+        scriptSrcFetchedCount: Number(scriptJsonLd.fetchedCount || 0),
+        scriptSrcJsonLdCandidateCount: Number(scriptJsonLd.candidateCount || 0),
+        scriptSrcJsonLdTypes: Array.isArray(scriptJsonLd.types) ? scriptJsonLd.types.slice(0, 50) : [],
+        scriptSrcSkippedLargeCount: Number(scriptJsonLd.skippedLargeCount || 0),
+        scriptSrcAppIndexDetected: !!scriptJsonLd.appIndexDetected,
+        htmlScanSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true,
+        parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
+        scriptSrcError: scriptJsonLd.error || null
+      };
+      const geoSignalsV1 = {
+        version: 'geoSignalsV1',
+        generatedAt: new Date().toISOString(),
+        url: String(finalUrl || urlToFetch || ''),
+        structuredData: structuredDataLight,
+        headings: {
+          h1Count: Number(headingsLight.h1Count || 0),
+          h2Count: Number(headingsLight.h2Count || 0),
+          h3Count: Number(headingsLight.h3Count || 0),
+          hasH1: Number(headingsLight.h1Count || 0) > 0,
+          hasSingleH1: Number(headingsLight.h1Count || 0) === 1,
+          h1Texts: [],
+          headingTexts: Array.from(new Set([]
+            .concat(Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample : [])
+            .concat(Array.isArray(enhancedShadow.shadowHeadingTexts) ? enhancedShadow.shadowHeadingTexts : [])
+            .concat(Array.isArray(optionalA11y.headings) ? optionalA11y.headings.map((h) => h && h.text).filter(Boolean) : [])
+          )).slice(0, 12),
+          primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
+          primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
+          primaryHeadingConfidence: headingsLight.primaryHeadingCandidate ? 'low' : 'low',
+          h1EquivalentCandidateFound: !!headingsLight.h1EquivalentCandidateFound,
+          sectionHeadingCandidate: '',
+          sectionHeadingCandidateSource: 'not_observed',
+          sectionHeadingConfidence: 'low',
+          source: Number(headingsLight.h1Count || 0) > 0 ? 'dom' : 'dom_light',
+          h1Source: headingsLight.h1Source || 'not_observed',
+          headingObservationLimited: Number(headingsLight.h1Count || 0) === 0,
+          excludedHeadingCount: 0,
+          excludedHeadingReasons: [],
+          a11yObserved: false
+        },
+        balanced: {
+          enabled: true,
+          shortFastDedicatedPath: true,
+          observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+          phaseGuarded: !!unifiedBalancedObserverProbe,
+          shadowHeadingScan: !!unifiedBalancedObserverProbe,
+          shadowHeadingObserved: Number(enhancedShadow.shadowHeadingCount || 0) > 0,
+          shadowHostCount: Number(enhancedShadow.shadowHostCount || 0),
+          shadowH1Texts: [],
+          shadowH2Texts: Array.isArray(enhancedShadow.shadowHeadingTexts) ? enhancedShadow.shadowHeadingTexts.slice(0, 5) : [],
+          primaryHeadingCandidate: headingsLight.primaryHeadingCandidate || basicDom.title || '',
+          primaryHeadingCandidateSource: headingsLight.primaryHeadingCandidateSource || (basicDom.title ? 'title' : 'not_observed'),
+          primaryHeadingConfidence: 'low',
+          h1EquivalentCandidateFound: !!headingsLight.h1EquivalentCandidateFound,
+          boundedWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+          hydration: {
+            waitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+            bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
+            bodyTextAfterWait: unifiedBodyTextLength,
+            anchorCountBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.anchorCountBeforeWait === 'number' ? hydrationGuardedWait.anchorCountBeforeWait : Number(basicDom.anchorCount || 0),
+            anchorCountAfterWait: Number(basicDom.anchorCount || 0),
+            navLinkCountBeforeWait: Number(linksTrust.navLinkCount || 0),
+            navLinkCountAfterWait: Number(linksTrust.navLinkCount || 0),
+            improvedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+            improvedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks)
+          },
+          h1Attempts: {
+            dom: { count: Number(headingsLight.h1Count || 0), source: 'dom_light' },
+            a11y: unifiedBalancedObserverProbe
+              ? { count: Number(optionalA11y.headingCount || 0), observed: true, limited: !!optionalA11y.limited, source: 'a11y_role_heading_light' }
+              : { count: 0, observed: false, error: 'skipped_shortfast_dedicated_path', source: 'a11y' },
+            iframeSameOrigin: { count: 0, iframeCount: 0, accessibleCount: 0, blockedCount: 0, source: 'iframe_same_origin' }
+          }
+        },
+        landmarks: {
+          hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ? landmarksLight.hasMainLandmark : null,
+          hasMainLandmark_final: mainLandmarkFinal,
+          mainLandmarkSource,
+          mainLandmarkConfidence,
+          mainLandmarkTextsSample: [],
+          mainLandmarkCandidateFound: !!landmarksLight.mainLandmarkCandidateFound,
+          mainLandmarkCandidateSource: landmarksLight.mainLandmarkCandidateSource || 'not_observed',
+          mainLandmarkCandidateConfidence: landmarksLight.mainLandmarkCandidateFound ? 'low' : 'low',
+          mainLandmarkCandidateTextsSample: [],
+          mainLandmarkObservationLimited: mainLandmarkFinal !== true,
+          a11yObserved: !!unifiedBalancedObserverProbe,
+          a11yMainCount: unifiedBalancedObserverProbe && typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
+        },
+        multimodalSignals: {
+          checked: true,
+          hasImage: !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0),
+          hasStructured: null,
+          hasOgImage: !!multimodal.hasOgImage,
+          hasTwitterImage: !!multimodal.hasTwitterImage,
+          hasFavicon: !!multimodal.hasFavicon,
+          hasAppleTouchIcon: !!multimodal.hasAppleTouchIcon,
+          hasStructuredLogo: null,
+          imageObjectCount: null,
+          structuredImageCount: null,
+          imgCount: Number(multimodal.imgCount || 0),
+          primaryImageOfPage: '',
+          sampleImageUrls: [],
+          source: 'shortfast_phase_builder'
+        },
+        trustSignals: {
+          hasContactLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactPathFound: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactObservedFromDom: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+          contactObservedFromScriptHint: false,
+          contactPathHintOnly: false,
+          contactLinkSample: null,
+          hasCompanyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+          hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+          source: 'shortfast_phase_builder'
+        },
+        observed: {
+          title: {
+            value: basicDom.title || null,
+            observed: !!basicDom.title,
+            source: 'rendered_dom_light',
+            confidence: basicDom.title ? 'high' : 'low'
+          },
+          metaDescription: {
+            value: basicDom.metaDescription || null,
+            observed: !!basicDom.metaDescription,
+            source: basicDom.metaDescription ? 'basic_dom_eval' : 'not_observed',
+            confidence: basicDom.metaDescription ? 'high' : 'low',
+            length: Number(basicDom.metaDescriptionLength || (basicDom.metaDescription ? basicDom.metaDescription.length : 0)) || 0
+          },
+          h1: {
+            values: [],
+            count: Number(headingsLight.h1Count || 0),
+            observed: true,
+            source: headingsLight.h1Source || 'not_observed',
+            confidence: Number(headingsLight.h1Count || 0) > 0 ? 'high' : 'low',
+            hasH1: Number(headingsLight.h1Count || 0) > 0,
+            hasSingleH1: Number(headingsLight.h1Count || 0) === 1,
+            headingObservationLimited: Number(headingsLight.h1Count || 0) === 0
+          },
+          headings: null,
+          links: {
+            navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 50) : [],
+            internalLinksSample: Array.isArray(linksTrust.internalLinksSample) ? linksTrust.internalLinksSample.slice(0, 50) : [],
+            hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+            hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
+            hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+            hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+            source: 'rendered_dom_light',
+            confidence: 'medium'
+          },
+          structuredData: structuredDataLight,
+          landmarks: null,
+          multimodalSignals: null,
+          trustSignals: null,
+          body: {
+            textLength: unifiedBodyTextLength,
+            sample: unifiedBodyTextSample || null,
+            observed: !!unifiedBodyTextSample,
+            source: 'rendered_dom_light',
+            confidence: 'medium'
+          }
+        },
+        diagnostics: {
+          evaluateCount: phases.length,
+          balancedMode: true,
+          shortFastMode: true,
+          shortFastDedicatedPath: true,
+          observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+          unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+          phaseGuardedObserver: !!unifiedBalancedObserverProbe,
+          reusedPhaseProbeBuilder: true,
+          skippedHeavyBalancedBuilder: true,
+          boundedHydrationWaitMs: unifiedBalancedObserverProbe ? 2500 : 0,
+          hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+          bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
+          bodyTextAfterWait: unifiedBodyTextLength,
+          hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+          hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
+          jsBundleAnalysis: false,
+          resourceChunkScan: false,
+          shadowHeadingScan: !!unifiedBalancedObserverProbe,
+          a11yHeadingScan: !!unifiedBalancedObserverProbe,
+          appRootHeadingScan: false,
+          heroHeadingScan: false,
+          iframeHeadingScan: false,
+          primaryHeadingScan: true,
+          shadowPrimaryHeadingScan: false,
+          mainCandidateScan: true,
+          htmlContentLdJsonScan: true,
+          skippedScans: unifiedBalancedObserverProbe
+            ? ['iframe_heading_scan', 'large_samples', 'heavy_balanced_builder', 'resource_chunk_scan']
+            : ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder'],
+          phaseStatuses,
+          observationLimitedByPhase,
+          phaseTimings: {
+            gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
+            hydrationGuardedWaitMs: phaseByName('hydrationGuardedWait').elapsedMs || null,
+            basicDomMs: phaseByName('basicDomEval').elapsedMs || null,
+            structuredDataMs: phaseByName('structuredDataLight').elapsedMs || null,
+            sameOriginScriptJsonLdMs: phaseByName('sameOriginScriptJsonLd').elapsedMs || null,
+            linksMs: phaseByName('linksAndTrust').elapsedMs || null,
+            multimodalMs: phaseByName('multimodal').elapsedMs || null,
+            headingsMs: phaseByName('headingsLight').elapsedMs || null,
+            landmarksMs: phaseByName('landmarksLight').elapsedMs || null,
+            totalMs: Math.max(0, Date.now() - probeStartedAt)
+          },
+          structuredDataPhaseDebug,
+          sameOriginScriptJsonLdPhaseDebug
+        }
+      };
+      geoSignalsV1.observed.headings = Object.assign({}, geoSignalsV1.headings, {
+        h1: [],
+        h2: [],
+        h3: [],
+        headingTexts: Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample.slice(0, 10) : [],
+        a11y: { observed: false, error: 'skipped_shortfast_dedicated_path' }
+      });
+      geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
+      geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
+      geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
+      const lightweightSummary = {
+        title: basicDom.title || null,
+        metaDescription: basicDom.metaDescription || null,
+        metaDescriptionLen: Number(basicDom.metaDescriptionLength || (basicDom.metaDescription ? basicDom.metaDescription.length : 0)) || null,
+        h1Count: Number(headingsLight.h1Count || 0),
+        h2Count: Number(headingsLight.h2Count || 0),
+        h1Source: headingsLight.h1Source || 'not_observed',
+        headingSource: geoSignalsV1.headings.source,
+        primaryHeadingCandidate: geoSignalsV1.headings.primaryHeadingCandidate,
+        primaryHeadingCandidateSource: geoSignalsV1.headings.primaryHeadingCandidateSource,
+        primaryHeadingConfidence: geoSignalsV1.headings.primaryHeadingConfidence,
+        h1EquivalentCandidateFound: geoSignalsV1.headings.h1EquivalentCandidateFound,
+        headingObservationLimited: geoSignalsV1.headings.headingObservationLimited,
+        hasMainLandmark: geoSignalsV1.landmarks.hasMainLandmark,
+        hasMainLandmarkFinal: geoSignalsV1.landmarks.hasMainLandmark_final,
+        mainLandmarkSource: geoSignalsV1.landmarks.mainLandmarkSource,
+        mainLandmarkCandidateFound: geoSignalsV1.landmarks.mainLandmarkCandidateFound,
+        mainLandmarkCandidateSource: geoSignalsV1.landmarks.mainLandmarkCandidateSource,
+        mainLandmarkObservationLimited: geoSignalsV1.landmarks.mainLandmarkObservationLimited,
+        hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
+        bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
+        bodyTextAfterWait: unifiedBodyTextLength,
+        hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
+        balancedMode: true,
+        shortFastDedicatedPath: true,
+        headingShadowScan: false,
+        headingA11yScan: false,
+        navLinkCount: Number(linksTrust.navLinkCount || 0),
+        internalLinkCount: Number(linksTrust.internalLinkCount || 0),
+        hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
+        hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
+        hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
+        hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
+        bodyTextLength: unifiedBodyTextLength,
+        bodyTextSample: unifiedBodyTextSample || null,
+        mainTextHead: unifiedBodyTextSample || null,
+        jsonldCount: structuredDataLight.rawCount,
+        jsonldParseableCount: structuredDataLight.parseableCount,
+        jsonldParseErrorsCount: structuredDataLight.parseErrorsCount,
+        jsonldTypes: structuredDataLight.types.slice(0, 50),
+        hasJsonLd: structuredDataLight.hasJsonLd,
+        hasWebsiteJsonLd: structuredDataLight.hasWebsite,
+        hasOrgJsonLd: structuredDataLight.hasOrganization,
+        hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
+        hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        structuredDataObservationLimited: structuredDataLight.observationLimited,
+        structuredDataObservationScope: structuredDataLight.observationScope,
+        structuredDataRenderedDomObserved: structuredDataLight.renderedDomObserved,
+        structuredDataHtmlContentLdJsonObserved: structuredDataLight.htmlContentLdJsonObserved,
+        structuredDataScriptSrcJsonLdObserved: structuredDataLight.scriptSrcJsonLdObserved,
+        structuredDataScriptSrcFetchedCount: structuredDataLight.scriptSrcFetchedCount,
+        structuredDataScriptSrcJsonLdCandidateCount: structuredDataLight.scriptSrcJsonLdCandidateCount,
+        structuredDataScriptSrcJsonLdTypes: structuredDataLight.scriptSrcJsonLdTypes.slice(0, 50),
+        hasOgImage: geoSignalsV1.multimodalSignals.hasOgImage,
+        hasTwitterImage: geoSignalsV1.multimodalSignals.hasTwitterImage,
+        hasFavicon: geoSignalsV1.multimodalSignals.hasFavicon,
+        hasAppleTouchIcon: geoSignalsV1.multimodalSignals.hasAppleTouchIcon,
+        hasStructuredLogo: geoSignalsV1.multimodalSignals.hasStructuredLogo,
+        hasContactLink: geoSignalsV1.trustSignals.hasContactLink,
+        contactPathFound: geoSignalsV1.trustSignals.contactPathFound,
+        contactObservedFromDom: geoSignalsV1.trustSignals.contactObservedFromDom,
+        contactObservedFromScriptHint: geoSignalsV1.trustSignals.contactObservedFromScriptHint,
+        contactPathHintOnly: geoSignalsV1.trustSignals.contactPathHintOnly
+      };
+      const phaseFailed = (name) => {
+        const p = phaseByName(name);
+        return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
+      };
+      const limitedPhaseNames = observationLimitedByPhase.map((p) => p.phase);
+      const structuredDataReady = structuredDataLight.hasJsonLd === true || structuredDataLight.observationLimited === true;
+      const linksReady = !phaseFailed('linksAndTrust') && (
+        Number(linksTrust.navLinkCount || 0) > 0 ||
+        Number(linksTrust.internalLinkCount || 0) > 0 ||
+        Number(linksTrust.anchorCount || 0) > 0
+      );
+      const headingsReady = !phaseFailed('headingsLight') && Object.prototype.hasOwnProperty.call(headingsLight, 'h1Count');
+      const landmarksReady = !phaseFailed('landmarksLight') && (
+        Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ||
+        Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') ||
+        typeof optionalA11y.mainCount === 'number'
+      );
+      const trustReady = !phaseFailed('linksAndTrust') && (
+        typeof linksTrust.hasContactLikeLink === 'boolean' ||
+        typeof linksTrust.hasCompanyLikeLink === 'boolean' ||
+        typeof linksTrust.hasPrivacyLikeLink === 'boolean'
+      );
+      const multimodalReady = !phaseFailed('multimodal') && (
+        typeof multimodal.hasOgImage === 'boolean' ||
+        typeof multimodal.hasFavicon === 'boolean' ||
+        typeof multimodal.imgCount === 'number'
+      );
+      const recoveredCoreSignals = [
+        structuredDataReady,
+        linksReady,
+        headingsReady,
+        landmarksReady,
+        trustReady,
+        multimodalReady
+      ];
+      const recoveredCoreSignalCount = recoveredCoreSignals.filter(Boolean).length;
+      const basicDomFailed = phaseFailed('basicDomEval');
+      const basicDomFatalSuppressed = basicDomFailed && !phaseFailed('goto') && recoveredCoreSignalCount >= 4;
+      const recoveredFromBasicDomTimeout = basicDomFatalSuppressed;
+      const coreSignalsReady = !phaseFailed('goto') && (
+        !basicDomFailed ||
+        basicDomFatalSuppressed ||
+        !!basicDom.title ||
+        unifiedBodyTextLength > 0 ||
+        Number(linksTrust.anchorCount || 0) > 0 ||
+        Number(linksTrust.internalLinkCount || 0) > 0
+      );
+      const fatalPhaseFailures = phaseStatuses
+        .filter((p) => {
+          if (!p.ok && p.name === 'goto') return true;
+          if (!p.ok && p.name === 'basicDomEval') return !basicDomFatalSuppressed;
+          return false;
+        })
+        .map((p) => ({
+          phase: p.name,
+          errorMessage: p.errorMessage || 'core_phase_failed'
+        }));
+      const corePhaseFailures = ['structuredDataLight', 'sameOriginScriptJsonLd', 'linksAndTrust', 'multimodal', 'headingsLight', 'landmarksLight']
+        .filter((name) => phaseFailed(name));
+      const qualityReasons = [];
+      if (recoveredFromBasicDomTimeout) qualityReasons.push('basic_dom_timeout_but_core_signals_recovered');
+      if (!basicDom.title) qualityReasons.push('title_not_observed');
+      if (!unifiedBodyTextLength) qualityReasons.push('body_text_not_observed');
+      if (!coreSignalsReady) qualityReasons.push('core_signals_not_ready');
+      if (!structuredDataLight.hasJsonLd) qualityReasons.push('structured_data_not_observed_or_limited');
+      if (!linksReady) qualityReasons.push('links_not_ready');
+      if (!headingsReady) qualityReasons.push('headings_not_ready');
+      if (!landmarksReady) qualityReasons.push('landmarks_not_ready');
+      if (observationLimitedByPhase.length) qualityReasons.push('phase_observation_limited');
+      if (corePhaseFailures.length) qualityReasons.push('core_phase_failures:' + corePhaseFailures.join(','));
+      let qualityStatus = 'ready';
+      if (fatalPhaseFailures.length || !coreSignalsReady) {
+        qualityStatus = 'failed';
+      } else if (corePhaseFailures.length >= 2 || (!linksReady && !structuredDataReady)) {
+        qualityStatus = 'degraded';
+      } else if (qualityReasons.length || !structuredDataLight.hasJsonLd) {
+        qualityStatus = 'limited';
+      }
+      if (!qualityReasons.length) qualityReasons.push('all_core_observer_phases_ready');
+      lightweightSummary.qualityStatus = qualityStatus;
+      lightweightSummary.coreSignalsReady = coreSignalsReady;
+      lightweightSummary.observationLimitedByPhaseCount = observationLimitedByPhase.length;
+      const diagnostics = {
+        probeOnly: false,
+        responseMode: 'shortFast',
+        shortFastMode: true,
+        shortFastDedicatedPath: true,
+        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+        unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+        phaseGuardedObserver: !!unifiedBalancedObserverProbe,
+        reusedPhaseProbeBuilder: true,
+        skippedHeavyBalancedBuilder: true,
+        balancedMode: true,
+        htmlSkipped: true,
+        scoringSkipped: true,
+        auditSigSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true,
+        phaseTimings: geoSignalsV1.diagnostics.phaseTimings,
+        phases: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage || '' })),
+        phaseStatuses,
+        observationLimitedByPhase,
+        qualityStatus,
+        qualityReasons,
+        fatalPhaseFailures,
+        limitedPhaseNames,
+        structuredDataPhaseDebug,
+        sameOriginScriptJsonLdPhaseDebug,
+        coreSignalsReady,
+        recoveredFromBasicDomTimeout,
+        recoveredCoreSignalCount,
+        basicDomFatalSuppressed,
+        structuredDataReady,
+        linksReady,
+        headingsReady,
+        landmarksReady,
+        trustReady,
+        multimodalReady,
+        blockedCounts,
+        skippedScans: geoSignalsV1.diagnostics.skippedScans,
+        timeoutGuardMs: 60000
+      };
+      const memoryHints = {
+        avoidedHeavyBlocks: [
+          'html',
+          'scoring.html',
+          'auditSig',
+          'heavy_balanced_builder',
+          'deep_shadow_heading_scan',
+          'a11y_heading_scan',
+          'iframe_heading_scan',
+          'resource_js_tap',
+          'chunk_tap',
+          'productSpecComparisonSignals',
+          'responsePayloadHugeMerge'
+        ],
+        estimatedSavedBytes: null,
+        shortFastMode: true,
+        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+        skippedScans: diagnostics.skippedScans
+      };
+      if (unifiedBalancedObserverProbe) {
+        const unifiedPayload = {
+          ok: qualityStatus !== 'failed',
+          mode: 'unifiedBalancedObserverProbe',
+          qualityStatus,
+          qualityReasons,
+          fatalPhaseFailures,
+          limitedPhaseNames,
+          observer: 'unified',
+          url: urlToFetch,
+          finalUrl,
+          status,
+          geoSignalsV1,
+          lightweightSummary,
+          diagnostics: Object.assign({}, diagnostics, {
+            probeOnly: true,
+            responseMode: undefined,
+            shortFastMode: false,
+            shortFastDedicatedPath: false,
+            fullScrapeSkipped: true,
+            balancedMainlineSkipped: true,
+            rawHtmlReturned: false,
+            rawJsReturned: false,
+            phaseTimeoutsMs: {
+              goto: 12000,
+              hydrationGuardedWait: 3000,
+              basicDom: 2000,
+              structuredDataLight: 3000,
+              sameOriginScriptJsonLd: 8000,
+              linksAndTrust: 3000,
+              multimodal: 1000,
+              headingsLight: 2000,
+              landmarksLight: 2000,
+              optionalEnhancedShadow: 2000,
+              optionalA11y: 2000
+            }
+          }),
+          memoryHints
+        };
+        try {
+          unifiedPayload.diagnostics.responseBytesApprox = Buffer.byteLength(JSON.stringify(unifiedPayload), 'utf8');
+        } catch (_) {}
+        logSf('UNIFIED_BALANCED_OBSERVER_PROBE_SEND', {
+          ok: unifiedPayload.ok,
+          status,
+          totalMs: unifiedPayload.diagnostics.phaseTimings && unifiedPayload.diagnostics.phaseTimings.totalMs,
+          phaseStatuses: unifiedPayload.diagnostics.phaseStatuses,
+          observationLimitedByPhase: unifiedPayload.diagnostics.observationLimitedByPhase,
+          jsonldTypes: lightweightSummary.jsonldTypes,
+          navLinkCount: lightweightSummary.navLinkCount,
+          internalLinkCount: lightweightSummary.internalLinkCount,
+          h1Count: lightweightSummary.h1Count,
+          hasMainLandmark: lightweightSummary.hasMainLandmarkFinal
+        });
+        logSfMemory('unified_balanced_observer_probe_send');
+        return res.status(200).json(unifiedPayload);
+      }
+      if (balancedShortFastResponse) {
+      const dedicatedPayload = {
+        ok: phases.every((p) => p.ok),
+        mode: 'signalsFirstBalanced',
+        responseMode: 'shortFast',
+        shortFastMode: true,
+        url: urlToFetch,
+        finalUrl,
+        status,
+        geoSignalsV1,
+        lightweightSummary,
+        diagnostics,
+        memoryHints
+      };
+      try {
+        dedicatedPayload.diagnostics.responseBytesApprox = Buffer.byteLength(JSON.stringify(dedicatedPayload), 'utf8');
+      } catch (_) {}
+      logSf('SIGNALS_FIRST_BALANCED_SHORTFAST_DEDICATED_SEND', {
+        ok: dedicatedPayload.ok,
+        status,
+        phaseTimings: diagnostics.phaseTimings,
+        navLinkCount: lightweightSummary.navLinkCount,
+        internalLinkCount: lightweightSummary.internalLinkCount,
+        h1Source: lightweightSummary.h1Source,
+        hasMainLandmark: lightweightSummary.hasMainLandmarkFinal,
+        jsonldCount: lightweightSummary.jsonldCount
+      });
+      logSfMemory('signals_first_balanced_shortfast_dedicated_send');
+      return res.status(200).json(dedicatedPayload);
+      }
+
+      const out = {
+        ok: phases.every((p) => p.ok),
+        mode: 'shortFastPhaseProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        timings: {
+          browserReadyMs: typeof scrapeTiming.browserReadyMs === 'number' ? scrapeTiming.browserReadyMs : null,
+          pageReadyMs: typeof scrapeTiming.pageReadyMs === 'number' ? scrapeTiming.pageReadyMs : null,
+          routeSetupMs,
+          gotoMs: gotoPhase ? gotoPhase.elapsedMs : null,
+          totalMs: Math.max(0, Date.now() - probeStartedAt)
+        },
+        phases,
+        blockedCounts,
+        diagnostics: {
+          probeOnly: true,
+          shortFastSkipped: true,
+          phaseProbe: true,
+          balancedSkipped: true,
+          fullScrapeSkipped: true,
+          rawHtmlReturned: false,
+          rawJsReturned: false,
+          phaseTimeoutMs: 3000,
+          sameOriginScriptFetchTimeoutMs: 3000,
+          sameOriginScriptMaxScripts: 3,
+          sameOriginScriptMaxBytes: 512000
+        }
+      };
+      logSf('SHORTFAST_PHASE_PROBE_SEND', {
+        ok: out.ok,
+        status: out.status,
+        timings: out.timings,
+        phaseTimings: phases.map((p) => ({ name: p.name, ok: p.ok, elapsedMs: p.elapsedMs, errorMessage: p.errorMessage })),
+        blockedCounts
+      });
+      logSfMemory('shortfast_phase_probe_send');
+      return res.status(200).json(out);
+    }
+
+    let jsonLdResourceTapState = null;
+    if (probeMode === 'jsonldresourcetap') {
+      jsonLdResourceTapState = {
+        startedAt: Date.now(),
+        promises: [],
+        candidates: [],
+        seen: new Set(),
+        skippedLargeCount: 0,
+        skippedNoHintCount: 0,
+        responseSeenCount: 0
+      };
+      const MAX_JSONLD_RESOURCE_CANDIDATES = 20;
+      const MAX_JSONLD_RESOURCE_BODY = 200000;
+      const cleanResourceJsonLdText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const walkResourceJsonLd = (node, out, depth = 0) => {
+        if (depth > 8) return;
+        if (Array.isArray(node)) {
+          node.forEach((item) => walkResourceJsonLd(item, out, depth + 1));
+          return;
+        }
+        if (!node || typeof node !== 'object') return;
+        const t = node['@type'];
+        if (Array.isArray(t)) t.forEach((x) => out.push(cleanResourceJsonLdText(x)));
+        else if (t) out.push(cleanResourceJsonLdText(t));
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkResourceJsonLd(item, out, depth + 1));
+      };
+      const regexTypesFromResourceText = (text) => {
+        const out = [];
+        const re = /["\\]?@type["\\]?\s*[:=]\s*(?:\\?["'])([^"'\\]{1,80})/g;
+        let m;
+        while ((m = re.exec(String(text || ''))) && out.length < 20) {
+          out.push(cleanResourceJsonLdText(m[1]));
+        }
+        return out;
+      };
+      page.on('response', (response) => {
+        try {
+          if (!jsonLdResourceTapState || jsonLdResourceTapState.candidates.length >= MAX_JSONLD_RESOURCE_CANDIDATES) return;
+          jsonLdResourceTapState.responseSeenCount += 1;
+          const responseUrl = String(response.url && response.url() || '');
+          if (!responseUrl || jsonLdResourceTapState.seen.has(responseUrl)) return;
+          const headers = response.headers ? response.headers() : {};
+          const contentType = String(headers['content-type'] || headers['Content-Type'] || '').toLowerCase();
+          const contentLengthHeader = headers['content-length'] || headers['Content-Length'];
+          const contentLength = Number(contentLengthHeader || 0);
+          const urlLooksRelevant = /json|ld|schema|structured|wp-json|\/api\/|api[.-]/i.test(responseUrl);
+          const typeLooksRelevant = /application\/ld\+json|application\/json|text\/json|javascript|ecmascript/i.test(contentType);
+          if (!typeLooksRelevant && !urlLooksRelevant) return;
+          if (/javascript|ecmascript/i.test(contentType) && !urlLooksRelevant) return;
+          if (contentLength && contentLength > MAX_JSONLD_RESOURCE_BODY) {
+            jsonLdResourceTapState.skippedLargeCount += 1;
+            return;
+          }
+          jsonLdResourceTapState.seen.add(responseUrl);
+          const p = (async () => {
+            try {
+              const text = await response.text();
+              const approxLength = String(text || '').length;
+              if (approxLength > MAX_JSONLD_RESOURCE_BODY) {
+                jsonLdResourceTapState.skippedLargeCount += 1;
+                return;
+              }
+              const hasContext = /@context/.test(text);
+              const hasType = /@type/.test(text);
+              const hasSchemaOrg = /schema\.org/i.test(text);
+              if (!hasContext && !hasType && !hasSchemaOrg) {
+                jsonLdResourceTapState.skippedNoHintCount += 1;
+                return;
+              }
+              const types = [];
+              let parseable = false;
+              let parseError = '';
+              try {
+                const parsed = JSON.parse(text);
+                parseable = true;
+                walkResourceJsonLd(parsed, types, 0);
+              } catch (e) {
+                parseError = String(e && (e.message || e) || '').slice(0, 160);
+                regexTypesFromResourceText(text).forEach((t) => types.push(t));
+              }
+              if (jsonLdResourceTapState.candidates.length >= MAX_JSONLD_RESOURCE_CANDIDATES) return;
+              jsonLdResourceTapState.candidates.push({
+                urlSample: responseUrl.slice(0, 220),
+                contentType: contentType.slice(0, 120),
+                approxLength,
+                hasContext,
+                hasType,
+                hasSchemaOrg,
+                parseable,
+                typesSample: Array.from(new Set(types.filter(Boolean))).slice(0, 20),
+                textSample: cleanResourceJsonLdText(text).slice(0, 260),
+                parseError
+              });
+            } catch (_) {}
+          })();
+          jsonLdResourceTapState.promises.push(p);
+        } catch (_) {}
+      });
+    }
 
     // ---- 主要待機（軽め） ----
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
     logSf('AFTER_GOTO', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
     });
     logSfMemory('after_goto');
+    if (probeMode === 'jsonldresourcetap') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      logSf('JSONLD_RESOURCE_TAP_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_resource_tap_probe_enter');
+      await page.waitForTimeout(1500).catch(() => {});
+      try {
+        await Promise.allSettled((jsonLdResourceTapState && jsonLdResourceTapState.promises || []).slice(0, 80));
+      } catch (_) {}
+      const candidates = (jsonLdResourceTapState && jsonLdResourceTapState.candidates || []).slice(0, 20);
+      const types = Array.from(new Set([].concat.apply([], candidates.map((c) => Array.isArray(c.typesSample) ? c.typesSample : [])).filter(Boolean))).slice(0, 50);
+      const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+      const parsedJsonLdCount = candidates.filter((c) => c && c.parseable && (c.hasContext || c.hasType || c.hasSchemaOrg)).length;
+      const out = {
+        ok: true,
+        mode: 'jsonLdResourceTapProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        candidateResponseCount: candidates.length,
+        parsedJsonLdCount,
+        types,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        candidates,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
+          rawBodyReturned: false,
+          responseSeenCount: jsonLdResourceTapState ? jsonLdResourceTapState.responseSeenCount : 0,
+          skippedLargeCount: jsonLdResourceTapState ? jsonLdResourceTapState.skippedLargeCount : 0,
+          skippedNoHintCount: jsonLdResourceTapState ? jsonLdResourceTapState.skippedNoHintCount : 0,
+          maxCandidateCount: 20,
+          maxBodyBytes: 200000,
+          elapsedMs: jsonLdResourceTapState ? (Date.now() - jsonLdResourceTapState.startedAt) : null
+        }
+      };
+      logSf('JSONLD_RESOURCE_TAP_PROBE_SEND', {
+        candidateResponseCount: out.candidateResponseCount,
+        parsedJsonLdCount: out.parsedJsonLdCount,
+        types: out.types,
+        skippedLargeCount: out.diagnostics.skippedLargeCount,
+        skippedNoHintCount: out.diagnostics.skippedNoHintCount
+      });
+      logSfMemory('jsonld_resource_tap_probe_send');
+      return res.status(200).json(out);
+    }
+    if (probeMode === 'jsonldbalanced') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const startedAt = Date.now();
+      logSf('JSONLD_BALANCED_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_balanced_probe_enter');
+
+      const summarizeTexts = (texts, source) => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const nodeTypes = [];
+        const samples = [];
+        const parseErrors = [];
+        const walkJsonLd = (node, depth = 0) => {
+          if (depth > 8) return;
+          if (Array.isArray(node)) {
+            node.forEach((item) => walkJsonLd(item, depth + 1));
+            return;
+          }
+          if (!node || typeof node !== 'object') return;
+          const t = node['@type'];
+          if (Array.isArray(t)) t.forEach((x) => nodeTypes.push(clean(x)));
+          else if (t) nodeTypes.push(clean(t));
+          if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
+        };
+        let parseableCount = 0;
+        let parseErrorsCount = 0;
+        (Array.isArray(texts) ? texts : []).forEach((entry, idx) => {
+          const text = typeof entry === 'string' ? entry : String((entry && entry.text) || '');
+          const type = typeof entry === 'object' && entry ? String(entry.type || '') : '';
+          const id = typeof entry === 'object' && entry ? String(entry.id || '') : '';
+          const head = clean(text).slice(0, 220);
+          if (samples.length < 8) samples.push({ source, index: idx, type, id, length: text.length, head });
+          try {
+            const parsed = JSON.parse(text);
+            parseableCount += 1;
+            walkJsonLd(parsed);
+          } catch (e) {
+            parseErrorsCount += 1;
+            if (parseErrors.length < 5) {
+              parseErrors.push({
+                source,
+                index: idx,
+                message: String(e && (e.message || e) || '').slice(0, 180),
+                head
+              });
+            }
+          }
+        });
+        const types = Array.from(new Set(nodeTypes.filter(Boolean))).slice(0, 50);
+        return {
+          source,
+          rawCount: Array.isArray(texts) ? texts.length : 0,
+          parseableCount,
+          parseErrorsCount,
+          types,
+          samples,
+          parseErrors
+        };
+      };
+
+      const collectDomJsonLd = async () => page.evaluate(() => {
+        const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const jsonLdScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+          .map((s) => ({ type: s.getAttribute('type') || '', id: s.id || '', text: s.textContent || '' }))
+          .filter((s) => clean(s.text));
+        const alternateJsonScripts = Array.from(document.querySelectorAll('script[type]'))
+          .map((s) => ({ type: s.getAttribute('type') || '', id: s.id || '', text: s.textContent || '' }))
+          .filter((s) => {
+            const type = String(s.type || '').toLowerCase();
+            if (type === 'application/ld+json') return false;
+            if (!/json|x-json|javascript|ecmascript/i.test(type)) return false;
+            return clean(s.text);
+          });
+        const nextEl = document.querySelector('script#__NEXT_DATA__');
+        const nuxtEl = document.querySelector('script#__NUXT_DATA__');
+        const htmlText = document.documentElement ? String(document.documentElement.innerHTML || '') : '';
+        const dataAttrCount = Array.from(document.querySelectorAll('[data-json],[data-schema],[data-ld],[data-structured]')).length;
+        return {
+          jsonLdTexts: jsonLdScripts,
+          alternateJsonScripts: alternateJsonScripts.slice(0, 20).map((s) => ({
+            type: s.type,
+            id: s.id,
+            length: String(s.text || '').length,
+            text: String(s.text || '').slice(0, 20000)
+          })),
+          nextDataFound: !!nextEl,
+          nuxtDataFound: !!nuxtEl || /\bwindow\.__NUXT__\b/.test(htmlText),
+          nextDataLength: nextEl ? String(nextEl.textContent || '').length : 0,
+          nuxtDataLength: nuxtEl ? String(nuxtEl.textContent || '').length : 0,
+          dataAttributeJsonCandidateCount: dataAttrCount,
+          escapedLdJsonHint: /application\\?\/ld\+json|@type|@graph/.test(htmlText)
+        };
+      }).catch(() => ({
+        jsonLdTexts: [],
+        alternateJsonScripts: [],
+        nextDataFound: false,
+        nuxtDataFound: false,
+        nextDataLength: 0,
+        nuxtDataLength: 0,
+        dataAttributeJsonCandidateCount: 0,
+        escapedLdJsonHint: false
+      }));
+
+      const beforeWaitDom = await collectDomJsonLd();
+      await page.waitForTimeout(1000).catch(() => {});
+      const afterWaitDom = await collectDomJsonLd();
+
+      const html = await page.content().catch(() => '');
+      const $ = cheerio.load(html || '');
+      const htmlContentTexts = [];
+      $('script[type="application/ld+json"]').each((_, el) => {
+        if (htmlContentTexts.length >= 120) return;
+        const txt = String($(el).text() || '').trim();
+        if (!txt) return;
+        htmlContentTexts.push({
+          type: String($(el).attr('type') || ''),
+          id: String($(el).attr('id') || ''),
+          text: txt.length > 300000 ? txt.slice(0, 300000) : txt
+        });
+      });
+      const htmlAlternateJsonScripts = [];
+      $('script[type]').each((_, el) => {
+        if (htmlAlternateJsonScripts.length >= 20) return;
+        const type = String($(el).attr('type') || '').toLowerCase();
+        if (type === 'application/ld+json') return;
+        if (!/json|x-json|javascript|ecmascript/i.test(type)) return;
+        const txt = String($(el).text() || '').trim();
+        if (!txt) return;
+        htmlAlternateJsonScripts.push({
+          type: String($(el).attr('type') || ''),
+          id: String($(el).attr('id') || ''),
+          length: txt.length,
+          text: txt.slice(0, 20000)
+        });
+      });
+
+      const renderedBeforeSummary = summarizeTexts(beforeWaitDom.jsonLdTexts || [], 'rendered_dom_before_wait');
+      const renderedAfterSummary = summarizeTexts(afterWaitDom.jsonLdTexts || [], 'rendered_dom_after_wait');
+      const htmlSummary = summarizeTexts(htmlContentTexts, 'page_content_ldjson');
+      const alternateSummary = summarizeTexts(
+        (afterWaitDom.alternateJsonScripts || []).concat(htmlAlternateJsonScripts || []),
+        'alternate_json_scripts'
+      );
+      const types = Array.from(new Set(
+        []
+          .concat(renderedBeforeSummary.types || [])
+          .concat(renderedAfterSummary.types || [])
+          .concat(htmlSummary.types || [])
+          .concat(alternateSummary.types || [])
+          .filter(Boolean)
+      )).slice(0, 50);
+      const samples = []
+        .concat(renderedBeforeSummary.samples || [])
+        .concat(renderedAfterSummary.samples || [])
+        .concat(htmlSummary.samples || [])
+        .concat(alternateSummary.samples || [])
+        .slice(0, 16);
+      const parseErrors = []
+        .concat(renderedBeforeSummary.parseErrors || [])
+        .concat(renderedAfterSummary.parseErrors || [])
+        .concat(htmlSummary.parseErrors || [])
+        .concat(alternateSummary.parseErrors || [])
+        .slice(0, 10);
+      const parseableCount =
+        renderedAfterSummary.parseableCount +
+        htmlSummary.parseableCount +
+        alternateSummary.parseableCount;
+      const parseErrorsCount =
+        renderedAfterSummary.parseErrorsCount +
+        htmlSummary.parseErrorsCount +
+        alternateSummary.parseErrorsCount;
+
+      const out = {
+        ok: true,
+        mode: 'balancedJsonLdProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        renderedDomRawCount: renderedAfterSummary.rawCount,
+        renderedDomBeforeWaitRawCount: renderedBeforeSummary.rawCount,
+        renderedDomAfterWaitRawCount: renderedAfterSummary.rawCount,
+        htmlContentRawCount: htmlSummary.rawCount,
+        alternateJsonScriptCount: alternateSummary.rawCount,
+        nextDataFound: !!(afterWaitDom.nextDataFound),
+        nuxtDataFound: !!(afterWaitDom.nuxtDataFound),
+        nextDataLength: Number(afterWaitDom.nextDataLength || 0),
+        nuxtDataLength: Number(afterWaitDom.nuxtDataLength || 0),
+        dataAttributeJsonCandidateCount: Number(afterWaitDom.dataAttributeJsonCandidateCount || 0),
+        escapedLdJsonHint: !!(afterWaitDom.escapedLdJsonHint || /application\\?\/ld\+json|@type|@graph/.test(String(html || ''))),
+        parseableCount,
+        types,
+        parseErrorsCount,
+        samples,
+        parseErrors,
+        diagnostics: {
+          fullScrapeSkipped: true,
+          rawHtmlReturned: false,
+          rawJsonLdReturned: false,
+          boundedWaitMs: 1000,
+          htmlLength: String(html || '').length,
+          elapsedMs: Date.now() - startedAt
+        }
+      };
+      logSf('JSONLD_BALANCED_PROBE_SEND', {
+        renderedDomRawCount: out.renderedDomRawCount,
+        htmlContentRawCount: out.htmlContentRawCount,
+        alternateJsonScriptCount: out.alternateJsonScriptCount,
+        parseableCount: out.parseableCount,
+        types: out.types,
+        elapsedMs: out.diagnostics.elapsedMs
+      });
+      logSfMemory('jsonld_balanced_probe_send');
+      return res.status(200).json(out);
+    }
+    if (probeMode === 'jsonldscriptsrc') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      const startedAt = Date.now();
+      const MAX_SCRIPTS = 10;
+      const MAX_BYTES_PER_SCRIPT = 1000000;
+      const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+      const safeUrlSample = (v) => String(v || '').slice(0, 220);
+      const extractSchemaTypes = (text) => {
+        const body = String(text || '');
+        const types = [];
+        const patterns = [
+          /["@]type["']?\s*:\s*["']([^"']{1,100})["']/gi,
+          /\\"@type\\"\s*:\s*\\"([^"\\]{1,100})\\"/gi,
+          /@type\\?["']?\s*[:=]\s*\\?["']([^"'\\]{1,100})/gi
+        ];
+        patterns.forEach((re) => {
+          let m;
+          while ((m = re.exec(body)) && types.length < 80) {
+            const t = clean(m[1]);
+            if (t) types.push(t);
+          }
+        });
+        return Array.from(new Set(types)).slice(0, 50);
+      };
+      const makeTextSample = (text) => {
+        const body = String(text || '');
+        const idxs = [
+          body.indexOf('@context'),
+          body.indexOf('\\"@context\\"'),
+          body.indexOf('schema.org'),
+          body.indexOf('@type'),
+          body.indexOf('\\"@type\\"')
+        ].filter((n) => n >= 0);
+        const idx = idxs.length ? Math.min.apply(null, idxs) : 0;
+        return clean(body.slice(Math.max(0, idx - 80), idx + 260));
+      };
+      const parseWholeJsonTypes = (text) => {
+        const found = [];
+        const walk = (node, depth = 0) => {
+          if (depth > 10 || node == null) return;
+          if (Array.isArray(node)) {
+            node.forEach((item) => walk(item, depth + 1));
+            return;
+          }
+          if (typeof node !== 'object') return;
+          const t = node['@type'];
+          if (Array.isArray(t)) t.forEach((x) => found.push(clean(x)));
+          else if (t) found.push(clean(t));
+          Object.keys(node).forEach((k) => {
+            if (k === '@type') return;
+            if (k === '@context') return;
+            walk(node[k], depth + 1);
+          });
+        };
+        try {
+          walk(JSON.parse(String(text || '')));
+          return Array.from(new Set(found.filter(Boolean))).slice(0, 50);
+        } catch (_) {
+          return [];
+        }
+      };
+      logSf('JSONLD_SCRIPT_SRC_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('jsonld_script_src_probe_enter');
+
+      let scriptSrcs = [];
+      let renderedScriptSrcs = [];
+      let htmlScriptSrcs = [];
+      let htmlLength = 0;
+      try {
+        renderedScriptSrcs = await page.evaluate(() => {
+          const out = [];
+          Array.from(document.querySelectorAll('script[src]')).forEach((s) => {
+            const src = s && s.getAttribute && s.getAttribute('src');
+            if (!src) return;
+            try {
+              out.push(new URL(src, location.href).toString());
+            } catch (_) {}
+          });
+          return out;
+        }).catch(() => []);
+        const html = await page.content().catch(() => '');
+        htmlLength = String(html || '').length;
+        const $ = cheerio.load(html || '');
+        $('script[src]').each((_, el) => {
+          const src = String($(el).attr('src') || '').trim();
+          if (!src) return;
+          try {
+            htmlScriptSrcs.push(new URL(src, finalUrl || urlToFetch).toString());
+          } catch (_) {}
+        });
+      } catch (_) {}
+
+      scriptSrcs = uniq([].concat(renderedScriptSrcs || []).concat(htmlScriptSrcs || []).filter(Boolean));
+      let origin = '';
+      try { origin = new URL(finalUrl || urlToFetch).origin; } catch (_) {}
+      const sameOriginScripts = scriptSrcs.filter((u) => {
+        try { return new URL(u).origin === origin; } catch (_) { return false; }
+      });
+      const targetScripts = sameOriginScripts.slice(0, MAX_SCRIPTS);
+      const candidates = [];
+      let fetchedScriptCount = 0;
+      let skippedLargeScriptCount = 0;
+      let parseableCount = 0;
+      let totalFetchedBytes = 0;
+      let maxScriptLength = 0;
+      for (const scriptUrl of targetScripts) {
+        const result = {
+          urlSample: safeUrlSample(scriptUrl),
+          approxLength: 0,
+          hasContext: false,
+          hasType: false,
+          hasSchemaOrg: false,
+          parseable: false,
+          typesSample: [],
+          textSample: ''
+        };
+        try {
+          const r = await page.request.get(scriptUrl, { timeout: 10000 });
+          const headers = typeof r.headers === 'function' ? r.headers() : {};
+          const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
+          if (contentLength > MAX_BYTES_PER_SCRIPT) {
+            skippedLargeScriptCount += 1;
+            result.approxLength = contentLength;
+            result.skippedReason = 'script_too_large_header';
+            if (candidates.length < 20) candidates.push(result);
+            continue;
+          }
+          const text = await r.text();
+          const len = String(text || '').length;
+          result.approxLength = len;
+          totalFetchedBytes += len;
+          maxScriptLength = Math.max(maxScriptLength, len);
+          if (len > MAX_BYTES_PER_SCRIPT) {
+            skippedLargeScriptCount += 1;
+            result.skippedReason = 'script_too_large_body';
+            if (candidates.length < 20) candidates.push(result);
+            continue;
+          }
+          fetchedScriptCount += 1;
+          result.hasContext = /@context|\\"@context\\"/.test(text);
+          result.hasType = /@type|\\"@type\\"/.test(text);
+          result.hasSchemaOrg = /schema\.org/i.test(text);
+          const parsedTypes = parseWholeJsonTypes(text);
+          const regexTypes = extractSchemaTypes(text);
+          result.parseable = parsedTypes.length > 0;
+          if (result.parseable) parseableCount += 1;
+          result.typesSample = Array.from(new Set([].concat(parsedTypes, regexTypes).filter(Boolean))).slice(0, 20);
+          result.textSample = (result.hasContext || result.hasType || result.hasSchemaOrg) ? makeTextSample(text).slice(0, 360) : '';
+          if ((result.hasContext || result.hasType || result.hasSchemaOrg || result.typesSample.length) && candidates.length < 20) {
+            candidates.push(result);
+          }
+        } catch (e) {
+          result.errorMessage = String(e && (e.message || e) || '').slice(0, 180);
+          if (candidates.length < 20) candidates.push(result);
+        }
+      }
+
+      const types = Array.from(new Set([].concat.apply([], candidates.map((c) => Array.isArray(c.typesSample) ? c.typesSample : [])).filter(Boolean))).slice(0, 50);
+      const typeSet = new Set(types.map((t) => String(t || '').toLowerCase()));
+      const out = {
+        ok: true,
+        mode: 'jsonLdScriptSrcProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        scriptSrcCount: scriptSrcs.length,
+        sameOriginScriptCount: sameOriginScripts.length,
+        fetchedScriptCount,
+        skippedLargeScriptCount,
+        jsonLdCandidateCount: candidates.filter((c) => c && (c.hasContext || c.hasType || c.hasSchemaOrg || (Array.isArray(c.typesSample) && c.typesSample.length))).length,
+        parseableCount,
+        types,
+        hasWebsite: typeSet.has('website'),
+        hasOrganization: typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness'),
+        hasBreadcrumbList: typeSet.has('breadcrumblist'),
+        hasFAQPage: typeSet.has('faqpage'),
+        candidates,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          rawJsReturned: false,
+          maxScripts: MAX_SCRIPTS,
+          maxBytesPerScript: MAX_BYTES_PER_SCRIPT,
+          htmlLength,
+          renderedScriptSrcCount: Array.isArray(renderedScriptSrcs) ? renderedScriptSrcs.length : 0,
+          htmlScriptSrcCount: Array.isArray(htmlScriptSrcs) ? htmlScriptSrcs.length : 0,
+          appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || ''))),
+          totalFetchedBytes,
+          maxScriptLength,
+          elapsedMs: Date.now() - startedAt
+        }
+      };
+      logSf('JSONLD_SCRIPT_SRC_PROBE_SEND', {
+        scriptSrcCount: out.scriptSrcCount,
+        sameOriginScriptCount: out.sameOriginScriptCount,
+        fetchedScriptCount: out.fetchedScriptCount,
+        skippedLargeScriptCount: out.skippedLargeScriptCount,
+        jsonLdCandidateCount: out.jsonLdCandidateCount,
+        parseableCount: out.parseableCount,
+        types: out.types,
+        appIndexDetected: out.diagnostics.appIndexDetected,
+        elapsedMs: out.diagnostics.elapsedMs
+      });
+      logSfMemory('jsonld_script_src_probe_send');
+      return res.status(200).json(out);
+    }
+    if (probeMode === 'primaryrisk') {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      const status = resp && typeof resp.status === 'function' ? resp.status() : null;
+      logSf('PRIMARY_RISK_PROBE_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        status
+      });
+      logSfMemory('primary_risk_probe_enter');
+      const startedAt = Date.now();
+      let probe = null;
+      let probeError = null;
+      try {
+        probe = await page.evaluate(() => {
+          const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+          const lower = (v) => clean(v).toLowerCase();
+          const title = clean(document.title || '');
+          const bodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+          const htmlLengthEstimate = String((document.documentElement && document.documentElement.outerHTML) || '').length;
+          const scripts = Array.from(document.querySelectorAll('script'));
+          const scriptsWithSrc = scripts
+            .map((s) => {
+              const src = s && s.getAttribute ? (s.getAttribute('src') || '') : '';
+              let href = '';
+              try { href = src ? new URL(src, location.href).toString() : ''; } catch (_) { href = src; }
+              return {
+                src: href,
+                type: clean(s && s.getAttribute ? s.getAttribute('type') : ''),
+                async: !!(s && s.async),
+                defer: !!(s && s.defer)
+              };
+            })
+            .filter((s) => s.src);
+          const perfScripts = (() => {
+            try {
+              return performance.getEntriesByType('resource')
+                .filter((r) => r && /script|javascript|ecmascript/i.test(String(r.initiatorType || '') + ' ' + String(r.name || '')))
+                .map((r) => ({
+                  name: String(r.name || ''),
+                  transferSize: Number(r.transferSize || 0),
+                  encodedBodySize: Number(r.encodedBodySize || 0),
+                  duration: Number(r.duration || 0)
+                }));
+            } catch (_) {
+              return [];
+            }
+          })();
+          const hasRoot = (sel) => !!document.querySelector(sel);
+          const rootIndicators = {
+            hasNextRoot: hasRoot('#__next'),
+            hasNuxtRoot: hasRoot('#__nuxt'),
+            hasAppRoot: hasRoot('#app,#root,[data-reactroot],[id*="app" i]'),
+            hasMain: hasRoot('main,[role="main"]')
+          };
+          const textAll = lower(`${title} ${bodyText.slice(0, 3000)} ${location.href}`);
+          const blockedPageIndications = {
+            errBlockedByClient: /err_blocked_by_client/i.test(textAll),
+            extensionBlocked: /拡張機能によってブロック|ブロックされています/i.test(textAll),
+            chromeError: /^chrome-error:/i.test(String(location.href || '')),
+            accessDenied: /access denied|forbidden|permission denied|アクセスできません|拒否されました/i.test(textAll),
+            ageGate: /年齢確認|age verification|生年月日|18歳以上/i.test(textAll)
+          };
+          const scriptUrls = scriptsWithSrc.map((s) => s.src);
+          const chunkLikeUrls = scriptUrls.filter((u) => /chunk|webpack|next\/static|_next\/static|app-|main-|runtime|vendor|bundle|\.m?js(?:\?|$)/i.test(u));
+          const scriptHosts = scriptUrls.map((u) => {
+            try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return ''; }
+          }).filter(Boolean);
+          const locationHost = String(location.hostname || '').replace(/^www\./, '');
+          const externalScriptHosts = Array.from(new Set(scriptHosts.filter((h) => h && h !== locationHost && !h.endsWith('.' + locationHost))));
+          const widgetScriptUrls = scriptUrls.filter((u) => /googletagmanager|google-analytics|youtube|probo|poplink|creativecdn|chat|karte|clarity|hotjar|doubleclick/i.test(u));
+          const moduleScriptCount = scriptsWithSrc.filter((s) => /module/i.test(s.type)).length;
+          const preloadScriptCount = Array.from(document.querySelectorAll('link[rel="preload"],link[rel="modulepreload"]'))
+            .filter((l) => /script|javascript|\.m?js/i.test(String(l.getAttribute('as') || '') + ' ' + String(l.getAttribute('href') || '')))
+            .length;
+          const perfTotalTransferSize = perfScripts.reduce((sum, r) => sum + Number(r.transferSize || r.encodedBodySize || 0), 0);
+          const perfMaxTransferSize = perfScripts.reduce((max, r) => Math.max(max, Number(r.transferSize || r.encodedBodySize || 0)), 0);
+          return {
+            title,
+            bodyTextLength: bodyText.length,
+            htmlLengthEstimate,
+            scriptCount: scriptsWithSrc.length,
+            inlineScriptCount: Math.max(0, scripts.length - scriptsWithSrc.length),
+            moduleScriptCount,
+            preloadScriptCount,
+            chunkLikeCount: chunkLikeUrls.length,
+            nextStaticCount: scriptUrls.filter((u) => /_next\/static|next\/static/i.test(u)).length,
+            externalScriptHostCount: externalScriptHosts.length,
+            widgetScriptCount: widgetScriptUrls.length,
+            sampleExternalScriptHosts: externalScriptHosts.slice(0, 10),
+            sampleWidgetScriptUrls: widgetScriptUrls.slice(0, 10),
+            sampleScriptUrls: scriptUrls.slice(0, 10),
+            sampleChunkUrls: chunkLikeUrls.slice(0, 10),
+            totalScriptUrlChars: scriptUrls.reduce((sum, u) => sum + String(u || '').length, 0),
+            perfScriptCount: perfScripts.length,
+            perfTotalTransferSize,
+            perfMaxTransferSize,
+            rootIndicators,
+            blockedPageIndications
+          };
+        });
+      } catch (e) {
+        probeError = String(e && (e.message || e) || 'primary_risk_probe_error').slice(0, 240);
+      }
+      const reasons = [];
+      const estimates = {
+        htmlLengthEstimate: probe && typeof probe.htmlLengthEstimate === 'number' ? probe.htmlLengthEstimate : null,
+        bodyTextLength: probe && typeof probe.bodyTextLength === 'number' ? probe.bodyTextLength : null,
+        scriptCount: probe && typeof probe.scriptCount === 'number' ? probe.scriptCount : null,
+        chunkLikeCount: probe && typeof probe.chunkLikeCount === 'number' ? probe.chunkLikeCount : null,
+        externalScriptHostCount: probe && typeof probe.externalScriptHostCount === 'number' ? probe.externalScriptHostCount : null,
+        widgetScriptCount: probe && typeof probe.widgetScriptCount === 'number' ? probe.widgetScriptCount : null,
+        perfScriptCount: probe && typeof probe.perfScriptCount === 'number' ? probe.perfScriptCount : null,
+        perfTotalTransferSize: probe && typeof probe.perfTotalTransferSize === 'number' ? probe.perfTotalTransferSize : null,
+        perfMaxTransferSize: probe && typeof probe.perfMaxTransferSize === 'number' ? probe.perfMaxTransferSize : null
+      };
+      const rootIndicators = probe && probe.rootIndicators ? probe.rootIndicators : {};
+      const blockedPageIndications = probe && probe.blockedPageIndications ? probe.blockedPageIndications : {};
+      if (probeError) reasons.push('probe_evaluate_failed');
+      if (status != null && status >= 500) reasons.push('status_5xx');
+      if (status != null && status >= 400 && status < 500) reasons.push('status_4xx');
+      if (estimates.htmlLengthEstimate != null && estimates.htmlLengthEstimate > 500000) reasons.push('large_rendered_html_estimate');
+      if (estimates.scriptCount != null && estimates.scriptCount >= 35) reasons.push('many_script_resources');
+      if (estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 15) reasons.push('many_chunk_like_scripts');
+      if (estimates.scriptCount != null && estimates.scriptCount >= 8 && estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 6) reasons.push('js_bundle_risk');
+      if (estimates.externalScriptHostCount != null && estimates.externalScriptHostCount >= 3) reasons.push('third_party_script_stack');
+      if (estimates.widgetScriptCount != null && estimates.widgetScriptCount >= 2) reasons.push('third_party_widget_scripts');
+      if (estimates.bodyTextLength != null && estimates.bodyTextLength < 2500 && estimates.chunkLikeCount != null && estimates.chunkLikeCount >= 5) reasons.push('script_rendered_site_indicator');
+      if (estimates.perfTotalTransferSize != null && estimates.perfTotalTransferSize > 3000000) reasons.push('large_script_transfer_estimate');
+      if (estimates.perfMaxTransferSize != null && estimates.perfMaxTransferSize > 1000000) reasons.push('large_single_script_transfer_estimate');
+      if (rootIndicators.hasNextRoot || rootIndicators.hasNuxtRoot || rootIndicators.hasAppRoot) reasons.push('spa_root_indicator');
+      if (blockedPageIndications.errBlockedByClient || blockedPageIndications.extensionBlocked || blockedPageIndications.chromeError) reasons.push('browser_or_extension_block_page_indicator');
+      if (blockedPageIndications.accessDenied) reasons.push('access_denied_indicator');
+      if (blockedPageIndications.ageGate) reasons.push('age_gate_indicator');
+      const highReasons = reasons.filter((r) => [
+        'status_5xx',
+        'large_rendered_html_estimate',
+        'many_script_resources',
+        'many_chunk_like_scripts',
+        'js_bundle_risk',
+        'large_script_transfer_estimate',
+        'large_single_script_transfer_estimate',
+        'browser_or_extension_block_page_indicator'
+      ].includes(r));
+      const risk = highReasons.length ? 'high' : (reasons.length ? 'medium' : 'low');
+      const shouldUseBalanced = risk === 'high' || (
+        risk === 'medium' &&
+        (reasons.includes('spa_root_indicator') || reasons.includes('age_gate_indicator') || reasons.includes('access_denied_indicator'))
+      );
+      const elapsedMs = Date.now() - startedAt;
+      logSf('PRIMARY_RISK_PROBE_SEND', {
+        risk,
+        shouldUseBalanced,
+        reasons,
+        elapsedMs
+      });
+      logSfMemory('primary_risk_probe_send');
+      return res.status(200).json({
+        ok: !probeError,
+        mode: 'primaryRiskProbe',
+        url: urlToFetch,
+        finalUrl,
+        status,
+        risk,
+        shouldUseBalanced,
+        reasons,
+        estimates,
+        title: probe && probe.title ? probe.title : null,
+        rootIndicators,
+        blockedPageIndications,
+        scriptSummary: probe ? {
+          inlineScriptCount: probe.inlineScriptCount,
+          moduleScriptCount: probe.moduleScriptCount,
+          preloadScriptCount: probe.preloadScriptCount,
+          chunkLikeCount: probe.chunkLikeCount,
+          nextStaticCount: probe.nextStaticCount,
+          externalScriptHostCount: probe.externalScriptHostCount,
+          widgetScriptCount: probe.widgetScriptCount,
+          totalScriptUrlChars: probe.totalScriptUrlChars,
+          sampleExternalScriptHosts: Array.isArray(probe.sampleExternalScriptHosts) ? probe.sampleExternalScriptHosts : [],
+          sampleWidgetScriptUrls: Array.isArray(probe.sampleWidgetScriptUrls) ? probe.sampleWidgetScriptUrls : [],
+          sampleScriptUrls: Array.isArray(probe.sampleScriptUrls) ? probe.sampleScriptUrls : [],
+          sampleChunkUrls: Array.isArray(probe.sampleChunkUrls) ? probe.sampleChunkUrls : []
+        } : null,
+        diagnostics: {
+          probeOnly: true,
+          fullScrapeSkipped: true,
+          scoringSkipped: true,
+          auditSigSkipped: true,
+          jsScanSkipped: true,
+          chunkScanSkipped: true,
+          elapsedMs,
+          errorMessage: probeError
+        }
+      });
+    }
+    if (signalsFirstLight || signalsFirstBalanced) {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_ENTER' : 'SIGNALS_FIRST_LIGHT_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : 'default')
+      });
+      logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
+      const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 0;
+      const hydrationMetrics = signalsFirstBalanced
+        ? await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse })
+        : null;
+      if (signalsFirstBalanced) {
+        logSf('SIGNALS_FIRST_BALANCED_HYDRATION_WAIT', {
+          waitMs: hydrationMetrics && hydrationMetrics.waitMs,
+          bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
+          bodyTextAfterWait: hydrationMetrics && hydrationMetrics.bodyTextAfterWait,
+          anchorCountBeforeWait: hydrationMetrics && hydrationMetrics.anchorCountBeforeWait,
+          anchorCountAfterWait: hydrationMetrics && hydrationMetrics.anchorCountAfterWait,
+          navLinkCountBeforeWait: hydrationMetrics && hydrationMetrics.navLinkCountBeforeWait,
+          navLinkCountAfterWait: hydrationMetrics && hydrationMetrics.navLinkCountAfterWait,
+          improvedBodyText: hydrationMetrics && hydrationMetrics.improvedBodyText,
+          improvedLinks: hydrationMetrics && hydrationMetrics.improvedLinks,
+          warningTextAfterWait: hydrationMetrics && hydrationMetrics.warningTextAfterWait
+        });
+      }
+      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
+        balancedMode: signalsFirstBalanced,
+        shortFastMode: balancedShortFastResponse,
+        boundedHydrationWaitMs,
+        hydrationMetrics,
+        gotoMs: typeof scrapeTiming.gotoMs === 'number'
+          ? scrapeTiming.gotoMs
+          : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
+      });
+      const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
+      const linksObserved = observed.links || {};
+      const headingsObserved = observed.headings || {};
+      const topHeadingsObserved = geoSignalsV1 && geoSignalsV1.headings ? geoSignalsV1.headings : {};
+      const landmarksObserved = (geoSignalsV1 && geoSignalsV1.landmarks) || observed.landmarks || {};
+      const structuredObserved = observed.structuredData || {};
+      const multimodalObserved = (geoSignalsV1 && geoSignalsV1.multimodalSignals) || observed.multimodalSignals || {};
+      const trustObserved = (geoSignalsV1 && geoSignalsV1.trustSignals) || observed.trustSignals || {};
+      const bodyObserved = observed.body || {};
+      const lightweightSummary = {
+        title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
+        metaDescription: observed.metaDescription && typeof observed.metaDescription.value === 'string' ? observed.metaDescription.value : null,
+        h1Count: observed.h1 && typeof observed.h1.count === 'number' ? observed.h1.count : 0,
+        h2Count: Array.isArray(headingsObserved.h2) ? headingsObserved.h2.length : 0,
+        h1Source: topHeadingsObserved.h1Source || (observed.h1 && observed.h1.source) || null,
+        headingSource: topHeadingsObserved.source || headingsObserved.source || null,
+        primaryHeadingCandidate: topHeadingsObserved.primaryHeadingCandidate || headingsObserved.primaryHeadingCandidate || null,
+        primaryHeadingCandidateSource: topHeadingsObserved.primaryHeadingCandidateSource || headingsObserved.primaryHeadingCandidateSource || null,
+        primaryHeadingConfidence: topHeadingsObserved.primaryHeadingConfidence || headingsObserved.primaryHeadingConfidence || null,
+        h1EquivalentCandidateFound: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'h1EquivalentCandidateFound')
+          ? topHeadingsObserved.h1EquivalentCandidateFound
+          : (Object.prototype.hasOwnProperty.call(headingsObserved, 'h1EquivalentCandidateFound') ? headingsObserved.h1EquivalentCandidateFound : null),
+        sectionHeadingCandidate: topHeadingsObserved.sectionHeadingCandidate || headingsObserved.sectionHeadingCandidate || null,
+        sectionHeadingCandidateSource: topHeadingsObserved.sectionHeadingCandidateSource || headingsObserved.sectionHeadingCandidateSource || null,
+        sectionHeadingConfidence: topHeadingsObserved.sectionHeadingConfidence || headingsObserved.sectionHeadingConfidence || null,
+        headingObservationLimited: Object.prototype.hasOwnProperty.call(topHeadingsObserved, 'headingObservationLimited')
+          ? topHeadingsObserved.headingObservationLimited
+          : !!(observed.h1 && observed.h1.headingObservationLimited),
+        hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark') ? landmarksObserved.hasMainLandmark : null,
+        hasMainLandmarkFinal: Object.prototype.hasOwnProperty.call(landmarksObserved, 'hasMainLandmark_final') ? landmarksObserved.hasMainLandmark_final : null,
+        mainLandmarkSource: landmarksObserved.mainLandmarkSource || null,
+        mainLandmarkCandidateFound: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkCandidateFound') ? landmarksObserved.mainLandmarkCandidateFound : null,
+        mainLandmarkCandidateSource: landmarksObserved.mainLandmarkCandidateSource || null,
+        mainLandmarkObservationLimited: Object.prototype.hasOwnProperty.call(landmarksObserved, 'mainLandmarkObservationLimited')
+          ? landmarksObserved.mainLandmarkObservationLimited
+          : true,
+        hydrationWaitMs: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.hydrationWaitMs === 'number' ? geoSignalsV1.diagnostics.hydrationWaitMs : null,
+        bodyTextBeforeWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextBeforeWait === 'number' ? geoSignalsV1.diagnostics.bodyTextBeforeWait : null,
+        bodyTextAfterWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextAfterWait === 'number' ? geoSignalsV1.diagnostics.bodyTextAfterWait : null,
+        hydrationImprovedBodyText: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
+        balancedMode: signalsFirstBalanced,
+        headingShadowScan: !!(geoSignalsV1 && geoSignalsV1.balanced && geoSignalsV1.balanced.shadowHeadingScan),
+        headingA11yScan: !balancedShortFastResponse,
+        navLinkCount: Array.isArray(linksObserved.navTextsSample) ? linksObserved.navTextsSample.length : 0,
+        internalLinkCount: Array.isArray(linksObserved.internalLinksSample) ? linksObserved.internalLinksSample.length : 0,
+        hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasCompanyLikeLink') ? linksObserved.hasCompanyLikeLink : null,
+        hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
+        hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
+        hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
+        bodyTextLength: typeof bodyObserved.textLength === 'number' ? bodyObserved.textLength : 0,
+        jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0,
+        jsonldParseableCount: typeof structuredObserved.parseableCount === 'number' ? structuredObserved.parseableCount : 0,
+        jsonldParseErrorsCount: typeof structuredObserved.parseErrorsCount === 'number' ? structuredObserved.parseErrorsCount : 0,
+        jsonldTypes: Array.isArray(structuredObserved.types) ? structuredObserved.types.slice(0, 50) : [],
+        hasJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasJsonLd') ? structuredObserved.hasJsonLd : null,
+        hasWebsiteJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasWebsite') ? structuredObserved.hasWebsite : null,
+        hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
+        hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
+        hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
+        structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : true,
+        structuredDataObservationScope: structuredObserved.observationScope || 'rendered_dom_only',
+        structuredDataRenderedDomObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'renderedDomObserved') ? structuredObserved.renderedDomObserved : true,
+        structuredDataHtmlContentLdJsonObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlContentLdJsonObserved') ? structuredObserved.htmlContentLdJsonObserved : false,
+        structuredDataHtmlContentRawCount: typeof structuredObserved.htmlContentRawCount === 'number' ? structuredObserved.htmlContentRawCount : 0,
+        structuredDataHtmlContentParseableCount: typeof structuredObserved.htmlContentParseableCount === 'number' ? structuredObserved.htmlContentParseableCount : 0,
+        structuredDataScriptSrcJsonLdObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcJsonLdObserved') ? structuredObserved.scriptSrcJsonLdObserved : false,
+        structuredDataScriptSrcCandidateCount: typeof structuredObserved.scriptSrcCandidateCount === 'number' ? structuredObserved.scriptSrcCandidateCount : 0,
+        structuredDataScriptSrcFetchedCount: typeof structuredObserved.scriptSrcFetchedCount === 'number' ? structuredObserved.scriptSrcFetchedCount : 0,
+        structuredDataScriptSrcJsonLdCandidateCount: typeof structuredObserved.scriptSrcJsonLdCandidateCount === 'number' ? structuredObserved.scriptSrcJsonLdCandidateCount : 0,
+        structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
+        structuredDataScriptSrcAppIndexDetected: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcAppIndexDetected') ? structuredObserved.scriptSrcAppIndexDetected : false,
+        structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
+        structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
+        structuredDataChunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'chunkScanSkipped') ? structuredObserved.chunkScanSkipped : true,
+        hasOgImage: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasOgImage') ? multimodalObserved.hasOgImage : null,
+        hasTwitterImage: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasTwitterImage') ? multimodalObserved.hasTwitterImage : null,
+        hasFavicon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasFavicon') ? multimodalObserved.hasFavicon : null,
+        hasAppleTouchIcon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasAppleTouchIcon') ? multimodalObserved.hasAppleTouchIcon : null,
+        hasStructuredLogo: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasStructuredLogo') ? multimodalObserved.hasStructuredLogo : null,
+        hasContactLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasContactLink') ? trustObserved.hasContactLink : null,
+        contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null,
+        contactObservedFromDom: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromDom') ? trustObserved.contactObservedFromDom : null,
+        contactObservedFromScriptHint: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromScriptHint') ? trustObserved.contactObservedFromScriptHint : null,
+        contactPathHintOnly: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathHintOnly') ? trustObserved.contactPathHintOnly : null
+      };
+      const diagnostics = {
+        evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
+          ? geoSignalsV1.diagnostics.evaluateCount
+          : null,
+        htmlSkipped: true,
+        scoringSkipped: true,
+        auditSigSkipped: true,
+        jsScanSkipped: true,
+        chunkScanSkipped: true,
+        balancedMode: signalsFirstBalanced,
+        boundedHydrationWaitMs,
+        hydrationWaitMs: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.hydrationWaitMs === 'number' ? geoSignalsV1.diagnostics.hydrationWaitMs : null,
+        bodyTextBeforeWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextBeforeWait === 'number' ? geoSignalsV1.diagnostics.bodyTextBeforeWait : null,
+        bodyTextAfterWait: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.bodyTextAfterWait === 'number' ? geoSignalsV1.diagnostics.bodyTextAfterWait : null,
+        hydrationImprovedBodyText: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedBodyText),
+        hydrationImprovedLinks: !!(geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.hydrationImprovedLinks),
+        shadowHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
+        a11yHeadingScan: !balancedShortFastResponse,
+        appRootHeadingScan: !!signalsFirstBalanced,
+        heroHeadingScan: !!signalsFirstBalanced,
+        iframeHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
+        primaryHeadingScan: !!signalsFirstBalanced,
+        shadowPrimaryHeadingScan: !!(signalsFirstBalanced && !balancedShortFastResponse),
+        mainCandidateScan: !!signalsFirstBalanced,
+        htmlContentLdJsonScan: !!signalsFirstBalanced,
+        responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : undefined),
+        shortFastMode: !!balancedShortFastResponse,
+        skippedScans: balancedShortFastResponse
+          ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples']
+          : [],
+        phaseTimings: geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.phaseTimings || null,
+        timeoutGuardMs: balancedShortFastResponse ? 60000 : null
+      };
+      const memoryHints = {
+        avoidedHeavyBlocks: [
+          'html',
+          'scoring.html',
+          'auditSig',
+          'resource_js_tap',
+          'chunk_tap',
+          ...(signalsFirstBalanced ? [] : ['multimodalSignals']),
+          'productSpecComparisonSignals',
+          'responsePayloadHugeMerge'
+        ],
+        estimatedSavedBytes: null
+      };
+      try {
+        const htmlEstimate = await page.evaluate(() => {
+          try { return String((document.documentElement && document.documentElement.outerHTML) || '').length; } catch (_) { return 0; }
+        }).catch(() => 0);
+        memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
+      } catch (_) {}
+      logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_SEND' : 'SIGNALS_FIRST_LIGHT_SEND', {
+        h1Count: lightweightSummary.h1Count,
+        hasMainLandmark: lightweightSummary.hasMainLandmarkFinal,
+        h1Source: lightweightSummary.h1Source,
+        headingObservationLimited: lightweightSummary.headingObservationLimited,
+        primaryHeadingCandidate: lightweightSummary.primaryHeadingCandidate,
+        primaryHeadingCandidateSource: lightweightSummary.primaryHeadingCandidateSource,
+        h1EquivalentCandidateFound: lightweightSummary.h1EquivalentCandidateFound,
+        sectionHeadingCandidate: lightweightSummary.sectionHeadingCandidate,
+        sectionHeadingCandidateSource: lightweightSummary.sectionHeadingCandidateSource,
+        mainLandmarkCandidateFound: lightweightSummary.mainLandmarkCandidateFound,
+        jsonldCount: lightweightSummary.jsonldCount,
+        navLinkCount: lightweightSummary.navLinkCount,
+        bodyTextLength: lightweightSummary.bodyTextLength
+      });
+      logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_send' : 'signals_first_light_send');
+      const signalsResponsePayload = {
+        ok: true,
+        mode: signalsFirstBalanced ? 'signalsFirstBalanced' : 'signalsFirstLight',
+        url: urlToFetch,
+        finalUrl,
+        status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        geoSignalsV1,
+        lightweightSummary,
+        diagnostics,
+        memoryHints
+      };
+      if (balancedShortResponse) {
+        const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
+        if (balancedShortFastResponse) {
+          shortPayload.responseMode = 'shortFast';
+          shortPayload.shortFastMode = true;
+          if (shortPayload.diagnostics) {
+            shortPayload.diagnostics.responseMode = 'shortFast';
+            shortPayload.diagnostics.shortFastMode = true;
+            shortPayload.diagnostics.timeoutGuardMs = 60000;
+            shortPayload.diagnostics.skippedScans = Array.from(new Set([]
+              .concat(shortPayload.diagnostics.skippedScans || [])
+              .concat(['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples'])
+            ));
+          }
+          if (shortPayload.memoryHints) {
+            shortPayload.memoryHints.shortFastMode = true;
+            shortPayload.memoryHints.skippedScans = shortPayload.diagnostics && shortPayload.diagnostics.skippedScans || [];
+          }
+        }
+        logSf('SIGNALS_FIRST_BALANCED_SHORT_SEND', {
+          responseMode: balancedShortFastResponse ? 'shortFast' : 'short',
+          trimmedFieldsCount: shortPayload && shortPayload.diagnostics && Array.isArray(shortPayload.diagnostics.trimmedFields)
+            ? shortPayload.diagnostics.trimmedFields.length
+            : 0,
+          estimatedOriginalBytes: shortPayload && shortPayload.diagnostics && shortPayload.diagnostics.estimatedOriginalBytes,
+          responseBytesApprox: shortPayload && shortPayload.diagnostics && shortPayload.diagnostics.responseBytesApprox,
+          navLinkCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.navLinkCount,
+          jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
+        });
+        return res.status(200).json(shortPayload);
+      }
+      return res.status(200).json(signalsResponsePayload);
+    }
+    if (signalsOnly) {
+      const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
+      logSf('SIGNALS_ONLY_EARLY_ENTER', {
+        url: String(urlToFetch || '').slice(0, 180),
+        finalUrl: String(finalUrl || '').slice(0, 180),
+        probe: probeMode || null
+      });
+      logSfMemory('signals_only_early_enter');
+      logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
+      logSfMemory('signals_only_early_before_geo_signals');
+      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+      logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
+        hasGeoSignals: !!geoSignalsV1,
+        error: geoSignalsV1 && geoSignalsV1.error ? true : false
+      });
+      logSfMemory('signals_only_early_after_geo_signals');
+      if (probeMode) {
+        const debug = {
+          skippedHeavyPayload: true,
+          reason: 'signalsOnly=1',
+          htmlLength: null,
+          renderedTextLength: null,
+          bodyTextLength: null,
+          auditSigSummary: null,
+          dataSummary: null,
+          evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics
+            ? geoSignalsV1.diagnostics.evaluateCount
+            : null
+        };
+        logSf('PROBE_ENTER', { probe: probeMode });
+        logSfMemory('probe_enter');
+        if (probeMode === 'content') {
+          logSf('PROBE_BEFORE_CONTENT');
+          logSfMemory('probe_before_content');
+          const probeHtml = await page.content().catch(() => '');
+          debug.htmlLength = String(probeHtml || '').length;
+          logSf('PROBE_AFTER_CONTENT', { htmlLength: debug.htmlLength });
+          logSfMemory('probe_after_content');
+        } else if (probeMode === 'text') {
+          logSf('PROBE_BEFORE_TEXT');
+          logSfMemory('probe_before_text');
+          const probeText = await page.evaluate(() => {
+            try {
+              const body = document.body;
+              return String((body && (body.innerText || body.textContent)) || '');
+            } catch (_) {
+              return '';
+            }
+          }).catch(() => '');
+          debug.renderedTextLength = String(probeText || '').length;
+          debug.bodyTextLength = debug.renderedTextLength;
+          logSf('PROBE_AFTER_TEXT', { renderedTextLength: debug.renderedTextLength });
+          logSfMemory('probe_after_text');
+        } else if (probeMode === 'audit') {
+          logSf('PROBE_BEFORE_AUDIT');
+          logSfMemory('probe_before_audit');
+          const probeAuditSig = await buildAuditSigFromPage(page).catch(() => null);
+          debug.auditSigSummary = {
+            exists: !!probeAuditSig,
+            keysCount: probeAuditSig && typeof probeAuditSig === 'object' ? Object.keys(probeAuditSig).length : 0,
+            jsonldCount: probeAuditSig && typeof probeAuditSig.jsonldCount === 'number' ? probeAuditSig.jsonldCount : null,
+            jsonldTypesCount: probeAuditSig && Array.isArray(probeAuditSig.jsonldTypes) ? probeAuditSig.jsonldTypes.length : null,
+            h1Count: probeAuditSig && typeof probeAuditSig.h1Count === 'number' ? probeAuditSig.h1Count : null
+          };
+          logSf('PROBE_AFTER_AUDIT', debug.auditSigSummary);
+          logSfMemory('probe_after_audit');
+        } else if (probeMode === 'data') {
+          logSf('PROBE_BEFORE_DATA');
+          logSfMemory('probe_before_data');
+          const probeBodySample = geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.body
+            ? String(geoSignalsV1.observed.body.sample || '')
+            : '';
+          const probeData = buildScoresFromScrape({
+            url: finalUrl || urlToFetch,
+            html: '',
+            bodyText: probeBodySample,
+            jsonld: [],
+            structured: {},
+            jsonldSynth: []
+          });
+          debug.dataSummary = {
+            exists: !!probeData,
+            keysCount: probeData && typeof probeData === 'object' ? Object.keys(probeData).length : 0,
+            hasBefore: !!(probeData && probeData.before),
+            hasAfter: !!(probeData && probeData.after)
+          };
+          logSf('PROBE_AFTER_DATA', debug.dataSummary);
+          logSfMemory('probe_after_data');
+        } else if (probeMode === 'resourcejson') {
+          logSf('PROBE_BEFORE_RESOURCE_JSON');
+          logSfMemory('probe_before_resource_json');
+          const resourceJsonSummary = {
+            stage: 'start',
+            candidateCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            sampleUrls: [],
+            sampleKeys: [],
+            maxBodyLength: 0
+          };
+          try {
+            resourceJsonSummary.stage = 'collect_resource_entries';
+            const probeResourceUrls = await page.evaluate(() => {
+              try {
+                return performance.getEntriesByType('resource')
+                  .map(e => e && e.name)
+                  .filter(Boolean);
+              } catch (_) {
+                return [];
+              }
+            }).catch(() => []);
+            const probeJsonUrls = uniq((Array.isArray(probeResourceUrls) ? probeResourceUrls : []).filter(u =>
+              /(\.json(\?|$))|googleapis|sheets|gviz|cms|data/i.test(String(u || ''))
+            )).slice(0, 40);
+            resourceJsonSummary.candidateCount = probeJsonUrls.length;
+            resourceJsonSummary.sampleUrls = probeJsonUrls.slice(0, 10);
+            resourceJsonSummary.stage = 'fetch_json_candidates';
+            for (const u of probeJsonUrls) {
+              resourceJsonSummary.attemptedCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                if (!r.ok()) continue;
+                const body = await r.text();
+                const len = String(body || '').length;
+                resourceJsonSummary.okCount += 1;
+                resourceJsonSummary.totalBytes += len;
+                resourceJsonSummary.maxBodyLength = Math.max(resourceJsonSummary.maxBodyLength, len);
+                if (resourceJsonSummary.sampleKeys.length < 20) {
+                  try {
+                    const parsed = JSON.parse(body);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                      Object.keys(parsed).slice(0, 8).forEach(k => resourceJsonSummary.sampleKeys.push(k));
+                    } else if (Array.isArray(parsed)) {
+                      resourceJsonSummary.sampleKeys.push('[array]');
+                    }
+                  } catch (_) {}
+                }
+              } catch (_) {
+                resourceJsonSummary.errorCount += 1;
+              }
+            }
+            resourceJsonSummary.stage = 'done';
+          } catch (e) {
+            resourceJsonSummary.stage = 'error';
+            resourceJsonSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          resourceJsonSummary.sampleKeys = Array.from(new Set(resourceJsonSummary.sampleKeys)).slice(0, 20);
+          debug.resourceJsonSummary = resourceJsonSummary;
+          logSf('PROBE_AFTER_RESOURCE_JSON', {
+            stage: resourceJsonSummary.stage,
+            candidateCount: resourceJsonSummary.candidateCount,
+            attemptedCount: resourceJsonSummary.attemptedCount,
+            okCount: resourceJsonSummary.okCount,
+            totalBytes: resourceJsonSummary.totalBytes,
+            maxBodyLength: resourceJsonSummary.maxBodyLength
+          });
+          logSfMemory('probe_after_resource_json');
+        } else if (probeMode === 'jstap') {
+          logSf('PROBE_BEFORE_JS_TAP');
+          logSfMemory('probe_before_js_tap');
+          const jsTapSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            moduleScriptCount: 0,
+            preloadScriptCount: 0,
+            chunkLikeCount: 0,
+            nextStaticCount: 0,
+            sampleScriptUrls: [],
+            sampleChunkUrls: [],
+            totalUrlChars: 0,
+            maxUrlLength: 0
+          };
+          try {
+            jsTapSummary.stage = 'collect_script_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => ({
+                    src: clean(el.getAttribute('src')),
+                    type: clean(el.getAttribute('type')),
+                    async: !!el.async,
+                    defer: !!el.defer
+                  })).filter(x => x.src),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => ({
+                    href: clean(el.getAttribute('href')),
+                    rel: clean(el.getAttribute('rel')),
+                    as: clean(el.getAttribute('as'))
+                  })).filter(x => x.href),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const scriptUrls = uniq((Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : []).map(x => absProbeUrl(x && x.src)).filter(Boolean));
+            const preloadUrls = uniq((Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : []).map(x => absProbeUrl(x && x.href)).filter(Boolean));
+            const perfUrls = uniq((Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : []).map(absProbeUrl).filter(Boolean));
+            const allUrls = uniq([].concat(scriptUrls, preloadUrls, perfUrls));
+            const chunkUrls = allUrls.filter(u => /chunk|webpack|\/_next\/static\/|app-index|\.m?js(\?|$)/i.test(String(u || '')));
+            jsTapSummary.scriptCount = scriptUrls.length;
+            jsTapSummary.moduleScriptCount = (Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .filter(x => /module/i.test(String(x && x.type || ''))).length;
+            jsTapSummary.preloadScriptCount = preloadUrls.length;
+            jsTapSummary.chunkLikeCount = chunkUrls.length;
+            jsTapSummary.nextStaticCount = allUrls.filter(u => /\/_next\/static\//i.test(String(u || ''))).length;
+            jsTapSummary.sampleScriptUrls = allUrls.slice(0, 20);
+            jsTapSummary.sampleChunkUrls = chunkUrls.slice(0, 20);
+            jsTapSummary.totalUrlChars = allUrls.reduce((sum, u) => sum + String(u || '').length, 0);
+            jsTapSummary.maxUrlLength = allUrls.reduce((max, u) => Math.max(max, String(u || '').length), 0);
+            jsTapSummary.stage = 'done';
+          } catch (e) {
+            jsTapSummary.stage = 'error';
+            jsTapSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsTapSummary = jsTapSummary;
+          logSf('PROBE_AFTER_JS_TAP', {
+            stage: jsTapSummary.stage,
+            scriptCount: jsTapSummary.scriptCount,
+            preloadScriptCount: jsTapSummary.preloadScriptCount,
+            chunkLikeCount: jsTapSummary.chunkLikeCount,
+            totalUrlChars: jsTapSummary.totalUrlChars
+          });
+          logSfMemory('probe_after_js_tap');
+        } else if (probeMode === 'jsfetch') {
+          logSf('PROBE_BEFORE_JS_FETCH', { maxFetch: probeMaxFetch });
+          logSfMemory('probe_before_js_fetch');
+          const jsFetchSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            maxBodyLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            sampleResults: []
+          };
+          try {
+            jsFetchSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            jsFetchSummary.scriptCount = jsUrls.length;
+            jsFetchSummary.stage = 'fetch_js_start';
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsFetchSummary.attemptedCount += 1;
+              jsFetchSummary.stage = 'fetch_js_each';
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                if (row.ok) jsFetchSummary.okCount += 1;
+                jsFetchSummary.totalBytes += row.bodyLength;
+                jsFetchSummary.maxBodyLength = Math.max(jsFetchSummary.maxBodyLength, row.bodyLength);
+              } catch (e) {
+                jsFetchSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsFetchSummary.totalElapsedMs += row.elapsedMs;
+                if (jsFetchSummary.sampleResults.length < 10) jsFetchSummary.sampleResults.push(row);
+              }
+            }
+            jsFetchSummary.stage = 'done';
+          } catch (e) {
+            jsFetchSummary.stage = 'error';
+            jsFetchSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsFetchSummary = jsFetchSummary;
+          logSf('PROBE_AFTER_JS_FETCH', {
+            stage: jsFetchSummary.stage,
+            scriptCount: jsFetchSummary.scriptCount,
+            attemptedCount: jsFetchSummary.attemptedCount,
+            okCount: jsFetchSummary.okCount,
+            errorCount: jsFetchSummary.errorCount,
+            totalBytes: jsFetchSummary.totalBytes,
+            totalElapsedMs: jsFetchSummary.totalElapsedMs,
+            maxBodyLength: jsFetchSummary.maxBodyLength
+          });
+          logSfMemory('probe_after_js_fetch');
+        } else if (probeMode === 'jsscan') {
+          logSf('PROBE_BEFORE_JS_SCAN', { maxFetch: probeMaxFetch });
+          logSfMemory('probe_before_js_scan');
+          const jsScanSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalRawBytes: 0,
+            totalDecodedBytes: 0,
+            totalScanBytes: 0,
+            maxRawLength: 0,
+            maxDecodedLength: 0,
+            maxScanLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            sampleResults: []
+          };
+          try {
+            jsScanSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            const phoneRe = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
+            const zipRe = /〒?\d{3}-?\d{4}/g;
+            const socialHostRe = /https?:\/\/[^\s"'<>]+/g;
+            jsScanSummary.scriptCount = jsUrls.length;
+            jsScanSummary.stage = 'fetch_js_start';
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                rawLength: 0,
+                decodedLength: 0,
+                scanLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsScanSummary.attemptedCount += 1;
+              jsScanSummary.stage = 'fetch_js_each';
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const raw = await r.text();
+                row.rawLength = String(raw || '').length;
+                jsScanSummary.stage = 'decode_each';
+                const decoded = decodeUnicodeEscapes(raw);
+                row.decodedLength = String(decoded || '').length;
+                jsScanSummary.stage = 'scan_each';
+                const scan = String(raw || '') + '\n' + String(decoded || '');
+                row.scanLength = scan.length;
+                row.matchCounts = {
+                  phone: (scan.match(phoneRe) || []).length,
+                  zip: (scan.match(zipRe) || []).length,
+                  url: (scan.match(socialHostRe) || []).length
+                };
+                if (row.ok) jsScanSummary.okCount += 1;
+                jsScanSummary.totalRawBytes += row.rawLength;
+                jsScanSummary.totalDecodedBytes += row.decodedLength;
+                jsScanSummary.totalScanBytes += row.scanLength;
+                jsScanSummary.maxRawLength = Math.max(jsScanSummary.maxRawLength, row.rawLength);
+                jsScanSummary.maxDecodedLength = Math.max(jsScanSummary.maxDecodedLength, row.decodedLength);
+                jsScanSummary.maxScanLength = Math.max(jsScanSummary.maxScanLength, row.scanLength);
+              } catch (e) {
+                jsScanSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsScanSummary.totalElapsedMs += row.elapsedMs;
+                if (jsScanSummary.sampleResults.length < 10) jsScanSummary.sampleResults.push(row);
+              }
+            }
+            jsScanSummary.stage = 'done';
+          } catch (e) {
+            jsScanSummary.stage = 'error';
+            jsScanSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsScanSummary = jsScanSummary;
+          logSf('PROBE_AFTER_JS_SCAN', {
+            stage: jsScanSummary.stage,
+            scriptCount: jsScanSummary.scriptCount,
+            attemptedCount: jsScanSummary.attemptedCount,
+            okCount: jsScanSummary.okCount,
+            errorCount: jsScanSummary.errorCount,
+            totalRawBytes: jsScanSummary.totalRawBytes,
+            totalDecodedBytes: jsScanSummary.totalDecodedBytes,
+            totalScanBytes: jsScanSummary.totalScanBytes,
+            maxScanLength: jsScanSummary.maxScanLength,
+            totalElapsedMs: jsScanSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_js_scan');
+        } else if (probeMode === 'jschunk') {
+          logSf('PROBE_BEFORE_JS_CHUNK', { maxFetch: probeMaxFetch, maxChunkFetch: probeMaxChunkFetch });
+          logSfMemory('probe_before_js_chunk');
+          const jsChunkSummary = {
+            stage: 'start',
+            scriptCount: 0,
+            attemptedScriptCount: 0,
+            chunkCandidateCount: 0,
+            attemptedChunkCount: 0,
+            okChunkCount: 0,
+            errorChunkCount: 0,
+            totalScriptScanBytes: 0,
+            totalChunkBytes: 0,
+            maxChunkBodyLength: 0,
+            totalElapsedMs: 0,
+            maxFetch: probeMaxFetch,
+            maxChunkFetch: probeMaxChunkFetch,
+            sampleChunkUrls: [],
+            sampleResults: []
+          };
+          try {
+            jsChunkSummary.stage = 'collect_js_urls';
+            const probeJs = await page.evaluate(() => {
+              try {
+                const clean = (v) => String(v || '').trim();
+                return {
+                  scriptSrcs: Array.from(document.querySelectorAll('script[src]')).map(el => clean(el.getAttribute('src'))).filter(Boolean),
+                  modulePreloads: Array.from(document.querySelectorAll('link[rel="modulepreload"][href],link[rel="preload"][as="script"][href]')).map(el => clean(el.getAttribute('href'))).filter(Boolean),
+                  performanceScripts: performance.getEntriesByType('resource')
+                    .map(e => clean(e && e.name))
+                    .filter(u => u && /(\.m?js(\?|$))|\/_next\/static\/|webpack|chunk|app-index/i.test(u))
+                };
+              } catch (_) {
+                return { scriptSrcs: [], modulePreloads: [], performanceScripts: [] };
+              }
+            }).catch(() => ({ scriptSrcs: [], modulePreloads: [], performanceScripts: [] }));
+            const absProbeUrl = (u) => {
+              try { return new URL(u, finalUrl || urlToFetch).toString(); } catch (_) { return String(u || ''); }
+            };
+            const jsUrls = uniq([]
+              .concat(Array.isArray(probeJs.scriptSrcs) ? probeJs.scriptSrcs : [])
+              .concat(Array.isArray(probeJs.modulePreloads) ? probeJs.modulePreloads : [])
+              .concat(Array.isArray(probeJs.performanceScripts) ? probeJs.performanceScripts : [])
+              .map(absProbeUrl)
+              .filter(Boolean)
+            );
+            const extraChunkUrls = new Set();
+            const phoneRe = /(?:\+81[-\s()]?)?0\d{1,4}[-\s()]?\d{1,4}[-\s()]?\d{3,4}/g;
+            const zipRe = /〒?\d{3}-?\d{4}/g;
+            const urlRe = /https?:\/\/[^\s"'<>]+/g;
+            jsChunkSummary.scriptCount = jsUrls.length;
+            for (const u of jsUrls.slice(0, probeMaxFetch)) {
+              jsChunkSummary.stage = 'fetch_js_each';
+              const eachStart = Date.now();
+              try {
+                const r = await page.request.get(u, { timeout: 10000 });
+                if (!r.ok()) continue;
+                const raw = await r.text();
+                const decoded = decodeUnicodeEscapes(raw);
+                const scan = String(raw || '') + '\n' + String(decoded || '');
+                jsChunkSummary.stage = 'scan_js_each';
+                jsChunkSummary.attemptedScriptCount += 1;
+                jsChunkSummary.totalScriptScanBytes += scan.length;
+                const matches = scan.match(/["'`](\/chunk-[A-Za-z0-9-]+\.js)["'`]/g) || [];
+                jsChunkSummary.stage = 'extract_chunk_urls';
+                for (const rawMatch of matches) {
+                  const rel = rawMatch.replace(/^["'`]|["'`]$/g, '');
+                  try {
+                    extraChunkUrls.add(new URL(rel, finalUrl || urlToFetch).toString());
+                  } catch (_) {}
+                }
+              } catch (_) {
+                jsChunkSummary.errorChunkCount += 0;
+              } finally {
+                jsChunkSummary.totalElapsedMs += Math.max(0, Date.now() - eachStart);
+              }
+            }
+            const chunkUrls = Array.from(extraChunkUrls);
+            jsChunkSummary.chunkCandidateCount = chunkUrls.length;
+            jsChunkSummary.sampleChunkUrls = chunkUrls.slice(0, 20);
+            for (const u of chunkUrls.slice(0, probeMaxChunkFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              jsChunkSummary.stage = 'fetch_chunk_each';
+              jsChunkSummary.attemptedChunkCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 15000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                row.matchCounts = {
+                  phone: ((body || '').match(phoneRe) || []).length,
+                  zip: ((body || '').match(zipRe) || []).length,
+                  url: ((body || '').match(urlRe) || []).length
+                };
+                if (row.ok) jsChunkSummary.okChunkCount += 1;
+                jsChunkSummary.totalChunkBytes += row.bodyLength;
+                jsChunkSummary.maxChunkBodyLength = Math.max(jsChunkSummary.maxChunkBodyLength, row.bodyLength);
+              } catch (e) {
+                jsChunkSummary.errorChunkCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                jsChunkSummary.totalElapsedMs += row.elapsedMs;
+                if (jsChunkSummary.sampleResults.length < 10) jsChunkSummary.sampleResults.push(row);
+              }
+            }
+            jsChunkSummary.stage = 'done';
+          } catch (e) {
+            jsChunkSummary.stage = 'error';
+            jsChunkSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.jsChunkSummary = jsChunkSummary;
+          logSf('PROBE_AFTER_JS_CHUNK', {
+            stage: jsChunkSummary.stage,
+            scriptCount: jsChunkSummary.scriptCount,
+            attemptedScriptCount: jsChunkSummary.attemptedScriptCount,
+            chunkCandidateCount: jsChunkSummary.chunkCandidateCount,
+            attemptedChunkCount: jsChunkSummary.attemptedChunkCount,
+            okChunkCount: jsChunkSummary.okChunkCount,
+            errorChunkCount: jsChunkSummary.errorChunkCount,
+            totalScriptScanBytes: jsChunkSummary.totalScriptScanBytes,
+            totalChunkBytes: jsChunkSummary.totalChunkBytes,
+            maxChunkBodyLength: jsChunkSummary.maxChunkBodyLength,
+            totalElapsedMs: jsChunkSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_js_chunk');
+        } else if (probeMode === 'subpages') {
+          logSf('PROBE_BEFORE_SUBPAGES', { maxSubpageFetch: probeMaxSubpageFetch });
+          logSfMemory('probe_before_subpages');
+          const subpagesSummary = {
+            stage: 'start',
+            internalLinkCount: 0,
+            candidateCount: 0,
+            attemptedCount: 0,
+            okCount: 0,
+            errorCount: 0,
+            totalBytes: 0,
+            maxBodyLength: 0,
+            totalElapsedMs: 0,
+            maxSubpageFetch: probeMaxSubpageFetch,
+            sampleCandidates: [],
+            sampleResults: []
+          };
+          try {
+            subpagesSummary.stage = 'collect_internal_links';
+            const targetOrigin = (() => {
+              try { return new URL(finalUrl || urlToFetch).origin; } catch (_) { return ''; }
+            })();
+            const probeLinks = await page.evaluate((origin) => {
+              try {
+                const norm = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('a[href]')).map(a => {
+                  let href = '';
+                  try { href = new URL(a.getAttribute('href') || a.href || '', location.href).toString(); } catch (_) {}
+                  let sameOrigin = false;
+                  try { sameOrigin = !!href && new URL(href).origin === origin; } catch (_) {}
+                  return {
+                    text: norm(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || ''),
+                    href,
+                    sameOrigin
+                  };
+                }).filter(x => x && x.href && x.sameOrigin);
+              } catch (_) {
+                return [];
+              }
+            }, targetOrigin).catch(() => []);
+            const internalLinks = Array.isArray(probeLinks) ? probeLinks : [];
+            subpagesSummary.internalLinkCount = internalLinks.length;
+            subpagesSummary.stage = 'build_subpage_candidates';
+            const candidateRe = /about|company|service|services|business|contact|inquiry|faq|privacy|policy|terms|support|plan|plans|product|products|会社|企業|サービス|事業|問い合わせ|お問い合わせ|よくある質問|プライバシー|個人情報|規約|サポート|料金|プラン|製品/i;
+            const fixedCandidates = targetOrigin && typeof pickSubPageCandidatesVNext_ === 'function'
+              ? pickSubPageCandidatesVNext_(targetOrigin)
+              : [];
+            const candidateSeen = new Set();
+            const candidates = [];
+            const addCandidate = (u) => {
+              try {
+                const parsed = new URL(String(u || ''), finalUrl || urlToFetch);
+                if (!targetOrigin || parsed.origin !== targetOrigin) return;
+                parsed.hash = '';
+                const k = parsed.toString().replace(/\/+$/, '');
+                if (!k || candidateSeen.has(k)) return;
+                candidateSeen.add(k);
+                candidates.push(k);
+              } catch (_) {}
+            };
+            for (const link of internalLinks) {
+              const hay = `${link && link.text || ''} ${link && link.href || ''}`;
+              if (candidateRe.test(hay)) addCandidate(link && link.href);
+            }
+            for (const u of fixedCandidates) addCandidate(u);
+            subpagesSummary.candidateCount = candidates.length;
+            subpagesSummary.sampleCandidates = candidates.slice(0, 20);
+            for (const u of candidates.slice(0, probeMaxSubpageFetch)) {
+              const eachStart = Date.now();
+              const row = {
+                url: String(u || '').slice(0, 180),
+                status: null,
+                contentType: '',
+                bodyLength: 0,
+                elapsedMs: 0,
+                ok: false
+              };
+              subpagesSummary.stage = 'fetch_subpage_each';
+              subpagesSummary.attemptedCount += 1;
+              try {
+                const r = await page.request.get(u, { timeout: 15000 });
+                row.status = typeof r.status === 'function' ? r.status() : null;
+                row.contentType = String((r.headers && r.headers()['content-type']) || '').slice(0, 120);
+                row.ok = !!(r && typeof r.ok === 'function' && r.ok());
+                const body = await r.text();
+                row.bodyLength = String(body || '').length;
+                if (/text\/html|application\/xhtml/i.test(row.contentType)) {
+                  const html = String(body || '');
+                  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+                  if (titleMatch) {
+                    row.title = String(titleMatch[1] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+                  }
+                  row.h1Count = (html.match(/<h1\b/gi) || []).length;
+                  row.h2Count = (html.match(/<h2\b/gi) || []).length;
+                }
+                if (row.ok) subpagesSummary.okCount += 1;
+                subpagesSummary.totalBytes += row.bodyLength;
+                subpagesSummary.maxBodyLength = Math.max(subpagesSummary.maxBodyLength, row.bodyLength);
+              } catch (e) {
+                subpagesSummary.errorCount += 1;
+                row.errorMessage = String(e && e.message || e).slice(0, 160);
+              } finally {
+                row.elapsedMs = Math.max(0, Date.now() - eachStart);
+                subpagesSummary.totalElapsedMs += row.elapsedMs;
+                if (subpagesSummary.sampleResults.length < 10) subpagesSummary.sampleResults.push(row);
+              }
+            }
+            subpagesSummary.stage = 'done';
+          } catch (e) {
+            subpagesSummary.stage = 'error';
+            subpagesSummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          }
+          debug.subpagesSummary = subpagesSummary;
+          logSf('PROBE_AFTER_SUBPAGES', {
+            stage: subpagesSummary.stage,
+            internalLinkCount: subpagesSummary.internalLinkCount,
+            candidateCount: subpagesSummary.candidateCount,
+            attemptedCount: subpagesSummary.attemptedCount,
+            okCount: subpagesSummary.okCount,
+            errorCount: subpagesSummary.errorCount,
+            totalBytes: subpagesSummary.totalBytes,
+            maxBodyLength: subpagesSummary.maxBodyLength,
+            totalElapsedMs: subpagesSummary.totalElapsedMs
+          });
+          logSfMemory('probe_after_subpages');
+        } else if (probeMode === 'payloadassembly') {
+          logSf('PROBE_BEFORE_PAYLOAD_ASSEMBLY');
+          logSfMemory('probe_before_payload_assembly');
+          const payloadAssemblyStartedAt = Date.now();
+          const payloadAssemblySummary = {
+            stage: 'start',
+            mode: 'payloadAssemblyLight',
+            url: urlToFetch,
+            finalUrl,
+            status: resp && typeof resp.status === 'function' ? resp.status() : null,
+            htmlLengthEstimate: 0,
+            renderedTextLengthEstimate: 0,
+            bodyTextLengthEstimate: 0,
+            geoSignalsBytesEstimate: 0,
+            candidateHeavyBlocks: [],
+            skippedHeavyBuilds: [
+              'auditSig',
+              'scoring',
+              'responsePayload',
+              'fullPayloadStringify'
+            ],
+            recommendation: [
+              'doNotHoldHtmlInResponsePayload',
+              'doNotPassHtmlIntoScoringWhenSignalsOnly',
+              'buildFromGeoSignalsV1'
+            ],
+            elapsedMs: 0
+          };
+          try {
+            payloadAssemblySummary.stage = 'estimate_sizes';
+            logSf('PROBE_PAYLOAD_ASSEMBLY_BEFORE_ESTIMATE');
+            logSfMemory('probe_payload_assembly_before_html');
+            const lengthEstimates = await page.evaluate(() => {
+              try {
+                const htmlLength = String((document.documentElement && document.documentElement.outerHTML) || '').length;
+                const body = document.body;
+                const renderedTextLength = String((body && (body.innerText || body.textContent)) || '').length;
+                return {
+                  htmlLength,
+                  renderedTextLength,
+                  bodyTextLength: renderedTextLength
+                };
+              } catch (_) {
+                return { htmlLength: 0, renderedTextLength: 0, bodyTextLength: 0 };
+              }
+            }).catch(() => ({ htmlLength: 0, renderedTextLength: 0, bodyTextLength: 0 }));
+            payloadAssemblySummary.htmlLengthEstimate = Number(lengthEstimates.htmlLength || 0);
+            payloadAssemblySummary.renderedTextLengthEstimate = Number(lengthEstimates.renderedTextLength || 0);
+            payloadAssemblySummary.bodyTextLengthEstimate = Number(lengthEstimates.bodyTextLength || 0);
+            try {
+              payloadAssemblySummary.geoSignalsBytesEstimate = Buffer.byteLength(JSON.stringify(geoSignalsV1 || {}), 'utf8');
+            } catch (_) {
+              payloadAssemblySummary.geoSignalsBytesEstimate = 0;
+            }
+            const responsePayloadShellEstimate = 512 + payloadAssemblySummary.geoSignalsBytesEstimate;
+            payloadAssemblySummary.candidateHeavyBlocks = [
+              {
+                key: 'html',
+                estimatedBytes: payloadAssemblySummary.htmlLengthEstimate,
+                present: payloadAssemblySummary.htmlLengthEstimate > 0,
+                buildSkipped: true
+              },
+              {
+                key: 'scoring.html',
+                estimatedBytes: payloadAssemblySummary.htmlLengthEstimate,
+                present: payloadAssemblySummary.htmlLengthEstimate > 0,
+                buildSkipped: true
+              },
+              {
+                key: 'auditSig',
+                estimatedBytes: null,
+                present: null,
+                buildSkipped: true,
+                reason: 'full_build_skipped_to_avoid_oom'
+              },
+              {
+                key: 'responsePayloadShell',
+                estimatedBytes: responsePayloadShellEstimate,
+                present: true,
+                buildSkipped: true
+              },
+              {
+                key: 'data/scoring',
+                estimatedBytes: null,
+                present: null,
+                buildSkipped: true,
+                reason: 'buildScoresFromScrape_skipped_to_avoid_oom'
+              }
+            ];
+            payloadAssemblySummary.stage = 'done';
+          } catch (e) {
+            payloadAssemblySummary.stage = 'error';
+            payloadAssemblySummary.errorMessage = String(e && e.message || e).slice(0, 180);
+          } finally {
+            payloadAssemblySummary.elapsedMs = Math.max(0, Date.now() - payloadAssemblyStartedAt);
+          }
+          debug.payloadAssemblySummary = payloadAssemblySummary;
+          logSf('PROBE_AFTER_PAYLOAD_ASSEMBLY', {
+            stage: payloadAssemblySummary.stage,
+            mode: payloadAssemblySummary.mode,
+            htmlLengthEstimate: payloadAssemblySummary.htmlLengthEstimate,
+            renderedTextLengthEstimate: payloadAssemblySummary.renderedTextLengthEstimate,
+            geoSignalsBytesEstimate: payloadAssemblySummary.geoSignalsBytesEstimate,
+            elapsedMs: payloadAssemblySummary.elapsedMs
+          });
+          logSfMemory('probe_after_payload_assembly');
+        }
+        logSf('PROBE_SEND', { probe: probeMode });
+        logSfMemory('probe_send');
+        return res.status(200).json({
+          ok: true,
+          mode: 'signalsOnlyProbe',
+          probe: probeMode,
+          url: urlToFetch,
+          finalUrl,
+          status: resp && typeof resp.status === 'function' ? resp.status() : null,
+          geoSignalsV1,
+          debug
+        });
+      }
+      logSf('SIGNALS_ONLY_EARLY_SEND');
+      logSfMemory('signals_only_early_send');
+      return res.status(200).json({
+        ok: true,
+        mode: 'signalsOnlyEarly',
+        url: urlToFetch,
+        finalUrl,
+        status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        geoSignalsV1,
+        debug: {
+          skippedHeavyPayload: true,
+          reason: 'signalsOnly=1',
+          evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics
+            ? geoSignalsV1.diagnostics.evaluateCount
+            : null
+        }
+      });
+    }
     await Promise.race([
       page.waitForResponse(r => {
         const u = r.url();
