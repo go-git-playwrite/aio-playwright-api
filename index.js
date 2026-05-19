@@ -5812,7 +5812,7 @@ async function scrapeOnce(req, res) {
           try {
             const clone = document.body && document.body.cloneNode(true);
             if (!clone) return '';
-            clone.querySelectorAll('script,style,noscript,template,svg').forEach((el) => el.remove());
+            clone.querySelectorAll('nav,header,footer,aside,[role="navigation"],script,style,noscript,template,svg').forEach((el) => el.remove());
             return clean(clone.innerText || clone.textContent);
           } catch (_) {
             return clean(document.body && document.body.innerText);
@@ -5822,6 +5822,7 @@ async function scrapeOnce(req, res) {
           const t = clean(text).slice(0, 500);
           if (!t) return true;
           if (/window\.fetch|document\.|function\s*\(|<script|<\/?[a-z][^>]*>/i.test(t)) return true;
+          if (/-webkit-|text-size-adjust|display\s*:|margin\s*:|padding\s*:|place-items\s*:|min-height\s*:/i.test(t)) return true;
           if (/JavaScriptを有効にしてください|javascript is required/i.test(t) && t.length < 220) return true;
           return false;
         };
@@ -5831,6 +5832,50 @@ async function scrapeOnce(req, res) {
           .replace(/if\s*\(!window\.fetch\)[\s\S]*/i, ' ')
           .replace(/JavaScriptを有効にしてください/gi, ' ')
         );
+        const textFromCloneWithoutChrome = (el) => {
+          try {
+            if (!el) return '';
+            const clone = el.cloneNode(true);
+            clone.querySelectorAll('nav,header,footer,aside,[role="navigation"],script,style,noscript,template,svg').forEach((node) => node.remove());
+            return normalizeBodySample(clone.innerText || clone.textContent);
+          } catch (_) {
+            return '';
+          }
+        };
+        const mainTextCandidate = () => {
+          const selectors = [
+            'main',
+            '[role="main"]',
+            'article',
+            '#main',
+            '#main-content',
+            '#content',
+            '[id*="content" i]',
+            'app-index',
+            '#app',
+            '#root'
+          ];
+          const candidates = [];
+          selectors.forEach((selector) => {
+            try {
+              Array.from(document.querySelectorAll(selector)).slice(0, 3).forEach((el) => {
+                const text = textFromCloneWithoutChrome(el);
+                if (text) candidates.push(text);
+              });
+            } catch (_) {}
+          });
+          if (!candidates.length) {
+            try {
+              Array.from(document.querySelectorAll('section')).slice(0, 8).forEach((el) => {
+                const text = textFromCloneWithoutChrome(el);
+                if (text) candidates.push(text);
+              });
+            } catch (_) {}
+          }
+          return candidates
+            .filter((text) => text.length >= 40)
+            .sort((a, b) => b.length - a.length)[0] || '';
+        };
         const shadowTextParts = [];
         try {
           const walkShadow = (root, depth = 0) => {
@@ -5849,19 +5894,22 @@ async function scrapeOnce(req, res) {
         } catch (_) {}
         const domBodyText = readableBodyText();
         const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+        const mainCandidateText = mainTextCandidate();
+        const titleText = clean(document.title || '').slice(0, 180);
         const sampleCandidates = [
-          clean(shadowTextParts.join(' ')),
+          mainCandidateText,
           domBodyText,
+          clean(shadowTextParts.join(' ')),
           bodyText
         ].map(normalizeBodySample).filter(Boolean);
-        const bodyTextSample = (sampleCandidates.find((text) => !looksLikeScriptOrWarning(text)) || bodyText || '').slice(0, 800);
+        const bodyTextSample = (sampleCandidates.find((text) => !looksLikeScriptOrWarning(text)) || titleText || '').slice(0, 800);
         const metaEl =
           document.querySelector('meta[name="description" i]') ||
           document.querySelector('meta[property="og:description" i]') ||
           document.querySelector('meta[name="twitter:description" i]');
         const metaDescription = clean(metaEl && metaEl.getAttribute('content'));
         return {
-          title: clean(document.title || '').slice(0, 180),
+          title: titleText,
           metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
           metaDescriptionLength: metaDescription ? metaDescription.length : 0,
           bodyTextLength: bodyText.length,
