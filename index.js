@@ -5811,12 +5811,12 @@ async function scrapeOnce(req, res) {
         const shadowTextParts = [];
         try {
           const walkShadow = (root, depth = 0) => {
-            if (!root || depth > 2 || shadowTextParts.length >= 30) return;
+            if (!root || depth > 4 || shadowTextParts.length >= 50) return;
             const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
             nodes.forEach((el) => {
-              if (!el || shadowTextParts.length >= 30) return;
+              if (!el || shadowTextParts.length >= 50) return;
               const text = clean(el.innerText || el.textContent);
-              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 220));
+              if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 300));
               if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
             });
           };
@@ -5909,6 +5909,18 @@ async function scrapeOnce(req, res) {
         const absUrl = (href) => {
           try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
         };
+        const uniqueBy = (items, keyFn, max) => {
+          const out = [];
+          const seen = new Set();
+          (items || []).forEach((item) => {
+            if (out.length >= max) return;
+            const key = clean(keyFn(item)).toLowerCase();
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            out.push(item);
+          });
+          return out;
+        };
         const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
           text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
           href: absUrl(a.getAttribute('href') || '').slice(0, 180),
@@ -5936,13 +5948,25 @@ async function scrapeOnce(req, res) {
         } catch (_) {}
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+        const navTextItems = uniqueBy(
+          anchors.filter((a) => a.navLike && a.text),
+          (a) => a.text,
+          50
+        );
+        const internalItems = uniqueBy(
+          anchors.filter((a) => {
+            try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
+          }),
+          (a) => `${a.text} ${a.href}`,
+          50
+        );
         return {
           anchorCount: anchors.length,
-          navLinkCount: anchors.filter((a) => a.navLike).length,
-          internalLinkCount: anchors.filter((a) => {
-            try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
-          }).length,
-          navTextsSample: anchors.filter((a) => a.navLike && a.text).map((a) => a.text).slice(0, 10),
+          rawNavAnchorCount: anchors.filter((a) => a.navLike).length,
+          navLinkCount: navTextItems.length,
+          internalLinkCount: internalItems.length,
+          navTextsSample: navTextItems.map((a) => a.text),
+          internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
           hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
@@ -5983,14 +6007,16 @@ async function scrapeOnce(req, res) {
 
       await runPhase('landmarksLight', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const main = document.querySelector('main,[role="main"],#main,#main-content');
-        const appCandidate = document.querySelector('#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]');
+        const main = document.querySelector('main');
+        const roleMain = !main ? document.querySelector('[role="main"]') : null;
+        const confirmedMain = main || roleMain;
+        const appCandidate = document.querySelector('#main,#main-content,#app,#root,#__next,[data-reactroot],app-index,[id*="app" i],[id*="content" i]');
         return {
-          hasMainLandmark: !!main,
-          hasMainLandmark_final: main ? true : null,
-          mainLandmarkSource: main ? 'dom_main_light' : 'not_observed',
-          mainLandmarkCandidateFound: !main && !!appCandidate,
-          mainLandmarkCandidateSource: !main && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
+          hasMainLandmark: !!confirmedMain,
+          hasMainLandmark_final: confirmedMain ? true : null,
+          mainLandmarkSource: main ? 'dom_main_light' : (roleMain ? 'dom_role_main_light' : 'not_observed'),
+          mainLandmarkCandidateFound: !confirmedMain && !!appCandidate,
+          mainLandmarkCandidateSource: !confirmedMain && appCandidate ? 'dom_app_candidate_light' : 'not_observed',
           mainLandmarkCandidateTextLength: appCandidate ? clean(appCandidate.innerText || appCandidate.textContent).length : 0
         };
       }), unifiedBalancedObserverProbe ? 2000 : 3000);
@@ -6098,6 +6124,19 @@ async function scrapeOnce(req, res) {
       const landmarksLight = phaseResult('landmarksLight');
       const enhancedShadow = phaseResult('optionalEnhancedShadow');
       const optionalA11y = phaseResult('optionalA11y');
+      const unifiedBodyTextLength = Math.max(
+        Number(basicDom.bodyTextLength || 0),
+        Number(hydrationGuardedWait.bodyTextAfterWait || 0)
+      );
+      const mainLandmarkFinal = Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
+        ? landmarksLight.hasMainLandmark_final
+        : null;
+      const mainLandmarkSource = mainLandmarkFinal === true
+        ? (landmarksLight.mainLandmarkSource && landmarksLight.mainLandmarkSource !== 'not_observed'
+          ? landmarksLight.mainLandmarkSource
+          : 'not_observed')
+        : (landmarksLight.mainLandmarkSource || 'not_observed');
+      const mainLandmarkConfidence = mainLandmarkFinal === true ? 'high' : 'low';
       const structuredDataPhase = phaseByName('structuredDataLight');
       const sameOriginScriptJsonLdPhase = phaseByName('sameOriginScriptJsonLd');
       const phaseStatuses = phases.map((p) => ({
@@ -6239,7 +6278,7 @@ async function scrapeOnce(req, res) {
           hydration: {
             waitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
             bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
-            bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+            bodyTextAfterWait: unifiedBodyTextLength,
             anchorCountBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.anchorCountBeforeWait === 'number' ? hydrationGuardedWait.anchorCountBeforeWait : Number(basicDom.anchorCount || 0),
             anchorCountAfterWait: Number(basicDom.anchorCount || 0),
             navLinkCountBeforeWait: Number(linksTrust.navLinkCount || 0),
@@ -6257,17 +6296,15 @@ async function scrapeOnce(req, res) {
         },
         landmarks: {
           hasMainLandmark: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark') ? landmarksLight.hasMainLandmark : null,
-          hasMainLandmark_final: Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
-            ? landmarksLight.hasMainLandmark_final
-            : (unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0 ? true : null),
-          mainLandmarkSource: landmarksLight.mainLandmarkSource || (unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0 ? 'a11y_main_light' : 'not_observed'),
-          mainLandmarkConfidence: landmarksLight.hasMainLandmark ? 'high' : 'low',
+          hasMainLandmark_final: mainLandmarkFinal,
+          mainLandmarkSource,
+          mainLandmarkConfidence,
           mainLandmarkTextsSample: [],
           mainLandmarkCandidateFound: !!landmarksLight.mainLandmarkCandidateFound,
           mainLandmarkCandidateSource: landmarksLight.mainLandmarkCandidateSource || 'not_observed',
           mainLandmarkCandidateConfidence: landmarksLight.mainLandmarkCandidateFound ? 'low' : 'low',
           mainLandmarkCandidateTextsSample: [],
-          mainLandmarkObservationLimited: !landmarksLight.hasMainLandmark && !(unifiedBalancedObserverProbe && Number(optionalA11y.mainCount || 0) > 0),
+          mainLandmarkObservationLimited: mainLandmarkFinal !== true,
           a11yObserved: !!unifiedBalancedObserverProbe,
           a11yMainCount: unifiedBalancedObserverProbe && typeof optionalA11y.mainCount === 'number' ? optionalA11y.mainCount : 0
         },
@@ -6324,8 +6361,8 @@ async function scrapeOnce(req, res) {
           },
           headings: null,
           links: {
-            navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 10) : [],
-            internalLinksSample: [],
+            navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 50) : [],
+            internalLinksSample: Array.isArray(linksTrust.internalLinksSample) ? linksTrust.internalLinksSample.slice(0, 50) : [],
             hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasCompanyLikeLink') ? linksTrust.hasCompanyLikeLink : null,
             hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
             hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
@@ -6338,7 +6375,7 @@ async function scrapeOnce(req, res) {
           multimodalSignals: null,
           trustSignals: null,
           body: {
-            textLength: Number(basicDom.bodyTextLength || 0),
+            textLength: unifiedBodyTextLength,
             sample: '',
             source: 'rendered_dom_light',
             confidence: 'medium'
@@ -6357,7 +6394,7 @@ async function scrapeOnce(req, res) {
           boundedHydrationWaitMs: unifiedBalancedObserverProbe ? 2500 : 0,
           hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
           bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
-          bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+          bodyTextAfterWait: unifiedBodyTextLength,
           hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
           hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
           jsBundleAnalysis: false,
@@ -6423,7 +6460,7 @@ async function scrapeOnce(req, res) {
         mainLandmarkObservationLimited: geoSignalsV1.landmarks.mainLandmarkObservationLimited,
         hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
         bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
-        bodyTextAfterWait: Number(basicDom.bodyTextLength || 0),
+        bodyTextAfterWait: unifiedBodyTextLength,
         hydrationImprovedBodyText: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedBodyText),
         hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
         balancedMode: true,
@@ -6436,7 +6473,7 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasServiceLikeLink') ? linksTrust.hasServiceLikeLink : null,
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
-        bodyTextLength: Number(basicDom.bodyTextLength || 0),
+        bodyTextLength: unifiedBodyTextLength,
         jsonldCount: structuredDataLight.rawCount,
         jsonldParseableCount: structuredDataLight.parseableCount,
         jsonldParseErrorsCount: structuredDataLight.parseErrorsCount,
@@ -6508,7 +6545,7 @@ async function scrapeOnce(req, res) {
         !basicDomFailed ||
         basicDomFatalSuppressed ||
         !!basicDom.title ||
-        Number(basicDom.bodyTextLength || 0) > 0 ||
+        unifiedBodyTextLength > 0 ||
         Number(linksTrust.anchorCount || 0) > 0 ||
         Number(linksTrust.internalLinkCount || 0) > 0
       );
@@ -6527,7 +6564,7 @@ async function scrapeOnce(req, res) {
       const qualityReasons = [];
       if (recoveredFromBasicDomTimeout) qualityReasons.push('basic_dom_timeout_but_core_signals_recovered');
       if (!basicDom.title) qualityReasons.push('title_not_observed');
-      if (!Number(basicDom.bodyTextLength || 0)) qualityReasons.push('body_text_not_observed');
+      if (!unifiedBodyTextLength) qualityReasons.push('body_text_not_observed');
       if (!coreSignalsReady) qualityReasons.push('core_signals_not_ready');
       if (!structuredDataLight.hasJsonLd) qualityReasons.push('structured_data_not_observed_or_limited');
       if (!linksReady) qualityReasons.push('links_not_ready');
