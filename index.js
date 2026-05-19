@@ -5818,18 +5818,34 @@ async function scrapeOnce(req, res) {
             return clean(document.body && document.body.innerText);
           }
         };
+        const stripCssAndScriptFragments = (text) => {
+          let t = clean(text);
+          if (!t) return '';
+          t = t
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/if\s*\(!window\.fetch\)[\s\S]*/i, ' ')
+            .replace(/window\.fetch[\s\S]*/i, ' ')
+            .replace(/@(?:media|supports|keyframes)\b[\s\S]{0,1200}/gi, ' ');
+          const cssStart = t.search(/\b(?:html\s*,\s*body|:root|body\s*\{|app-[\w-]+\[[^\]]+\]\s*\{|#[\w-]+\s*\{|\\.[\w-]+\s*\{|--[\w-]+\s*:|display\s*:|font-[\w-]+\s*:|-webkit-[\w-]+\s*:|text-size-adjust\s*:)/i);
+          if (cssStart >= 0) {
+            const prefix = t.slice(0, cssStart).trim();
+            t = prefix.length >= 12 ? prefix : t.slice(cssStart).replace(/[^{}]{0,160}\{[^{}]*\}/g, ' ');
+          }
+          return clean(t
+            .replace(/[^{}]{0,160}\{[^{}]*\}/g, ' ')
+            .replace(/\b(?:display|margin|padding|min-height|place-items|font-[\w-]+|-webkit-[\w-]+|text-size-adjust)\s*:\s*[^;]+;?/gi, ' ')
+            .replace(/--[\w-]+\s*:\s*[^;]+;?/g, ' ')
+          );
+        };
         const looksLikeScriptOrWarning = (text) => {
           const t = clean(text).slice(0, 500);
           if (!t) return true;
           if (/window\.fetch|document\.|function\s*\(|<script|<\/?[a-z][^>]*>/i.test(t)) return true;
-          if (/-webkit-|text-size-adjust|display\s*:|margin\s*:|padding\s*:|place-items\s*:|min-height\s*:/i.test(t)) return true;
+          if (/html\s*,\s*body\s*\{|@media|:root|--[\w-]+\s*:|-webkit-|text-size-adjust|display\s*:|font-[\w-]+\s*:|margin\s*:|padding\s*:|place-items\s*:|min-height\s*:/i.test(t)) return true;
           if (/JavaScriptを有効にしてください|javascript is required/i.test(t) && t.length < 220) return true;
           return false;
         };
-        const normalizeBodySample = (text) => clean(String(text || '')
-          .replace(/<[^>]*>/g, ' ')
-          .replace(/[^{}]{0,120}\{[^{}]*\}/g, ' ')
-          .replace(/if\s*\(!window\.fetch\)[\s\S]*/i, ' ')
+        const normalizeBodySample = (text) => stripCssAndScriptFragments(String(text || '')
           .replace(/JavaScriptを有効にしてください/gi, ' ')
         );
         const textFromCloneWithoutChrome = (el) => {
