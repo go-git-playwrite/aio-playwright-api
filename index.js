@@ -5808,6 +5808,29 @@ async function scrapeOnce(req, res) {
 
       await runPhase('basicDomEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const readableBodyText = () => {
+          try {
+            const clone = document.body && document.body.cloneNode(true);
+            if (!clone) return '';
+            clone.querySelectorAll('script,style,noscript,template,svg').forEach((el) => el.remove());
+            return clean(clone.innerText || clone.textContent);
+          } catch (_) {
+            return clean(document.body && document.body.innerText);
+          }
+        };
+        const looksLikeScriptOrWarning = (text) => {
+          const t = clean(text).slice(0, 500);
+          if (!t) return true;
+          if (/window\.fetch|document\.|function\s*\(|<script|<\/?[a-z][^>]*>/i.test(t)) return true;
+          if (/JavaScriptを有効にしてください|javascript is required/i.test(t) && t.length < 220) return true;
+          return false;
+        };
+        const normalizeBodySample = (text) => clean(String(text || '')
+          .replace(/<[^>]*>/g, ' ')
+          .replace(/[^{}]{0,120}\{[^{}]*\}/g, ' ')
+          .replace(/if\s*\(!window\.fetch\)[\s\S]*/i, ' ')
+          .replace(/JavaScriptを有効にしてください/gi, ' ')
+        );
         const shadowTextParts = [];
         try {
           const walkShadow = (root, depth = 0) => {
@@ -5815,6 +5838,8 @@ async function scrapeOnce(req, res) {
             const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
             nodes.forEach((el) => {
               if (!el || shadowTextParts.length >= 50) return;
+              const tag = String(el.tagName || '').toLowerCase();
+              if (['script', 'style', 'noscript', 'template', 'svg'].includes(tag)) return;
               const text = clean(el.innerText || el.textContent);
               if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 300));
               if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
@@ -5822,8 +5847,14 @@ async function scrapeOnce(req, res) {
           };
           walkShadow(document, 0);
         } catch (_) {}
-        const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
+        const domBodyText = readableBodyText();
         const bodyText = clean([domBodyText].concat(shadowTextParts).join(' '));
+        const sampleCandidates = [
+          clean(shadowTextParts.join(' ')),
+          domBodyText,
+          bodyText
+        ].map(normalizeBodySample).filter(Boolean);
+        const bodyTextSample = (sampleCandidates.find((text) => !looksLikeScriptOrWarning(text)) || bodyText || '').slice(0, 800);
         const metaEl =
           document.querySelector('meta[name="description" i]') ||
           document.querySelector('meta[property="og:description" i]') ||
@@ -5834,6 +5865,7 @@ async function scrapeOnce(req, res) {
           metaDescription: metaDescription ? metaDescription.slice(0, 500) : '',
           metaDescriptionLength: metaDescription ? metaDescription.length : 0,
           bodyTextLength: bodyText.length,
+          bodyTextSample,
           anchorCount: document.querySelectorAll('a[href]').length,
           scriptCount: document.querySelectorAll('script').length,
           shadowTextPartsCount: shadowTextParts.length
@@ -6128,6 +6160,9 @@ async function scrapeOnce(req, res) {
         Number(basicDom.bodyTextLength || 0),
         Number(hydrationGuardedWait.bodyTextAfterWait || 0)
       );
+      const unifiedBodyTextSample = typeof basicDom.bodyTextSample === 'string' && basicDom.bodyTextSample.trim()
+        ? basicDom.bodyTextSample.replace(/\s+/g, ' ').trim().slice(0, 800)
+        : '';
       const mainLandmarkFinal = Object.prototype.hasOwnProperty.call(landmarksLight, 'hasMainLandmark_final') && landmarksLight.hasMainLandmark_final != null
         ? landmarksLight.hasMainLandmark_final
         : null;
@@ -6376,7 +6411,8 @@ async function scrapeOnce(req, res) {
           trustSignals: null,
           body: {
             textLength: unifiedBodyTextLength,
-            sample: '',
+            sample: unifiedBodyTextSample || null,
+            observed: !!unifiedBodyTextSample,
             source: 'rendered_dom_light',
             confidence: 'medium'
           }
@@ -6474,6 +6510,8 @@ async function scrapeOnce(req, res) {
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasContactLikeLink') ? linksTrust.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksTrust, 'hasPrivacyLikeLink') ? linksTrust.hasPrivacyLikeLink : null,
         bodyTextLength: unifiedBodyTextLength,
+        bodyTextSample: unifiedBodyTextSample || null,
+        mainTextHead: unifiedBodyTextSample || null,
         jsonldCount: structuredDataLight.rawCount,
         jsonldParseableCount: structuredDataLight.parseableCount,
         jsonldParseErrorsCount: structuredDataLight.parseErrorsCount,
