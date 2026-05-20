@@ -5994,6 +5994,83 @@ async function scrapeOnce(req, res) {
           bodyTextLength: clean(document.body && (document.body.innerText || document.body.textContent) || '').length
         };
       }, label);
+      const collectAioCheckSummaryLight = async (pageUrl) => {
+        const botTokens = ['GPTBot', 'Google-Extended', 'CCBot', 'ClaudeBot', 'PerplexityBot', 'Applebot-Extended'];
+        let origin = '';
+        try { origin = new URL(String(pageUrl || urlToFetch || '')).origin; } catch (_) {}
+        const empty = {
+          checked: false,
+          hasRobotsTxt: null,
+          robotsTxtUrl: origin ? `${origin}/robots.txt` : null,
+          robotsAiBotHints: null,
+          robotsAiBotHintTokens: [],
+          hasLlmsTxt: null,
+          hasLlmsFullTxt: null,
+          llmsTxtUrl: origin ? `${origin}/llms.txt` : null,
+          llmsFullTxtUrl: origin ? `${origin}/llms-full.txt` : null,
+          checkedLlmsTxtUrls: origin ? [`${origin}/llms.txt`] : [],
+          checkedLlmsFullTxtUrls: origin ? [`${origin}/llms-full.txt`] : [],
+          aiPolicyEvidenceSource: 'not_observed'
+        };
+        if (!origin || typeof fetch !== 'function') return Object.assign({}, empty, {
+          checked: false,
+          aiPolicyEvidenceSource: 'check_failed'
+        });
+        const fetchText = async (targetUrl, timeoutMs = 1500) => {
+          const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+          const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+          try {
+            const response = await fetch(targetUrl, {
+              method: 'GET',
+              redirect: 'follow',
+              signal: controller ? controller.signal : undefined,
+              headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
+            });
+            const status = response && typeof response.status === 'number' ? response.status : null;
+            if (!response || !response.ok) return { ok: false, status, text: '' };
+            const text = String(await response.text() || '').slice(0, 120000);
+            return { ok: true, status, text };
+          } catch (e) {
+            return { ok: false, status: null, text: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
+          } finally {
+            if (timer) clearTimeout(timer);
+          }
+        };
+        const robotsTxtUrl = `${origin}/robots.txt`;
+        const llmsTxtUrl = `${origin}/llms.txt`;
+        const llmsFullTxtUrl = `${origin}/llms-full.txt`;
+        const [robots, llms, llmsFull] = await Promise.all([
+          fetchText(robotsTxtUrl, 1500),
+          fetchText(llmsTxtUrl, 1500),
+          fetchText(llmsFullTxtUrl, 1500)
+        ]);
+        const robotsEvaluated = robots && robots.ok;
+        const robotsText = robotsEvaluated ? String(robots.text || '') : '';
+        const hintTokens = robotsEvaluated
+          ? botTokens.filter((token) => new RegExp(`(^|[^A-Za-z0-9_-])${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^A-Za-z0-9_-]|$)`, 'i').test(robotsText))
+          : [];
+        const hasLlmsTxt = llms && llms.ok ? true : (llms && llms.status === 404 ? false : null);
+        const hasLlmsFullTxt = llmsFull && llmsFull.ok ? true : (llmsFull && llmsFull.status === 404 ? false : null);
+        const robotsAiBotHints = robotsEvaluated ? hintTokens.length > 0 : null;
+        const evidence = [];
+        if (robotsEvaluated) evidence.push('robots_txt');
+        if (hasLlmsTxt === true) evidence.push('llms_txt');
+        if (hasLlmsFullTxt === true) evidence.push('llms_full_txt');
+        return {
+          checked: true,
+          hasRobotsTxt: robotsEvaluated ? true : (robots && robots.status === 404 ? false : null),
+          robotsTxtUrl,
+          robotsAiBotHints,
+          robotsAiBotHintTokens: hintTokens,
+          hasLlmsTxt,
+          hasLlmsFullTxt,
+          llmsTxtUrl,
+          llmsFullTxtUrl,
+          checkedLlmsTxtUrls: [llmsTxtUrl],
+          checkedLlmsFullTxtUrls: [llmsFullTxtUrl],
+          aiPolicyEvidenceSource: evidence.length ? evidence.join('_and_') : 'not_observed'
+        };
+      };
       await runPhase('goto', async () => {
         let gotoPartial = false;
         let domContentLoaded = false;
@@ -6602,6 +6679,8 @@ async function scrapeOnce(req, res) {
         };
       }), unifiedBalancedObserverProbe ? 1000 : 3000);
 
+      await runPhase('aioCheck', async () => collectAioCheckSummaryLight(finalUrl || urlToFetch), 2500);
+
       await runPhase('headingsLight', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
         const texts = (sel, max) => Array.from(document.querySelectorAll(sel)).map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, max);
@@ -6749,6 +6828,7 @@ async function scrapeOnce(req, res) {
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
       const linksTrust = phaseResult('linksAndTrust');
       const multimodal = phaseResult('multimodal');
+      const aioCheck = phaseResult('aioCheck');
       const headingsLight = phaseResult('headingsLight');
       const landmarksLight = phaseResult('landmarksLight');
       const enhancedShadow = phaseResult('optionalEnhancedShadow');
@@ -7116,6 +7196,21 @@ async function scrapeOnce(req, res) {
           },
           source: 'shortfast_phase_builder'
         },
+        aioCheck: {
+          checked: aioCheck.checked === true,
+          hasRobotsTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasRobotsTxt') ? aioCheck.hasRobotsTxt : null,
+          robotsTxtUrl: aioCheck.robotsTxtUrl || null,
+          robotsAiBotHints: Object.prototype.hasOwnProperty.call(aioCheck, 'robotsAiBotHints') ? aioCheck.robotsAiBotHints : null,
+          robotsAiBotHintTokens: Array.isArray(aioCheck.robotsAiBotHintTokens) ? aioCheck.robotsAiBotHintTokens.slice(0, 20) : [],
+          hasLlmsTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasLlmsTxt') ? aioCheck.hasLlmsTxt : null,
+          hasLlmsFullTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasLlmsFullTxt') ? aioCheck.hasLlmsFullTxt : null,
+          llmsTxtUrl: aioCheck.llmsTxtUrl || null,
+          llmsFullTxtUrl: aioCheck.llmsFullTxtUrl || null,
+          checkedLlmsTxtUrls: Array.isArray(aioCheck.checkedLlmsTxtUrls) ? aioCheck.checkedLlmsTxtUrls.slice(0, 10) : [],
+          checkedLlmsFullTxtUrls: Array.isArray(aioCheck.checkedLlmsFullTxtUrls) ? aioCheck.checkedLlmsFullTxtUrls.slice(0, 10) : [],
+          aiPolicyEvidenceSource: aioCheck.aiPolicyEvidenceSource || 'not_observed',
+          source: 'unified_observer_aio_check'
+        },
         observed: {
           title: {
             value: basicDom.title || null,
@@ -7215,6 +7310,7 @@ async function scrapeOnce(req, res) {
             sameOriginScriptJsonLdMs: phaseByName('sameOriginScriptJsonLd').elapsedMs || null,
             linksMs: phaseByName('linksAndTrust').elapsedMs || null,
             multimodalMs: phaseByName('multimodal').elapsedMs || null,
+            aioCheckMs: phaseByName('aioCheck').elapsedMs || null,
             headingsMs: phaseByName('headingsLight').elapsedMs || null,
             landmarksMs: phaseByName('landmarksLight').elapsedMs || null,
             totalMs: Math.max(0, Date.now() - probeStartedAt)
@@ -7234,6 +7330,7 @@ async function scrapeOnce(req, res) {
       geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
       geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
       geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
+      geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
       const lightweightSummary = {
         title: basicDom.title || null,
         metaDescription: basicDom.metaDescription || null,
@@ -7337,6 +7434,7 @@ async function scrapeOnce(req, res) {
         contactPointMissingFields: geoSignalsV1.trustSignals.contactPointMissingFields,
         contactPointSource: geoSignalsV1.trustSignals.contactPointSource,
         footerSignals: geoSignalsV1.coverage.footerSignals,
+        aioCheck: geoSignalsV1.aioCheck,
         contactConfidence: geoSignalsV1.trustSignals.contactConfidence || null
       };
       const phaseFailed = (name) => {
@@ -7494,6 +7592,7 @@ async function scrapeOnce(req, res) {
           url: urlToFetch,
           finalUrl,
           status,
+          aioCheck: geoSignalsV1.aioCheck,
           geoSignalsV1,
           lightweightSummary,
           diagnostics: Object.assign({}, diagnostics, {
@@ -7548,6 +7647,7 @@ async function scrapeOnce(req, res) {
         url: urlToFetch,
         finalUrl,
         status,
+        aioCheck: geoSignalsV1.aioCheck,
         geoSignalsV1,
         lightweightSummary,
         diagnostics,
