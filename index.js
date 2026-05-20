@@ -5600,11 +5600,13 @@ async function scrapeOnce(req, res) {
     shortfastphases: 'shortfastphases',
     'shortfast-phase': 'shortfastphases',
     'unified-balanced-observer': 'unifiedbalancedobserver',
+    'unified-balanced-observer-lite': 'unifiedbalancedobserverlite',
     unifiedbalancedobserver: 'unifiedbalancedobserver',
+    unifiedbalancedobserverlite: 'unifiedbalancedobserverlite',
     'balanced-observer': 'unifiedbalancedobserver',
     'unified-observer': 'unifiedbalancedobserver'
   };
-  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases', 'unifiedbalancedobserver'];
+  const probeModes = ['content', 'text', 'audit', 'data', 'resourcejson', 'jstap', 'jsfetch', 'jsscan', 'jschunk', 'subpages', 'payloadassembly', 'primaryrisk', 'jsonldbalanced', 'jsonldresourcetap', 'jsonldscriptsrc', 'gototiming', 'shortfastphases', 'unifiedbalancedobserver', 'unifiedbalancedobserverlite'];
   const probeMode = probeAliases[probeModeRaw] || (probeModes.includes(probeModeRaw) ? probeModeRaw : '');
   const observerProbeMode = signalsFirstBalanced && (observerMode === 'unifiedprobe' || observerMode === 'unified-probe' || observerMode === 'unified') ? 'unifiedbalancedobserver' : '';
   const probeMaxFetchRaw = Number(req.query.maxFetch);
@@ -5880,9 +5882,11 @@ async function scrapeOnce(req, res) {
       return res.status(200).json(out);
     }
 
-    if (probeMode === 'shortfastphases' || probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver' || balancedShortFastResponse) {
-      const unifiedBalancedObserverProbe = probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver';
+    if (probeMode === 'shortfastphases' || probeMode === 'unifiedbalancedobserver' || probeMode === 'unifiedbalancedobserverlite' || observerProbeMode === 'unifiedbalancedobserver' || balancedShortFastResponse) {
+      const unifiedBalancedObserverLite = probeMode === 'unifiedbalancedobserverlite';
+      const unifiedBalancedObserverProbe = probeMode === 'unifiedbalancedobserver' || observerProbeMode === 'unifiedbalancedobserver' || unifiedBalancedObserverLite;
       const probeStartedAt = Date.now();
+      const observerBudgetMs = unifiedBalancedObserverLite ? 25000 : 60000;
       const phases = [];
       const blockedCounts = {
         image: 0,
@@ -5923,6 +5927,8 @@ async function scrapeOnce(req, res) {
         Promise.resolve().then(() => promise),
         new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
       ]);
+      const observerElapsedMs = () => Math.max(0, Date.now() - probeStartedAt);
+      const observerBudgetExceeded = () => unifiedBalancedObserverProbe && observerElapsedMs() >= observerBudgetMs;
       const runPhase = async (name, fn, timeoutMs = 3000) => {
         const started = Date.now();
         const phase = {
@@ -5932,14 +5938,63 @@ async function scrapeOnce(req, res) {
           errorMessage: '',
           minimalResult: null
         };
+        if (observerBudgetExceeded()) {
+          phase.ok = true;
+          phase.minimalResult = {
+            skipped: true,
+            limited: true,
+            budgetAborted: true,
+            reason: 'observer_budget_exceeded'
+          };
+          phase.elapsedMs = 0;
+          phases.push(phase);
+          try {
+            console.log('[UNIFIED_OBSERVER][BUDGET_ABORT]', JSON.stringify({
+              phase: name,
+              lite: unifiedBalancedObserverLite,
+              elapsedMs: observerElapsedMs(),
+              budgetMs: observerBudgetMs
+            }));
+          } catch (_) {}
+          return phase;
+        }
+        try {
+          console.log('[UNIFIED_OBSERVER][PHASE_START]', JSON.stringify({
+            phase: name,
+            lite: unifiedBalancedObserverLite,
+            elapsedMs: observerElapsedMs(),
+            timeoutMs
+          }));
+        } catch (_) {}
         try {
           phase.minimalResult = await withTimeout(fn(), timeoutMs, name);
           phase.ok = true;
         } catch (e) {
           phase.errorMessage = String(e && (e.message || e) || '').slice(0, 240);
+          try {
+            console.log(/\btimeout_\d+ms\b/i.test(phase.errorMessage) ? '[UNIFIED_OBSERVER][PHASE_TIMEOUT]' : '[UNIFIED_OBSERVER][PHASE_END]', JSON.stringify({
+              phase: name,
+              ok: false,
+              lite: unifiedBalancedObserverLite,
+              elapsedMs: Math.max(0, Date.now() - started),
+              totalElapsedMs: observerElapsedMs(),
+              errorMessage: phase.errorMessage
+            }));
+          } catch (_) {}
         }
         phase.elapsedMs = Math.max(0, Date.now() - started);
         phases.push(phase);
+        if (phase.ok) {
+          try {
+            console.log('[UNIFIED_OBSERVER][PHASE_END]', JSON.stringify({
+              phase: name,
+              ok: true,
+              lite: unifiedBalancedObserverLite,
+              elapsedMs: phase.elapsedMs,
+              totalElapsedMs: observerElapsedMs()
+            }));
+          } catch (_) {}
+        }
         return phase;
       };
       let resp = null;
@@ -6038,10 +6093,10 @@ async function scrapeOnce(req, res) {
       }
 
       await runPhase('hydrationGuardedWait', async () => {
-        if (!unifiedBalancedObserverProbe) {
+        if (!unifiedBalancedObserverProbe || unifiedBalancedObserverLite) {
           return {
             skipped: true,
-            reason: 'not_unified_balanced_observer_probe'
+            reason: unifiedBalancedObserverLite ? 'lite_probe_skips_hydration_guarded_wait' : 'not_unified_balanced_observer_probe'
           };
         }
         const before = await page.evaluate(() => ({
@@ -6111,7 +6166,7 @@ async function scrapeOnce(req, res) {
           hydrationImprovedBodyText: after.bodyTextLength > before.bodyTextLength,
           hydrationImprovedLinks: after.anchorCount > before.anchorCount || after.shadowAnchorCount > before.shadowAnchorCount
         };
-      }, 4500);
+      }, unifiedBalancedObserverLite ? 500 : 4500);
 
       await runPhase('headMetaEval', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
@@ -6424,9 +6479,9 @@ async function scrapeOnce(req, res) {
 
       await runPhase('sameOriginScriptJsonLd', async () => {
         const summary = await collectSameOriginScriptSrcJsonLdSummaryLight(page, finalUrl || urlToFetch, {
-          maxScripts: unifiedBalancedObserverProbe ? 5 : 3,
-          maxBytesPerScript: unifiedBalancedObserverProbe ? 1000000 : 512000,
-          requestTimeoutMs: unifiedBalancedObserverProbe ? 5000 : 3000
+          maxScripts: unifiedBalancedObserverLite ? 2 : (unifiedBalancedObserverProbe ? 5 : 3),
+          maxBytesPerScript: unifiedBalancedObserverLite ? 512000 : (unifiedBalancedObserverProbe ? 1000000 : 512000),
+          requestTimeoutMs: unifiedBalancedObserverLite ? 1500 : (unifiedBalancedObserverProbe ? 5000 : 3000)
         });
         return {
           scriptSrcCount: summary.scriptSrcCount,
@@ -6442,9 +6497,9 @@ async function scrapeOnce(req, res) {
           fetchErrorsCount: summary.fetchErrorsCount || 0,
           fetchErrorsSample: Array.isArray(summary.fetchErrorsSample) ? summary.fetchErrorsSample.slice(0, 5) : []
         };
-      }, unifiedBalancedObserverProbe ? 10000 : 5000);
+      }, unifiedBalancedObserverLite ? 3000 : (unifiedBalancedObserverProbe ? 10000 : 5000));
 
-      await runPhase('linksAndTrust', async () => page.evaluate(() => {
+      await runPhase('linksAndTrust', async () => page.evaluate((liteMode) => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
         const absUrl = (href) => {
           try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
@@ -6484,7 +6539,7 @@ async function scrapeOnce(req, res) {
               if (el.shadowRoot) walkShadowAnchors(el.shadowRoot, depth + 1);
             });
           };
-          if (anchors.length < 50) walkShadowAnchors(document, 0);
+          if (!liteMode && anchors.length < 50) walkShadowAnchors(document, 0);
         } catch (_) {}
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
@@ -6561,7 +6616,7 @@ async function scrapeOnce(req, res) {
           },
           shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
         };
-      }), 3000);
+      }, unifiedBalancedObserverLite), unifiedBalancedObserverLite ? 2000 : 3000);
 
       await runPhase('multimodal', async () => page.evaluate(() => {
         const has = (sel) => !!document.querySelector(sel);
@@ -6610,10 +6665,10 @@ async function scrapeOnce(req, res) {
       }), unifiedBalancedObserverProbe ? 2000 : 3000);
 
       await runPhase('optionalEnhancedShadow', async () => {
-        if (!unifiedBalancedObserverProbe) {
+        if (!unifiedBalancedObserverProbe || unifiedBalancedObserverLite) {
           return {
             skipped: true,
-            reason: 'not_unified_balanced_observer_probe'
+            reason: unifiedBalancedObserverLite ? 'lite_probe_skips_optional_enhanced_shadow' : 'not_unified_balanced_observer_probe'
           };
         }
         return page.evaluate(() => {
@@ -6660,10 +6715,10 @@ async function scrapeOnce(req, res) {
       }, 2000);
 
       await runPhase('optionalA11y', async () => {
-        if (!unifiedBalancedObserverProbe) {
+        if (!unifiedBalancedObserverProbe || unifiedBalancedObserverLite) {
           return {
             skipped: true,
-            reason: 'not_unified_balanced_observer_probe'
+            reason: unifiedBalancedObserverLite ? 'lite_probe_skips_optional_a11y' : 'not_unified_balanced_observer_probe'
           };
         }
         const headings = await page.getByRole('heading').evaluateAll((els) => els.slice(0, 20).map((el) => ({
@@ -7151,12 +7206,13 @@ async function scrapeOnce(req, res) {
           balancedMode: true,
           shortFastMode: true,
           shortFastDedicatedPath: true,
-          observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+          observer: unifiedBalancedObserverProbe ? (unifiedBalancedObserverLite ? 'unified_lite' : 'unified') : undefined,
           unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+          unifiedBalancedObserverLite: !!unifiedBalancedObserverLite,
           phaseGuardedObserver: !!unifiedBalancedObserverProbe,
           reusedPhaseProbeBuilder: true,
           skippedHeavyBalancedBuilder: true,
-          boundedHydrationWaitMs: unifiedBalancedObserverProbe ? 2500 : 0,
+          boundedHydrationWaitMs: unifiedBalancedObserverLite ? 0 : (unifiedBalancedObserverProbe ? 2500 : 0),
           hydrationWaitMs: unifiedBalancedObserverProbe ? Number(hydrationGuardedWait.waitMs || 0) : 0,
           bodyTextBeforeWait: unifiedBalancedObserverProbe && typeof hydrationGuardedWait.bodyTextBeforeWait === 'number' ? hydrationGuardedWait.bodyTextBeforeWait : Number(basicDom.bodyTextLength || 0),
           bodyTextAfterWait: unifiedBodyTextLength,
@@ -7164,8 +7220,8 @@ async function scrapeOnce(req, res) {
           hydrationImprovedLinks: !!(unifiedBalancedObserverProbe && hydrationGuardedWait.hydrationImprovedLinks),
           jsBundleAnalysis: false,
           resourceChunkScan: false,
-          shadowHeadingScan: !!unifiedBalancedObserverProbe,
-          a11yHeadingScan: !!unifiedBalancedObserverProbe,
+          shadowHeadingScan: !!(unifiedBalancedObserverProbe && !unifiedBalancedObserverLite),
+          a11yHeadingScan: !!(unifiedBalancedObserverProbe && !unifiedBalancedObserverLite),
           appRootHeadingScan: false,
           heroHeadingScan: false,
           iframeHeadingScan: false,
@@ -7173,9 +7229,11 @@ async function scrapeOnce(req, res) {
           shadowPrimaryHeadingScan: false,
           mainCandidateScan: true,
           htmlContentLdJsonScan: true,
-          skippedScans: unifiedBalancedObserverProbe
-            ? ['iframe_heading_scan', 'large_samples', 'heavy_balanced_builder', 'resource_chunk_scan']
-            : ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder'],
+          skippedScans: unifiedBalancedObserverLite
+            ? ['hydration_guarded_wait', 'optional_enhanced_shadow', 'optional_a11y', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder', 'resource_chunk_scan']
+            : (unifiedBalancedObserverProbe
+              ? ['iframe_heading_scan', 'large_samples', 'heavy_balanced_builder', 'resource_chunk_scan']
+              : ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples', 'heavy_balanced_builder']),
           phaseStatuses,
           observationLimitedByPhase,
           phaseTimings: {
@@ -7400,8 +7458,9 @@ async function scrapeOnce(req, res) {
         responseMode: 'shortFast',
         shortFastMode: true,
         shortFastDedicatedPath: true,
-        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+        observer: unifiedBalancedObserverProbe ? (unifiedBalancedObserverLite ? 'unified_lite' : 'unified') : undefined,
         unifiedBalancedObserverProbe: !!unifiedBalancedObserverProbe,
+        unifiedBalancedObserverLite: !!unifiedBalancedObserverLite,
         phaseGuardedObserver: !!unifiedBalancedObserverProbe,
         reusedPhaseProbeBuilder: true,
         skippedHeavyBalancedBuilder: true,
@@ -7433,7 +7492,7 @@ async function scrapeOnce(req, res) {
         multimodalReady,
         blockedCounts,
         skippedScans: geoSignalsV1.diagnostics.skippedScans,
-        timeoutGuardMs: 60000
+        timeoutGuardMs: observerBudgetMs
       };
       const memoryHints = {
         avoidedHeavyBlocks: [
@@ -7451,18 +7510,18 @@ async function scrapeOnce(req, res) {
         ],
         estimatedSavedBytes: null,
         shortFastMode: true,
-        observer: unifiedBalancedObserverProbe ? 'unified' : undefined,
+        observer: unifiedBalancedObserverProbe ? (unifiedBalancedObserverLite ? 'unified_lite' : 'unified') : undefined,
         skippedScans: diagnostics.skippedScans
       };
       if (unifiedBalancedObserverProbe) {
         const unifiedPayload = {
           ok: qualityStatus !== 'failed',
-          mode: 'unifiedBalancedObserverProbe',
+          mode: unifiedBalancedObserverLite ? 'unifiedBalancedObserverLite' : 'unifiedBalancedObserverProbe',
           qualityStatus,
           qualityReasons,
           fatalPhaseFailures,
           limitedPhaseNames,
-          observer: 'unified',
+          observer: unifiedBalancedObserverLite ? 'unified_lite' : 'unified',
           url: urlToFetch,
           finalUrl,
           status,
@@ -7479,16 +7538,17 @@ async function scrapeOnce(req, res) {
             rawJsReturned: false,
             phaseTimeoutsMs: {
               goto: 12000,
-              hydrationGuardedWait: 3000,
+              hydrationGuardedWait: unifiedBalancedObserverLite ? 500 : 3000,
               basicDom: 2000,
               structuredDataLight: 3000,
-              sameOriginScriptJsonLd: 8000,
-              linksAndTrust: 3000,
+              sameOriginScriptJsonLd: unifiedBalancedObserverLite ? 3000 : 8000,
+              linksAndTrust: unifiedBalancedObserverLite ? 2000 : 3000,
               multimodal: 1000,
               headingsLight: 2000,
               landmarksLight: 2000,
-              optionalEnhancedShadow: 2000,
-              optionalA11y: 2000
+              optionalEnhancedShadow: unifiedBalancedObserverLite ? 0 : 2000,
+              optionalA11y: unifiedBalancedObserverLite ? 0 : 2000,
+              observerBudgetMs
             }
           }),
           memoryHints
