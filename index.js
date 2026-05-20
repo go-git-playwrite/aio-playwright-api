@@ -5932,6 +5932,17 @@ async function scrapeOnce(req, res) {
           errorMessage: '',
           minimalResult: null
         };
+        if (unifiedBalancedObserverProbe) {
+          try {
+            console.log('[UNIFIED_OBSERVER][PHASE_START]', JSON.stringify({
+              label: 'unified-balanced-observer',
+              phase: name,
+              url: urlToFetch,
+              elapsedMs: Math.max(0, Date.now() - probeStartedAt),
+              timeoutMs
+            }));
+          } catch (_) {}
+        }
         try {
           phase.minimalResult = await withTimeout(fn(), timeoutMs, name);
           phase.ok = true;
@@ -5940,6 +5951,23 @@ async function scrapeOnce(req, res) {
         }
         phase.elapsedMs = Math.max(0, Date.now() - started);
         phases.push(phase);
+        if (unifiedBalancedObserverProbe) {
+          try {
+            const isTimeout = /\btimeout_\d+ms\b/i.test(phase.errorMessage || '');
+            console.log(
+              phase.ok ? '[UNIFIED_OBSERVER][PHASE_END]' : (isTimeout ? '[UNIFIED_OBSERVER][PHASE_TIMEOUT]' : '[UNIFIED_OBSERVER][PHASE_ERROR]'),
+              JSON.stringify({
+                label: 'unified-balanced-observer',
+                phase: name,
+                ok: phase.ok,
+                url: urlToFetch,
+                elapsedMs: phase.elapsedMs,
+                totalElapsedMs: Math.max(0, Date.now() - probeStartedAt),
+                errorMessage: phase.errorMessage || ''
+              })
+            );
+          } catch (_) {}
+        }
         return phase;
       };
       let resp = null;
