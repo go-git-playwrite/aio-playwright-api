@@ -3298,6 +3298,117 @@ function classifyJsonLdTypesForSeo(types) {
     typeClassificationSource: 'balanced_unified_schema_type_filter'
   };
 }
+function collectGeoThemeSignalsLight_(input = {}) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const uniq = (items, max = 20) => {
+    const seen = new Set();
+    const out = [];
+    (Array.isArray(items) ? items : []).forEach((item) => {
+      const v = clean(item);
+      if (!v) return;
+      const key = v.toLowerCase();
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(v);
+    });
+    return out.slice(0, max);
+  };
+  const clip = (v, max = 160) => clean(v).slice(0, max);
+  const termsBySignal = {
+    comparison_support: ['比較', '違い', '選び方', '比較表', '他社', '種類', 'おすすめ', 'compare', 'comparison'],
+    scenario_support: ['利用シーン', 'こんな方', '用途', '目的別', 'ケース', 'example', 'use case'],
+    evidence_support: ['実績', '事例', '導入', '利用者数', '口コミ', 'レビュー', 'No.1', '数値根拠', 'case study']
+  };
+  const headingTexts = uniq(input.headings || [], 30).map((text) => clip(text, 120));
+  const navLinkTexts = uniq(input.navTexts || [], 50).map((text) => clip(text, 120));
+  const bodyText = clip(input.bodyTextSample || '', 800);
+  const bodyWindows = [];
+  if (bodyText) {
+    bodyWindows.push(bodyText);
+    bodyText.split(/[。．.!?！？\n]/).map(clean).filter(Boolean).slice(0, 12).forEach((text) => bodyWindows.push(text));
+  }
+  const checkedTextLength = bodyText.length + headingTexts.join(' ').length + navLinkTexts.join(' ').length;
+  const includesTerm = (text, term) => {
+    const t = clean(term);
+    if (!t) return false;
+    return /^[a-z0-9\s./+-]+$/i.test(t)
+      ? clean(text).toLowerCase().indexOf(t.toLowerCase()) >= 0
+      : clean(text).indexOf(t) >= 0;
+  };
+  const findMatches = (texts, terms, maxItems, maxTextLen) => {
+    const matches = [];
+    const matchedTerms = [];
+    (Array.isArray(texts) ? texts : []).forEach((text) => {
+      const hitTerms = terms.filter((term) => includesTerm(text, term));
+      if (!hitTerms.length) return;
+      hitTerms.forEach((term) => {
+        if (!matchedTerms.includes(term)) matchedTerms.push(term);
+      });
+      if (matches.length < maxItems) {
+        matches.push({
+          text: clip(text, maxTextLen || 160),
+          terms: hitTerms.slice(0, 5)
+        });
+      }
+    });
+    return { matches, matchedTerms };
+  };
+  const buildSignal = (id, terms) => {
+    const headingHit = findMatches(headingTexts, terms, 3, 120);
+    const bodyHit = findMatches(bodyWindows, terms, 2, 160);
+    const navHit = findMatches(navLinkTexts, terms, 2, 120);
+    const matchedTerms = uniq([].concat(headingHit.matchedTerms, bodyHit.matchedTerms, navHit.matchedTerms), 12);
+    const headingObserved = headingHit.matches.length > 0;
+    const bodyObserved = bodyHit.matches.length > 0;
+    const navObserved = navHit.matches.length > 0;
+    const present = matchedTerms.length > 0;
+    const confidence = headingObserved && bodyObserved
+      ? 'high'
+      : (headingObserved || bodyObserved ? 'medium' : (navObserved ? 'low' : 'none'));
+    const sourceParts = [
+      headingObserved ? 'heading' : '',
+      bodyObserved ? 'body_snippet' : '',
+      navObserved ? 'nav_link_text' : ''
+    ].filter(Boolean);
+    return {
+      present,
+      confidence,
+      matchedTerms,
+      matchedHeadings: headingHit.matches.map((m) => m.text).slice(0, 3),
+      snippets: bodyHit.matches.map((m) => ({ text: m.text, source: 'body_snippet' })).slice(0, 2),
+      source: 'heading_body_nav_scan',
+      checkedTextLength,
+      reason: present
+        ? `matched ${matchedTerms.length} term(s) via ${sourceParts.join('+')}`
+        : 'configured terms not observed in checked headings/body snippets/nav links'
+    };
+  };
+  const signals = {};
+  Object.keys(termsBySignal).forEach((id) => {
+    signals[id] = buildSignal(id, termsBySignal[id]);
+  });
+  const signalIds = Object.keys(signals);
+  const positiveSignals = signalIds.filter((id) => signals[id].present === true);
+  const weakSignals = signalIds.filter((id) => signals[id].present !== true);
+  const confidenceSummary = signalIds.reduce((acc, id) => {
+    const key = signals[id].confidence || 'none';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  return {
+    version: 'geoThemeSignalsV1',
+    source: 'rendered_dom_text_light',
+    checkedTextLength,
+    checkedHeadingCount: headingTexts.length,
+    checkedSnippetCount: bodyWindows.length,
+    signals,
+    summary: {
+      positiveSignals,
+      weakSignals,
+      confidenceSummary
+    }
+  };
+}
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
 function summarizeJsonLdTextsLight(texts, source) {
@@ -7056,11 +7167,20 @@ async function scrapeOnce(req, res) {
       const linkBoolean = (key) => linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, key) ? linksTrust[key] : null;
       const multimodalBoolean = (key) => multimodalObserved && Object.prototype.hasOwnProperty.call(multimodal, key) ? !!multimodal[key] : null;
       const multimodalNumber = (key) => multimodalObserved && typeof multimodal[key] === 'number' ? Number(multimodal[key]) : null;
+      const geoThemeSignals = collectGeoThemeSignalsLight_({
+        bodyTextSample: unifiedBodyTextSample,
+        headings: []
+          .concat(Array.isArray(headingsLight.headingTextsSample) ? headingsLight.headingTextsSample : [])
+          .concat(Array.isArray(enhancedShadow.shadowHeadingTexts) ? enhancedShadow.shadowHeadingTexts : [])
+          .concat(Array.isArray(optionalA11y.headings) ? optionalA11y.headings.map((h) => h && h.text).filter(Boolean) : []),
+        navTexts: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample : []
+      });
       const geoSignalsV1 = {
         version: 'geoSignalsV1',
         generatedAt: new Date().toISOString(),
         url: String(finalUrl || urlToFetch || ''),
         structuredData: structuredDataLight,
+        geoThemeSignals,
         headings: {
           h1Count: Number(headingsLight.h1Count || 0),
           h2Count: Number(headingsLight.h2Count || 0),
@@ -7435,8 +7555,21 @@ async function scrapeOnce(req, res) {
         contactPointSource: geoSignalsV1.trustSignals.contactPointSource,
         footerSignals: geoSignalsV1.coverage.footerSignals,
         aioCheck: geoSignalsV1.aioCheck,
-        contactConfidence: geoSignalsV1.trustSignals.contactConfidence || null
+        contactConfidence: geoSignalsV1.trustSignals.contactConfidence || null,
+        geoThemeSignalSummary: geoThemeSignals.summary
       };
+      try {
+        const payloadBytesEstimate = Buffer.byteLength(JSON.stringify(geoThemeSignals || {}), 'utf8');
+        console.log('[SF][GEO_THEME_SIGNALS]', JSON.stringify({
+          url: String(urlToFetch || ''),
+          finalUrl: String(finalUrl || urlToFetch || ''),
+          checkedTextLength: geoThemeSignals.checkedTextLength,
+          positiveSignals: geoThemeSignals.summary.positiveSignals,
+          weakSignals: geoThemeSignals.summary.weakSignals,
+          confidenceSummary: geoThemeSignals.summary.confidenceSummary,
+          payloadBytesEstimate
+        }));
+      } catch (_) {}
       const phaseFailed = (name) => {
         const p = phaseByName(name);
         return !!(p && p.name && !p.ok && !(p.minimalResult && p.minimalResult.skipped));
