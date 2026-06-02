@@ -5520,6 +5520,10 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const shortLinks = {
     navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
     internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
+    externalProfileLinksSample: arr(links.externalProfileLinksSample, 10, 'geoSignalsV1.observed.links.externalProfileLinksSample', (v) => str(v, 180)),
+    socialLinksSample: arr(links.socialLinksSample, 10, 'geoSignalsV1.observed.links.socialLinksSample', (v) => str(v, 180)),
+    footerExternalLinksSample: arr(links.footerExternalLinksSample, 10, 'geoSignalsV1.observed.links.footerExternalLinksSample', (v) => str(v, 180)),
+    externalLinksSample: arr(links.externalLinksSample, 10, 'geoSignalsV1.observed.links.externalLinksSample', (v) => str(v, 180)),
     hasCompanyLikeLink: links.hasCompanyLikeLink,
     hasServiceLikeLink: links.hasServiceLikeLink,
     hasContactLikeLink: links.hasContactLikeLink,
@@ -6677,10 +6681,12 @@ async function scrapeOnce(req, res) {
           });
           return out;
         };
+        const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
         const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
           text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
           href: absUrl(a.getAttribute('href') || '').slice(0, 180),
           navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+          footerLike: !!a.closest('footer,[role="contentinfo"]'),
           source: 'dom'
         })).filter((a) => a.href);
         try {
@@ -6694,6 +6700,7 @@ async function scrapeOnce(req, res) {
                   text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')).slice(0, 80),
                   href: absUrl(el.getAttribute('href') || '').slice(0, 180),
                   navLike: !!el.closest('nav,[role="navigation"],header,footer'),
+                  footerLike: !!el.closest('footer,[role="contentinfo"]'),
                   source: 'open_shadow_dom_light'
                 });
               }
@@ -6725,6 +6732,11 @@ async function scrapeOnce(req, res) {
           (a) => `${a.text} ${a.href}`,
           50
         );
+        const externalProfileItems = uniqueBy(
+          anchors.filter((a) => profileHostRe.test(a.href)),
+          (a) => a.href,
+          10
+        );
         const footer = document.querySelector('footer,[role="contentinfo"]');
         const footerAnchors = footer
           ? Array.from(footer.querySelectorAll('a[href]')).map((a) => ({
@@ -6732,6 +6744,11 @@ async function scrapeOnce(req, res) {
               href: absUrl(a.getAttribute('href') || '').slice(0, 180)
             })).filter((a) => a.href)
           : [];
+        const footerExternalProfileItems = uniqueBy(
+          footerAnchors.filter((a) => profileHostRe.test(a.href)),
+          (a) => a.href,
+          10
+        );
         const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
         const breadcrumbEl = document.querySelector([
           '[aria-label*="breadcrumb" i]',
@@ -6748,6 +6765,10 @@ async function scrapeOnce(req, res) {
           internalLinkCount: internalItems.length,
           navTextsSample: navTextItems.map((a) => a.text),
           internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
+          externalProfileLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
+          socialLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
+          footerExternalLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
+          externalLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
           hasCompanyLikeLink: companyLike,
           hasServiceLikeLink: serviceLike,
           hasContactLikeLink: contactLike,
@@ -6773,6 +6794,9 @@ async function scrapeOnce(req, res) {
             hasContactLink: footer ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
             hasTermsLink: footer ? /terms|legal|law|特定商取引|利用規約|規約|法務/.test(footerHay) : null,
             sampleTexts: footerAnchors.map((a) => a.text).filter(Boolean).slice(0, 8),
+            externalProfileLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
+            socialLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
+            footerExternalLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
             source: 'dom_footer_scan'
           },
           shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
@@ -7312,6 +7336,9 @@ async function scrapeOnce(req, res) {
             hasContactLink: null,
             hasTermsLink: null,
             sampleTexts: [],
+            externalProfileLinksSample: [],
+            socialLinksSample: [],
+            footerExternalLinksSample: [],
             source: 'dom_footer_scan'
           },
           source: 'shortfast_phase_builder'
@@ -7359,6 +7386,10 @@ async function scrapeOnce(req, res) {
           links: {
             navTextsSample: Array.isArray(linksTrust.navTextsSample) ? linksTrust.navTextsSample.slice(0, 50) : [],
             internalLinksSample: Array.isArray(linksTrust.internalLinksSample) ? linksTrust.internalLinksSample.slice(0, 50) : [],
+            externalProfileLinksSample: Array.isArray(linksTrust.externalProfileLinksSample) ? linksTrust.externalProfileLinksSample.slice(0, 10) : [],
+            socialLinksSample: Array.isArray(linksTrust.socialLinksSample) ? linksTrust.socialLinksSample.slice(0, 10) : [],
+            footerExternalLinksSample: Array.isArray(linksTrust.footerExternalLinksSample) ? linksTrust.footerExternalLinksSample.slice(0, 10) : [],
+            externalLinksSample: Array.isArray(linksTrust.externalLinksSample) ? linksTrust.externalLinksSample.slice(0, 10) : [],
             hasCompanyLikeLink: linkBoolean('hasCompanyLikeLink'),
             hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
             hasContactLikeLink: linkBoolean('hasContactLikeLink'),
@@ -7481,6 +7512,10 @@ async function scrapeOnce(req, res) {
         headingA11yScan: false,
         navLinkCount: linkNumber('navLinkCount'),
         internalLinkCount: linkNumber('internalLinkCount'),
+        externalProfileLinksSample: Array.isArray(linksTrust.externalProfileLinksSample) ? linksTrust.externalProfileLinksSample.slice(0, 10) : [],
+        socialLinksSample: Array.isArray(linksTrust.socialLinksSample) ? linksTrust.socialLinksSample.slice(0, 10) : [],
+        footerExternalLinksSample: Array.isArray(linksTrust.footerExternalLinksSample) ? linksTrust.footerExternalLinksSample.slice(0, 10) : [],
+        externalLinksSample: Array.isArray(linksTrust.externalLinksSample) ? linksTrust.externalLinksSample.slice(0, 10) : [],
         hasCompanyLikeLink: linkBoolean('hasCompanyLikeLink'),
         hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
         hasContactLikeLink: linkBoolean('hasContactLikeLink'),
