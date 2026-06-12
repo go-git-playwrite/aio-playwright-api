@@ -3795,6 +3795,23 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const absUrl = (href) => {
         try { return new URL(href, location.href).toString(); } catch (_) { return clean(href); }
       };
+      const queryAllDeep = (selector) => {
+        const out = [];
+        const seen = new Set();
+        const walk = (root, depth = 0) => {
+          if (!root || depth > 6 || !root.querySelectorAll) return;
+          Array.from(root.querySelectorAll(selector)).forEach((el) => {
+            if (!el || seen.has(el)) return;
+            seen.add(el);
+            out.push(el);
+          });
+          Array.from(root.querySelectorAll('*')).forEach((el) => {
+            if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+          });
+        };
+        walk(document, 0);
+        return out;
+      };
       const nodeTypes = [];
       const firstJsonLdTextValue = (value, depth = 0) => {
         if (depth > 5 || value == null) return '';
@@ -3819,6 +3836,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         primaryImageOfPage: '',
         structuredImageTypes: []
       };
+      const sameAsValues = [];
+      const sameAsValuesByType = { organization: [], website: [], person: [] };
       const walkJsonLd = (node, depth = 0) => {
         if (depth > 8) return;
         if (Array.isArray(node)) {
@@ -3857,9 +3876,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         if (primaryImageValue && !multimodalJsonLd.primaryImageOfPage) {
           multimodalJsonLd.primaryImageOfPage = absUrl(primaryImageValue);
         }
+        const normalizedTypes = currentTypes.map((type) => clean(type).toLowerCase().replace(/^https?:\/\/schema\.org\//i, ''));
+        const sameAs = node.sameAs;
+        const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
+        sameAsList.forEach((value) => {
+          const url = clean(value);
+          if (!/^https?:\/\//i.test(url)) return;
+          sameAsValues.push(url);
+          if (normalizedTypes.some((type) => ['organization', 'corporation', 'localbusiness'].includes(type))) sameAsValuesByType.organization.push(url);
+          if (normalizedTypes.includes('website')) sameAsValuesByType.website.push(url);
+          if (normalizedTypes.includes('person')) sameAsValuesByType.person.push(url);
+        });
         if (Array.isArray(node['@graph'])) node['@graph'].forEach((item) => walkJsonLd(item, depth + 1));
       };
-      const rawJsonLd = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+      const rawJsonLd = queryAllDeep('script[type*="ld+json" i]')
         .map((s) => clean(s.textContent || ''))
         .filter(Boolean);
       let parseableJsonLdCount = 0;
@@ -3880,13 +3910,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const titleValue = clean(document.title || '');
       const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
       const metaValue = clean(metaEl && metaEl.getAttribute('content'));
-      const h1 = limit(Array.from(document.querySelectorAll('h1')).map((el) => clean(el.innerText || el.textContent)), 10);
-      const h2 = limit(Array.from(document.querySelectorAll('h2')).map((el) => clean(el.innerText || el.textContent)), 20);
-      const h3 = limit(Array.from(document.querySelectorAll('h3')).map((el) => clean(el.innerText || el.textContent)), 20);
-      const mainH1 = limit(Array.from(document.querySelectorAll('main h1,[role="main"] h1,#main h1,#main-content h1')).map((el) => clean(el.innerText || el.textContent)), 10);
-      const mainH2 = limit(Array.from(document.querySelectorAll('main h2,[role="main"] h2,#main h2,#main-content h2')).map((el) => clean(el.innerText || el.textContent)), 20);
+      const h1 = limit(queryAllDeep('h1').map((el) => clean(el.innerText || el.textContent)), 10);
+      const h2 = limit(queryAllDeep('h2').map((el) => clean(el.innerText || el.textContent)), 20);
+      const h3 = limit(queryAllDeep('h3').map((el) => clean(el.innerText || el.textContent)), 20);
+      const mainH1 = limit(queryAllDeep('main h1,[role="main"] h1,#main h1,#main-content h1').map((el) => clean(el.innerText || el.textContent)), 10);
+      const mainH2 = limit(queryAllDeep('main h2,[role="main"] h2,#main h2,#main-content h2').map((el) => clean(el.innerText || el.textContent)), 20);
       const collectHeadingsIn = (selector, h1Limit = 10, h2Limit = 20) => {
-        const roots = Array.from(document.querySelectorAll(selector || '') || []);
+        const roots = queryAllDeep(selector || '');
         const h1Vals = [];
         const h2Vals = [];
         roots.forEach((root) => {
@@ -4035,11 +4065,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           } catch (_) {}
         }
       }
-      const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
+      const anchors = queryAllDeep('a[href]').map((a) => ({
         text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
         href: absUrl(a.getAttribute('href') || ''),
         navLike: !!a.closest('nav,[role="navigation"],header,footer'),
-        source: 'dom'
+        footerLike: !!a.closest('footer,[role="contentinfo"]'),
+        source: (a.getRootNode && a.getRootNode() instanceof ShadowRoot) ? 'open_shadow_dom' : 'dom'
       })).filter((a) => a.href);
       const shadowTextParts = [];
       const linksPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
@@ -4077,10 +4108,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         const hit = anchors.find((a) => re.test(textHref(a)));
         return hit ? { text: hit.text, href: hit.href } : null;
       };
+      const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
+      const externalProfileItems = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => a.href), 10);
+      const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
       browserPhaseTimings.linksMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - linksPhaseStart));
       const multimodalPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       const firstMetaContent = (selectors) => {
@@ -4116,7 +4150,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         'link[rel~="apple-touch-icon"][href]',
         'link[rel="apple-touch-icon-precomposed"][href]'
       ]);
-      const imgNodes = Array.from(document.querySelectorAll('img'));
+      const imgNodes = queryAllDeep('img');
       const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
         absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
           (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
@@ -4183,6 +4217,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         links: {
           navTextsSample: limit(navTexts, 50),
           internalLinksSample: internal.slice(0, 50),
+          externalProfileLinksSample: externalProfileItems.slice(0, 10),
+          socialLinksSample: externalProfileItems.slice(0, 10),
+          footerExternalLinksSample: footerExternalProfileItems.slice(0, 10),
+          externalLinksSample: externalProfileItems.slice(0, 10),
           hasCompanyLikeLink: hasLike(/company|about|corporate|会社|企業|運営|概要/),
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
@@ -4208,6 +4246,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           observationLimited: true,
           observationScope: 'rendered_dom_only',
           renderedDomObserved: true,
+          organizationSummary: {
+            observed: hasJsonLd,
+            hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : null,
+            missingFields: [],
+            source: 'seo_jsonld'
+          },
+          sameAsSummary: {
+            observed: hasJsonLd,
+            count: limit(sameAsValues, 20).length,
+            externalCount: limit(sameAsValues, 20).length,
+            sameAsCountByType: {
+              organization: limit(sameAsValuesByType.organization, 20).length,
+              website: limit(sameAsValuesByType.website, 20).length,
+              person: limit(sameAsValuesByType.person, 20).length
+            },
+            hasOrganizationSameAs: limit(sameAsValuesByType.organization, 20).length > 0,
+            hasWebSiteSameAs: limit(sameAsValuesByType.website, 20).length > 0,
+            hasPersonSameAs: limit(sameAsValuesByType.person, 20).length > 0,
+            valuesSample: limit(sameAsValues, 8),
+            source: 'seo_jsonld'
+          },
           htmlScanSkipped: true,
           jsScanSkipped: true,
           chunkScanSkipped: true,
@@ -4602,6 +4661,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       scriptSrcAppIndexDetected: balancedMode ? !!(scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.appIndexDetected) : false,
       renderedDomRawCount: renderedRawCount,
       renderedDomParseableCount: renderedParseableCount,
+      organizationSummary: renderedStructured.organizationSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.organizationSummary) || null,
+      sameAsSummary: renderedStructured.sameAsSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.sameAsSummary) || null,
       htmlScanSkipped: true,
       jsScanSkipped: true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
@@ -4815,6 +4876,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         links: {
           navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
           internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
+          externalProfileLinksSample: observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.slice(0, 10) : [],
+          socialLinksSample: observed.links && Array.isArray(observed.links.socialLinksSample) ? observed.links.socialLinksSample.slice(0, 10) : [],
+          footerExternalLinksSample: observed.links && Array.isArray(observed.links.footerExternalLinksSample) ? observed.links.footerExternalLinksSample.slice(0, 10) : [],
+          externalLinksSample: observed.links && Array.isArray(observed.links.externalLinksSample) ? observed.links.externalLinksSample.slice(0, 10) : [],
           hasCompanyLikeLink: observed.links ? observed.links.hasCompanyLikeLink : null,
           hasServiceLikeLink: observed.links ? observed.links.hasServiceLikeLink : null,
           hasContactLikeLink: observed.links ? observed.links.hasContactLikeLink : null,
@@ -4990,6 +5055,9 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const shadowTextParts = [];
       const shadowAnchors = [];
+      let shadowJsonLdCount = 0;
+      let shadowH1Count = 0;
+      let shadowHostCount = 0;
       if (!shortFastMode) {
         try {
           const walkShadow = (root, depth = 0) => {
@@ -5004,7 +5072,14 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
               if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
                 shadowAnchors.push(el);
               }
-              if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+              if (String(el.tagName || '').toLowerCase() === 'h1') shadowH1Count += 1;
+              if (String(el.tagName || '').toLowerCase() === 'script' && /ld\+json/i.test(String(el.getAttribute && el.getAttribute('type') || ''))) {
+                shadowJsonLdCount += 1;
+              }
+              if (el.shadowRoot) {
+                shadowHostCount += 1;
+                walkShadow(el.shadowRoot, depth + 1);
+              }
             });
           };
           walkShadow(document, 0);
@@ -5018,6 +5093,9 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
         bodyTextLength: bodyText.length,
         anchorCount: anchors.length,
         navLinkCount: navAnchors.length,
+        shadowJsonLdCount,
+        shadowH1Count,
+        shadowHostCount,
         warningText: /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText)
       };
     }, { shortFastMode }).catch(() => ({
@@ -5033,7 +5111,8 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       before.warningText ||
       before.bodyTextLength < 800 ||
       before.anchorCount === 0 ||
-      before.navLinkCount === 0
+      before.navLinkCount === 0 ||
+      (before.shadowHostCount > 0 && before.shadowJsonLdCount === 0 && before.shadowH1Count === 0)
     );
     if (maxWaitMs > 0 && sparseBefore) {
       const startedAt = Date.now();
@@ -5042,6 +5121,9 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
             const shadowTextParts = [];
             let shadowAnchorCount = 0;
+            let shadowJsonLdCount = 0;
+            let shadowH1Count = 0;
+            let shadowHostCount = 0;
             if (!shortFastMode) {
               try {
                 const walkShadow = (root, depth = 0) => {
@@ -5054,7 +5136,14 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
                       if (text && text.length >= 2) shadowTextParts.push(text.slice(0, 500));
                     }
                     if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) shadowAnchorCount += 1;
-                    if (el.shadowRoot) walkShadow(el.shadowRoot, depth + 1);
+                    if (String(el.tagName || '').toLowerCase() === 'h1') shadowH1Count += 1;
+                    if (String(el.tagName || '').toLowerCase() === 'script' && /ld\+json/i.test(String(el.getAttribute && el.getAttribute('type') || ''))) {
+                      shadowJsonLdCount += 1;
+                    }
+                    if (el.shadowRoot) {
+                      shadowHostCount += 1;
+                      walkShadow(el.shadowRoot, depth + 1);
+                    }
                   });
                 };
                 walkShadow(document, 0);
@@ -5064,7 +5153,8 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
           const anchors = document.querySelectorAll('a[href]').length + shadowAnchorCount;
           const navAnchors = document.querySelectorAll('nav a[href],[role="navigation"] a[href],header a[href],footer a[href]').length;
           const warningText = /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText);
-          return (!warningText && bodyText.length >= 800) || anchors >= 5 || navAnchors >= 2;
+          const shadowStructuredReady = shortFastMode || shadowHostCount === 0 || shadowJsonLdCount > 0 || shadowH1Count > 0;
+          return !warningText && shadowStructuredReady && (bodyText.length >= 800 || anchors >= 5 || navAnchors >= 2);
         }, { shortFastMode }, { timeout: maxWaitMs, polling: 250 });
       } catch (_) {
         try { await page.waitForTimeout(Math.min(750, maxWaitMs)); } catch (_) {}
@@ -6508,7 +6598,24 @@ async function scrapeOnce(req, res) {
             if (v && typeof v === 'object') return Object.keys(v).length > 0;
             return clean(v).length > 0;
           };
-          const texts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+          const queryAllDeep = (selector) => {
+            const out = [];
+            const seen = new Set();
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 6 || !root.querySelectorAll) return;
+              Array.from(root.querySelectorAll(selector)).forEach((el) => {
+                if (!el || seen.has(el)) return;
+                seen.add(el);
+                out.push(el);
+              });
+              Array.from(root.querySelectorAll('*')).forEach((el) => {
+                if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            walk(document, 0);
+            return out;
+          };
+          const texts = queryAllDeep('script[type*="ld+json" i]')
             .map((s) => clean(s.textContent || ''))
             .filter(Boolean);
           let parseableCount = 0;
@@ -6682,33 +6789,33 @@ async function scrapeOnce(req, res) {
           return out;
         };
         const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
-        const anchors = Array.from(document.querySelectorAll('a[href]')).map((a) => ({
-          text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
-          href: absUrl(a.getAttribute('href') || '').slice(0, 180),
-          navLike: !!a.closest('nav,[role="navigation"],header,footer'),
-          footerLike: !!a.closest('footer,[role="contentinfo"]'),
-          source: 'dom'
-        })).filter((a) => a.href);
-        try {
-          const walkShadowAnchors = (root, depth = 0) => {
-            if (!root || depth > 2 || anchors.length >= 120) return;
-            const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
-            nodes.forEach((el) => {
-              if (!el || anchors.length >= 120) return;
-              if (String(el.tagName || '').toLowerCase() === 'a' && el.getAttribute && el.getAttribute('href')) {
-                anchors.push({
-                  text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')).slice(0, 80),
-                  href: absUrl(el.getAttribute('href') || '').slice(0, 180),
-                  navLike: !!el.closest('nav,[role="navigation"],header,footer'),
-                  footerLike: !!el.closest('footer,[role="contentinfo"]'),
-                  source: 'open_shadow_dom_light'
-                });
-              }
-              if (el.shadowRoot) walkShadowAnchors(el.shadowRoot, depth + 1);
-            });
+          const queryAllDeep = (selector) => {
+            const out = [];
+            const seen = new Set();
+            const walk = (root, depth = 0) => {
+              if (!root || depth > 6 || !root.querySelectorAll) return;
+              Array.from(root.querySelectorAll(selector)).forEach((el) => {
+                if (!el || seen.has(el)) return;
+                seen.add(el);
+                out.push(el);
+              });
+              Array.from(root.querySelectorAll('*')).forEach((el) => {
+                if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+              });
+            };
+            walk(document, 0);
+            return out;
           };
-          if (anchors.length < 50) walkShadowAnchors(document, 0);
-        } catch (_) {}
+          const anchors = queryAllDeep('a[href]').map((a) => ({
+            text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
+            href: absUrl(a.getAttribute('href') || '').slice(0, 180),
+            navLike: !!a.closest('nav,[role="navigation"],header,footer'),
+            footerLike: !!a.closest('footer,[role="contentinfo"]'),
+            source: 'dom'
+          })).filter((a) => a.href);
+          anchors.forEach((a) => {
+            if (a.source === 'dom' && a.href) a.source = 'dom_or_open_shadow_dom';
+          });
         const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
         const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
         const firstLike = (re) => {
@@ -6737,27 +6844,22 @@ async function scrapeOnce(req, res) {
           (a) => a.href,
           10
         );
-        const footer = document.querySelector('footer,[role="contentinfo"]');
-        const footerAnchors = footer
-          ? Array.from(footer.querySelectorAll('a[href]')).map((a) => ({
-              text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')).slice(0, 80),
-              href: absUrl(a.getAttribute('href') || '').slice(0, 180)
-            })).filter((a) => a.href)
-          : [];
+        const footerAnchors = anchors.filter((a) => a.footerLike);
         const footerExternalProfileItems = uniqueBy(
           footerAnchors.filter((a) => profileHostRe.test(a.href)),
           (a) => a.href,
           10
         );
         const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
-        const breadcrumbEl = document.querySelector([
+        const breadcrumbEl = queryAllDeep([
           '[aria-label*="breadcrumb" i]',
           '[class*="breadcrumb" i]',
           '[id*="breadcrumb" i]',
           'nav[aria-label*="パンくず" i]',
           '[class*="パンくず" i]'
-        ].join(','));
+        ].join(','))[0] || null;
         const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
+        const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0;
         return {
           anchorCount: anchors.length,
           rawNavAnchorCount: anchors.filter((a) => a.navLike).length,
@@ -6786,31 +6888,48 @@ async function scrapeOnce(req, res) {
           breadcrumbUiSource: 'dom_scan',
           breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
           footerSignals: {
-            observed: !!footer,
-            linkCount: footer ? footerAnchors.length : null,
-            hasPrivacyLink: footer ? /privacy|プライバシー|個人情報/.test(footerHay) : null,
-            hasCompanyLink: footer ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
-            hasCompanyProfileLink: footer ? /company|about|corporate|profile|会社概要|企業情報|会社情報|企業|運営|概要/.test(footerHay) : null,
-            hasContactLink: footer ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
-            hasTermsLink: footer ? /terms|legal|law|特定商取引|利用規約|規約|法務/.test(footerHay) : null,
+            observed: footerObserved,
+            linkCount: footerObserved ? footerAnchors.length : null,
+            hasPrivacyLink: footerObserved ? /privacy|プライバシー|個人情報/.test(footerHay) : null,
+            hasCompanyLink: footerObserved ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
+            hasCompanyProfileLink: footerObserved ? /company|about|corporate|profile|会社概要|企業情報|会社情報|企業|運営|概要/.test(footerHay) : null,
+            hasContactLink: footerObserved ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
+            hasTermsLink: footerObserved ? /terms|legal|law|特定商取引|利用規約|規約|法務/.test(footerHay) : null,
             sampleTexts: footerAnchors.map((a) => a.text).filter(Boolean).slice(0, 8),
             externalProfileLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
             socialLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
             footerExternalLinksSample: footerExternalProfileItems.map((a) => a.href).slice(0, 10),
             source: 'dom_footer_scan'
           },
-          shadowAnchorCount: anchors.filter((a) => a.source === 'open_shadow_dom_light').length
+          shadowAnchorCount: anchors.filter((a) => a.source === 'dom_or_open_shadow_dom').length
         };
       }), 3000);
 
       await runPhase('multimodal', async () => page.evaluate(() => {
         const has = (sel) => !!document.querySelector(sel);
+        const queryAllDeep = (selector) => {
+          const out = [];
+          const seen = new Set();
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 6 || !root.querySelectorAll) return;
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el)) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          };
+          walk(document, 0);
+          return out;
+        };
         return {
           hasOgImage: has('meta[property="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"]'),
           hasTwitterImage: has('meta[name="twitter:image"],meta[name="twitter:image:src"]'),
           hasFavicon: has('link[rel~="icon"][href],link[rel="shortcut icon"][href]'),
           hasAppleTouchIcon: has('link[rel~="apple-touch-icon"][href],link[rel="apple-touch-icon-precomposed"][href]'),
-          imgCount: document.querySelectorAll('img').length
+          imgCount: queryAllDeep('img').length
         };
       }), unifiedBalancedObserverProbe ? 1000 : 3000);
 
@@ -6818,7 +6937,24 @@ async function scrapeOnce(req, res) {
 
       await runPhase('headingsLight', async () => page.evaluate(() => {
         const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
-        const texts = (sel, max) => Array.from(document.querySelectorAll(sel)).map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, max);
+        const queryAllDeep = (selector) => {
+          const out = [];
+          const seen = new Set();
+          const walk = (root, depth = 0) => {
+            if (!root || depth > 6 || !root.querySelectorAll) return;
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el)) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          };
+          walk(document, 0);
+          return out;
+        };
+        const texts = (sel, max) => queryAllDeep(sel).map((el) => clean(el.innerText || el.textContent)).filter(Boolean).slice(0, max);
         const h1 = texts('h1', 5);
         const h2 = texts('h2', 10);
         const h3 = texts('h3', 10);
@@ -8676,12 +8812,10 @@ async function scrapeOnce(req, res) {
         responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : 'default')
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 0;
-      const hydrationMetrics = signalsFirstBalanced
-        ? await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse })
-        : null;
-      if (signalsFirstBalanced) {
-        logSf('SIGNALS_FIRST_BALANCED_HYDRATION_WAIT', {
+      const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+      if (signalsFirstBalanced || signalsFirstLight) {
+        logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_HYDRATION_WAIT' : 'SIGNALS_FIRST_LIGHT_HYDRATION_WAIT', {
           waitMs: hydrationMetrics && hydrationMetrics.waitMs,
           bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
           bodyTextAfterWait: hydrationMetrics && hydrationMetrics.bodyTextAfterWait,
@@ -8749,6 +8883,10 @@ async function scrapeOnce(req, res) {
         headingA11yScan: !balancedShortFastResponse,
         navLinkCount: Array.isArray(linksObserved.navTextsSample) ? linksObserved.navTextsSample.length : 0,
         internalLinkCount: Array.isArray(linksObserved.internalLinksSample) ? linksObserved.internalLinksSample.length : 0,
+        externalProfileLinksSample: Array.isArray(linksObserved.externalProfileLinksSample) ? linksObserved.externalProfileLinksSample.slice(0, 10) : [],
+        socialLinksSample: Array.isArray(linksObserved.socialLinksSample) ? linksObserved.socialLinksSample.slice(0, 10) : [],
+        footerExternalLinksSample: Array.isArray(linksObserved.footerExternalLinksSample) ? linksObserved.footerExternalLinksSample.slice(0, 10) : [],
+        externalLinksSample: Array.isArray(linksObserved.externalLinksSample) ? linksObserved.externalLinksSample.slice(0, 10) : [],
         hasCompanyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasCompanyLikeLink') ? linksObserved.hasCompanyLikeLink : null,
         hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
@@ -8781,6 +8919,18 @@ async function scrapeOnce(req, res) {
         structuredDataScriptSrcJsonLdTypes: Array.isArray(structuredObserved.scriptSrcJsonLdTypes) ? structuredObserved.scriptSrcJsonLdTypes.slice(0, 50) : [],
         structuredDataExcludedFromSeoTypes: Array.isArray(structuredObserved.excludedFromSeoTypes) ? structuredObserved.excludedFromSeoTypes.slice(0, 50) : [],
         structuredDataTypeClassificationSource: structuredObserved.typeClassificationSource || '',
+        organizationSummary: structuredObserved.organizationSummary || null,
+        sameAsSummary: structuredObserved.sameAsSummary || null,
+        sameAsObserved: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.observed : null,
+        sameAsCount: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.count : null,
+        sameAsExternalCount: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.externalCount : null,
+        sameAsCountByType: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.sameAsCountByType : null,
+        hasOrganizationSameAs: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.hasOrganizationSameAs : null,
+        hasWebSiteSameAs: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.hasWebSiteSameAs : null,
+        hasPersonSameAs: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.hasPersonSameAs : null,
+        sameAsValuesSample: structuredObserved.sameAsSummary && Array.isArray(structuredObserved.sameAsSummary.valuesSample)
+          ? structuredObserved.sameAsSummary.valuesSample.slice(0, 8)
+          : [],
         structuredDataScriptSrcAppIndexDetected: Object.prototype.hasOwnProperty.call(structuredObserved, 'scriptSrcAppIndexDetected') ? structuredObserved.scriptSrcAppIndexDetected : false,
         structuredDataHtmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'htmlScanSkipped') ? structuredObserved.htmlScanSkipped : true,
         structuredDataJsScanSkipped: Object.prototype.hasOwnProperty.call(structuredObserved, 'jsScanSkipped') ? structuredObserved.jsScanSkipped : true,
@@ -8790,6 +8940,9 @@ async function scrapeOnce(req, res) {
         hasFavicon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasFavicon') ? multimodalObserved.hasFavicon : null,
         hasAppleTouchIcon: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasAppleTouchIcon') ? multimodalObserved.hasAppleTouchIcon : null,
         hasStructuredLogo: Object.prototype.hasOwnProperty.call(multimodalObserved, 'hasStructuredLogo') ? multimodalObserved.hasStructuredLogo : null,
+        imageObjectCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'imageObjectCount') ? multimodalObserved.imageObjectCount : null,
+        structuredImageCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'structuredImageCount') ? multimodalObserved.structuredImageCount : null,
+        imgCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'imgCount') ? multimodalObserved.imgCount : null,
         hasContactLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasContactLink') ? trustObserved.hasContactLink : null,
         contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null,
         contactObservedFromDom: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromDom') ? trustObserved.contactObservedFromDom : null,
@@ -8875,6 +9028,10 @@ async function scrapeOnce(req, res) {
         url: urlToFetch,
         finalUrl,
         status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        externalProfileLinksSample: Array.isArray(lightweightSummary.externalProfileLinksSample) ? lightweightSummary.externalProfileLinksSample.slice(0, 10) : [],
+        socialLinksSample: Array.isArray(lightweightSummary.socialLinksSample) ? lightweightSummary.socialLinksSample.slice(0, 10) : [],
+        footerExternalLinksSample: Array.isArray(lightweightSummary.footerExternalLinksSample) ? lightweightSummary.footerExternalLinksSample.slice(0, 10) : [],
+        externalLinksSample: Array.isArray(lightweightSummary.externalLinksSample) ? lightweightSummary.externalLinksSample.slice(0, 10) : [],
         geoSignalsV1,
         lightweightSummary,
         diagnostics,
