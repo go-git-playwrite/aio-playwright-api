@@ -1012,14 +1012,17 @@ async function probeJsonLdAndCopyright(page, { maxWaitMs = 15000, pollMs = 200 }
     // フォールバック失敗は無視して通常の timeout 結果へ
   }
 
-  // --- ここまで来たら「見つからなかった」 ---
+  // --- ここまで来たら「最後まで観測したが見つからなかった」 ---
   return {
     jsonld_detected_once: false,
     jsonld_detect_count: Number(r.jsonldCount || 0),
     jsonld_types_all: Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [],
     jsonld_types:     Array.isArray(r.jsonldTypesAll) ? r.jsonldTypesAll : [], // 互換
     jsonld_wait_ms:   Date.now() - t0,
-    jsonld_timed_out: true,
+    jsonld_timed_out: false,
+    jsonld_scan_started: true,
+    jsonld_scan_finished: true,
+    jsonld_parse_failed: !!(r && r.jsonldParseFailed),
     jsonld_sample_head: String(r.jsonldSampleHead || ''),
 
     header_present: headerSeen,
@@ -2333,7 +2336,7 @@ async function buildAuditSigFromPage(page) {
 
       jp = jp || {};
       jp.jsonld_scan_started = out.jsonld_scan_started;
-      jp.jsonld_scan_finished = true;
+      jp.jsonld_scan_finished = !scanFailed;
       jp.jsonld_parse_failed = !!(jp && jp.jsonld_parse_failed); // 既存があれば尊重
       jp.consent_wall_suspected = out.consent_wall_suspected;
       jp.jsonld_wait_ms = out.jsonld_wait_ms;
@@ -2341,10 +2344,10 @@ async function buildAuditSigFromPage(page) {
       jp.consent_click_tried = out.consent_click_tried;
       jp.consent_click_succeeded = out.consent_click_succeeded;
 
-      // ★ timeout判定は “出現待ち” 基準に統一
-      //    - selectorが見つかったなら timed_out=false
-      //    - 見つからず、かつ検出0で、scanFailedでないなら timed_out=true
-      jp.jsonld_timed_out = (!selectorFound && !scanFailed && detectCount === 0 && out.consent_wall_suspected === true);
+      // ★ timeout判定は「未検出」ではなく「観測不能」だけに限定
+      //    - selectorが見つからず検出0でも、probeが完走していれば timed_out=false
+      //    - probe例外/abort、または consent wall 疑いで観測不能な場合だけ true
+      jp.jsonld_timed_out = !!(scanFailed || (!selectorFound && detectCount === 0 && out.consent_wall_suspected === true));
     }catch(_){}
 
     return jp;
@@ -2362,7 +2365,7 @@ async function buildAuditSigFromPage(page) {
   // JSON-LD 関連
   const jsonldCount    = Number(jp.jsonld_detect_count || 0);
   const jsonldDetected = jsonldCount > 0;
-  const jsonldTimedOut = (/application\/ld\+json/i.test(String(await page.content()||''))) ? !!jp.jsonld_timed_out : false;
+  const jsonldTimedOut = !!jp.jsonld_timed_out;
   const jsonldTypesAll = Array.isArray(jp.jsonld_types_all)
     ? jp.jsonld_types_all
     : [];
