@@ -7325,8 +7325,24 @@ async function scrapeOnce(req, res) {
       const multimodalObserved = !!(phaseByName('multimodal') && phaseByName('multimodal').ok) || typeof multimodal.imgCount === 'number';
       const linkNumber = (key) => linksObserved && typeof linksTrust[key] === 'number' ? Number(linksTrust[key]) : null;
       const linkBoolean = (key) => linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, key) ? linksTrust[key] : null;
-      const multimodalBoolean = (key) => multimodalObserved && Object.prototype.hasOwnProperty.call(multimodal, key) ? !!multimodal[key] : null;
-      const multimodalNumber = (key) => multimodalObserved && typeof multimodal[key] === 'number' ? Number(multimodal[key]) : null;
+      const multimodalImage = multimodal && multimodal.image && typeof multimodal.image === 'object' ? multimodal.image : {};
+      const multimodalBoolean = (key) => {
+        if (!multimodalObserved) return null;
+        if (Object.prototype.hasOwnProperty.call(multimodal, key)) return !!multimodal[key];
+        if (Object.prototype.hasOwnProperty.call(multimodalImage, key)) return !!multimodalImage[key];
+        return null;
+      };
+      const multimodalNumber = (key) => {
+        if (!multimodalObserved) return null;
+        if (typeof multimodal[key] === 'number') return Number(multimodal[key]);
+        if (typeof multimodalImage[key] === 'number') return Number(multimodalImage[key]);
+        return null;
+      };
+      const multimodalString = (key) => multimodalObserved ? String(multimodal[key] || multimodalImage[key] || '').trim() : '';
+      const ogImageUrl = multimodalString('ogImageUrl');
+      const twitterImageUrl = multimodalString('twitterImageUrl');
+      const faviconUrl = multimodalString('faviconUrl');
+      const appleTouchIconUrl = multimodalString('appleTouchIconUrl');
       const geoThemeSignals = collectGeoThemeSignalsLight_({
         bodyTextSample: unifiedBodyTextSample,
         headings: []
@@ -7417,18 +7433,22 @@ async function scrapeOnce(req, res) {
         },
         multimodalSignals: {
           checked: multimodalObserved,
-          hasImage: multimodalObserved ? !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0) : null,
+          hasImage: multimodalObserved ? !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || ogImageUrl || twitterImageUrl || faviconUrl || appleTouchIconUrl || Number(multimodal.imgCount || multimodalImage.imageCount || 0) > 0) : null,
           hasStructured: null,
-          hasOgImage: multimodalBoolean('hasOgImage'),
-          hasTwitterImage: multimodalBoolean('hasTwitterImage'),
-          hasFavicon: multimodalBoolean('hasFavicon'),
-          hasAppleTouchIcon: multimodalBoolean('hasAppleTouchIcon'),
+          hasOgImage: multimodalBoolean('hasOgImage') === true || !!ogImageUrl,
+          ogImageUrl,
+          hasTwitterImage: multimodalBoolean('hasTwitterImage') === true || !!twitterImageUrl,
+          twitterImageUrl,
+          hasFavicon: multimodalBoolean('hasFavicon') === true || !!faviconUrl,
+          faviconUrl,
+          hasAppleTouchIcon: multimodalBoolean('hasAppleTouchIcon') === true || !!appleTouchIconUrl,
+          appleTouchIconUrl,
           hasStructuredLogo: null,
           imageObjectCount: null,
           structuredImageCount: null,
           imgCount: multimodalNumber('imgCount'),
-          primaryImageOfPage: '',
-          sampleImageUrls: [],
+          primaryImageOfPage: ogImageUrl || twitterImageUrl || '',
+          sampleImageUrls: [ogImageUrl, twitterImageUrl].filter(Boolean).slice(0, 5),
           source: 'shortfast_phase_builder'
         },
         trustSignals: {
