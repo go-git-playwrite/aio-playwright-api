@@ -4115,6 +4115,50 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       }).map((a) => ({ text: a.text, href: a.href }));
       const externalProfileItems = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => a.href), 10);
       const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
+      const semanticHeaderCount = queryAllDeep('header,[role="banner"]').length;
+      const semanticNavCount = queryAllDeep('nav,[role="navigation"]').length;
+      const semanticFooterCount = queryAllDeep('footer,[role="contentinfo"]').length;
+      const semanticElements = {
+        hasHeaderElement: semanticHeaderCount > 0,
+        hasNavElement: semanticNavCount > 0,
+        hasFooterElement: semanticFooterCount > 0,
+        headerCount: semanticHeaderCount,
+        navCount: semanticNavCount,
+        footerCount: semanticFooterCount,
+        semanticElementsObserved: true,
+        source: 'rendered_dom_light'
+      };
+      const breadcrumbEl = queryAllDeep([
+        '[aria-label*="breadcrumb" i]',
+        '[class*="breadcrumb" i]',
+        '[id*="breadcrumb" i]',
+        'nav[aria-label*="パンくず" i]',
+        '[class*="パンくず" i]'
+      ].join(','))[0] || null;
+      const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
+      const footerAnchors = anchors.filter((a) => a.footerLike);
+      const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
+      const legalRe = /legal|law|特定商取引|特商法|法務/;
+      const termsRe = /terms|利用規約|規約/;
+      const privacyPolicyRe = /privacy|privacy\s*policy|プライバシーポリシー|個人情報保護方針|個人情報/;
+      const legalLike = hasLike(legalRe);
+      const termsLike = hasLike(termsRe);
+      const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0;
+      const footerSignals = {
+        observed: footerObserved,
+        linkCount: footerObserved ? footerAnchors.length : null,
+        hasPrivacyLink: footerObserved ? privacyPolicyRe.test(footerHay) : null,
+        hasCompanyLink: footerObserved ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
+        hasCompanyProfileLink: footerObserved ? /company|about|corporate|profile|会社概要|企業情報|会社情報|企業|運営|概要/.test(footerHay) : null,
+        hasContactLink: footerObserved ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
+        hasLegalLink: footerObserved ? legalRe.test(footerHay) : null,
+        hasTermsLink: footerObserved ? termsRe.test(footerHay) : null,
+        sampleTexts: footerAnchors.map((a) => a.text).filter(Boolean).slice(0, 8),
+        externalProfileLinksSample: footerExternalProfileItems.slice(0, 10),
+        socialLinksSample: footerExternalProfileItems.slice(0, 10),
+        footerExternalLinksSample: footerExternalProfileItems.slice(0, 10),
+        source: 'rendered_dom_footer_scan'
+      };
       browserPhaseTimings.linksMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - linksPhaseStart));
       const multimodalPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       const firstMetaContent = (selectors) => {
@@ -4158,7 +4202,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
       const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
-      const privacyRe = /privacy|policy|プライバシー|個人情報/;
+      const privacyRe = /privacy|policy|プライバシー|個人情報|プライバシーポリシー|個人情報保護方針/;
       const trustSignals = {
         hasContactLink: hasLike(contactRe),
         contactPathFound: hasLike(contactRe),
@@ -4177,6 +4221,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasPrivacyPolicyLink: hasLike(privacyRe),
         privacyLinkSource: hasLike(privacyRe) ? 'dom' : 'not_observed',
         privacyLinkSample: firstLikeLink(privacyRe),
+        hasLegalLink: legalLike,
+        legalLinkSource: legalLike === true ? 'dom' : (legalLike === false ? 'not_observed' : 'not_observed'),
+        legalLinkSample: firstLikeLink(legalRe),
+        hasTermsLink: termsLike,
+        termsLinkSource: termsLike === true ? 'dom' : (termsLike === false ? 'not_observed' : 'not_observed'),
+        termsLinkSample: firstLikeLink(termsRe),
         source: 'balanced_light'
       };
       const multimodalSignals = {
@@ -4225,13 +4275,26 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
           hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          hasLegalLikeLink: legalLike,
+          hasTermsLikeLink: termsLike,
           contactLinkSource: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/) ? 'dom' : 'not_observed',
           companyLinkSource: hasLike(/company|about|corporate|会社|企業|運営|概要/) ? 'dom' : 'not_observed',
           serviceLinkSource: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/) ? 'dom' : 'not_observed',
-          privacyLinkSource: hasLike(/privacy|プライバシー|個人情報/) ? 'dom' : 'not_observed'
+          privacyLinkSource: hasLike(/privacy|プライバシー|個人情報/) ? 'dom' : 'not_observed',
+          legalLinkSource: legalLike === true ? 'dom' : 'not_observed',
+          termsLinkSource: termsLike === true ? 'dom' : 'not_observed'
         },
         multimodalSignals,
         trustSignals,
+        coverage: {
+          semanticElements,
+          breadcrumbUiObserved: true,
+          hasBreadcrumbUi: !!breadcrumbEl,
+          breadcrumbUiSource: 'dom_scan',
+          breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
+          footerSignals,
+          source: 'rendered_dom_light'
+        },
         structuredData: {
           types: typeList,
           rawCount: rawJsonLd.length,
@@ -4570,6 +4633,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const observedTrustSignals = observed.trustSignals && typeof observed.trustSignals === 'object'
       ? observed.trustSignals
       : null;
+    const observedCoverageSignals = observed.coverage && typeof observed.coverage === 'object'
+      ? observed.coverage
+      : null;
     const scriptTrustObserved = scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed;
     const domContactObserved = observedTrustSignals && typeof observedTrustSignals.contactPathFound === 'boolean'
       ? observedTrustSignals.contactPathFound
@@ -4580,6 +4646,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       : null;
     const domPrivacyObserved = observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean'
       ? observedTrustSignals.hasPrivacyPolicyLink
+      : null;
+    const domLegalObserved = observedTrustSignals && typeof observedTrustSignals.hasLegalLink === 'boolean'
+      ? observedTrustSignals.hasLegalLink
+      : null;
+    const domTermsObserved = observedTrustSignals && typeof observedTrustSignals.hasTermsLink === 'boolean'
+      ? observedTrustSignals.hasTermsLink
       : null;
     const scriptCompanyHint = scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true;
     const scriptServiceHint = scriptTrustObserved && scriptSrcJsonLdSummary.servicePathFound === true;
@@ -4615,6 +4687,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
         ? observedTrustSignals.privacyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
+      hasLegalLink: domLegalObserved,
+      legalLinkSource: domLegalObserved === true ? 'dom' : 'not_observed',
+      legalLinkSample: observedTrustSignals && observedTrustSignals.legalLinkSample
+        ? observedTrustSignals.legalLinkSample
+        : null,
+      hasTermsLink: domTermsObserved,
+      termsLinkSource: domTermsObserved === true ? 'dom' : 'not_observed',
+      termsLinkSample: observedTrustSignals && observedTrustSignals.termsLinkSample
+        ? observedTrustSignals.termsLinkSample
+        : null,
       scriptSrcTrustObserved: !!scriptTrustObserved,
       source: scriptTrustObserved ? 'balanced_light_dom_plus_script_src' : 'balanced_light'
     };
@@ -4794,6 +4876,38 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         source: 'balanced_light'
       },
       trustSignals: trustSignalsLight,
+      coverage: observedCoverageSignals || {
+        semanticElements: {
+          hasHeaderElement: null,
+          hasNavElement: null,
+          hasFooterElement: null,
+          headerCount: null,
+          navCount: null,
+          footerCount: null,
+          semanticElementsObserved: null,
+          source: 'not_observed'
+        },
+        breadcrumbUiObserved: null,
+        hasBreadcrumbUi: null,
+        breadcrumbUiSource: 'not_observed',
+        breadcrumbUiTextSample: '',
+        footerSignals: {
+          observed: null,
+          linkCount: null,
+          hasPrivacyLink: null,
+          hasCompanyLink: null,
+          hasCompanyProfileLink: null,
+          hasContactLink: null,
+          hasLegalLink: null,
+          hasTermsLink: null,
+          sampleTexts: [],
+          externalProfileLinksSample: [],
+          socialLinksSample: [],
+          footerExternalLinksSample: [],
+          source: 'not_observed'
+        },
+        source: 'not_observed'
+      },
       observed: {
         title: {
           value: observed.title || null,
@@ -4941,6 +5055,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         },
         multimodalSignals: observedMultimodalSignals || null,
         trustSignals: trustSignalsLight,
+        coverage: observedCoverageSignals || null,
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
@@ -8865,6 +8980,10 @@ async function scrapeOnce(req, res) {
       const structuredObserved = observed.structuredData || {};
       const multimodalObserved = (geoSignalsV1 && geoSignalsV1.multimodalSignals) || observed.multimodalSignals || {};
       const trustObserved = (geoSignalsV1 && geoSignalsV1.trustSignals) || observed.trustSignals || {};
+      const coverageObserved = (geoSignalsV1 && geoSignalsV1.coverage) || observed.coverage || {};
+      const semanticObserved = coverageObserved && coverageObserved.semanticElements && typeof coverageObserved.semanticElements === 'object'
+        ? coverageObserved.semanticElements
+        : {};
       const bodyObserved = observed.body || {};
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
@@ -8911,6 +9030,12 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
+        hasHeaderElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasHeaderElement') ? semanticObserved.hasHeaderElement : null,
+        hasNavElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasNavElement') ? semanticObserved.hasNavElement : null,
+        hasFooterElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasFooterElement') ? semanticObserved.hasFooterElement : null,
+        breadcrumbUiObserved: Object.prototype.hasOwnProperty.call(coverageObserved, 'breadcrumbUiObserved') ? coverageObserved.breadcrumbUiObserved : null,
+        hasBreadcrumbUi: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasBreadcrumbUi') ? coverageObserved.hasBreadcrumbUi : null,
+        breadcrumbUiSource: coverageObserved.breadcrumbUiSource || null,
         bodyTextLength: typeof bodyObserved.textLength === 'number' ? bodyObserved.textLength : 0,
         jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0,
         jsonldParseableCount: typeof structuredObserved.parseableCount === 'number' ? structuredObserved.parseableCount : 0,
@@ -8972,6 +9097,11 @@ async function scrapeOnce(req, res) {
         companyLinkSource: trustObserved.companyLinkSource || linksObserved.companyLinkSource || null,
         serviceLinkSource: trustObserved.serviceLinkSource || linksObserved.serviceLinkSource || null,
         privacyLinkSource: trustObserved.privacyLinkSource || linksObserved.privacyLinkSource || null,
+        hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasPrivacyPolicyLink') ? trustObserved.hasPrivacyPolicyLink : null,
+        hasLegalLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasLegalLink') ? trustObserved.hasLegalLink : null,
+        hasTermsLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasTermsLink') ? trustObserved.hasTermsLink : null,
+        legalLinkSource: trustObserved.legalLinkSource || linksObserved.legalLinkSource || null,
+        termsLinkSource: trustObserved.termsLinkSource || linksObserved.termsLinkSource || null,
         contactConfidence: trustObserved.contactConfidence || null
       };
       const diagnostics = {
