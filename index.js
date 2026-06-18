@@ -4141,8 +4141,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const legalRe = /legal|law|特定商取引|特商法|法務/;
       const termsRe = /terms|利用規約|規約/;
       const privacyPolicyRe = /privacy|privacy\s*policy|プライバシーポリシー|個人情報保護方針|個人情報/;
+      const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
       const legalLike = hasLike(legalRe);
       const termsLike = hasLike(termsRe);
+      const faqLink = hasLike(faqRe);
+      const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
+      const faqSectionEl = queryAllDeep([
+        'section[aria-label*="faq" i]',
+        'section[aria-label*="よくある質問" i]',
+        'section[id*="faq" i]',
+        'section[class*="faq" i]',
+        '[id*="faq" i]',
+        '[class*="faq" i]'
+      ].join(',')).find((el) => {
+        const text = clean(el && (el.innerText || el.textContent)).slice(0, 200);
+        return faqRe.test(text || '');
+      }) || null;
+      const faqHeadingEl = queryAllDeep('h1,h2,h3,h4,[role="heading"]').find((el) => {
+        const text = clean(el && (el.innerText || el.textContent));
+        return faqRe.test(text || '');
+      }) || null;
+      const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
       const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0;
       const footerSignals = {
         observed: footerObserved,
@@ -4288,6 +4307,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         trustSignals,
         coverage: {
           semanticElements,
+          hasFaqLink: faqLink,
+          hasFaqNav: faqNav,
+          hasFaqSection: !!(faqSectionEl || faqHeadingEl),
+          faqLinkSource: faqLink === true ? 'dom_link_text' : 'not_observed',
+          faqLinkSample: firstLikeLink(faqRe),
+          faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
+          faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
@@ -4887,6 +4913,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           semanticElementsObserved: null,
           source: 'not_observed'
         },
+        hasFaqLink: null,
+        hasFaqNav: null,
+        hasFaqSection: null,
+        faqLinkSource: 'not_observed',
+        faqLinkSample: null,
+        faqSectionSource: 'not_observed',
+        faqSectionTextSample: '',
         breadcrumbUiObserved: null,
         hasBreadcrumbUi: null,
         breadcrumbUiSource: 'not_observed',
@@ -6942,6 +6975,9 @@ async function scrapeOnce(req, res) {
         const serviceLike = hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/);
         const contactLike = hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/);
         const privacyLike = hasLike(/privacy|プライバシー|個人情報/);
+        const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
+        const faqLink = hasLike(faqRe);
+        const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
         const navTextItems = uniqueBy(
           anchors.filter((a) => a.navLike && a.text),
           (a) => a.text,
@@ -6974,6 +7010,22 @@ async function scrapeOnce(req, res) {
           '[class*="パンくず" i]'
         ].join(','))[0] || null;
         const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
+        const faqSectionEl = queryAllDeep([
+          'section[aria-label*="faq" i]',
+          'section[aria-label*="よくある質問" i]',
+          'section[id*="faq" i]',
+          'section[class*="faq" i]',
+          '[id*="faq" i]',
+          '[class*="faq" i]'
+        ].join(',')).find((el) => {
+          const text = clean(el && (el.innerText || el.textContent)).slice(0, 200);
+          return faqRe.test(text || '');
+        }) || null;
+        const faqHeadingEl = queryAllDeep('h1,h2,h3,h4,[role="heading"]').find((el) => {
+          const text = clean(el && (el.innerText || el.textContent));
+          return faqRe.test(text || '');
+        }) || null;
+        const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
         const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0;
         return {
           anchorCount: anchors.length,
@@ -6998,6 +7050,13 @@ async function scrapeOnce(req, res) {
           companyLinkSample: firstLike(/company|about|corporate|会社|企業|運営|概要/),
           serviceLinkSample: firstLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           privacyLinkSample: firstLike(/privacy|プライバシー|個人情報/),
+          hasFaqLink: faqLink,
+          hasFaqNav: faqNav,
+          faqLinkSource: sourceFor(faqLink),
+          faqLinkSample: firstLike(faqRe),
+          hasFaqSection: !!(faqSectionEl || faqHeadingEl),
+          faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
+          faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
@@ -7594,6 +7653,13 @@ async function scrapeOnce(req, res) {
           source: 'shortfast_phase_builder'
         },
         coverage: {
+          hasFaqLink: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqLink') ? linksTrust.hasFaqLink : null,
+          hasFaqNav: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqNav') ? linksTrust.hasFaqNav : null,
+          hasFaqSection: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqSection') ? linksTrust.hasFaqSection : null,
+          faqLinkSource: linksTrust.faqLinkSource || (linksObserved ? 'not_observed' : 'phase_failed'),
+          faqLinkSample: linksTrust.faqLinkSample || null,
+          faqSectionSource: linksTrust.faqSectionSource || (linksObserved ? 'not_observed' : 'phase_failed'),
+          faqSectionTextSample: linksTrust.faqSectionTextSample || '',
           breadcrumbUiObserved: linksObserved ? (linksTrust.breadcrumbUiObserved === true) : null,
           hasBreadcrumbUi: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasBreadcrumbUi') ? !!linksTrust.hasBreadcrumbUi : null,
           breadcrumbUiSource: linksTrust.breadcrumbUiSource || (linksObserved ? 'dom_scan' : 'not_observed'),
@@ -7825,6 +7891,9 @@ async function scrapeOnce(req, res) {
         sameAsValuesSample: structuredDataLight.sameAsSummary && Array.isArray(structuredDataLight.sameAsSummary.valuesSample)
           ? structuredDataLight.sameAsSummary.valuesSample.slice(0, 8)
           : [],
+        hasFaqLink: geoSignalsV1.coverage.hasFaqLink,
+        hasFaqNav: geoSignalsV1.coverage.hasFaqNav,
+        hasFaqSection: geoSignalsV1.coverage.hasFaqSection,
         breadcrumbUiObserved: geoSignalsV1.coverage.breadcrumbUiObserved,
         hasBreadcrumbUi: geoSignalsV1.coverage.hasBreadcrumbUi,
         breadcrumbUiSource: geoSignalsV1.coverage.breadcrumbUiSource,
@@ -9033,6 +9102,9 @@ async function scrapeOnce(req, res) {
         hasHeaderElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasHeaderElement') ? semanticObserved.hasHeaderElement : null,
         hasNavElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasNavElement') ? semanticObserved.hasNavElement : null,
         hasFooterElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasFooterElement') ? semanticObserved.hasFooterElement : null,
+        hasFaqLink: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqLink') ? coverageObserved.hasFaqLink : null,
+        hasFaqNav: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqNav') ? coverageObserved.hasFaqNav : null,
+        hasFaqSection: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqSection') ? coverageObserved.hasFaqSection : null,
         breadcrumbUiObserved: Object.prototype.hasOwnProperty.call(coverageObserved, 'breadcrumbUiObserved') ? coverageObserved.breadcrumbUiObserved : null,
         hasBreadcrumbUi: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasBreadcrumbUi') ? coverageObserved.hasBreadcrumbUi : null,
         breadcrumbUiSource: coverageObserved.breadcrumbUiSource || null,
