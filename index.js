@@ -4110,6 +4110,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       };
       const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
+      const ctaIgnoreRe = /^(home|top|menu|close|prev|previous|next|share|facebook|instagram|x|twitter|youtube|line|linkedin|tiktok|ホーム|トップ|メニュー|閉じる|前へ|次へ|共有)$/i;
+      const ctaCandidateRe = /(?:お問い合わせ|お問合せ|問い合わせ|相談|資料請求|見積|申し込|申込|購入|詳しく見る|詳細を見る|採用情報|エントリー|contact|inquiry|consult|request|quote|apply|entry|buy|purchase|learn more|read more|details)/i;
+      const ctaTextFrom = (el) => {
+        if (!el) return '';
+        const tag = String(el.tagName || '').toLowerCase();
+        const raw = tag === 'input'
+          ? (el.getAttribute('value') || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+          : (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+        return clean(raw).slice(0, 80);
+      };
+      const ctaElements = queryAllDeep('a[href],button,[role="button"],input[type="submit"],input[type="button"]');
+      const ctaTexts = limit(Array.from(new Set(ctaElements
+        .map(ctaTextFrom)
+        .filter((text) => text && text.length <= 80 && !ctaIgnoreRe.test(text) && ctaCandidateRe.test(text)))), 10);
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
@@ -4264,6 +4278,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
       };
+      const claritySignals = {
+        ctaTexts,
+        ctaCandidatesCount: ctaTexts.length,
+        ctaObserved: true,
+        source: 'balanced_light'
+      };
       browserPhaseTimings.multimodalMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - multimodalPhaseStart));
       const domBodyText = clean(document.body && (document.body.innerText || document.body.textContent));
       const bodyText = clean([domBodyText].concat(shadowTextParts).join(' ')).slice(0, 100000);
@@ -4304,6 +4324,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           termsLinkSource: termsLike === true ? 'dom' : 'not_observed'
         },
         multimodalSignals,
+        clarity: claritySignals,
         trustSignals,
         coverage: {
           semanticElements,
@@ -4901,6 +4922,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasStructured: null,
         source: 'balanced_light'
       },
+      clarity: observed.clarity || {
+        ctaTexts: [],
+        ctaCandidatesCount: null,
+        ctaObserved: null,
+        source: 'not_observed'
+      },
       trustSignals: trustSignalsLight,
       coverage: observedCoverageSignals || {
         semanticElements: {
@@ -5087,6 +5114,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           confidence: mainLandmarkConfidence
         },
         multimodalSignals: observedMultimodalSignals || null,
+        clarity: observed.clarity || null,
         trustSignals: trustSignalsLight,
         coverage: observedCoverageSignals || null,
         body: {
@@ -6983,6 +7011,23 @@ async function scrapeOnce(req, res) {
           (a) => a.text,
           50
         );
+        const ctaIgnoreRe = /^(home|top|menu|close|prev|previous|next|share|facebook|instagram|x|twitter|youtube|line|linkedin|tiktok|ホーム|トップ|メニュー|閉じる|前へ|次へ|共有)$/i;
+        const ctaCandidateRe = /(?:お問い合わせ|お問合せ|問い合わせ|相談|資料請求|見積|申し込|申込|購入|詳しく見る|詳細を見る|採用情報|エントリー|contact|inquiry|consult|request|quote|apply|entry|buy|purchase|learn more|read more|details)/i;
+        const ctaTextFrom = (el) => {
+          if (!el) return '';
+          const tag = String(el.tagName || '').toLowerCase();
+          const raw = tag === 'input'
+            ? (el.getAttribute('value') || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+            : (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+          return clean(raw).slice(0, 80);
+        };
+        const ctaElements = queryAllDeep('a[href],button,[role="button"],input[type="submit"],input[type="button"]');
+        const ctaItems = uniqueBy(
+          ctaElements.map((el) => ({ text: ctaTextFrom(el), source: 'dom_or_open_shadow_dom' }))
+            .filter((item) => item.text && item.text.length <= 80 && !ctaIgnoreRe.test(item.text) && ctaCandidateRe.test(item.text)),
+          (item) => item.text,
+          10
+        );
         const internalItems = uniqueBy(
           anchors.filter((a) => {
             try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
@@ -7033,6 +7078,9 @@ async function scrapeOnce(req, res) {
           navLinkCount: navTextItems.length,
           internalLinkCount: internalItems.length,
           navTextsSample: navTextItems.map((a) => a.text),
+          ctaTexts: ctaItems.map((item) => item.text),
+          ctaCandidatesCount: ctaItems.length,
+          ctaObserved: true,
           internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
           externalProfileLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
           socialLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
@@ -7652,6 +7700,12 @@ async function scrapeOnce(req, res) {
           contactPointSource: structuredTrustSummary.contactPointSource,
           source: 'shortfast_phase_builder'
         },
+        clarity: {
+          ctaTexts: Array.isArray(linksTrust.ctaTexts) ? linksTrust.ctaTexts.slice(0, 10) : [],
+          ctaCandidatesCount: linksObserved && typeof linksTrust.ctaCandidatesCount === 'number' ? Number(linksTrust.ctaCandidatesCount) : null,
+          ctaObserved: linksObserved ? linksTrust.ctaObserved === true : null,
+          source: 'shortfast_phase_builder'
+        },
         coverage: {
           hasFaqLink: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqLink') ? linksTrust.hasFaqLink : null,
           hasFaqNav: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqNav') ? linksTrust.hasFaqNav : null,
@@ -7857,6 +7911,9 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
         hasContactLikeLink: linkBoolean('hasContactLikeLink'),
         hasPrivacyLikeLink: linkBoolean('hasPrivacyLikeLink'),
+        ctaTexts: Array.isArray(geoSignalsV1.clarity.ctaTexts) ? geoSignalsV1.clarity.ctaTexts.slice(0, 10) : [],
+        ctaCandidatesCount: geoSignalsV1.clarity.ctaCandidatesCount,
+        ctaObserved: geoSignalsV1.clarity.ctaObserved,
         bodyTextLength: unifiedBodyTextLength,
         bodyTextSample: unifiedBodyTextSample || null,
         mainTextHead: unifiedBodyTextSample || null,
@@ -9048,6 +9105,7 @@ async function scrapeOnce(req, res) {
       const landmarksObserved = (geoSignalsV1 && geoSignalsV1.landmarks) || observed.landmarks || {};
       const structuredObserved = observed.structuredData || {};
       const multimodalObserved = (geoSignalsV1 && geoSignalsV1.multimodalSignals) || observed.multimodalSignals || {};
+      const clarityObserved = (geoSignalsV1 && geoSignalsV1.clarity) || observed.clarity || {};
       const trustObserved = (geoSignalsV1 && geoSignalsV1.trustSignals) || observed.trustSignals || {};
       const coverageObserved = (geoSignalsV1 && geoSignalsV1.coverage) || observed.coverage || {};
       const semanticObserved = coverageObserved && coverageObserved.semanticElements && typeof coverageObserved.semanticElements === 'object'
@@ -9099,6 +9157,9 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
+        ctaTexts: Array.isArray(clarityObserved.ctaTexts) ? clarityObserved.ctaTexts.slice(0, 10) : [],
+        ctaCandidatesCount: typeof clarityObserved.ctaCandidatesCount === 'number' ? clarityObserved.ctaCandidatesCount : null,
+        ctaObserved: Object.prototype.hasOwnProperty.call(clarityObserved, 'ctaObserved') ? clarityObserved.ctaObserved : null,
         hasHeaderElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasHeaderElement') ? semanticObserved.hasHeaderElement : null,
         hasNavElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasNavElement') ? semanticObserved.hasNavElement : null,
         hasFooterElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasFooterElement') ? semanticObserved.hasFooterElement : null,
