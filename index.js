@@ -3223,6 +3223,12 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'content_length_too_large'
       };
     }
+    const hydrationMetrics = await collectBalancedHydrationMetrics(page, 3500, { shortFastMode: false });
+    let webdriverValue = '__unavailable__';
+    try {
+      const rawWebdriverValue = await page.evaluate(() => navigator.webdriver);
+      webdriverValue = typeof rawWebdriverValue === 'undefined' ? '__undefined__' : rawWebdriverValue;
+    } catch (_) {}
     const waitStartedAt = Date.now();
     const waitStrategyParts = [];
     try {
@@ -3412,6 +3418,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       nextDataExists: !!(observed && observed.nextDataExists),
       nuxtDataExists: !!(observed && observed.nuxtDataExists),
       shadowHostCount: Number(observed && observed.shadowHostCount || 0),
+      hydrationMetrics,
+      webdriverValue,
+      launchProfile: 'signalsFirstLightAligned',
       jsErrors,
       failedRequests,
       consoleErrors,
@@ -3480,7 +3489,16 @@ app.post('/subpage-jsonld-light', async (req, res) => {
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage']
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
     });
     context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -3492,6 +3510,9 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo',
       ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
     const tasks = normalizedUrls.map(url => {
       let origin = '';
@@ -3621,6 +3642,9 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       delete out.nextDataExists;
       delete out.nuxtDataExists;
       delete out.shadowHostCount;
+      delete out.hydrationMetrics;
+      delete out.webdriverValue;
+      delete out.launchProfile;
       delete out.jsErrors;
       delete out.failedRequests;
       delete out.consoleErrors;
@@ -3676,6 +3700,28 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       nextDataExists: p.nextDataExists,
       nuxtDataExists: p.nuxtDataExists,
       shadowHostCount: p.shadowHostCount,
+      hydrationMetrics: p.hydrationMetrics ? {
+        waitMs: p.hydrationMetrics.waitMs,
+        bodyTextBeforeWait: p.hydrationMetrics.bodyTextBeforeWait,
+        bodyTextAfterWait: p.hydrationMetrics.bodyTextAfterWait,
+        anchorCountBeforeWait: p.hydrationMetrics.anchorCountBeforeWait,
+        anchorCountAfterWait: p.hydrationMetrics.anchorCountAfterWait,
+        navLinkCountBeforeWait: p.hydrationMetrics.navLinkCountBeforeWait,
+        navLinkCountAfterWait: p.hydrationMetrics.navLinkCountAfterWait,
+        shadowHostCountBeforeWait: p.hydrationMetrics.shadowHostCountBeforeWait,
+        shadowHostCountAfterWait: p.hydrationMetrics.shadowHostCountAfterWait,
+        shadowJsonLdCountBeforeWait: p.hydrationMetrics.shadowJsonLdCountBeforeWait,
+        shadowJsonLdCountAfterWait: p.hydrationMetrics.shadowJsonLdCountAfterWait,
+        shadowH1CountBeforeWait: p.hydrationMetrics.shadowH1CountBeforeWait,
+        shadowH1CountAfterWait: p.hydrationMetrics.shadowH1CountAfterWait,
+        improvedBodyText: p.hydrationMetrics.improvedBodyText,
+        improvedLinks: p.hydrationMetrics.improvedLinks,
+        warningTextBeforeWait: p.hydrationMetrics.warningTextBeforeWait,
+        warningTextAfterWait: p.hydrationMetrics.warningTextAfterWait,
+        error: p.hydrationMetrics.error || null
+      } : null,
+      webdriverValue: p.webdriverValue,
+      launchProfile: p.launchProfile,
       jsonldTypes: p.jsonldTypes,
       waitedMs: p.waitedMs,
       waitStrategy: p.waitStrategy,
@@ -6070,8 +6116,8 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
     }));
   };
   try {
-    const before = await measure();
-    const sparseBefore = !!(
+      const before = await measure();
+      const sparseBefore = !!(
       before.warningText ||
       before.bodyTextLength < 800 ||
       before.anchorCount === 0 ||
@@ -6132,6 +6178,12 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
         anchorCountAfterWait: after.anchorCount,
         navLinkCountBeforeWait: before.navLinkCount,
         navLinkCountAfterWait: after.navLinkCount,
+        shadowHostCountBeforeWait: before.shadowHostCount,
+        shadowHostCountAfterWait: after.shadowHostCount,
+        shadowJsonLdCountBeforeWait: before.shadowJsonLdCount,
+        shadowJsonLdCountAfterWait: after.shadowJsonLdCount,
+        shadowH1CountBeforeWait: before.shadowH1Count,
+        shadowH1CountAfterWait: after.shadowH1Count,
         improvedBodyText: after.bodyTextLength > before.bodyTextLength,
         improvedLinks: after.anchorCount > before.anchorCount || after.navLinkCount > before.navLinkCount,
         warningTextBeforeWait: !!before.warningText,
@@ -6146,6 +6198,12 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       anchorCountAfterWait: before.anchorCount,
       navLinkCountBeforeWait: before.navLinkCount,
       navLinkCountAfterWait: before.navLinkCount,
+      shadowHostCountBeforeWait: before.shadowHostCount,
+      shadowHostCountAfterWait: before.shadowHostCount,
+      shadowJsonLdCountBeforeWait: before.shadowJsonLdCount,
+      shadowJsonLdCountAfterWait: before.shadowJsonLdCount,
+      shadowH1CountBeforeWait: before.shadowH1Count,
+      shadowH1CountAfterWait: before.shadowH1Count,
       warningTextBeforeWait: !!before.warningText,
       warningTextAfterWait: !!before.warningText
     });
