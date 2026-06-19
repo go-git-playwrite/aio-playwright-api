@@ -3045,8 +3045,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const context = opts.context;
+  let page = null;
   try {
     const initialUrl = new URL(String(url || ''));
     if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
@@ -3070,17 +3070,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'blocked_private_or_metadata_host'
       };
     }
-    const response = await fetch(url, {
-      method: 'GET',
-      redirect: 'follow',
-      signal: controller ? controller.signal : undefined,
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (compatible; GEO-SubpageJsonLdLight/1.0; +https://www.fork.co.jp/)'
-      }
+    if (!context || typeof context.newPage !== 'function') throw new Error('missing_playwright_context');
+    page = await context.newPage();
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: timeoutMs
     });
-    const status = response && typeof response.status === 'number' ? response.status : null;
-    const finalUrl = response && response.url ? response.url : url;
+    const status = response && typeof response.status === 'function' ? response.status() : null;
+    const finalUrl = page && typeof page.url === 'function' ? page.url() : (response && response.url ? response.url : url);
     let finalParsed = null;
     try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
     if (finalParsed && isBlockedSubpageJsonLdHost(finalParsed.hostname)) {
@@ -3125,7 +3122,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'redirect_origin_mismatch'
       };
     }
-    if (!response || !response.ok) {
+    if (!response || (typeof response.ok === 'function' && !response.ok())) {
       return {
         url,
         finalUrl,
@@ -3146,8 +3143,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: status ? `HTTP ${status}` : 'fetch_failed'
       };
     }
-    const contentType = response.headers && typeof response.headers.get === 'function'
-      ? String(response.headers.get('content-type') || '')
+    const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+    const contentType = headers && typeof headers === 'object'
+      ? String(headers['content-type'] || '')
       : '';
     if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
       return {
@@ -3170,8 +3168,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'unsupported_content_type'
       };
     }
-    const contentLengthHeader = response.headers && typeof response.headers.get === 'function'
-      ? Number(response.headers.get('content-length') || 0)
+    const contentLengthHeader = headers && typeof headers === 'object'
+      ? Number(headers['content-length'] || 0)
       : 0;
     if (Number.isFinite(contentLengthHeader) && contentLengthHeader > maxHtmlBytes) {
       return {
@@ -3194,8 +3192,83 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'content_length_too_large'
       };
     }
-    const html = await response.text();
-    if (Buffer.byteLength(String(html || ''), 'utf8') > maxHtmlBytes) {
+    try {
+      await page.waitForTimeout(Math.min(3500, Math.max(1000, timeoutMs - 1000)));
+    } catch (_) {}
+    const observed = await page.evaluate(() => {
+      const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+      const queryAllDeep = (selector, opts = {}) => {
+        const out = [];
+        const seen = new Set();
+        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
+        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
+        const walk = (root, depth = 0) => {
+          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+          try {
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el) || out.length >= maxNodes) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          } catch (_) {}
+        };
+        walk(document, 0);
+        return out;
+      };
+      const h1Texts = [];
+      queryAllDeep('h1', { maxNodes: 50 }).forEach((el) => {
+        const text = clean(el.innerText || el.textContent);
+        if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
+      });
+      const jsonldTexts = queryAllDeep('script[type*="ld+json" i]', { maxNodes: 50 })
+        .map(el => String(el.textContent || '').trim())
+        .filter(Boolean);
+      const breadcrumbCandidates = queryAllDeep([
+        'nav[aria-label*="breadcrumb" i]',
+        '[aria-label*="パンくず"]',
+        '.breadcrumb',
+        '.breadcrumbs',
+        '[class*="breadcrumb" i]',
+        '[id*="breadcrumb" i]',
+        '[class*="breadcrumbs" i]',
+        '[id*="breadcrumbs" i]',
+        '[class*="pankuzu" i]',
+        '[id*="pankuzu" i]',
+        'ol',
+        'ul'
+      ].join(','), { maxNodes: 200 });
+      let hasBreadcrumbUi = false;
+      for (const el of breadcrumbCandidates) {
+        const attrs = [
+          el.getAttribute && el.getAttribute('class'),
+          el.getAttribute && el.getAttribute('id'),
+          el.getAttribute && el.getAttribute('aria-label')
+        ].map(v => clean(v).toLowerCase()).join(' ');
+        const text = clean(el.innerText || el.textContent).slice(0, 160);
+        const liCount = el.querySelectorAll ? el.querySelectorAll('li').length : 0;
+        if (/(breadcrumb|breadcrumbs|pankuzu)/i.test(attrs) || /パンくず/.test(attrs) || /パンくず/.test(text) || (liCount >= 2 && /[>›»]/.test(text))) {
+          hasBreadcrumbUi = true;
+          break;
+        }
+      }
+      const canonicalEl = document.querySelector('link[rel~="canonical" i]');
+      const title = clean(document.title || '').slice(0, 180);
+      const canonical = canonicalEl && canonicalEl.href ? String(canonicalEl.href || '').trim() : '';
+      return {
+        finalUrl: location.href,
+        title,
+        canonical,
+        h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
+        h1Texts,
+        jsonldTexts,
+        hasBreadcrumbUi,
+        htmlLength: String((document.documentElement && document.documentElement.outerHTML) || '').length
+      };
+    });
+    if (Number(observed && observed.htmlLength || 0) > maxHtmlBytes) {
       return {
         url,
         finalUrl,
@@ -3216,7 +3289,38 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'html_too_large'
       };
     }
-    return parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode);
+    const jsonldTypes = [];
+    let parseErrors = 0;
+    (Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts : []).forEach(raw => {
+      try {
+        collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+      } catch (_) {
+        parseErrors += 1;
+      }
+    });
+    const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+    const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+    const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
+    return {
+      url,
+      finalUrl: observedFinalUrl || finalUrl || url,
+      status,
+      ok: true,
+      pageType: inferSubpageJsonLdPageType(observedFinalUrl || finalUrl || url, opts.siteMode, uniqueTypes),
+      title: normalizeSubpageJsonLdText(observed && observed.title).slice(0, 180),
+      canonical: normalizeSubpageJsonLdText(observed && observed.canonical),
+      h1Count: Number(observed && observed.h1Count || 0),
+      h1Texts: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
+      jsonldTypes: uniqueTypes,
+      hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
+      hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
+      hasFaqJsonLd: lowerTypes.has('faqpage'),
+      hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
+      hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
+      hasBreadcrumbUi: !!(observed && observed.hasBreadcrumbUi),
+      error: null,
+      parseErrors
+    };
   } catch (e) {
     return {
       url,
@@ -3238,7 +3342,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       error: e && e.name === 'AbortError' ? 'timeout' : String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
     };
   } finally {
-    if (timer) clearTimeout(timer);
+    try { if (page) await page.close(); } catch (_) {}
   }
 }
 
@@ -3265,11 +3369,48 @@ app.post('/subpage-jsonld-light', async (req, res) => {
     siteMode,
     timeout
   }));
-  const tasks = normalizedUrls.map(url => {
-    let origin = '';
-    try { origin = new URL(url).origin; } catch (_) {}
-    if (baseOrigin && origin !== baseOrigin) {
-      return Promise.resolve({
+  let browser = null;
+  let context = null;
+  let settled = [];
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage']
+    });
+    context = await browser.newContext({
+      ignoreHTTPSErrors: true
+    });
+    const tasks = normalizedUrls.map(url => {
+      let origin = '';
+      try { origin = new URL(url).origin; } catch (_) {}
+      if (baseOrigin && origin !== baseOrigin) {
+        return Promise.resolve({
+          url,
+          finalUrl: url,
+          status: null,
+          ok: false,
+          pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+          title: '',
+          canonical: '',
+          h1Count: 0,
+          h1Texts: [],
+          jsonldTypes: [],
+          hasBreadcrumbJsonLd: false,
+          hasProductJsonLd: false,
+          hasFaqJsonLd: false,
+          hasArticleJsonLd: false,
+          hasBlogPostingJsonLd: false,
+          hasBreadcrumbUi: false,
+          error: 'origin_mismatch'
+        });
+      }
+      return fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+    });
+    settled = await Promise.allSettled(tasks);
+  } catch (e) {
+    settled = normalizedUrls.map(url => ({
+      status: 'fulfilled',
+      value: {
         url,
         finalUrl: url,
         status: null,
@@ -3286,12 +3427,13 @@ app.post('/subpage-jsonld-light', async (req, res) => {
         hasArticleJsonLd: false,
         hasBlogPostingJsonLd: false,
         hasBreadcrumbUi: false,
-        error: 'origin_mismatch'
-      });
-    }
-    return fetchSubpageJsonLdLight(url, { siteMode, timeout });
-  });
-  const settled = await Promise.allSettled(tasks);
+        error: String(e && (e.message || e) || 'playwright_failed').slice(0, 160)
+      }
+    }));
+  } finally {
+    try { if (context) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+  }
   const pages = settled.map((result, index) => {
     if (result.status === 'fulfilled') return result.value;
     const url = normalizedUrls[index] || '';
@@ -3358,6 +3500,22 @@ app.post('/subpage-jsonld-light', async (req, res) => {
     fetchedCount: payload.fetchedCount,
     elapsedMs: payload.elapsedMs,
     summary
+  }));
+  console.log('[DEBUG][SUBPAGE_JSONLD_LIGHT_PLAYWRIGHT_OBSERVED]', JSON.stringify({
+    requestedCount: payload.requestedCount,
+    fetchedCount: payload.fetchedCount,
+    elapsedMs: payload.elapsedMs,
+    pages: payload.pages.map(p => ({
+      url: p.url,
+      finalUrl: p.finalUrl,
+      status: p.status,
+      ok: p.ok,
+      h1Count: p.h1Count,
+      jsonldTypes: p.jsonldTypes,
+      hasBreadcrumbJsonLd: p.hasBreadcrumbJsonLd,
+      hasBreadcrumbUi: p.hasBreadcrumbUi,
+      error: p.error
+    }))
   }));
   return res.status(200).json(payload);
 });
