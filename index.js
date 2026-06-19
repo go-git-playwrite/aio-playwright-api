@@ -2954,6 +2954,16 @@ function collectSubpageJsonLdTypes(node, out, depth = 0) {
   });
 }
 
+function countSubpageJsonLdTypes(types) {
+  const counts = {};
+  (Array.isArray(types) ? types : []).forEach(type => {
+    const normalized = normalizeSubpageJsonLdType(type);
+    if (!normalized) return;
+    counts[normalized] = (counts[normalized] || 0) + 1;
+  });
+  return counts;
+}
+
 function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
   const typeSet = new Set((Array.isArray(jsonldTypes) ? jsonldTypes : []).map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
   const path = (() => {
@@ -2994,6 +3004,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     }
   });
   const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+  const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
   const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
   const breadcrumbSelector = [
     'nav[aria-label*="breadcrumb" i]',
@@ -3031,6 +3042,9 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     h1Count: $('h1').length,
     h1Texts,
     jsonldTypes: uniqueTypes,
+    jsonldTypeCounts,
+    breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
+    listItemCount: Number(jsonldTypeCounts.ListItem || 0),
     hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
     hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
     hasFaqJsonLd: lowerTypes.has('faqpage'),
@@ -3326,28 +3340,27 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
   }
 }
 
-app.post('/discover-subpage-candidates-light', async (req, res) => {
-  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
-  if (!rawTopUrl) return res.status(400).json({ ok: false, error: 'topUrl or url is required' });
-  let topUrl = '';
-  let origin = '';
+function normalizeDiscoverTopUrl(rawTopUrl) {
+  if (!rawTopUrl) return { ok: false, error: 'topUrl or url is required' };
   try {
     const parsed = new URL(String(rawTopUrl || ''));
     if (!/^https?:$/.test(parsed.protocol)) throw new Error('unsupported protocol');
     if (isBlockedSubpageJsonLdHost(parsed.hostname)) throw new Error('blocked_private_or_metadata_host');
     parsed.hash = '';
-    topUrl = parsed.toString();
-    origin = parsed.origin;
+    return { ok: true, topUrl: parsed.toString(), origin: parsed.origin };
   } catch (e) {
-    return res.status(400).json({ ok: false, error: String(e && (e.message || e) || 'invalid topUrl').slice(0, 160) });
+    return { ok: false, error: String(e && (e.message || e) || 'invalid topUrl').slice(0, 160) };
   }
-  const limit = Math.max(1, Math.min(50, Number(req.body && req.body.limit || 20) || 20));
+}
+
+async function discoverSubpageCandidatesLightData_(topUrl, origin, limit) {
+  const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
   const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0 };
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
   await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors);
-  const candidates = Array.from(candidateMap.values())
+  const allCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
       source: item.source,
@@ -3355,17 +3368,30 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
       score: item.score,
       reason: item.reason
     }))
-    .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url))
-    .slice(0, limit);
+    .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  return {
+    candidates: allCandidates.slice(0, normalizedLimit),
+    totalCandidates: allCandidates.length,
+    sourceSummary,
+    errors
+  };
+}
+
+app.post('/discover-subpage-candidates-light', async (req, res) => {
+  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
+  const normalized = normalizeDiscoverTopUrl(rawTopUrl);
+  if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
+  const limit = Math.max(1, Math.min(50, Number(req.body && req.body.limit || 20) || 20));
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, limit);
   return res.status(200).json({
     ok: true,
     mode: 'discoverSubpageCandidatesLight',
-    topUrl,
-    origin,
+    topUrl: normalized.topUrl,
+    origin: normalized.origin,
     limit,
-    candidates,
-    sourceSummary,
-    errors
+    candidates: discovered.candidates,
+    sourceSummary: discovered.sourceSummary,
+    errors: discovered.errors
   });
 });
 
@@ -3724,6 +3750,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       }
     });
     const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+    const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
     const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
     const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
     return {
@@ -3737,6 +3764,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       h1Count: Number(observed && observed.h1Count || 0),
       h1Texts: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
       jsonldTypes: uniqueTypes,
+      jsonldTypeCounts,
+      breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
+      listItemCount: Number(jsonldTypeCounts.ListItem || 0),
       domJsonLdScriptCount: Number(observed && observed.domJsonLdScriptCount || 0),
       deepJsonLdScriptCount: Number(observed && observed.deepJsonLdScriptCount || 0),
       readyState: String(observed && observed.readyState || ''),
@@ -3788,6 +3818,176 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
   } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
+}
+
+function compactSubpageJsonLdObservation_(page) {
+  const rawCounts = page && page.jsonldTypeCounts && typeof page.jsonldTypeCounts === 'object'
+    ? page.jsonldTypeCounts
+    : {};
+  const breadcrumbListCount = Number(
+    page && typeof page.breadcrumbListCount === 'number'
+      ? page.breadcrumbListCount
+      : rawCounts.BreadcrumbList || 0
+  );
+  const listItemCount = Number(
+    page && typeof page.listItemCount === 'number'
+      ? page.listItemCount
+      : rawCounts.ListItem || 0
+  );
+  return Object.assign({}, page || {}, {
+    url: page && page.url || '',
+    ok: !!(page && page.ok),
+    finalUrl: page && page.finalUrl || page && page.url || '',
+    status: page && typeof page.status !== 'undefined' ? page.status : null,
+    h1Count: Number(page && page.h1Count || 0),
+    h1Texts: Array.isArray(page && page.h1Texts) ? page.h1Texts.slice(0, 5) : [],
+    jsonldTypes: Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [],
+    breadcrumbListCount,
+    listItemCount
+  });
+}
+
+async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
+  const started = Date.now();
+  const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
+  const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
+  const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const concurrency = Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4));
+  const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
+  let browser = null;
+  let context = null;
+  const pages = new Array(normalizedUrls.length);
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                 'Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    let nextIndex = 0;
+    const workerCount = Math.min(concurrency, normalizedUrls.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < normalizedUrls.length) {
+        const index = nextIndex++;
+        const url = normalizedUrls[index];
+        try {
+          let origin = '';
+          try { origin = new URL(url).origin; } catch (_) {}
+          if (baseOrigin && origin !== baseOrigin) {
+            pages[index] = {
+              url,
+              finalUrl: url,
+              status: null,
+              ok: false,
+              pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+              title: '',
+              canonical: '',
+              h1Count: 0,
+              h1Texts: [],
+              jsonldTypes: [],
+              breadcrumbListCount: 0,
+              listItemCount: 0,
+              hasBreadcrumbJsonLd: false,
+              hasProductJsonLd: false,
+              hasFaqJsonLd: false,
+              hasArticleJsonLd: false,
+              hasBlogPostingJsonLd: false,
+              hasBreadcrumbUi: false,
+              error: 'origin_mismatch'
+            };
+            continue;
+          }
+          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+        } catch (e) {
+          pages[index] = {
+            url,
+            finalUrl: url,
+            status: null,
+            ok: false,
+            pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+            title: '',
+            canonical: '',
+            h1Count: 0,
+            h1Texts: [],
+            jsonldTypes: [],
+            breadcrumbListCount: 0,
+            listItemCount: 0,
+            hasBreadcrumbJsonLd: false,
+            hasProductJsonLd: false,
+            hasFaqJsonLd: false,
+            hasArticleJsonLd: false,
+            hasBlogPostingJsonLd: false,
+            hasBreadcrumbUi: false,
+            error: String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
+          };
+        }
+      }
+    });
+    await Promise.allSettled(workers);
+  } catch (e) {
+    normalizedUrls.forEach((url, index) => {
+      pages[index] = pages[index] || {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        breadcrumbListCount: 0,
+        listItemCount: 0,
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: String(e && (e.message || e) || 'playwright_failed').slice(0, 160)
+      };
+    });
+  } finally {
+    try { if (context) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+  }
+  const compactPages = pages.map(page => compactSubpageJsonLdObservation_(page));
+  return {
+    requestedCount: normalizedUrls.length,
+    fetchedCount: compactPages.filter(page => page.ok === true).length,
+    elapsedMs: Math.max(0, Date.now() - started),
+    pages: compactPages,
+    summary: {
+      hasBreadcrumbJsonLdOnSubpage: compactPages.some(page => page.hasBreadcrumbJsonLd === true),
+      hasProductJsonLdOnSubpage: compactPages.some(page => page.hasProductJsonLd === true),
+      hasFaqJsonLdOnSubpage: compactPages.some(page => page.hasFaqJsonLd === true),
+      hasArticleJsonLdOnSubpage: compactPages.some(page => page.hasArticleJsonLd === true),
+      hasBlogPostingJsonLdOnSubpage: compactPages.some(page => page.hasBlogPostingJsonLd === true),
+      hasBreadcrumbUiOnSubpage: compactPages.some(page => page.hasBreadcrumbUi === true)
+    }
+  };
 }
 
 app.post('/subpage-jsonld-light', async (req, res) => {
@@ -4062,6 +4262,50 @@ app.post('/subpage-jsonld-light', async (req, res) => {
     }));
   });
   return res.status(200).json(payload);
+});
+
+app.post('/discover-and-observe-subpages-light', async (req, res) => {
+  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
+  const normalized = normalizeDiscoverTopUrl(rawTopUrl);
+  if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
+  const limit = Math.max(1, Math.min(20, Number(req.body && req.body.limit || 10) || 10));
+  const candidateLimit = Math.max(limit * 3, 20);
+  const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
+  const selectedCandidates = discovered.candidates.slice(0, limit);
+  const urls = selectedCandidates.map(candidate => candidate.url);
+  const observed = await observeSubpageJsonLdLightUrls_(urls, {
+    siteMode,
+    timeout: req.body && req.body.timeout,
+    concurrency: 3
+  });
+  const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+  const observationErrors = observations
+    .map((page, index) => {
+      if (page && page.ok === true) return null;
+      const candidate = selectedCandidates[index] || {};
+      return {
+        url: page && page.url || candidate.url || '',
+        source: candidate.source || '',
+        message: String(page && page.error || 'observation_failed').slice(0, 160)
+      };
+    })
+    .filter(Boolean);
+  return res.status(200).json({
+    ok: true,
+    mode: 'discoverAndObserveSubpagesLight',
+    topUrl: normalized.topUrl,
+    origin: normalized.origin,
+    limit,
+    candidateSummary: {
+      sourceSummary: discovered.sourceSummary,
+      totalCandidates: discovered.totalCandidates,
+      observedCount: observations.length
+    },
+    candidates: selectedCandidates,
+    observations,
+    errors: [].concat(discovered.errors || [], observationErrors)
+  });
 });
 
 // -------------------- Simple in-memory cache --------------------
