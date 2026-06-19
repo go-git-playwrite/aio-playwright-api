@@ -159,6 +159,7 @@ const PQueue = require('p-queue').default;
 const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: '64kb' }));
 
 function logSfMemory(label) {
   try {
@@ -2898,6 +2899,467 @@ app.get('/health', (_, res) => res.status(200).json({ ok: true, build: BUILD_TAG
 app.get('/healthz', (_, res) => {
   const m = process.memoryUsage();
   res.status(200).json({ ok: true, rss: m.rss, heapUsed: m.heapUsed });
+});
+
+// -------------------- Subpage JSON-LD light batch --------------------
+function normalizeSubpageJsonLdText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeSubpageJsonLdType(value) {
+  return normalizeSubpageJsonLdText(value).replace(/^https?:\/\/schema\.org\//i, '');
+}
+
+function isBlockedSubpageJsonLdHost(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === 'metadata.google.internal' || host.endsWith('.metadata.google.internal')) return true;
+  if (/metadata/i.test(host) && /(google|cloud|aws|azure|instance|internal)/i.test(host)) return true;
+  if (host === '169.254.169.254') return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const parts = host.split('.').map(n => Number(n));
+    if (parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+    const a = parts[0];
+    const b = parts[1];
+    if (a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  if (/^fc|^fd/i.test(host)) return true;
+  if (/^fe[89ab]/i.test(host)) return true;
+  return false;
+}
+
+function collectSubpageJsonLdTypes(node, out, depth = 0) {
+  if (!node || depth > 10) return;
+  if (Array.isArray(node)) {
+    node.forEach(item => collectSubpageJsonLdTypes(item, out, depth + 1));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  const typeValue = node['@type'];
+  const types = Array.isArray(typeValue) ? typeValue : (typeValue ? [typeValue] : []);
+  types.forEach(type => {
+    const normalized = normalizeSubpageJsonLdType(type);
+    if (normalized) out.push(normalized);
+  });
+  if (Array.isArray(node['@graph'])) {
+    node['@graph'].forEach(item => collectSubpageJsonLdTypes(item, out, depth + 1));
+  }
+  Object.keys(node).forEach(key => {
+    if (key === '@graph' || key === '@type') return;
+    const value = node[key];
+    if (value && typeof value === 'object') collectSubpageJsonLdTypes(value, out, depth + 1);
+  });
+}
+
+function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
+  const typeSet = new Set((Array.isArray(jsonldTypes) ? jsonldTypes : []).map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+  const path = (() => {
+    try { return new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { return String(url || '').toLowerCase(); }
+  })();
+  if (typeSet.has('product') || typeSet.has('offer')) return 'product';
+  if (typeSet.has('faqpage')) return 'faq';
+  if (typeSet.has('article') || typeSet.has('newsarticle') || typeSet.has('blogposting')) return 'article';
+  if (typeSet.has('breadcrumblist')) return 'category_or_detail';
+  if (/\/(?:faq|faqs|guide|guides|help|support)(?:\/|$|-|_)/i.test(path)) return 'faq';
+  if (/\/(?:product|products|item|items)(?:\/|$|-|_)/i.test(path)) return 'product';
+  if (/\/(?:category|categories|collections|collection)(?:\/|$|-|_)/i.test(path)) return 'category';
+  return siteMode === 'ec' && /\/collections?\//i.test(path) ? 'category' : 'unknown';
+}
+
+function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
+  const $ = cheerio.load(String(html || ''));
+  const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
+  const canonicalRaw = normalizeSubpageJsonLdText($('link[rel~="canonical" i]').first().attr('href') || '');
+  let canonical = canonicalRaw;
+  if (canonicalRaw) {
+    try { canonical = new URL(canonicalRaw, finalUrl || url).toString(); } catch (_) {}
+  }
+  const h1Texts = [];
+  $('h1').each((_, el) => {
+    const text = normalizeSubpageJsonLdText($(el).text());
+    if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
+  });
+  const jsonldTypes = [];
+  let parseErrors = 0;
+  $('script[type*="ld+json" i]').each((_, el) => {
+    const raw = String($(el).contents().text() || $(el).html() || '').trim();
+    if (!raw) return;
+    try {
+      collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+    } catch (_) {
+      parseErrors += 1;
+    }
+  });
+  const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+  const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+  const breadcrumbSelector = [
+    'nav[aria-label*="breadcrumb" i]',
+    '[aria-label*="パンくず"]',
+    '[class*="breadcrumb" i]',
+    '[id*="breadcrumb" i]',
+    '[class*="breadcrumbs" i]',
+    '[id*="breadcrumbs" i]',
+    '[class*="pankuzu" i]',
+    '[id*="pankuzu" i]'
+  ].join(',');
+  let hasBreadcrumbUi = $(breadcrumbSelector).length > 0;
+  if (!hasBreadcrumbUi) {
+    $('nav, ol, ul, div').slice(0, 200).each((_, el) => {
+      if (hasBreadcrumbUi) return;
+      const attrs = [
+        $(el).attr('class'),
+        $(el).attr('id'),
+        $(el).attr('aria-label')
+      ].map(v => normalizeSubpageJsonLdText(v).toLowerCase()).join(' ');
+      const text = normalizeSubpageJsonLdText($(el).text()).slice(0, 120);
+      if (/(breadcrumb|breadcrumbs|pankuzu)/i.test(attrs) || /パンくず/.test(attrs) || /パンくず/.test(text)) {
+        hasBreadcrumbUi = true;
+      }
+    });
+  }
+  return {
+    url,
+    finalUrl: finalUrl || url,
+    status,
+    ok: true,
+    pageType: inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes),
+    title,
+    canonical,
+    h1Count: $('h1').length,
+    h1Texts,
+    jsonldTypes: uniqueTypes,
+    hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
+    hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
+    hasFaqJsonLd: lowerTypes.has('faqpage'),
+    hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
+    hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
+    hasBreadcrumbUi,
+    error: null,
+    parseErrors
+  };
+}
+
+async function fetchSubpageJsonLdLight(url, opts = {}) {
+  const maxHtmlBytes = 2 * 1024 * 1024;
+  const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const initialUrl = new URL(String(url || ''));
+    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
+      return {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'blocked_private_or_metadata_host'
+      };
+    }
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller ? controller.signal : undefined,
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (compatible; GEO-SubpageJsonLdLight/1.0; +https://www.fork.co.jp/)'
+      }
+    });
+    const status = response && typeof response.status === 'number' ? response.status : null;
+    const finalUrl = response && response.url ? response.url : url;
+    let finalParsed = null;
+    try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
+    if (finalParsed && isBlockedSubpageJsonLdHost(finalParsed.hostname)) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'blocked_private_or_metadata_host'
+      };
+    }
+    if (finalParsed && finalParsed.origin !== initialUrl.origin) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'redirect_origin_mismatch'
+      };
+    }
+    if (!response || !response.ok) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: status ? `HTTP ${status}` : 'fetch_failed'
+      };
+    }
+    const contentType = response.headers && typeof response.headers.get === 'function'
+      ? String(response.headers.get('content-type') || '')
+      : '';
+    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'unsupported_content_type'
+      };
+    }
+    const contentLengthHeader = response.headers && typeof response.headers.get === 'function'
+      ? Number(response.headers.get('content-length') || 0)
+      : 0;
+    if (Number.isFinite(contentLengthHeader) && contentLengthHeader > maxHtmlBytes) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'content_length_too_large'
+      };
+    }
+    const html = await response.text();
+    if (Buffer.byteLength(String(html || ''), 'utf8') > maxHtmlBytes) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'html_too_large'
+      };
+    }
+    return parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode);
+  } catch (e) {
+    return {
+      url,
+      finalUrl: url,
+      status: null,
+      ok: false,
+      pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+      title: '',
+      canonical: '',
+      h1Count: 0,
+      h1Texts: [],
+      jsonldTypes: [],
+      hasBreadcrumbJsonLd: false,
+      hasProductJsonLd: false,
+      hasFaqJsonLd: false,
+      hasArticleJsonLd: false,
+      hasBlogPostingJsonLd: false,
+      hasBreadcrumbUi: false,
+      error: e && e.name === 'AbortError' ? 'timeout' : String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+app.post('/subpage-jsonld-light', async (req, res) => {
+  const started = Date.now();
+  const urls = req && req.body && Array.isArray(req.body.urls) ? req.body.urls : null;
+  if (!urls) return res.status(400).json({ ok: false, error: 'urls must be an array' });
+  if (urls.length > 5) return res.status(400).json({ ok: false, error: 'urls max is 5' });
+  const normalizedUrls = [];
+  for (const raw of urls) {
+    try {
+      const u = new URL(String(raw || ''));
+      if (!/^https?:$/.test(u.protocol)) throw new Error('unsupported protocol');
+      normalizedUrls.push(u.toString());
+    } catch (_) {
+      return res.status(400).json({ ok: false, error: 'urls must contain only valid http/https URLs' });
+    }
+  }
+  const siteMode = normalizeSubpageJsonLdText(req.body.siteMode || 'generic').toLowerCase() || 'generic';
+  const timeout = Math.max(1000, Math.min(15000, Number(req.body.timeout || 8000) || 8000));
+  const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
+  console.log('[SUBPAGE_JSONLD_LIGHT][START]', JSON.stringify({
+    requestedCount: normalizedUrls.length,
+    siteMode,
+    timeout
+  }));
+  const tasks = normalizedUrls.map(url => {
+    let origin = '';
+    try { origin = new URL(url).origin; } catch (_) {}
+    if (baseOrigin && origin !== baseOrigin) {
+      return Promise.resolve({
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'origin_mismatch'
+      });
+    }
+    return fetchSubpageJsonLdLight(url, { siteMode, timeout });
+  });
+  const settled = await Promise.allSettled(tasks);
+  const pages = settled.map((result, index) => {
+    if (result.status === 'fulfilled') return result.value;
+    const url = normalizedUrls[index] || '';
+    return {
+      url,
+      finalUrl: url,
+      status: null,
+      ok: false,
+      pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+      title: '',
+      canonical: '',
+      h1Count: 0,
+      h1Texts: [],
+      jsonldTypes: [],
+      hasBreadcrumbJsonLd: false,
+      hasProductJsonLd: false,
+      hasFaqJsonLd: false,
+      hasArticleJsonLd: false,
+      hasBlogPostingJsonLd: false,
+      hasBreadcrumbUi: false,
+      error: String(result.reason && (result.reason.message || result.reason) || 'fetch_failed').slice(0, 160)
+    };
+  });
+  pages.forEach(page => {
+    console.log('[SUBPAGE_JSONLD_LIGHT][PAGE]', JSON.stringify({
+      url: page.url,
+      status: page.status,
+      ok: page.ok,
+      pageType: page.pageType,
+      jsonldTypes: page.jsonldTypes,
+      hasBreadcrumbJsonLd: page.hasBreadcrumbJsonLd,
+      hasProductJsonLd: page.hasProductJsonLd,
+      hasFaqJsonLd: page.hasFaqJsonLd,
+      hasArticleJsonLd: page.hasArticleJsonLd,
+      hasBlogPostingJsonLd: page.hasBlogPostingJsonLd,
+      hasBreadcrumbUi: page.hasBreadcrumbUi,
+      error: page.error
+    }));
+  });
+  const summary = {
+    hasBreadcrumbJsonLdOnSubpage: pages.some(page => page.hasBreadcrumbJsonLd === true),
+    hasProductJsonLdOnSubpage: pages.some(page => page.hasProductJsonLd === true),
+    hasFaqJsonLdOnSubpage: pages.some(page => page.hasFaqJsonLd === true),
+    hasArticleJsonLdOnSubpage: pages.some(page => page.hasArticleJsonLd === true),
+    hasBlogPostingJsonLdOnSubpage: pages.some(page => page.hasBlogPostingJsonLd === true),
+    hasBreadcrumbUiOnSubpage: pages.some(page => page.hasBreadcrumbUi === true)
+  };
+  const payload = {
+    ok: true,
+    mode: 'subpageJsonLdLight',
+    siteMode,
+    requestedCount: normalizedUrls.length,
+    fetchedCount: pages.filter(page => page.ok === true).length,
+    elapsedMs: Math.max(0, Date.now() - started),
+    pages: pages.map(page => {
+      const out = Object.assign({}, page);
+      delete out.parseErrors;
+      return out;
+    }),
+    summary
+  };
+  console.log('[SUBPAGE_JSONLD_LIGHT][DONE]', JSON.stringify({
+    requestedCount: payload.requestedCount,
+    fetchedCount: payload.fetchedCount,
+    elapsedMs: payload.elapsedMs,
+    summary
+  }));
+  return res.status(200).json(payload);
 });
 
 // -------------------- Simple in-memory cache --------------------
