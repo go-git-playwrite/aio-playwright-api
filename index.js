@@ -3068,17 +3068,49 @@ function discoverSubpageCandidateKey(url) {
   }
 }
 
-function scoreDiscoverSubpageCandidate(url, source) {
+function isDiscoverImportantPath(path) {
+  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|access|sitemap)(?:\/|$|-|_)/i.test(String(path || ''));
+}
+
+function isDiscoverDetailLikePath(path) {
+  const p = String(path || '').toLowerCase();
+  if (/\/(?:case|cases|works|news|topics|blog|column)\/.+/i.test(p)) return true;
+  if (/\/\d{4}\/\d{1,2}(?:\/|$)/.test(p)) return true;
+  if (/(?:\/|[-_])\d{3,}(?:\.html)?$/i.test(p)) return true;
+  if (/\/[^/]+\.html$/i.test(p) && !/\/index\.html$/i.test(p) && p.split('/').filter(Boolean).length >= 2) return true;
+  return false;
+}
+
+function reasonDiscoverSubpageCandidate(url, source, sources) {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
-  const sourceScore = source === 'sitemap' ? 40 : (source === 'htmlSitemap' ? 30 : (source === 'nav' ? 20 : (source === 'footer' ? 15 : 0)));
-  const importantRe = /\/(?:about|company|corporate|profile|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|recruit|career|privacy|policy|faq|access)(?:\/|$|-|_)/i;
+  const important = isDiscoverImportantPath(path);
+  const detailLike = isDiscoverDetailLikePath(path);
+  const sourceCount = Array.isArray(sources) ? sources.length : 1;
+  if (sourceCount >= 2 && important) return 'multiple sources with important path';
+  if (source === 'nav' && important) return 'primary navigation link with important path';
+  if (source === 'footer' && important) return 'footer link with important path';
+  if (source === 'htmlSitemap' && important) return 'HTML sitemap link with important path';
+  if (source === 'sitemap' && detailLike) return 'sitemap detail-like url';
+  if (source === 'sitemap' && important) return 'sitemap url with important path';
+  return `${source || 'unknown'} candidate`;
+}
+
+function scoreDiscoverSubpageCandidate(url, source, sources) {
+  let path = '';
+  try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : 0)));
   const depth = path.split('/').filter(Boolean).length;
+  const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
-  if (importantRe.test(path)) score += 50;
-  score += Math.max(0, 18 - depth * 5);
-  if (/\/(?:case|cases|news|topics|blog|column)\/.+/i.test(path) && depth >= 2) score -= 45;
-  if (depth >= 4) score -= 15;
+  if (isDiscoverImportantPath(path)) score += 50;
+  if (depth <= 1) score += 15;
+  else if (depth === 2) score += 8;
+  if (sourceCount >= 2) score += Math.min(30, 10 + (sourceCount - 2) * 10);
+  if (depth >= 3) score -= Math.min(30, (depth - 2) * 10);
+  if (isDiscoverDetailLikePath(path)) score -= 30;
+  if (/(?:\/|[-_])\d{3,}(?:\.html)?$/i.test(path) || /\/\d{4}(?:\/|-|_)/.test(path)) score -= 20;
+  if (/\/[^/]+\.html$/i.test(path) && !/\/index\.html$/i.test(path) && depth >= 2) score -= 10;
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
@@ -3086,23 +3118,24 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   const url = normalizeDiscoverSubpageUrl(rawUrl, origin);
   if (!url) return false;
   const key = discoverSubpageCandidateKey(url);
-  const sourcePriority = { sitemap: 4, htmlSitemap: 3, nav: 2, footer: 1 };
+  const sourcePriority = { sitemap: 1, htmlSitemap: 2, footer: 3, nav: 4 };
   const existing = map.get(key);
   if (existing) {
     if (!existing.sources.includes(source)) existing.sources.push(source);
     if ((sourcePriority[source] || 0) > (sourcePriority[existing.source] || 0)) {
       existing.source = source;
-      existing.reason = reason;
     }
-    existing.score = Math.max(existing.score, scoreDiscoverSubpageCandidate(url, existing.source));
+    existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
     return false;
   }
   const item = {
     url,
     source,
     sources: [source],
-    score: scoreDiscoverSubpageCandidate(url, source),
-    reason
+    score: scoreDiscoverSubpageCandidate(url, source, [source]),
+    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason
   };
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
@@ -3223,7 +3256,7 @@ async function collectDiscoverLinksFromPage(page) {
   }).catch(() => ({ htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
 }
 
-async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, limit) {
+async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors) {
   let browser = null;
   let context = null;
   let page = null;
@@ -3259,9 +3292,8 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
     const topLinks = await collectDiscoverLinksFromPage(page);
-    if (candidateMap.size < limit && Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
+    if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
       for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
-        if (candidateMap.size >= limit) break;
         const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
         if (!sitemapPageUrl) continue;
         try {
@@ -3314,9 +3346,7 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
-  if (candidateMap.size < limit) {
-    await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, limit);
-  }
+  await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors);
   const candidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
