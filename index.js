@@ -3192,8 +3192,54 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'content_length_too_large'
       };
     }
+    const waitStartedAt = Date.now();
+    const waitStrategyParts = [];
     try {
-      await page.waitForTimeout(Math.min(3500, Math.max(1000, timeoutMs - 1000)));
+      await page.waitForLoadState('networkidle', { timeout: Math.min(1800, Math.max(800, timeoutMs - 1000)) });
+      waitStrategyParts.push('networkidle');
+    } catch (_) {
+      waitStrategyParts.push('networkidle_timeout');
+    }
+    const countJsonLdScripts = async () => page.evaluate(() => {
+      const queryAllDeep = (selector, opts = {}) => {
+        const out = [];
+        const seen = new Set();
+        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
+        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
+        const walk = (root, depth = 0) => {
+          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+          try {
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el) || out.length >= maxNodes) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          } catch (_) {}
+        };
+        walk(document, 0);
+        return out;
+      };
+      return {
+        domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
+        deepJsonLdScriptCount: queryAllDeep('script[type*="ld+json" i]', { maxNodes: 80 }).length
+      };
+    }).catch(() => ({ domJsonLdScriptCount: 0, deepJsonLdScriptCount: 0 }));
+    let jsonLdCountProbe = await countJsonLdScripts();
+    const pollStartedAt = Date.now();
+    while (
+      Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) <= 0 &&
+      Date.now() - pollStartedAt < 2500
+    ) {
+      try { await page.waitForTimeout(250); } catch (_) {}
+      jsonLdCountProbe = await countJsonLdScripts();
+    }
+    waitStrategyParts.push(Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) > 0 ? 'jsonld_poll_found' : 'jsonld_poll_timeout');
+    try {
+      await page.waitForTimeout(1000);
+      waitStrategyParts.push('post_poll_wait_1000ms');
     } catch (_) {}
     const observed = await page.evaluate(() => {
       const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -3261,6 +3307,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         finalUrl: location.href,
         title,
         canonical,
+        domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
+        deepJsonLdScriptCount: jsonldTexts.length,
         h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
         h1Texts,
         jsonldTexts,
@@ -3312,6 +3360,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       h1Count: Number(observed && observed.h1Count || 0),
       h1Texts: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
       jsonldTypes: uniqueTypes,
+      domJsonLdScriptCount: Number(observed && observed.domJsonLdScriptCount || 0),
+      deepJsonLdScriptCount: Number(observed && observed.deepJsonLdScriptCount || 0),
+      waitedMs: Math.max(0, Date.now() - waitStartedAt),
+      waitStrategy: waitStrategyParts.join('+'),
       hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
       hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
       hasFaqJsonLd: lowerTypes.has('faqpage'),
@@ -3463,7 +3515,13 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       status: page.status,
       ok: page.ok,
       pageType: page.pageType,
+      title: page.title,
+      domJsonLdScriptCount: page.domJsonLdScriptCount,
+      deepJsonLdScriptCount: page.deepJsonLdScriptCount,
+      h1Count: page.h1Count,
       jsonldTypes: page.jsonldTypes,
+      waitedMs: page.waitedMs,
+      waitStrategy: page.waitStrategy,
       hasBreadcrumbJsonLd: page.hasBreadcrumbJsonLd,
       hasProductJsonLd: page.hasProductJsonLd,
       hasFaqJsonLd: page.hasFaqJsonLd,
@@ -3491,6 +3549,10 @@ app.post('/subpage-jsonld-light', async (req, res) => {
     pages: pages.map(page => {
       const out = Object.assign({}, page);
       delete out.parseErrors;
+      delete out.domJsonLdScriptCount;
+      delete out.deepJsonLdScriptCount;
+      delete out.waitedMs;
+      delete out.waitStrategy;
       return out;
     }),
     summary
@@ -3505,13 +3567,18 @@ app.post('/subpage-jsonld-light', async (req, res) => {
     requestedCount: payload.requestedCount,
     fetchedCount: payload.fetchedCount,
     elapsedMs: payload.elapsedMs,
-    pages: payload.pages.map(p => ({
+    pages: pages.map(p => ({
       url: p.url,
       finalUrl: p.finalUrl,
       status: p.status,
       ok: p.ok,
+      title: p.title,
+      domJsonLdScriptCount: p.domJsonLdScriptCount,
+      deepJsonLdScriptCount: p.deepJsonLdScriptCount,
       h1Count: p.h1Count,
       jsonldTypes: p.jsonldTypes,
+      waitedMs: p.waitedMs,
+      waitStrategy: p.waitStrategy,
       hasBreadcrumbJsonLd: p.hasBreadcrumbJsonLd,
       hasBreadcrumbUi: p.hasBreadcrumbUi,
       error: p.error
