@@ -3042,6 +3042,306 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   };
 }
 
+function normalizeDiscoverSubpageUrl(rawUrl, origin) {
+  let parsed = null;
+  try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return null; }
+  if (!/^https?:$/.test(parsed.protocol)) return null;
+  if (origin && parsed.origin !== origin) return null;
+  parsed.hash = '';
+  parsed.search = '';
+  const path = parsed.pathname || '/';
+  const lowerPath = path.toLowerCase();
+  if (isBlockedSubpageJsonLdHost(parsed.hostname)) return null;
+  if (lowerPath === '/' || lowerPath === '') return null;
+  if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?|xml)(?:$|\/)/i.test(lowerPath)) return null;
+  if (/\/(?:wp-json|feed)(?:\/|$)/i.test(lowerPath)) return null;
+  if (/\/(?:tag|category|author|page)\//i.test(lowerPath)) return null;
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function discoverSubpageCandidateKey(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return (u.origin + u.pathname).replace(/\/$/, '').toLowerCase();
+  } catch (_) {
+    return String(url || '').replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function scoreDiscoverSubpageCandidate(url, source) {
+  let path = '';
+  try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
+  const sourceScore = source === 'sitemap' ? 40 : (source === 'htmlSitemap' ? 30 : (source === 'nav' ? 20 : (source === 'footer' ? 15 : 0)));
+  const importantRe = /\/(?:about|company|corporate|profile|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|recruit|career|privacy|policy|faq|access)(?:\/|$|-|_)/i;
+  const depth = path.split('/').filter(Boolean).length;
+  let score = sourceScore;
+  if (importantRe.test(path)) score += 50;
+  score += Math.max(0, 18 - depth * 5);
+  if (/\/(?:case|cases|news|topics|blog|column)\/.+/i.test(path) && depth >= 2) score -= 45;
+  if (depth >= 4) score -= 15;
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary) {
+  const url = normalizeDiscoverSubpageUrl(rawUrl, origin);
+  if (!url) return false;
+  const key = discoverSubpageCandidateKey(url);
+  const sourcePriority = { sitemap: 4, htmlSitemap: 3, nav: 2, footer: 1 };
+  const existing = map.get(key);
+  if (existing) {
+    if (!existing.sources.includes(source)) existing.sources.push(source);
+    if ((sourcePriority[source] || 0) > (sourcePriority[existing.source] || 0)) {
+      existing.source = source;
+      existing.reason = reason;
+    }
+    existing.score = Math.max(existing.score, scoreDiscoverSubpageCandidate(url, existing.source));
+    return false;
+  }
+  const item = {
+    url,
+    source,
+    sources: [source],
+    score: scoreDiscoverSubpageCandidate(url, source),
+    reason
+  };
+  map.set(key, item);
+  if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
+  return true;
+}
+
+async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller ? controller.signal : undefined,
+      headers: {
+        'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+      }
+    });
+    const status = response && typeof response.status === 'number' ? response.status : null;
+    if (!response || !response.ok) return { ok: false, status, text: '', finalUrl: response && response.url || url };
+    const text = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
+    return { ok: true, status, text, finalUrl: response.url || url };
+  } catch (e) {
+    return { ok: false, status: null, text: '', finalUrl: url, error: String(e && (e.message || e) || '').slice(0, 160) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function parseDiscoverSitemapXml(xml) {
+  const $ = cheerio.load(String(xml || ''), { xmlMode: true });
+  const sitemapLocs = [];
+  const urlLocs = [];
+  $('sitemap > loc').each((_, el) => {
+    const loc = normalizeSubpageJsonLdText($(el).text());
+    if (loc) sitemapLocs.push(loc);
+  });
+  $('url > loc').each((_, el) => {
+    const loc = normalizeSubpageJsonLdText($(el).text());
+    if (loc) urlLocs.push(loc);
+  });
+  return { sitemapLocs, urlLocs };
+}
+
+async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors) {
+  const roots = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'].map(path => origin.replace(/\/$/, '') + path);
+  for (const sitemapUrl of roots) {
+    const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000);
+    if (!rootRes.ok) {
+      errors.push({ source: 'sitemap', message: `${sitemapUrl}: ${rootRes.status || rootRes.error || 'fetch_failed'}` });
+      continue;
+    }
+    const parsed = parseDiscoverSitemapXml(rootRes.text);
+    if (parsed.urlLocs.length) {
+      parsed.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+      return;
+    }
+    if (parsed.sitemapLocs.length) {
+      const children = parsed.sitemapLocs.slice(0, 10);
+      for (const childUrl of children) {
+        const normalizedChild = normalizeDiscoverSubpageUrl(childUrl, origin) || childUrl;
+        try {
+          const childParsed = new URL(String(normalizedChild || childUrl));
+          if (childParsed.origin !== origin) continue;
+        } catch (_) {
+          continue;
+        }
+        const childRes = await fetchDiscoverSubpageText(childUrl, 8000);
+        if (!childRes.ok) {
+          errors.push({ source: 'sitemap', message: `${childUrl}: ${childRes.status || childRes.error || 'fetch_failed'}` });
+          continue;
+        }
+        const childParsedXml = parseDiscoverSitemapXml(childRes.text);
+        childParsedXml.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+      }
+      return;
+    }
+  }
+}
+
+async function collectDiscoverLinksFromPage(page) {
+  return page.evaluate(() => {
+    const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+    const absUrl = (href) => {
+      try { return new URL(href, location.href).toString(); } catch (_) { return ''; }
+    };
+    const queryAllDeep = (selector, opts = {}) => {
+      const out = [];
+      const seen = new Set();
+      const maxNodes = Math.max(1, Math.min(600, Number(opts.maxNodes || 300)));
+      const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 5)));
+      const walk = (root, depth = 0) => {
+        if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+        try {
+          Array.from(root.querySelectorAll(selector)).forEach((el) => {
+            if (!el || seen.has(el) || out.length >= maxNodes) return;
+            seen.add(el);
+            out.push(el);
+          });
+          Array.from(root.querySelectorAll('*')).forEach((el) => {
+            if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+          });
+        } catch (_) {}
+      };
+      walk(document, 0);
+      return out;
+    };
+    const linkFrom = (a) => ({
+      href: absUrl(a.getAttribute && a.getAttribute('href') || ''),
+      text: clean(a.innerText || a.textContent || a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title')) || '')
+    });
+    const allLinks = queryAllDeep('a[href]', { maxNodes: 500 }).map(linkFrom).filter(x => x.href);
+    const htmlSitemapLinks = allLinks.filter(x => /sitemap|site-map|サイトマップ/i.test(`${x.href} ${x.text}`)).slice(0, 5);
+    const navLinks = queryAllDeep('nav a[href],[role="navigation"] a[href],header a[href]', { maxNodes: 250 }).map(linkFrom).filter(x => x.href).slice(0, 200);
+    const footerLinks = queryAllDeep('footer a[href],[role="contentinfo"] a[href]', { maxNodes: 200 }).map(linkFrom).filter(x => x.href).slice(0, 160);
+    return { allLinks: allLinks.slice(0, 500), htmlSitemapLinks, navLinks, footerLinks };
+  }).catch(() => ({ htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
+}
+
+async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, limit) {
+  let browser = null;
+  let context = null;
+  let page = null;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    page = await context.newPage();
+    page.setDefaultNavigationTimeout(15000);
+    page.setDefaultTimeout(15000);
+    await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
+    const topLinks = await collectDiscoverLinksFromPage(page);
+    if (candidateMap.size < limit && Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
+      for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
+        if (candidateMap.size >= limit) break;
+        const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
+        if (!sitemapPageUrl) continue;
+        try {
+          await page.goto(sitemapPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
+          const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
+          (htmlSitemapLinks.allLinks || []).forEach(link => {
+            addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+          });
+        } catch (e) {
+          errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
+        }
+      }
+      await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+      await collectBalancedHydrationMetrics(page, 1500, { shortFastMode: false }).catch(() => null);
+    }
+    const navFooterLinks = await collectDiscoverLinksFromPage(page);
+    (navFooterLinks.navLinks || []).forEach(link => {
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+    });
+    (navFooterLinks.footerLinks || []).forEach(link => {
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+    });
+  } catch (e) {
+    errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+    try { if (context) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+  }
+}
+
+app.post('/discover-subpage-candidates-light', async (req, res) => {
+  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
+  if (!rawTopUrl) return res.status(400).json({ ok: false, error: 'topUrl or url is required' });
+  let topUrl = '';
+  let origin = '';
+  try {
+    const parsed = new URL(String(rawTopUrl || ''));
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error('unsupported protocol');
+    if (isBlockedSubpageJsonLdHost(parsed.hostname)) throw new Error('blocked_private_or_metadata_host');
+    parsed.hash = '';
+    topUrl = parsed.toString();
+    origin = parsed.origin;
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: String(e && (e.message || e) || 'invalid topUrl').slice(0, 160) });
+  }
+  const limit = Math.max(1, Math.min(50, Number(req.body && req.body.limit || 20) || 20));
+  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0 };
+  const errors = [];
+  const candidateMap = new Map();
+  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
+  if (candidateMap.size < limit) {
+    await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, limit);
+  }
+  const candidates = Array.from(candidateMap.values())
+    .map(item => ({
+      url: item.url,
+      source: item.source,
+      sources: item.sources,
+      score: item.score,
+      reason: item.reason
+    }))
+    .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url))
+    .slice(0, limit);
+  return res.status(200).json({
+    ok: true,
+    mode: 'discoverSubpageCandidatesLight',
+    topUrl,
+    origin,
+    limit,
+    candidates,
+    sourceSummary,
+    errors
+  });
+});
+
+// Render check:
+// curl -sS -X POST "https://aio-playwright-api-2.onrender.com/discover-subpage-candidates-light" -H "content-type: application/json" --max-time 180 -d '{"topUrl":"https://www.fork.co.jp/","limit":20}' | jq
+
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
