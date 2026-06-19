@@ -3047,6 +3047,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
   const context = opts.context;
   let page = null;
+  const jsErrors = [];
+  const failedRequests = [];
+  const consoleErrors = [];
   try {
     const initialUrl = new URL(String(url || ''));
     if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
@@ -3072,6 +3075,34 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     }
     if (!context || typeof context.newPage !== 'function') throw new Error('missing_playwright_context');
     page = await context.newPage();
+    try {
+      page.setDefaultNavigationTimeout(timeoutMs);
+      page.setDefaultTimeout(timeoutMs);
+    } catch (_) {}
+    page.on('pageerror', (err) => {
+      if (jsErrors.length >= 10) return;
+      jsErrors.push(String(err && (err.message || err) || '').slice(0, 240));
+    });
+    page.on('console', (msg) => {
+      try {
+        if (!msg || !['error', 'warning'].includes(msg.type()) || consoleErrors.length >= 10) return;
+        consoleErrors.push({
+          type: msg.type(),
+          text: String(msg.text() || '').slice(0, 240)
+        });
+      } catch (_) {}
+    });
+    page.on('requestfailed', (request) => {
+      try {
+        if (failedRequests.length >= 10) return;
+        const failure = request.failure && request.failure();
+        failedRequests.push({
+          url: String(request.url() || '').slice(0, 240),
+          resourceType: request.resourceType && request.resourceType(),
+          failureText: String(failure && failure.errorText || '').slice(0, 160)
+        });
+      } catch (_) {}
+    });
     const response = await page.goto(url, {
       waitUntil: 'domcontentloaded',
       timeout: timeoutMs
@@ -3303,12 +3334,22 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       const canonicalEl = document.querySelector('link[rel~="canonical" i]');
       const title = clean(document.title || '').slice(0, 180);
       const canonical = canonicalEl && canonicalEl.href ? String(canonicalEl.href || '').trim() : '';
+      const allNodes = Array.from(document.querySelectorAll('*')).slice(0, 3000);
+      const shadowHostCount = allNodes.filter(el => !!el.shadowRoot).length;
       return {
         finalUrl: location.href,
+        readyState: document.readyState || '',
+        locationHref: location.href,
         title,
         canonical,
         domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
         deepJsonLdScriptCount: jsonldTexts.length,
+        scriptCount: document.querySelectorAll('script').length,
+        moduleScriptCount: document.querySelectorAll('script[type="module"],script[type="module"][src]').length,
+        nextDataExists: !!document.querySelector('#__NEXT_DATA__'),
+        nuxtDataExists: !!(window.__NUXT__ || document.querySelector('#__NUXT_DATA__')),
+        shadowHostCount,
+        bodyTextLength: String((document.body && document.body.innerText) || '').length,
         h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
         h1Texts,
         jsonldTexts,
@@ -3362,6 +3403,18 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       jsonldTypes: uniqueTypes,
       domJsonLdScriptCount: Number(observed && observed.domJsonLdScriptCount || 0),
       deepJsonLdScriptCount: Number(observed && observed.deepJsonLdScriptCount || 0),
+      readyState: String(observed && observed.readyState || ''),
+      locationHref: String(observed && observed.locationHref || ''),
+      bodyTextLength: Number(observed && observed.bodyTextLength || 0),
+      htmlLength: Number(observed && observed.htmlLength || 0),
+      scriptCount: Number(observed && observed.scriptCount || 0),
+      moduleScriptCount: Number(observed && observed.moduleScriptCount || 0),
+      nextDataExists: !!(observed && observed.nextDataExists),
+      nuxtDataExists: !!(observed && observed.nuxtDataExists),
+      shadowHostCount: Number(observed && observed.shadowHostCount || 0),
+      jsErrors,
+      failedRequests,
+      consoleErrors,
       waitedMs: Math.max(0, Date.now() - waitStartedAt),
       waitStrategy: waitStrategyParts.join('+'),
       hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
@@ -3430,6 +3483,14 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       args: ['--no-sandbox', '--disable-dev-shm-usage']
     });
     context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                 'Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
       ignoreHTTPSErrors: true
     });
     const tasks = normalizedUrls.map(url => {
@@ -3551,6 +3612,18 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       delete out.parseErrors;
       delete out.domJsonLdScriptCount;
       delete out.deepJsonLdScriptCount;
+      delete out.readyState;
+      delete out.locationHref;
+      delete out.bodyTextLength;
+      delete out.htmlLength;
+      delete out.scriptCount;
+      delete out.moduleScriptCount;
+      delete out.nextDataExists;
+      delete out.nuxtDataExists;
+      delete out.shadowHostCount;
+      delete out.jsErrors;
+      delete out.failedRequests;
+      delete out.consoleErrors;
       delete out.waitedMs;
       delete out.waitStrategy;
       return out;
@@ -3584,6 +3657,34 @@ app.post('/subpage-jsonld-light', async (req, res) => {
       error: p.error
     }))
   }));
+  pages.forEach(p => {
+    console.log('[DEBUG][SUBPAGE_JSONLD_LIGHT_PAGE_DIAG]', JSON.stringify({
+      url: p.url,
+      finalUrl: p.finalUrl,
+      status: p.status,
+      ok: p.ok,
+      readyState: p.readyState,
+      locationHref: p.locationHref,
+      title: p.title,
+      domJsonLdScriptCount: p.domJsonLdScriptCount,
+      deepJsonLdScriptCount: p.deepJsonLdScriptCount,
+      h1Count: p.h1Count,
+      bodyTextLength: p.bodyTextLength,
+      htmlLength: p.htmlLength,
+      scriptCount: p.scriptCount,
+      moduleScriptCount: p.moduleScriptCount,
+      nextDataExists: p.nextDataExists,
+      nuxtDataExists: p.nuxtDataExists,
+      shadowHostCount: p.shadowHostCount,
+      jsonldTypes: p.jsonldTypes,
+      waitedMs: p.waitedMs,
+      waitStrategy: p.waitStrategy,
+      jsErrors: Array.isArray(p.jsErrors) ? p.jsErrors.slice(0, 10) : [],
+      consoleErrors: Array.isArray(p.consoleErrors) ? p.consoleErrors.slice(0, 10) : [],
+      failedRequests: Array.isArray(p.failedRequests) ? p.failedRequests.slice(0, 10) : [],
+      error: p.error
+    }));
+  });
   return res.status(200).json(payload);
 });
 
