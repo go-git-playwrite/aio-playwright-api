@@ -3988,6 +3988,20 @@ function sortCoverageObserveCandidates_(candidates) {
   });
 }
 
+function getCoverageCandidatePageType_(candidate) {
+  const path = getCoverageCandidatePath_(candidate).toLowerCase();
+  if (!path) return 'unknown';
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 'about';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
+  if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
+  if (/\/(?:sitemap)(?:\/|$|-|_)/i.test(path)) return 'sitemap';
+  return 'unknown';
+}
+
 function buildCoverageCandidatePageTypes_(candidates) {
   const out = {
     about: false,
@@ -4000,16 +4014,8 @@ function buildCoverageCandidatePageTypes_(candidates) {
     sitemap: false
   };
   (Array.isArray(candidates) ? candidates : []).forEach(candidate => {
-    const path = getCoverageCandidatePath_(candidate).toLowerCase();
-    if (!path) return;
-    if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) out.about = true;
-    if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) out.business = true;
-    if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) out.service = true;
-    if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) out.case = true;
-    if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) out.recruit = true;
-    if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) out.contact = true;
-    if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) out.legal = true;
-    if (/\/(?:sitemap)(?:\/|$|-|_)/i.test(path)) out.sitemap = true;
+    const pageType = getCoverageCandidatePageType_(candidate);
+    if (Object.prototype.hasOwnProperty.call(out, pageType)) out[pageType] = true;
   });
   return out;
 }
@@ -4023,7 +4029,7 @@ function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 
       return {
         url,
         path,
-        pageType: inferSubpageJsonLdPageType(url, 'generic', []),
+        pageType: getCoverageCandidatePageType_(candidate),
         source: String(candidate && candidate.source || ''),
         sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 8) : [],
         score: Number(candidate && candidate.score || 0) || 0,
