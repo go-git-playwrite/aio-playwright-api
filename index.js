@@ -12969,27 +12969,49 @@ async function scrapeOnce(req, res) {
         durationMs: null,
         detail: {
           memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
-          source: 'document_outer_html_length_estimate'
+          source: signalsFirstLight
+            ? 'skip_outer_html_length_estimate_signals_light'
+            : 'document_outer_html_length_estimate',
+          skipped: signalsFirstLight === true
         }
       });
-      try {
-        const htmlEstimate = await page.evaluate(() => {
-          try { return String((document.documentElement && document.documentElement.outerHTML) || '').length; } catch (_) { return 0; }
-        }).catch(() => 0);
-        memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
+      if (signalsFirstLight) {
         logResponseBuildPhase('memory_guard_payload_complete', memoryGuardPayloadStartedAt, {
           detail: {
             memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+            source: 'skip_outer_html_length_estimate_signals_light',
+            skipped: true,
             approxPayloadSize: null,
-            htmlEstimate,
-            estimatedSavedBytes: memoryHints.estimatedSavedBytes
+            htmlEstimate: null,
+            estimatedSavedBytes: null
           }
         });
-      } catch (_) {}
+      } else {
+        try {
+          const htmlEstimate = await page.evaluate(() => {
+            try { return String((document.documentElement && document.documentElement.outerHTML) || '').length; } catch (_) { return 0; }
+          }).catch(() => 0);
+          memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
+          logResponseBuildPhase('memory_guard_payload_complete', memoryGuardPayloadStartedAt, {
+            detail: {
+              memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+              source: 'document_outer_html_length_estimate',
+              skipped: false,
+              approxPayloadSize: null,
+              htmlEstimate,
+              estimatedSavedBytes: memoryHints.estimatedSavedBytes
+            }
+          });
+        } catch (_) {}
+      }
       if (memoryHints.estimatedSavedBytes == null) {
         logResponseBuildPhase('memory_guard_payload_complete', memoryGuardPayloadStartedAt, {
           detail: {
             memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+            source: signalsFirstLight
+              ? 'skip_outer_html_length_estimate_signals_light'
+              : 'document_outer_html_length_estimate',
+            skipped: signalsFirstLight === true,
             approxPayloadSize: null,
             htmlEstimate: null,
             estimatedSavedBytes: null
