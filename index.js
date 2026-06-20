@@ -3501,6 +3501,9 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
 
 const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
 const SUBPAGE_LIGHT_CONTENT_MAX_MS = 5000;
+const SUBPAGE_LIGHT_PAGE_BUDGET_MS = 12000;
+const SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS = 3000;
+const SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS = 1500;
 
 function logSubpageFetchPhase11_(payload = {}) {
   try {
@@ -3543,6 +3546,33 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
   const context = opts.context;
   const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : {};
   const fetchStartedAtMs = Date.now();
+  const pageBudgetDeadlineAtMs = fetchStartedAtMs + SUBPAGE_LIGHT_PAGE_BUDGET_MS;
+  let pageBudgetExceeded = false;
+  let extractTimedOut = false;
+  let returnedPartial = false;
+  let closeTimedOut = false;
+  const remainingPageBudgetMs = () => Math.max(0, pageBudgetDeadlineAtMs - Date.now());
+  const withPageBudget = async (promise, label, fallbackValue = null) => {
+    const remainingMs = remainingPageBudgetMs();
+    if (remainingMs <= 0) {
+      pageBudgetExceeded = true;
+      return fallbackValue;
+    }
+    let timer = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((resolve) => {
+          timer = setTimeout(() => {
+            pageBudgetExceeded = true;
+            resolve(fallbackValue);
+          }, remainingMs);
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   const logPhase = (phase, startedAtMs, extra = {}) => {
     logSubpageFetchPhase11_(Object.assign({
       debugRunId: phase11.debugRunId || null,
@@ -3553,6 +3583,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       durationMs: startedAtMs ? Date.now() - startedAtMs : null,
       timeoutMs,
       waitUntil: subpageWaitUntil,
+      detail: {
+        pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+        pageBudgetExceeded,
+        closeTimedOut,
+        extractTimedOut,
+        returnedPartial,
+        observed: null
+      },
       errorName: null,
       errorMessage: null
     }, extra));
@@ -3634,10 +3672,13 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     logPhase('goto_start', gotoStartedAtMs, { completedAt: null, durationMs: null });
     let response = null;
     try {
-      response = await page.goto(url, {
+      response = await withPageBudget(page.goto(url, {
         waitUntil: subpageWaitUntil,
         timeout: timeoutMs
-      });
+      }), 'goto', null);
+      if (!response && pageBudgetExceeded) {
+        throw new Error(`subpage_page_budget_timeout_${SUBPAGE_LIGHT_PAGE_BUDGET_MS}ms`);
+      }
       logPhase('goto_complete', gotoStartedAtMs);
     } catch (gotoErr) {
       logPhase('goto_error', gotoStartedAtMs, {
@@ -3918,7 +3959,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       durationMs: null,
       detail: {}
     });
-    const observed = await page.evaluate(() => {
+    const observed = await Promise.race([
+      page.evaluate(() => {
       const detailTimings = {};
       const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
       const h1Texts = [];
@@ -4023,7 +4065,101 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           textSampleMs: detailTimings.textSampleMs
         }
       };
-    });
+      }),
+      new Promise((resolve) => setTimeout(() => {
+        extractTimedOut = true;
+        returnedPartial = true;
+        resolve(null);
+      }, Math.min(SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
+    ]);
+    if (!observed) {
+      logDetail('evaluate_complete', evaluateStartedAtMs, {
+        detail: {
+          pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+          pageBudgetExceeded,
+          extractTimedOut,
+          returnedPartial,
+          observed: false
+        },
+        errorName: 'Error',
+        errorMessage: extractTimedOut ? `subpage_extract_timeout_${SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS}ms` : 'subpage_extract_unavailable'
+      });
+      logPhase('extract_complete', extractStartedAtMs, {
+        detail: {
+          pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+          pageBudgetExceeded,
+          extractTimedOut,
+          returnedPartial,
+          observed: false
+        }
+      });
+      const partialReturnStartedAtMs = Date.now();
+      logDetail('return_build_start', partialReturnStartedAtMs, {
+        completedAt: null,
+        durationMs: null,
+        detail: {
+          pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+          pageBudgetExceeded,
+          extractTimedOut,
+          returnedPartial,
+          observed: false
+        }
+      });
+      const partialPayload = {
+        url,
+        finalUrl: finalUrl || url,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        metaDescription: '',
+        ogTitle: '',
+        ogDescription: '',
+        ogImageExists: false,
+        h1Count: 0,
+        h1Texts: [],
+        h2Sample: [],
+        jsonldTypes: [],
+        jsonLdCount: 0,
+        breadcrumbListCount: 0,
+        listItemCount: 0,
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        hasMain: false,
+        hasMainLandmark: false,
+        internalLinkCount: 0,
+        externalLinkCount: 0,
+        sampledText: '',
+        error: extractTimedOut ? `subpage_extract_timeout_${SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS}ms` : 'subpage_extract_unavailable',
+        pageBudgetExceeded,
+        extractTimedOut,
+        returnedPartial: true
+      };
+      logDetail('return_build_complete', partialReturnStartedAtMs, {
+        detail: {
+          pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+          pageBudgetExceeded,
+          extractTimedOut,
+          returnedPartial: true,
+          observed: false
+        }
+      });
+      logPhase('return', fetchStartedAtMs, {
+        detail: {
+          pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+          pageBudgetExceeded,
+          extractTimedOut,
+          returnedPartial: true,
+          observed: false
+        }
+      });
+      return partialPayload;
+    }
     logDetail('evaluate_complete', evaluateStartedAtMs, {
       detail: observed && observed.__detail || {}
     });
@@ -4156,7 +4292,11 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       externalLinkCount: Number(observed && observed.externalLinkCount || 0),
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       error: null,
-      parseErrors
+      parseErrors,
+      pageBudgetExceeded,
+      extractTimedOut,
+      closeTimedOut,
+      returnedPartial
     };
     logDetail('return_build_complete', returnBuildStartedAtMs, {
       detail: {
@@ -4169,7 +4309,16 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     logPhase('return', fetchStartedAtMs);
     return resultPayload;
   } catch (e) {
+    returnedPartial = false;
     logPhase('return', fetchStartedAtMs, {
+      detail: {
+        pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+        pageBudgetExceeded,
+        closeTimedOut,
+        extractTimedOut,
+        returnedPartial,
+        observed: false
+      },
       errorName: e && e.name ? String(e.name).slice(0, 80) : null,
       errorMessage: String(e && (e.message || e) || '').slice(0, 200)
     });
@@ -4190,13 +4339,37 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       hasArticleJsonLd: false,
       hasBlogPostingJsonLd: false,
       hasBreadcrumbUi: false,
+      pageBudgetExceeded,
+      extractTimedOut,
+      closeTimedOut,
+      returnedPartial,
       error: e && e.name === 'AbortError' ? 'timeout' : String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
     };
   } finally {
     const closeStartedAtMs = Date.now();
     logPhase('close_start', closeStartedAtMs, { completedAt: null, durationMs: null });
-    try { if (page) await page.close(); } catch (_) {}
-    logPhase('close_complete', closeStartedAtMs);
+    try {
+      if (page) {
+        const closeResult = await Promise.race([
+          page.close().then(() => 'closed').catch(() => 'close_error'),
+          new Promise(resolve => setTimeout(() => resolve('close_timeout'), SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS))
+        ]);
+        if (closeResult === 'close_timeout') closeTimedOut = true;
+      }
+    } catch (_) {}
+    logPhase('close_complete', closeStartedAtMs, {
+      timeoutMs: SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS,
+      detail: {
+        pageBudgetMs: SUBPAGE_LIGHT_PAGE_BUDGET_MS,
+        pageBudgetExceeded,
+        closeTimedOut,
+        extractTimedOut,
+        returnedPartial,
+        observed: null
+      },
+      errorName: closeTimedOut ? 'Error' : null,
+      errorMessage: closeTimedOut ? `subpage_close_timeout_${SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS}ms` : null
+    });
   }
 }
 
