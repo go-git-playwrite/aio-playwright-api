@@ -4349,11 +4349,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     };
     const hasEmptyLightExtraction = (data) => {
       if (!data) return true;
-      return normalizeSubpageJsonLdText(data.title).length === 0 &&
-        normalizeSubpageJsonLdText(data.sampledText).length === 0 &&
-        Number(data.bodyTextLength || 0) <= 0 &&
-        Number(data.h1Count || 0) <= 0 &&
-        !(Array.isArray(data.jsonldTexts) && data.jsonldTexts.length > 0);
+      return Number(data.bodyTextLength || 0) <= 0 ||
+        normalizeSubpageJsonLdText(data.sampledText).length === 0 ||
+        normalizeSubpageJsonLdText(data.title).length === 0 ||
+        Number(data.h1Count || 0) <= 0;
     };
     const runFallbackExtraction = async (reason) => {
       let extractionError = null;
@@ -4561,13 +4560,17 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         resolve(null);
       }, Math.min(SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
     ]);
-    if (hasEmptyLightExtraction(observed)) {
+    if (reached && navigationCommitted && hasEmptyLightExtraction(observed)) {
+      usedFallbackExtraction = true;
       const fallbackResult = await runFallbackExtraction(observed ? 'primary_extraction_empty' : 'primary_extraction_unavailable');
       if (fallbackResult.fallback) {
         observed = Object.assign({}, observed || {}, fallbackResult.fallback);
-        usedFallbackExtraction = true;
       }
       extractionError = fallbackResult.extractionError;
+    }
+    if (observed) {
+      observed.usedFallbackExtraction = usedFallbackExtraction;
+      observed.extractionError = extractionError;
     }
     try {
       const pageTitleProbe = await Promise.race([
