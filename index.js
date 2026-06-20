@@ -5075,6 +5075,66 @@ function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 
     });
 }
 
+function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, opts = {}) {
+  if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return coverageSignalsV1;
+  const selectedRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(
+    Array.isArray(selectedCandidates) ? selectedCandidates : [],
+    Array.isArray(selectedCandidates) ? selectedCandidates.length : 0,
+    {
+      debugRunId: opts && opts.debugRunId,
+      origin: opts && opts.origin,
+      reason: 'preserve_selected_representatives_after_observation'
+    }
+  );
+  if (!selectedRepresentativePages.length) return coverageSignalsV1;
+  const observedRepresentatives = Array.isArray(coverageSignalsV1.representativePages)
+    ? coverageSignalsV1.representativePages
+    : [];
+  const observedByPath = new Map();
+  observedRepresentatives.forEach(page => {
+    const key = normalizeCoveragePathKey_(page && (page.finalUrl || page.url || page.path) || '');
+    if (key) observedByPath.set(key, page);
+  });
+  const preserved = selectedRepresentativePages.map(candidatePage => {
+    const key = normalizeCoveragePathKey_(candidatePage && (candidatePage.url || candidatePage.path) || '');
+    const observed = observedByPath.get(key);
+    if (!observed) return candidatePage;
+    return Object.assign({}, candidatePage, observed, {
+      url: observed.url || candidatePage.url || '',
+      finalUrl: observed.finalUrl || candidatePage.finalUrl || candidatePage.url || '',
+      path: observed.path || candidatePage.path || '',
+      pageType: candidatePage.pageType || observed.pageType || '',
+      canonicalPageFamily: candidatePage.canonicalPageFamily || observed.canonicalPageFamily || getCoverageCanonicalPageFamily_(candidatePage),
+      source: candidatePage.source || observed.source || '',
+      score: Number(candidatePage.score || observed.score || 0) || 0,
+      candidateOnly: observed.reached === true || observed.navigationCommitted === true || observed.candidateOnly === false
+        ? false
+        : true,
+      reached: observed.reached === true,
+      navigationCommitted: observed.navigationCommitted === true,
+      returnedPartial: observed.returnedPartial === true,
+      matchedCandidateSources: Array.isArray(candidatePage.matchedCandidateSources)
+        ? candidatePage.matchedCandidateSources.slice(0, 8)
+        : (Array.isArray(candidatePage.sources) ? candidatePage.sources.slice(0, 8) : [])
+    });
+  });
+  logRepresentativeSelectionPhase11_({
+    debugRunId: opts && opts.debugRunId,
+    origin: opts && opts.origin,
+    phase: 'coverage_representative_assign_complete',
+    reason: 'preserve_selected_representatives_after_observation',
+    candidateCount: Array.isArray(selectedCandidates) ? selectedCandidates.length : 0,
+    eligibleCount: selectedRepresentativePages.length,
+    selectedCount: selectedRepresentativePages.length,
+    backfillCount: Math.max(0, selectedRepresentativePages.length - observedRepresentatives.length),
+    finalCount: preserved.length,
+    beforeCount: observedRepresentatives.length,
+    afterCount: preserved.length
+  });
+  coverageSignalsV1.representativePages = preserved;
+  return coverageSignalsV1;
+}
+
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -6169,9 +6229,13 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         }));
       } catch (_) {}
     }
-    const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
+    let coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
       candidates: coverageCandidates
     }));
+    coverageSignalsV1 = preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, {
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin
+    });
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
         url: normalized.topUrl,
