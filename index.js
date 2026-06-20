@@ -4576,6 +4576,7 @@ function buildLightweightSubpageSignalsSummary_(subpageSignals) {
 
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
+  const SUBPAGE_OBSERVATION_TIMEOUT_MS = 30000;
   const phase11State = opts && opts.phase11State && typeof opts.phase11State === 'object'
     ? opts.phase11State
     : null;
@@ -4583,7 +4584,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     if (!phase11State) return;
     Object.assign(phase11State, patch);
   };
-  const subpageGuardMs = Math.max(3000, Math.min(20000, Number(opts && opts.subpageGuardMs || 12000) || 12000));
+  const subpageGuardMs = Math.max(3000, Math.min(30000, Number(opts && opts.subpageGuardMs || SUBPAGE_OBSERVATION_TIMEOUT_MS) || SUBPAGE_OBSERVATION_TIMEOUT_MS));
   const withSubpageTimeout = (promise, ms, label) => Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
