@@ -4110,7 +4110,6 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
 
 function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return null;
-  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0) return null;
   return {
     version: 'coverageSignalsV1',
     source: 'discover-and-observe-subpages-light',
@@ -4224,7 +4223,6 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500)
       };
     });
-  if (!pages.length) return null;
   const summary = buildSubpageSignalsSummary_(pages);
   return {
     version: 'subpageSignalsV1',
@@ -4345,16 +4343,33 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     if (!selectedCandidates.length) {
+      const emptyPayload = {
+        topUrl: normalized.topUrl,
+        origin: normalized.origin,
+        candidateSummary: {
+          sourceSummary: discovered.sourceSummary,
+          totalCandidates: discovered.totalCandidates,
+          observedCount: 0
+        },
+        candidates: discovered.candidates || [],
+        observations: []
+      };
+      const emptySubpageSignals = buildSubpageSignalsV1FromSubpageObservation_(emptyPayload);
+      if (emptySubpageSignals) geoSignalsV1.subpageSignals = emptySubpageSignals;
+      const emptyCoverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(emptyPayload);
+      const emptyCoverageSignals = buildGeoSignalsCoverageSignals_(emptyCoverageSignalsV1);
+      if (emptyCoverageSignals) geoSignalsV1.coverageSignals = emptyCoverageSignals;
       logPayload.origin = normalized.origin;
       logPayload.reason = 'no_subpage_candidates';
       traceCoverageMemory('attach_skip_no_candidates', {
         candidateCount: discovered.totalCandidates
       });
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        attached: !!emptyCoverageSignals,
         reason: logPayload.reason
       })));
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
-      return null;
+      return emptyCoverageSignals;
     }
     traceCoverageMemory('observe_before', {
       browserCreated: !reuseContextForObserve,
