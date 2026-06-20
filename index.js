@@ -3847,6 +3847,105 @@ function compactSubpageJsonLdObservation_(page) {
   });
 }
 
+function isCoverageSignalsAboutPath_(value) {
+  const path = (() => {
+    try { return new URL(String(value || '')).pathname.toLowerCase(); } catch (_) { return String(value || '').toLowerCase(); }
+  })();
+  return /\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path);
+}
+
+function buildCoverageSignalsV1FromSubpageObservation_(payload) {
+  const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
+  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const candidateByUrl = new Map();
+  candidates.forEach(candidate => {
+    if (!candidate || !candidate.url) return;
+    candidateByUrl.set(String(candidate.url), candidate);
+  });
+  const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
+    ? payload.candidateSummary.sourceSummary
+    : null;
+  const candidateSourceSummary = rawSourceSummary
+    ? {
+        sitemap: Number(rawSourceSummary.sitemap || 0),
+        nav: Number(rawSourceSummary.nav || 0),
+        footer: Number(rawSourceSummary.footer || 0),
+        other: Number(rawSourceSummary.other || rawSourceSummary.htmlSitemap || 0)
+      }
+    : candidates.reduce((acc, candidate) => {
+        const sources = Array.isArray(candidate && candidate.sources)
+          ? candidate.sources
+          : (candidate && candidate.source ? [candidate.source] : []);
+        sources.forEach(source => {
+          if (source === 'sitemap' || source === 'nav' || source === 'footer') acc[source] += 1;
+          else acc.other += 1;
+        });
+        return acc;
+      }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
+  const observedPages = observations.filter(page => page && page.ok === true);
+  const hasBreadcrumb = page => {
+    const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
+    return page && (
+      page.hasBreadcrumbJsonLd === true ||
+      Number(page.breadcrumbListCount || 0) > 0 ||
+      types.some(type => normalizeSubpageJsonLdType(type).toLowerCase() === 'breadcrumblist')
+    );
+  };
+  const representativePages = observedPages
+    .map(page => {
+      const candidate = candidateByUrl.get(String(page.url || '')) || {};
+      const finalUrl = page.finalUrl || page.url || '';
+      const path = (() => {
+        try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
+      })();
+      const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
+      const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      return {
+        url: page.url || '',
+        finalUrl,
+        path,
+        title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
+        h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
+        hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
+        hasBreadcrumbList: hasBreadcrumb(page),
+        jsonLdTypes,
+        matchedCandidateSources: Array.isArray(candidate.sources)
+          ? candidate.sources.slice(0, 8)
+          : (candidate.source ? [candidate.source] : [])
+      };
+    })
+    .sort((a, b) => {
+      if (a.hasBreadcrumbList !== b.hasBreadcrumbList) return a.hasBreadcrumbList ? -1 : 1;
+      if (a.hasH1 !== b.hasH1) return a.hasH1 ? -1 : 1;
+      const aAbout = isCoverageSignalsAboutPath_(a.finalUrl || a.url || a.path);
+      const bAbout = isCoverageSignalsAboutPath_(b.finalUrl || b.url || b.path);
+      if (aAbout !== bAbout) return aAbout ? -1 : 1;
+      if (a.matchedCandidateSources.length !== b.matchedCandidateSources.length) {
+        return b.matchedCandidateSources.length - a.matchedCandidateSources.length;
+      }
+      return String(a.url || '').localeCompare(String(b.url || ''));
+    })
+    .slice(0, 10);
+  const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
+  const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
+  return {
+    version: 'coverageSignalsV1',
+    generatedAt: new Date().toISOString(),
+    source: 'discover-and-observe-subpages-light',
+    topUrl: payload && payload.topUrl || '',
+    origin: payload && payload.origin || '',
+    candidateSourceSummary,
+    observedSubpageCount: observedPages.length,
+    observedH1PageCount,
+    observedBreadcrumbPageCount,
+    hasObservedSubpageH1: observedH1PageCount > 0,
+    hasObservedBreadcrumbList: observedBreadcrumbPageCount > 0,
+    hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
+    representativePages,
+    notes: []
+  };
+}
+
 async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const started = Date.now();
   const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
@@ -4268,8 +4367,11 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
   const normalized = normalizeDiscoverTopUrl(rawTopUrl);
   if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
-  const limit = Math.max(1, Math.min(20, Number(req.body && req.body.limit || 10) || 10));
-  const candidateLimit = Math.max(limit * 3, 20);
+  const limit = Math.max(1, Math.min(20, Number(req.body && (req.body.maxObserve || req.body.limit) || 10) || 10));
+  const candidateLimit = Math.max(
+    limit,
+    Math.min(50, Number(req.body && req.body.maxCandidates || 0) || Math.max(limit * 3, 20))
+  );
   const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
   const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
   const selectedCandidates = discovered.candidates.slice(0, limit);
@@ -4291,7 +4393,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
       };
     })
     .filter(Boolean);
-  return res.status(200).json({
+  const payload = {
     ok: true,
     mode: 'discoverAndObserveSubpagesLight',
     topUrl: normalized.topUrl,
@@ -4305,7 +4407,21 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     candidates: selectedCandidates,
     observations,
     errors: [].concat(discovered.errors || [], observationErrors)
-  });
+  };
+  payload.coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(payload);
+  console.log('[DEBUG][COVERAGE_SIGNALS_V1_SUMMARY]', JSON.stringify({
+    topUrl: payload.topUrl,
+    origin: payload.origin,
+    observedSubpageCount: payload.coverageSignalsV1.observedSubpageCount,
+    observedH1PageCount: payload.coverageSignalsV1.observedH1PageCount,
+    observedBreadcrumbPageCount: payload.coverageSignalsV1.observedBreadcrumbPageCount,
+    hasObservedAboutPage: payload.coverageSignalsV1.hasObservedAboutPage,
+    hasObservedBreadcrumbList: payload.coverageSignalsV1.hasObservedBreadcrumbList,
+    representativePageCount: Array.isArray(payload.coverageSignalsV1.representativePages)
+      ? payload.coverageSignalsV1.representativePages.length
+      : 0
+  }));
+  return res.status(200).json(payload);
 });
 
 // -------------------- Simple in-memory cache --------------------
