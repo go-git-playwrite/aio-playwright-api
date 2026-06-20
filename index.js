@@ -4322,11 +4322,19 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
 
 function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return null;
+  const representativePagesInput = Array.isArray(coverageSignalsV1.representativePages)
+    ? coverageSignalsV1.representativePages
+    : [];
+  const candidatePageTypesInput = coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]);
+  const observedSubpageCount = Number(coverageSignalsV1.observedSubpageCount || 0);
+  const hasCandidatePageType = Object.keys(candidatePageTypesInput || {}).some(key => candidatePageTypesInput[key] === true);
   const out = {
     version: 'coverageSignalsV1',
     source: 'discover-and-observe-subpages-light',
     checked: true,
-    observedSubpageCount: Number(coverageSignalsV1.observedSubpageCount || 0),
+    observedSubpageCount,
+    observedCount: observedSubpageCount,
+    hasSubpageSignals: observedSubpageCount > 0 || representativePagesInput.length > 0 || hasCandidatePageType,
     observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
     observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
     hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
@@ -4338,11 +4346,8 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       footer: 0,
       other: 0
     },
-    candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
-    representativePages: (Array.isArray(coverageSignalsV1.representativePages)
-      ? coverageSignalsV1.representativePages
-      : []
-    ).slice(0, 5).map(page => ({
+    candidatePageTypes: candidatePageTypesInput,
+    representativePages: representativePagesInput.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
       title: page && page.title || '',
@@ -4361,6 +4366,37 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   if (coverageSignalsV1.reason) out.reason = normalizeSubpageJsonLdText(coverageSignalsV1.reason).slice(0, 160);
   if (coverageSignalsV1.error) out.error = normalizeSubpageJsonLdText(coverageSignalsV1.error).slice(0, 160);
   return out;
+}
+
+function logSubpageCoverageSignalsFinalAudit_(payload = {}) {
+  try {
+    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object'
+      ? payload.coverageSignals
+      : {};
+    const representativePages = Array.isArray(coverageSignals.representativePages)
+      ? coverageSignals.representativePages
+      : [];
+    console.log('[DEBUG][SUBPAGE_COVERAGE_SIGNALS_FINAL_AUDIT]', JSON.stringify({
+      route: payload.route || '/scrape',
+      mode: payload.mode || 'signalsMode=light',
+      origin: String(payload.origin || ''),
+      hasGeoSignalsV1: payload.hasGeoSignalsV1 === true,
+      hasCoverageSignals: !!(payload.coverageSignals && typeof payload.coverageSignals === 'object'),
+      hasSubpageSignals: !!(payload.subpageSignals && typeof payload.subpageSignals === 'object'),
+      observedCount: typeof coverageSignals.observedCount === 'number'
+        ? coverageSignals.observedCount
+        : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+      candidatePageTypes: coverageSignals.candidatePageTypes || {},
+      representativePagesCount: representativePages.length,
+      representativePages: representativePages.slice(0, 10).map(page => ({
+        path: String(page && page.path || '').slice(0, 160),
+        pageType: String(page && page.pageType || '').slice(0, 80),
+        score: Number(page && page.score || 0) || 0,
+        candidateOnly: page && page.candidateOnly === true
+      })),
+      responseMode: payload.responseMode || null
+    }));
+  } catch (_) {}
 }
 
 function inferSubpageSignalsPageType_(page) {
@@ -4586,6 +4622,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     try { return new URL(String(normalized && normalized.topUrl || topUrl || '')).hostname.toLowerCase(); } catch (_) { return ''; }
   })();
   const shouldSkipSubpageForMemoryGuard = memoryGuardHosts.includes(normalizedHost);
+  let lastDiscoveredForCoverage = null;
   try {
     traceCoverageMemory('attach_start', {
       candidateCount: 0,
@@ -4643,6 +4680,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         reason: logPayload.reason
       })));
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      logSubpageCoverageSignalsFinalAudit_({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        hasGeoSignalsV1: !!geoSignalsV1,
+        coverageSignals: geoSignalsV1 && geoSignalsV1.coverageSignals,
+        subpageSignals: geoSignalsV1 && geoSignalsV1.subpageSignals,
+        responseMode: 'pre_response_memory_guard'
+      });
       return emptyCoverageSignals;
     }
     traceCoverageMemory('discover_before', {
@@ -4655,6 +4701,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       context: opts && opts.context,
       reuseBrowser: reusePageForDiscover || reuseContextForObserve
     }), subpageGuardMs, 'subpage_discovery');
+    lastDiscoveredForCoverage = discovered;
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
@@ -4792,21 +4839,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return null;
     }
     geoSignalsV1.coverageSignals = coverageSignals;
-    try {
-      console.log('[DEBUG][SUBPAGE_COVERAGE_SIGNALS_FINAL_AUDIT]', JSON.stringify({
-        origin: normalized.origin,
-        hasSubpageSignals: !!geoSignalsV1.subpageSignals,
-        observedCount: coverageSignals.observedSubpageCount,
-        candidatePageTypes: coverageSignals.candidatePageTypes,
-        representativePagesCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
-        representativePages: (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : []).slice(0, 10).map(page => ({
-          path: String(page && page.path || '').slice(0, 160),
-          pageType: String(page && page.pageType || '').slice(0, 80),
-          score: Number(page && page.score || 0) || 0,
-          candidateOnly: page && page.candidateOnly === true
-        }))
-      }));
-    } catch (_) {}
+    logSubpageCoverageSignalsFinalAudit_({
+      route: '/scrape',
+      mode: 'signalsMode=light',
+      origin: normalized.origin,
+      hasGeoSignalsV1: !!geoSignalsV1,
+      coverageSignals,
+      subpageSignals: geoSignalsV1 && geoSignalsV1.subpageSignals,
+      responseMode: 'pre_response_attach'
+    });
     traceCoverageMemory('attach_done', {
       browserCreated: !(reusePageForDiscover && reuseContextForObserve),
       contextCreated: true,
@@ -4832,7 +4873,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     return coverageSignals;
   } catch (e) {
     logPayload.reason = String(e && (e.message || e) || 'coverage_integration_failed').slice(0, 160);
-    const emptyCoverageSignals = attachEmptySignals(logPayload.reason || 'coverage_integration_failed', null);
+    const emptyCoverageSignals = attachEmptySignals(logPayload.reason || 'coverage_integration_failed', lastDiscoveredForCoverage);
+    logSubpageCoverageSignalsFinalAudit_({
+      route: '/scrape',
+      mode: 'signalsMode=light',
+      origin: normalized && normalized.origin || '',
+      hasGeoSignalsV1: !!geoSignalsV1,
+      coverageSignals: emptyCoverageSignals,
+      subpageSignals: geoSignalsV1 && geoSignalsV1.subpageSignals,
+      responseMode: 'pre_response_fallback'
+    });
     traceCoverageMemory('attach_error', {
       reason: logPayload.reason
     });
@@ -8395,7 +8445,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
       shadowPrimaryHeadingScan: geoDiagnostics.shadowPrimaryHeadingScan,
       mainCandidateScan: geoDiagnostics.mainCandidateScan,
       htmlContentLdJsonScan: geoDiagnostics.htmlContentLdJsonScan
-    }
+    },
+    coverageSignals: g.coverageSignals || null,
+    subpageSignals: g.subpageSignals || null
   };
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
@@ -11871,8 +11923,26 @@ async function scrapeOnce(req, res) {
           navLinkCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.navLinkCount,
           jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
         });
+        logSubpageCoverageSignalsFinalAudit_({
+          route: '/scrape',
+          mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+          origin: (() => { try { return new URL(String(shortPayload && (shortPayload.finalUrl || shortPayload.url) || '')).origin; } catch (_) { return ''; } })(),
+          hasGeoSignalsV1: !!(shortPayload && shortPayload.geoSignalsV1),
+          coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
+          subpageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.subpageSignals,
+          responseMode: shortPayload && shortPayload.responseMode
+        });
         return res.status(200).json(shortPayload);
       }
+      logSubpageCoverageSignalsFinalAudit_({
+        route: '/scrape',
+        mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+        origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
+        hasGeoSignalsV1: !!(signalsResponsePayload && signalsResponsePayload.geoSignalsV1),
+        coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
+        subpageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.subpageSignals,
+        responseMode: signalsResponsePayload && signalsResponsePayload.responseMode || 'default'
+      });
       return res.status(200).json(signalsResponsePayload);
     }
     if (signalsOnly) {
