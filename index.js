@@ -4759,36 +4759,121 @@ function getCoverageCanonicalPageFamily_(candidate) {
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path) || /プライバシー|規約|法務|セキュリティ|サイトマップ|privacy|policy|terms|legal|security|sitemap/i.test(haystack) || pageType === 'legal' || pageType === 'sitemap') return 'legal';
   if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path) || /問い合わせ|お問い合わせ|contact|inquiry/i.test(haystack) || pageType === 'contact') return 'contact';
   if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path) || /採用|求人|recruit|career|jobs/i.test(haystack) || pageType === 'recruit') return 'recruit';
-  if (/\/(?:business)(?:\/|$|-|_)/i.test(path) || /事業|business/i.test(haystack) || pageType === 'business') return 'business';
-  if (/\/(?:service|services|solution|solutions|plan|plans|flow|features?)(?:\/|$|-|_)/i.test(path) || /サービス|料金|申し込み|申込|流れ|プラン|機能|service|solution|plan|flow|feature/i.test(haystack) || pageType === 'service') return 'service';
+  if (/\/(?:business|solution|solutions|consulting)(?:\/|$|-|_)/i.test(path) || /事業|ソリューション|制作|開発|支援|business|company services|solution|consulting/i.test(haystack) || pageType === 'business') return 'business';
+  if (/\/(?:service|services|plan|plans|price|pricing|fee|fees)(?:\/|$|-|_)/i.test(path) || /サービス|料金|データ量|プラン|service|services|plan|price|pricing|fee/i.test(haystack) || pageType === 'service') return 'service';
+  if (/\/(?:flow|guide|guides|howto|how-to|usage|shopping-guide|user-guide)(?:\/|$|-|_)/i.test(path) || /使い方|ご利用ガイド|申し込みの流れ|申込みの流れ|導入手順|flow|guide|howto|how-to|usage/i.test(haystack) || pageType === 'guide') return 'guide';
   if (/\/(?:support|cycle-support|help)(?:\/|$|-|_)/i.test(path) || /サポート|ヘルプ|support|help/i.test(haystack) || pageType === 'support') return 'support';
-  if (/\/(?:shop|shops|store|stores|maintenance|uketori|products|product|collections)(?:\/|$|-|_)/i.test(path) || /商品|製品|店舗|ショップ|ストア|受取|メンテ|products?|store|shop|collection/i.test(haystack) || pageType === 'store' || pageType === 'category') return 'store';
   if (/\/(?:faq)(?:\/|$|-|_)/i.test(path) || /よくある質問|faq/i.test(haystack) || pageType === 'faq') return 'support';
-  if (/\/(?:guide|guides|shopping-guide|user-guide)(?:\/|$|-|_)/i.test(path) || /ガイド|guide/i.test(haystack) || pageType === 'guide') return 'guide';
+  if (/\/(?:shop|shops|store|stores|maintenance|uketori|products|product|collections|category|categories|item|items)(?:\/|$|-|_)/i.test(path) || /商品|製品|カテゴリ|店舗|ショップ|ストア|申込|申し込み|受取|メンテ|products?|product|category|item|store|shop|collection/i.test(haystack) || pageType === 'store' || pageType === 'category') return 'store';
+  if (/\/(?:case|cases|works|work|portfolio|projects|clients)(?:\/|$|-|_)/i.test(path) || /事例|実績|制作実績|works|case|portfolio|clients?|project/i.test(haystack) || pageType === 'case') return 'case';
   if (/\/(?:blogs\/news|news|topics|blog|column)(?:\/|$|-|_)/i.test(path) || /お知らせ|ニュース|news|topics|blog|column/i.test(haystack) || pageType === 'news') return 'news';
-  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path) || /事例|実績|works|case|portfolio|project/i.test(haystack) || pageType === 'case') return 'business';
-  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path) || /会社|企業|概要|about|company|corporate|profile/i.test(haystack) || pageType === 'about') return 'about';
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile|philosophy|message)(?:\/|$|-|_)/i.test(path) || /会社概要|企業情報|私たちについて|理念|代表挨拶|会社|企業|概要|about|company|corporate|profile|philosophy|message/i.test(haystack) || pageType === 'about') return 'about';
   return pageType && pageType !== 'unknown' ? pageType : 'unknown';
 }
 
-function getCoverageCanonicalFamilyPriority_(family) {
-  const priority = {
-    business: 0,
-    service: 0,
-    support: 0,
-    store: 0,
-    guide: 0,
-    news: 0,
-    about: 1,
-    recruit: 2,
-    contact: 3,
-    legal: 5
+function inferCoverageSiteShape_(candidates) {
+  const familyCounts = {};
+  const pageTypeCounts = {};
+  (Array.isArray(candidates) ? candidates : []).forEach(candidate => {
+    const family = getCoverageCanonicalPageFamily_(candidate);
+    const pageType = getCoverageCandidatePageType_(candidate);
+    familyCounts[family] = (familyCounts[family] || 0) + 1;
+    pageTypeCounts[pageType] = (pageTypeCounts[pageType] || 0) + 1;
+  });
+  const ecommerceScore =
+    Number(familyCounts.support || 0) +
+    Number(familyCounts.guide || 0) +
+    Number(familyCounts.store || 0) +
+    Number(pageTypeCounts.faq || 0) +
+    Number(pageTypeCounts.category || 0) +
+    Number(pageTypeCounts.store || 0);
+  const serviceScore =
+    Number(familyCounts.service || 0) +
+    Number(familyCounts.guide || 0) +
+    Number(familyCounts.support || 0) +
+    Number(familyCounts.store || 0) +
+    Number(familyCounts.news || 0);
+  const corporateScore =
+    Number(familyCounts.business || 0) +
+    Number(familyCounts.about || 0) +
+    Number(familyCounts.case || 0) +
+    Number(familyCounts.recruit || 0) +
+    Number(familyCounts.service || 0);
+  const scores = [
+    ['ecommerce', ecommerceScore],
+    ['service', serviceScore],
+    ['corporate', corporateScore]
+  ].sort((a, b) => b[1] - a[1]);
+  if (!scores[0] || scores[0][1] <= 0) return 'generic';
+  if (scores[0][1] === scores[1][1]) return 'generic';
+  return scores[0][0];
+}
+
+function getCoverageCanonicalFamilyPriority_(family, siteShape = 'generic') {
+  const priorityByShape = {
+    ecommerce: {
+      support: 0,
+      guide: 0,
+      store: 1,
+      service: 2,
+      news: 2,
+      business: 3,
+      case: 3,
+      about: 4,
+      recruit: 4,
+      contact: 5,
+      unknown: 5,
+      legal: 9
+    },
+    service: {
+      service: 0,
+      guide: 1,
+      support: 2,
+      store: 3,
+      news: 4,
+      business: 5,
+      case: 5,
+      about: 6,
+      recruit: 6,
+      contact: 7,
+      unknown: 7,
+      legal: 9
+    },
+    corporate: {
+      business: 0,
+      service: 0,
+      about: 1,
+      case: 2,
+      recruit: 3,
+      news: 4,
+      guide: 5,
+      support: 5,
+      store: 5,
+      contact: 6,
+      unknown: 6,
+      legal: 9
+    },
+    generic: {
+      business: 0,
+      service: 0,
+      support: 0,
+      guide: 0,
+      store: 0,
+      case: 0,
+      about: 1,
+      recruit: 1,
+      news: 2,
+      contact: 3,
+      unknown: 3,
+      legal: 9
+    }
   };
+  const priority = priorityByShape[siteShape] || priorityByShape.generic;
   return Object.prototype.hasOwnProperty.call(priority, family) ? priority[family] : 4;
 }
 
 function getCoverageRepresentativePriority_(page) {
-  return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page));
+  return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page), 'generic');
 }
 
 function getCoverageCandidatePath_(candidate) {
@@ -4804,10 +4889,23 @@ function normalizeCoveragePathKey_(value) {
 }
 
 function sortCoverageObserveCandidates_(candidates) {
+  const siteShape = inferCoverageSiteShape_(candidates);
+  const sourcePriority = (candidate) => {
+    const sources = Array.isArray(candidate && candidate.sources)
+      ? candidate.sources.map(item => String(item || '').toLowerCase())
+      : [String(candidate && candidate.source || '').toLowerCase()];
+    if (sources.some(source => /header|global|primary|main.?nav|nav/.test(source))) return 0;
+    if (sources.includes('sitemap') || sources.includes('htmlsitemap')) return 1;
+    if (sources.includes('footer')) return 3;
+    return 2;
+  };
   return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
-    const aPriority = getCoverageRepresentativePriority_(a);
-    const bPriority = getCoverageRepresentativePriority_(b);
+    const aPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(a), siteShape);
+    const bPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(b), siteShape);
     if (aPriority !== bPriority) return aPriority - bPriority;
+    const aSourcePriority = sourcePriority(a);
+    const bSourcePriority = sourcePriority(b);
+    if (aSourcePriority !== bSourcePriority) return aSourcePriority - bSourcePriority;
     const aSources = Array.isArray(a && a.sources) ? a.sources.length : (a && a.source ? 1 : 0);
     const bSources = Array.isArray(b && b.sources) ? b.sources.length : (b && b.source ? 1 : 0);
     if (aSources !== bSources) return bSources - aSources;
@@ -4854,8 +4952,8 @@ function filterCoverageRepresentativeCandidates_(candidates) {
   return (Array.isArray(candidates) ? candidates : []).filter(isCoverageRepresentativeCandidate_);
 }
 
-function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {}) {
-  const max = Math.max(0, Math.min(10, Number(limit || 2) || 2));
+function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {}) {
+  const max = Math.max(0, Math.min(4, Number(limit || 4) || 4));
   const allSorted = sortCoverageObserveCandidates_(Array.isArray(candidates) ? candidates : []);
   const eligible = filterCoverageRepresentativeCandidates_(candidates);
   logRepresentativeSelectionPhase11_({
@@ -4932,9 +5030,20 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
   });
   const selected = [];
   const selectedKeys = new Set();
+  const hasAlternativeNonNewsCandidate = () => primaryPool.some(candidate => {
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    return key && !selectedKeys.has(key) && getCoverageCanonicalPageFamily_(candidate) !== 'news';
+  });
   const addSelected = (candidate) => {
     const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
     if (!key || selectedKeys.has(key) || selected.length >= max) return false;
+    if (
+      getCoverageCanonicalPageFamily_(candidate) === 'news' &&
+      selected.some(item => getCoverageCanonicalPageFamily_(item) === 'news') &&
+      hasAlternativeNonNewsCandidate()
+    ) {
+      return false;
+    }
     selected.push(candidate);
     selectedKeys.add(key);
     return true;
@@ -5109,7 +5218,7 @@ function buildCoverageCandidatePageTypes_(candidates) {
   return out;
 }
 
-function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 2, opts = {}) {
+function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 4, opts = {}) {
   return selectCoverageRepresentativeCandidates_(candidates, limit, opts)
     .map(buildCoverageRepresentativePageFromCandidate_);
 }
@@ -5373,7 +5482,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     .slice(0, 10);
   const representativePages = observedRepresentativePages.length
     ? observedRepresentativePages
-    : buildLightweightRepresentativePagesFromCandidates_(candidates, 2);
+    : buildLightweightRepresentativePagesFromCandidates_(candidates, 4);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
   return {
@@ -5886,7 +5995,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   };
   const reusePageForDiscover = !!(opts && opts.page);
   const reuseContextForObserve = !!(opts && opts.context);
-  const maxObserve = Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
+  const maxObserve = Math.max(1, Math.min(4, Number(opts && opts.maxObserve || 4) || 4));
   const phase11DebugRunId = opts && opts.debugRunId ? opts.debugRunId : null;
   const phase11SignalsMode = opts && opts.signalsMode ? opts.signalsMode : null;
   const phase11ResponseMode = opts && opts.responseMode ? opts.responseMode : null;
@@ -6016,7 +6125,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         geoSignalsV1.coverageSignals.source = 'lightweight_candidate_only';
         geoSignalsV1.coverageSignals.representativePages = buildLightweightRepresentativePagesFromCandidates_(
           lightweightDiscovered && lightweightDiscovered.candidates || [],
-          2,
+          4,
           {
             debugRunId: phase11DebugRunId,
             origin: normalized.origin,
@@ -6093,7 +6202,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
       ? auditCandidates
       : discovered.candidates;
-    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2, {
+    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 4, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
       reason: 'audit_representative_preview'
@@ -13861,7 +13970,7 @@ async function scrapeOnce(req, res) {
         page,
         context,
         reuseBrowser: true,
-        maxObserve: 2,
+        maxObserve: 4,
         debugRunId,
         signalsMode: signalsMode || null,
         responseMode: watchdogResponseMode,
