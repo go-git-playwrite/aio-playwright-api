@@ -5464,6 +5464,35 @@ function logRepresentativeObservationQualityPhase12_(payload = {}) {
   } catch (_) {}
 }
 
+function logRepresentativeFinalResponsePhase12Audit_(payload = {}) {
+  try {
+    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object'
+      ? payload.coverageSignals
+      : null;
+    const representativePages = coverageSignals && Array.isArray(coverageSignals.representativePages)
+      ? coverageSignals.representativePages
+      : [];
+    console.log('[DEBUG][REPRESENTATIVE_FINAL_RESPONSE_PHASE12_AUDIT]', JSON.stringify({
+      route: payload.route || '/scrape',
+      mode: payload.mode || null,
+      responseMode: payload.responseMode || null,
+      origin: String(payload.origin || '').slice(0, 180),
+      hasCoverageSignals: !!coverageSignals,
+      observedCount: coverageSignals && typeof coverageSignals.observedCount === 'number'
+        ? coverageSignals.observedCount
+        : (coverageSignals && typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+      representativePagesCount: coverageSignals && typeof coverageSignals.representativePagesCount === 'number'
+        ? coverageSignals.representativePagesCount
+        : representativePages.length,
+      representativePagesLength: representativePages.length,
+      representativeObservationQuality: coverageSignals && coverageSignals.representativeObservationQuality || null,
+      representativePaths: representativePages.map(page => String(page && page.path || '').slice(0, 160)).filter(Boolean).slice(0, 12),
+      candidatePageTypes: coverageSignals && coverageSignals.candidatePageTypes || {},
+      earlyReturnReason: payload.earlyReturnReason || null
+    }));
+  } catch (_) {}
+}
+
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -6105,7 +6134,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
   ]);
-  const attachEmptySignals = (reason, discovered) => {
+  const attachEmptySignals = (reason, discovered, selectedCandidatesForFallback) => {
     const sourceSummary = discovered && discovered.sourceSummary || { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, other: 0 };
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
@@ -6126,6 +6155,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const emptySubpageSignals = buildSubpageSignalsV1FromSubpageObservation_(emptyPayload);
     if (emptySubpageSignals && geoSignalsV1 && typeof geoSignalsV1 === 'object') geoSignalsV1.subpageSignals = emptySubpageSignals;
     const emptyCoverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(emptyPayload);
+    if (Array.isArray(selectedCandidatesForFallback) && selectedCandidatesForFallback.length) {
+      preserveSelectedCoverageRepresentatives_(emptyCoverageSignalsV1, selectedCandidatesForFallback, {
+        debugRunId: phase11DebugRunId,
+        origin: normalized && normalized.origin || '',
+        observationAttempted: false,
+        observedSubpages: []
+      });
+    }
     emptyCoverageSignalsV1.reason = reason;
     const emptyCoverageSignals = buildGeoSignalsCoverageSignals_(emptyCoverageSignalsV1);
     if (emptyCoverageSignals && geoSignalsV1 && typeof geoSignalsV1 === 'object') geoSignalsV1.coverageSignals = emptyCoverageSignals;
@@ -6263,6 +6300,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     threshold: null
   });
   let lastDiscoveredForCoverage = null;
+  let lastSelectedCandidatesForCoverage = [];
   try {
     traceCoverageMemory('attach_start', {
       candidateCount: 0,
@@ -6401,6 +6439,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       origin: normalized.origin,
       reason: 'coverage_observe_selection'
     });
+    lastSelectedCandidatesForCoverage = selectedCandidates;
     const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
@@ -6686,7 +6725,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       errorName: e && e.name ? String(e.name).slice(0, 80) : null,
       errorMessage: String(e && (e.message || e) || '').slice(0, 200)
     });
-    const emptyCoverageSignals = attachEmptySignals(logPayload.reason || 'coverage_integration_failed', lastDiscoveredForCoverage);
+    const emptyCoverageSignals = attachEmptySignals(
+      logPayload.reason || 'coverage_integration_failed',
+      lastDiscoveredForCoverage,
+      lastSelectedCandidatesForCoverage
+    );
     logSubpageCoverageSignalsFinalAudit_({
       route: '/scrape',
       mode: 'signalsMode=light',
@@ -14689,6 +14732,9 @@ async function scrapeOnce(req, res) {
             shortPayload.memoryHints.skippedScans = shortPayload.diagnostics && shortPayload.diagnostics.skippedScans || [];
           }
         }
+        if (shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals) {
+          attachRepresentativeObservationQuality_(shortPayload.geoSignalsV1.coverageSignals);
+        }
         logSf('SIGNALS_FIRST_BALANCED_SHORT_SEND', {
           responseMode: balancedShortFastResponse ? 'shortFast' : 'short',
           trimmedFieldsCount: shortPayload && shortPayload.diagnostics && Array.isArray(shortPayload.diagnostics.trimmedFields)
@@ -14715,6 +14761,14 @@ async function scrapeOnce(req, res) {
           responseMode: shortPayload && shortPayload.responseMode,
           coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
           subpageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.subpageSignals
+        });
+        logRepresentativeFinalResponsePhase12Audit_({
+          route: '/scrape',
+          mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+          responseMode: shortPayload && shortPayload.responseMode,
+          origin: (() => { try { return new URL(String(shortPayload && (shortPayload.finalUrl || shortPayload.url) || '')).origin; } catch (_) { return ''; } })(),
+          coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
+          earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
         });
         const responseSendStartedAt = Date.now();
         logWatchdog('response_send_start', responseSendStartedAt, {
@@ -14748,6 +14802,17 @@ async function scrapeOnce(req, res) {
         responseMode: signalsResponsePayload && signalsResponsePayload.responseMode || 'default',
         coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
         subpageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.subpageSignals
+      });
+      if (signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals) {
+        attachRepresentativeObservationQuality_(signalsResponsePayload.geoSignalsV1.coverageSignals);
+      }
+      logRepresentativeFinalResponsePhase12Audit_({
+        route: '/scrape',
+        mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+        responseMode: signalsResponsePayload && signalsResponsePayload.responseMode || 'default',
+        origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
+        coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
+        earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
       });
       const responseSendStartedAt = Date.now();
       logWatchdog('response_send_start', responseSendStartedAt, {
