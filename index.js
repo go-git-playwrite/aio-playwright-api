@@ -4818,6 +4818,22 @@ function sortCoverageObserveCandidates_(candidates) {
   });
 }
 
+function buildCoverageRepresentativePageFromCandidate_(candidate) {
+  const url = String(candidate && candidate.url || '');
+  const path = getCoverageCandidatePath_(candidate);
+  return {
+    url,
+    path,
+    pageType: getCoverageCandidatePageType_(candidate),
+    canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
+    source: String(candidate && candidate.source || ''),
+    sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 8) : [],
+    score: Number(candidate && candidate.score || 0) || 0,
+    reason: String(candidate && candidate.reason || '').slice(0, 160),
+    candidateOnly: true
+  };
+}
+
 function getCoverageRepresentativeRejectReason_(candidate) {
   const url = String(candidate && candidate.url || '');
   const path = getCoverageCandidatePath_(candidate).toLowerCase();
@@ -4886,11 +4902,10 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
       rejectReason: rejectReason || null
     }));
   });
-  const primary = sortCoverageObserveCandidates_(eligible).slice(0, max);
-  const primaryKeys = new Set(primary.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
-  sortCoverageObserveCandidates_(eligible).slice(0, 50).forEach(candidate => {
+  const primaryPool = sortCoverageObserveCandidates_(eligible);
+  sortCoverageObserveCandidates_(eligible).slice(0, 50).forEach((candidate, index) => {
     const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
-    const selected = primaryKeys.has(key);
+    const selected = index < max;
     logRepresentativeSelectionPhase11_({
       debugRunId: opts && opts.debugRunId,
       origin: opts && opts.origin,
@@ -4908,15 +4923,53 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
       rejectReason: selected ? null : 'lower_primary_priority',
       candidateCount: allSorted.length,
       eligibleCount: eligible.length,
-      selectedCount: primary.length,
+      selectedCount: Math.min(max, primaryPool.length),
       backfillCount: 0,
-      finalCount: primary.length,
+      finalCount: Math.min(max, primaryPool.length),
       beforeCount: eligible.length,
-      afterCount: primary.length
+      afterCount: Math.min(max, primaryPool.length)
     });
   });
-  if (primary.length >= max) return primary;
-  const selectedKeys = new Set(primary.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
+  const selected = [];
+  const selectedKeys = new Set();
+  const addSelected = (candidate) => {
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    if (!key || selectedKeys.has(key) || selected.length >= max) return false;
+    selected.push(candidate);
+    selectedKeys.add(key);
+    return true;
+  };
+  if (primaryPool.length) addSelected(primaryPool[0]);
+  while (selected.length < max) {
+    const selectedFamilies = new Set(selected.map(getCoverageCanonicalPageFamily_));
+    const diverseCandidate = primaryPool.find(candidate => {
+      const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+      if (!key || selectedKeys.has(key)) return false;
+      return !selectedFamilies.has(getCoverageCanonicalPageFamily_(candidate));
+    });
+    if (!diverseCandidate) break;
+    addSelected(diverseCandidate);
+  }
+  primaryPool.forEach(candidate => {
+    if (selected.length >= max) return;
+    addSelected(candidate);
+  });
+  if (selected.length >= max) {
+    logRepresentativeSelectionPhase11_({
+      debugRunId: opts && opts.debugRunId,
+      origin: opts && opts.origin,
+      phase: 'selection_return',
+      reason: 'selection_return_target_count',
+      candidateCount: allSorted.length,
+      eligibleCount: eligible.length,
+      selectedCount: selected.length,
+      backfillCount: 0,
+      finalCount: selected.length,
+      beforeCount: allSorted.length,
+      afterCount: selected.length
+    });
+    return selected.slice(0, max);
+  }
   const backfill = [];
   logRepresentativeSelectionPhase11_({
     debugRunId: opts && opts.debugRunId,
@@ -4925,14 +4978,14 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
     reason: 'representative_backfill_to_min_count',
     candidateCount: allSorted.length,
     eligibleCount: eligible.length,
-    selectedCount: primary.length,
+    selectedCount: selected.length,
     backfillCount: 0,
-    finalCount: primary.length,
-    beforeCount: primary.length,
-    afterCount: primary.length
+    finalCount: selected.length,
+    beforeCount: selected.length,
+    afterCount: selected.length
   });
   allSorted.forEach(candidate => {
-    if (primary.length + backfill.length >= max) {
+    if (selected.length + backfill.length >= max) {
       return;
     }
     const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
@@ -4959,11 +5012,11 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
         rejectReason,
         candidateCount: allSorted.length,
         eligibleCount: eligible.length,
-        selectedCount: primary.length,
+        selectedCount: selected.length,
         backfillCount: backfill.length,
-        finalCount: primary.length + backfill.length,
-        beforeCount: primary.length,
-        afterCount: primary.length + backfill.length
+        finalCount: selected.length + backfill.length,
+        beforeCount: selected.length,
+        afterCount: selected.length + backfill.length
       });
       return;
     }
@@ -4986,14 +5039,14 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
       rejectReason: null,
       candidateCount: allSorted.length,
       eligibleCount: eligible.length,
-      selectedCount: primary.length,
+      selectedCount: selected.length,
       backfillCount: backfill.length,
-      finalCount: primary.length + backfill.length,
-      beforeCount: primary.length,
-      afterCount: primary.length + backfill.length
+      finalCount: selected.length + backfill.length,
+      beforeCount: selected.length,
+      afterCount: selected.length + backfill.length
     });
   });
-  const out = primary.concat(backfill).slice(0, max);
+  const out = selected.concat(backfill).slice(0, max);
   logRepresentativeSelectionPhase11_({
     debugRunId: opts && opts.debugRunId,
     origin: opts && opts.origin,
@@ -5001,7 +5054,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {
     reason: out.length < max ? 'selection_return_below_target_count' : 'selection_return_target_count',
     candidateCount: allSorted.length,
     eligibleCount: eligible.length,
-    selectedCount: primary.length,
+    selectedCount: selected.length,
     backfillCount: backfill.length,
     finalCount: out.length,
     beforeCount: allSorted.length,
@@ -5058,34 +5111,13 @@ function buildCoverageCandidatePageTypes_(candidates) {
 
 function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 2, opts = {}) {
   return selectCoverageRepresentativeCandidates_(candidates, limit, opts)
-    .map(candidate => {
-      const url = String(candidate && candidate.url || '');
-      const path = getCoverageCandidatePath_(candidate);
-      return {
-        url,
-        path,
-        pageType: getCoverageCandidatePageType_(candidate),
-        canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
-        source: String(candidate && candidate.source || ''),
-        sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 8) : [],
-        score: Number(candidate && candidate.score || 0) || 0,
-        reason: String(candidate && candidate.reason || '').slice(0, 160),
-        candidateOnly: true
-      };
-    });
+    .map(buildCoverageRepresentativePageFromCandidate_);
 }
 
 function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, opts = {}) {
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return coverageSignalsV1;
-  const selectedRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(
-    Array.isArray(selectedCandidates) ? selectedCandidates : [],
-    Array.isArray(selectedCandidates) ? selectedCandidates.length : 0,
-    {
-      debugRunId: opts && opts.debugRunId,
-      origin: opts && opts.origin,
-      reason: 'preserve_selected_representatives_after_observation'
-    }
-  );
+  const selectedRepresentativePages = (Array.isArray(selectedCandidates) ? selectedCandidates : [])
+    .map(buildCoverageRepresentativePageFromCandidate_);
   if (!selectedRepresentativePages.length) return coverageSignalsV1;
   const observedRepresentatives = Array.isArray(coverageSignalsV1.representativePages)
     ? coverageSignalsV1.representativePages
