@@ -4609,6 +4609,25 @@ function logScrapePhase11Watchdog_(payload = {}) {
   } catch (_) {}
 }
 
+function logBuildGeoSignalsPhase11_(payload = {}) {
+  try {
+    console.log('[DEBUG][BUILD_GEO_SIGNALS_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      url: String(payload.url || '').slice(0, 240),
+      origin: String(payload.origin || '').slice(0, 180),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      mode: payload.mode || null,
+      signalsMode: payload.signalsMode || null,
+      detail: payload.detail && typeof payload.detail === 'object' ? payload.detail : {},
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 function logSubpageObservationItemPhase11_(payload = {}) {
   try {
     console.log('[DEBUG][SUBPAGE_OBSERVATION_ITEM_PHASE11]', JSON.stringify({
@@ -6717,6 +6736,33 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
   const startedAt = Date.now();
   const balancedMode = !!(opts && opts.balancedMode);
   const shortFastMode = !!(opts && opts.shortFastMode);
+  const debugRunId = opts && opts.debugRunId ? opts.debugRunId : null;
+  const phase11Url = String(url || '');
+  let phase11Origin = '';
+  try { phase11Origin = new URL(phase11Url).origin; } catch (_) {}
+  const phase11Mode = opts && opts.mode
+    ? opts.mode
+    : (balancedMode ? 'balanced' : 'light');
+  const phase11SignalsMode = opts && opts.signalsMode ? opts.signalsMode : null;
+  const logBuildPhase = (phase, phaseStartedAt, extra = {}) => {
+    const completedAt = extra && Object.prototype.hasOwnProperty.call(extra, 'completedAt')
+      ? extra.completedAt
+      : new Date().toISOString();
+    const durationMs = typeof extra.durationMs === 'number'
+      ? extra.durationMs
+      : (typeof phaseStartedAt === 'number' && completedAt ? Math.max(0, Date.now() - phaseStartedAt) : null);
+    logBuildGeoSignalsPhase11_(Object.assign({
+      debugRunId,
+      url: phase11Url,
+      origin: phase11Origin,
+      phase,
+      startedAt: typeof phaseStartedAt === 'number' ? new Date(phaseStartedAt).toISOString() : phaseStartedAt,
+      completedAt,
+      durationMs,
+      mode: phase11Mode,
+      signalsMode: phase11SignalsMode
+    }, extra || {}));
+  };
   const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
   const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
     ? opts.hydrationMetrics
@@ -6730,7 +6776,42 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     totalMs: null
   };
   try {
+    logBuildPhase('build_start', startedAt, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        balancedMode,
+        shortFastMode,
+        boundedHydrationWaitMs,
+        hydrationSkipped: hydrationMetrics && hydrationMetrics.skipped === true
+      }
+    });
     const basicDomStart = Date.now();
+    logBuildPhase('dom_snapshot_start', basicDomStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: { evaluate: 'rendered_dom_snapshot' }
+    });
+    logBuildPhase('jsonld_collect_start', basicDomStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: { source: 'dom_snapshot_evaluate' }
+    });
+    logBuildPhase('link_collect_start', basicDomStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: { source: 'dom_snapshot_evaluate' }
+    });
+    logBuildPhase('sameas_collect_start', basicDomStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: { source: 'dom_snapshot_evaluate' }
+    });
+    logBuildPhase('multimodal_collect_start', basicDomStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: { source: 'dom_snapshot_evaluate' }
+    });
     const observed = await page.evaluate(({ inputUrl, balancedMode, shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
@@ -7339,7 +7420,58 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       phaseTimings.linksMs = typeof observed.phaseTimings.linksMs === 'number' ? observed.phaseTimings.linksMs : null;
       phaseTimings.multimodalMs = typeof observed.phaseTimings.multimodalMs === 'number' ? observed.phaseTimings.multimodalMs : null;
     }
+    const observedPhaseDetail = {
+      finalUrl: String(observed && observed.finalUrl || '').slice(0, 240),
+      scriptCount: observed && observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : null,
+      jsonLdCount: observed && observed.structuredData && typeof observed.structuredData.rawCount === 'number' ? observed.structuredData.rawCount : null,
+      jsonLdParseableCount: observed && observed.structuredData && typeof observed.structuredData.parseableCount === 'number' ? observed.structuredData.parseableCount : null,
+      jsonLdTypesCount: observed && observed.structuredData && Array.isArray(observed.structuredData.types) ? observed.structuredData.types.length : null,
+      linkCount: observed && observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.length : null,
+      navTextCount: observed && observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.length : null,
+      textLength: observed && observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : null,
+      imageCount: observed && observed.multimodalSignals && typeof observed.multimodalSignals.imgCount === 'number' ? observed.multimodalSignals.imgCount : null,
+      linksMs: phaseTimings.linksMs,
+      multimodalMs: phaseTimings.multimodalMs
+    };
+    logBuildPhase('dom_snapshot_complete', basicDomStart, { detail: observedPhaseDetail });
+    logBuildPhase('jsonld_collect_complete', basicDomStart, {
+      detail: {
+        source: 'dom_snapshot_evaluate',
+        jsonLdCount: observedPhaseDetail.jsonLdCount,
+        jsonLdParseableCount: observedPhaseDetail.jsonLdParseableCount,
+        jsonLdTypesCount: observedPhaseDetail.jsonLdTypesCount
+      }
+    });
+    logBuildPhase('link_collect_complete', basicDomStart, {
+      detail: {
+        source: 'dom_snapshot_evaluate',
+        linkCount: observedPhaseDetail.linkCount,
+        navTextCount: observedPhaseDetail.navTextCount,
+        linksMs: observedPhaseDetail.linksMs
+      }
+    });
+    logBuildPhase('sameas_collect_complete', basicDomStart, {
+      detail: {
+        source: 'dom_snapshot_evaluate',
+        sameAsCount: observed && observed.structuredData && observed.structuredData.sameAsSummary && typeof observed.structuredData.sameAsSummary.count === 'number'
+          ? observed.structuredData.sameAsSummary.count
+          : null
+      }
+    });
+    logBuildPhase('multimodal_collect_complete', basicDomStart, {
+      detail: {
+        source: 'dom_snapshot_evaluate',
+        imageCount: observedPhaseDetail.imageCount,
+        multimodalMs: observedPhaseDetail.multimodalMs
+      }
+    });
 
+    const summaryBuildStartedAt = Date.now();
+    logBuildPhase('summary_build_start', summaryBuildStartedAt, {
+      completedAt: null,
+      durationMs: null,
+      detail: { source: 'node_summary_assembly' }
+    });
     const normalizeHeadingText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
     const uniqueHeadingTexts = (arr, limitCount) => {
       const out = [];
@@ -7596,6 +7728,15 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       : null;
     const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
     const structuredDataStart = Date.now();
+    logBuildPhase('jsonld_collect_start', structuredDataStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        source: balancedMode ? 'html_content_and_script_src_jsonld' : 'rendered_dom_only',
+        balancedMode,
+        shortFastMode
+      }
+    });
     const htmlContentJsonLdSummary = balancedMode
       ? await collectHtmlContentJsonLdSummaryLight(page)
       : null;
@@ -7605,6 +7746,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         : {})
       : null;
     phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
+    logBuildPhase('jsonld_collect_complete', structuredDataStart, {
+      detail: {
+        source: balancedMode ? 'html_content_and_script_src_jsonld' : 'rendered_dom_only',
+        structuredDataMs: phaseTimings.structuredDataMs,
+        htmlRawCount: htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.rawCount === 'number' ? htmlContentJsonLdSummary.rawCount : null,
+        scriptSrcCandidateCount: scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.candidateCount === 'number' ? scriptSrcJsonLdSummary.candidateCount : null,
+        scriptSrcFetchedCount: scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.fetchedCount === 'number' ? scriptSrcJsonLdSummary.fetchedCount : null,
+        scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null
+      }
+    });
     const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
     const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
     const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
@@ -8099,6 +8250,17 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         })
       }
     };
+    logBuildPhase('summary_build_complete', summaryBuildStartedAt, {
+      detail: {
+        h1Count: geoSignalsV1.headings && geoSignalsV1.headings.h1Count,
+        h2Count: geoSignalsV1.headings && geoSignalsV1.headings.h2Count,
+        jsonLdCount: geoSignalsV1.observed && geoSignalsV1.observed.structuredData && geoSignalsV1.observed.structuredData.rawCount,
+        linkCount: geoSignalsV1.observed && geoSignalsV1.observed.links && Array.isArray(geoSignalsV1.observed.links.internalLinksSample)
+          ? geoSignalsV1.observed.links.internalLinksSample.length
+          : null,
+        textLength: geoSignalsV1.observed && geoSignalsV1.observed.body && geoSignalsV1.observed.body.textLength
+      }
+    });
     try {
       console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
         h1Count: geoSignalsV1.observed.h1.count,
@@ -8136,8 +8298,22 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         renderedTextLength: geoSignalsV1.observed.body.textLength
       }));
     } catch (_) {}
+    logBuildPhase('build_complete', startedAt, {
+      detail: {
+        totalMs: Math.max(0, Date.now() - startedAt),
+        basicDomMs: phaseTimings.basicDomMs,
+        structuredDataMs: phaseTimings.structuredDataMs,
+        linksMs: phaseTimings.linksMs,
+        multimodalMs: phaseTimings.multimodalMs
+      }
+    });
     return geoSignalsV1;
   } catch (e) {
+    logBuildPhase('build_complete', startedAt, {
+      detail: { failed: true },
+      errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+      errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+    });
     return {
       version: 'geoSignalsV1',
       generatedAt,
@@ -12191,6 +12367,9 @@ async function scrapeOnce(req, res) {
           shortFastMode: balancedShortFastResponse,
           boundedHydrationWaitMs,
           hydrationMetrics,
+          debugRunId,
+          mode: signalsFirstBalanced ? 'signals_first_balanced' : 'signals_first_light',
+          signalsMode: signalsMode || null,
           gotoMs: typeof scrapeTiming.gotoMs === 'number'
             ? scrapeTiming.gotoMs
             : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
