@@ -4697,7 +4697,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   })();
   const shouldSkipSubpageForMemoryGuard = memoryGuardHosts.includes(normalizedHost);
   let lastDiscoveredForCoverage = null;
-  let phase11ObservationItems = [];
   try {
     traceCoverageMemory('attach_start', {
       candidateCount: 0,
@@ -4848,33 +4847,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     setPhase11State({ observationStarted: true });
-    phase11ObservationItems = selectedCandidates.map((candidate, index) => {
-      const startedAt = new Date().toISOString();
-      const item = {
-        candidate,
-        index: index + 1,
-        total: selectedCandidates.length,
-        startedAt,
-        startedAtMs: Date.now()
-      };
-      logSubpageObservationItemPhase11_({
-        debugRunId: phase11State && phase11State.debugRunId,
-        origin: normalized.origin,
-        targetUrl: candidate && candidate.url,
-        path: getCoverageCandidatePath_(candidate),
-        pageType: getCoverageCandidatePageType_(candidate),
-        index: item.index,
-        total: item.total,
-        phase: 'start',
-        startedAt,
-        completedAt: null,
-        durationMs: null,
-        observed: null,
-        errorName: null,
-        errorMessage: null
-      });
-      return item;
-    });
     const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
@@ -4882,7 +4854,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
       sequential: true,
-      maxTotalMs: subpageGuardMs
+      maxTotalMs: subpageGuardMs,
+      phase11: {
+        debugRunId: phase11State && phase11State.debugRunId,
+        origin: normalized.origin,
+        candidates: selectedCandidates
+      }
     });
     setPhase11State({ observationCompleted: true });
     traceCoverageMemory('observe_after', {
@@ -4899,26 +4876,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         fallbackReason: 'partial_subpage_observation_timeout'
       });
     }
-    phase11ObservationItems.forEach((item, index) => {
-      const page = observations[index] || {};
-      const completedAt = new Date().toISOString();
-      logSubpageObservationItemPhase11_({
-        debugRunId: phase11State && phase11State.debugRunId,
-        origin: normalized.origin,
-        targetUrl: item.candidate && item.candidate.url,
-        path: getCoverageCandidatePath_(item.candidate),
-        pageType: getCoverageCandidatePageType_(item.candidate),
-        index: item.index,
-        total: item.total,
-        phase: page && page.ok === false ? 'error' : 'complete',
-        startedAt: item.startedAt,
-        completedAt,
-        durationMs: Date.now() - item.startedAtMs,
-        observed: !!(page && page.ok === true),
-        errorName: null,
-        errorMessage: page && page.error ? String(page.error).slice(0, 200) : null
-      });
-    });
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
@@ -5012,24 +4969,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     return coverageSignals;
   } catch (e) {
     logPayload.reason = String(e && (e.message || e) || 'coverage_integration_failed').slice(0, 160);
-    phase11ObservationItems.forEach(item => {
-      logSubpageObservationItemPhase11_({
-        debugRunId: phase11State && phase11State.debugRunId,
-        origin: normalized && normalized.origin || '',
-        targetUrl: item.candidate && item.candidate.url,
-        path: getCoverageCandidatePath_(item.candidate),
-        pageType: getCoverageCandidatePageType_(item.candidate),
-        index: item.index,
-        total: item.total,
-        phase: 'error',
-        startedAt: item.startedAt,
-        completedAt: new Date().toISOString(),
-        durationMs: Date.now() - item.startedAtMs,
-        observed: false,
-        errorName: e && e.name ? String(e.name).slice(0, 80) : null,
-        errorMessage: String(e && (e.message || e) || '').slice(0, 200)
-      });
-    });
     setPhase11State({
       fallbackReason: logPayload.reason || 'pre_response_fallback',
       timeoutTriggered: /timeout/i.test(String(logPayload.reason || '')),
@@ -5066,10 +5005,15 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const maxTotalMs = Number(opts.maxTotalMs || 0) > 0
     ? Math.max(1000, Number(opts.maxTotalMs || 0))
     : 0;
+  const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : null;
+  const phase11Candidates = Array.isArray(phase11 && phase11.candidates) ? phase11.candidates : [];
   const reuseContext = !!(opts && opts.context);
-  const concurrency = reuseContext
+  const sequential = opts && opts.sequential === true;
+  const concurrency = sequential
     ? 1
-    : Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4));
+    : (reuseContext
+    ? 1
+    : Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4)));
   const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
   let browser = null;
   let context = opts && opts.context || null;
@@ -5151,10 +5095,34 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
       while (nextIndex < normalizedUrls.length) {
         const index = nextIndex++;
         const url = normalizedUrls[index];
+        const candidate = phase11Candidates[index] || { url };
+        let itemStartedAt = null;
+        let itemStartedAtMs = null;
+        const logItem = (phase, extra = {}) => {
+          logSubpageObservationItemPhase11_(Object.assign({
+            debugRunId: phase11 && phase11.debugRunId,
+            origin: phase11 && phase11.origin || baseOrigin,
+            targetUrl: url,
+            path: getCoverageCandidatePath_(candidate),
+            pageType: getCoverageCandidatePageType_(candidate),
+            index: index + 1,
+            total: normalizedUrls.length,
+            phase,
+            startedAt: itemStartedAt,
+            completedAt: null,
+            durationMs: null,
+            observed: null,
+            errorName: null,
+            errorMessage: null
+          }, extra));
+        };
         try {
           const elapsedMs = Date.now() - started;
           const remainingMs = maxTotalMs ? maxTotalMs - elapsedMs : 0;
           if (maxTotalMs && remainingMs <= 500) {
+            itemStartedAt = new Date().toISOString();
+            itemStartedAtMs = Date.now();
+            logItem('start');
             pages[index] = {
               url,
               finalUrl: url,
@@ -5176,11 +5144,21 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               hasBreadcrumbUi: false,
               error: `subpage_observation_timeout_${maxTotalMs}ms`
             };
+            logItem('error', {
+              completedAt: new Date().toISOString(),
+              durationMs: Date.now() - itemStartedAtMs,
+              observed: false,
+              errorName: 'Error',
+              errorMessage: `subpage_observation_timeout_${maxTotalMs}ms`
+            });
             continue;
           }
           let origin = '';
           try { origin = new URL(url).origin; } catch (_) {}
           if (baseOrigin && origin !== baseOrigin) {
+            itemStartedAt = new Date().toISOString();
+            itemStartedAtMs = Date.now();
+            logItem('start');
             pages[index] = {
               url,
               finalUrl: url,
@@ -5202,6 +5180,13 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               hasBreadcrumbUi: false,
               error: 'origin_mismatch'
             };
+            logItem('error', {
+              completedAt: new Date().toISOString(),
+              durationMs: Date.now() - itemStartedAtMs,
+              observed: false,
+              errorName: 'Error',
+              errorMessage: 'origin_mismatch'
+            });
             continue;
           }
           try {
@@ -5217,7 +5202,17 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           const pageTimeout = maxTotalMs
             ? Math.max(1000, Math.min(timeout, remainingMs || timeout))
             : timeout;
+          itemStartedAt = new Date().toISOString();
+          itemStartedAtMs = Date.now();
+          logItem('start');
           pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout: pageTimeout, context });
+          logItem(pages[index] && pages[index].ok === false ? 'error' : 'complete', {
+            completedAt: new Date().toISOString(),
+            durationMs: Date.now() - itemStartedAtMs,
+            observed: !!(pages[index] && pages[index].ok === true),
+            errorName: pages[index] && pages[index].error ? 'Error' : null,
+            errorMessage: pages[index] && pages[index].error ? String(pages[index].error).slice(0, 200) : null
+          });
           try {
             console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
               phase: 'observe_page_after',
@@ -5229,6 +5224,11 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
             }));
           } catch (_) {}
         } catch (e) {
+          if (!itemStartedAt) {
+            itemStartedAt = new Date().toISOString();
+            itemStartedAtMs = Date.now();
+            logItem('start');
+          }
           pages[index] = {
             url,
             finalUrl: url,
@@ -5250,6 +5250,13 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
             hasBreadcrumbUi: false,
             error: String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
           };
+          logItem('error', {
+            completedAt: new Date().toISOString(),
+            durationMs: Date.now() - itemStartedAtMs,
+            observed: false,
+            errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+            errorMessage: String(e && (e.message || e) || 'fetch_failed').slice(0, 200)
+          });
         }
       }
     });
