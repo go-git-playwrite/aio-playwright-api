@@ -3500,6 +3500,7 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
 // curl -sS -X POST "https://aio-playwright-api-2.onrender.com/discover-subpage-candidates-light" -H "content-type: application/json" --max-time 180 -d '{"topUrl":"https://www.fork.co.jp/","limit":20}' | jq
 
 const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
+const SUBPAGE_LIGHT_CONTENT_MAX_MS = 5000;
 
 function logSubpageFetchPhase11_(payload = {}) {
   try {
@@ -3512,6 +3513,7 @@ function logSubpageFetchPhase11_(payload = {}) {
       durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
       timeoutMs: typeof payload.timeoutMs === 'number' ? payload.timeoutMs : null,
       waitUntil: payload.waitUntil || null,
+      detail: payload.detail && typeof payload.detail === 'object' ? payload.detail : {},
       errorName: payload.errorName || null,
       errorMessage: payload.errorMessage || null
     }));
@@ -3761,21 +3763,62 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       };
     }
     const contentStartedAtMs = Date.now();
-    logPhase('content_start', contentStartedAtMs, { completedAt: null, durationMs: null });
+    let contentDeadlineReached = false;
+    let skippedRemainingWait = false;
+    const contentDeadlineAtMs = contentStartedAtMs + SUBPAGE_LIGHT_CONTENT_MAX_MS;
+    const remainingContentMs = () => Math.max(0, contentDeadlineAtMs - Date.now());
+    const withContentDeadline = async (promise, label) => {
+      const remainingMs = remainingContentMs();
+      if (remainingMs <= 0) {
+        contentDeadlineReached = true;
+        skippedRemainingWait = true;
+        return null;
+      }
+      let timer = null;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((resolve) => {
+            timer = setTimeout(() => {
+              contentDeadlineReached = true;
+              skippedRemainingWait = true;
+              resolve(null);
+            }, remainingMs);
+          })
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    logPhase('content_start', contentStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      timeoutMs: SUBPAGE_LIGHT_CONTENT_MAX_MS
+    });
     const hydrationMetrics = null;
     let webdriverValue = '__unavailable__';
     const contentWaitStartedAtMs = Date.now();
     logDetail('content_wait_start', contentWaitStartedAtMs, {
       completedAt: null,
       durationMs: null,
-      detail: { waitMs: 0 }
+      detail: {
+        waitMs: 0,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
     });
     try {
-      const rawWebdriverValue = await page.evaluate(() => navigator.webdriver);
-      webdriverValue = typeof rawWebdriverValue === 'undefined' ? '__undefined__' : rawWebdriverValue;
+      const rawWebdriverValue = await withContentDeadline(page.evaluate(() => navigator.webdriver), 'webdriver_probe');
+      if (rawWebdriverValue !== null) webdriverValue = typeof rawWebdriverValue === 'undefined' ? '__undefined__' : rawWebdriverValue;
     } catch (_) {}
     logDetail('content_wait_complete', contentWaitStartedAtMs, {
-      detail: { waitMs: Date.now() - contentWaitStartedAtMs }
+      detail: {
+        waitMs: Date.now() - contentWaitStartedAtMs,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
     });
     const waitStartedAt = Date.now();
     const waitStrategyParts = [];
@@ -3789,21 +3832,44 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     logDetail('jsonld_poll_start', jsonLdPollStartedAtMs, {
       completedAt: null,
       durationMs: null,
-      detail: { pollMaxMs: 2000 }
+      detail: {
+        pollMaxMs: 2000,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
     });
-    let jsonLdCountProbe = await countJsonLdScripts();
+    let jsonLdCountProbe = await withContentDeadline(countJsonLdScripts(), 'jsonld_initial_probe');
+    if (!jsonLdCountProbe) jsonLdCountProbe = { domJsonLdScriptCount: 0, deepJsonLdScriptCount: 0 };
     const pollStartedAt = Date.now();
     while (
       Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) <= 0 &&
-      Date.now() - pollStartedAt < 2000
+      Date.now() - pollStartedAt < 2000 &&
+      remainingContentMs() > 0
     ) {
-      try { await page.waitForTimeout(250); } catch (_) {}
-      jsonLdCountProbe = await countJsonLdScripts();
+      try {
+        await withContentDeadline(page.waitForTimeout(Math.min(250, remainingContentMs())), 'jsonld_poll_wait');
+      } catch (_) {}
+      if (remainingContentMs() <= 0) {
+        contentDeadlineReached = true;
+        skippedRemainingWait = true;
+        break;
+      }
+      const nextProbe = await withContentDeadline(countJsonLdScripts(), 'jsonld_poll_probe');
+      if (!nextProbe) {
+        contentDeadlineReached = true;
+        skippedRemainingWait = true;
+        break;
+      }
+      jsonLdCountProbe = nextProbe;
     }
     waitStrategyParts.push(Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) > 0 ? 'jsonld_poll_found' : 'jsonld_poll_timeout');
     logDetail('jsonld_poll_complete', jsonLdPollStartedAtMs, {
       detail: {
         pollMaxMs: 2000,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait,
         scriptCount: Number(jsonLdCountProbe && jsonLdCountProbe.domJsonLdScriptCount || 0),
         jsonLdCount: Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0)
       }
@@ -3812,16 +3878,38 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     logDetail('post_wait_start', postWaitStartedAtMs, {
       completedAt: null,
       durationMs: null,
-      detail: { postWaitMs: 500 }
+      detail: {
+        postWaitMs: 500,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
     });
     try {
-      await page.waitForTimeout(500);
-      waitStrategyParts.push('post_poll_wait_500ms');
+      if (remainingContentMs() > 0) {
+        await withContentDeadline(page.waitForTimeout(Math.min(500, remainingContentMs())), 'post_wait');
+        if (!contentDeadlineReached) waitStrategyParts.push('post_poll_wait_500ms');
+      } else {
+        contentDeadlineReached = true;
+        skippedRemainingWait = true;
+      }
     } catch (_) {}
     logDetail('post_wait_complete', postWaitStartedAtMs, {
-      detail: { postWaitMs: Date.now() - postWaitStartedAtMs }
+      detail: {
+        postWaitMs: Date.now() - postWaitStartedAtMs,
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
     });
-    logPhase('content_complete', contentStartedAtMs);
+    logPhase('content_complete', contentStartedAtMs, {
+      timeoutMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+      detail: {
+        contentCapMs: SUBPAGE_LIGHT_CONTENT_MAX_MS,
+        contentDeadlineReached,
+        skippedRemainingWait
+      }
+    });
     const extractStartedAtMs = Date.now();
     logPhase('extract_start', extractStartedAtMs, { completedAt: null, durationMs: null });
     const evaluateStartedAtMs = Date.now();
