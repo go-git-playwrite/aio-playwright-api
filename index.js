@@ -3500,10 +3500,43 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
 
 const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
 
+function logSubpageFetchPhase11_(payload = {}) {
+  try {
+    console.log('[DEBUG][SUBPAGE_FETCH_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      targetUrl: String(payload.targetUrl || '').slice(0, 240),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      timeoutMs: typeof payload.timeoutMs === 'number' ? payload.timeoutMs : null,
+      waitUntil: payload.waitUntil || null,
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
   const context = opts.context;
+  const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : {};
+  const fetchStartedAtMs = Date.now();
+  const logPhase = (phase, startedAtMs, extra = {}) => {
+    logSubpageFetchPhase11_(Object.assign({
+      debugRunId: phase11.debugRunId || null,
+      targetUrl: url,
+      phase,
+      startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+      completedAt: startedAtMs ? new Date().toISOString() : null,
+      durationMs: startedAtMs ? Date.now() - startedAtMs : null,
+      timeoutMs,
+      waitUntil: 'domcontentloaded',
+      errorName: null,
+      errorMessage: null
+    }, extra));
+  };
   let page = null;
   const jsErrors = [];
   const failedRequests = [];
@@ -3532,7 +3565,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       };
     }
     if (!context || typeof context.newPage !== 'function') throw new Error('missing_playwright_context');
+    const newPageStartedAtMs = Date.now();
+    logPhase('browser_new_page_start', newPageStartedAtMs, { completedAt: null, durationMs: null });
     page = await context.newPage();
+    logPhase('browser_new_page_complete', newPageStartedAtMs);
     try {
       page.setDefaultNavigationTimeout(timeoutMs);
       page.setDefaultTimeout(timeoutMs);
@@ -3561,10 +3597,22 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         });
       } catch (_) {}
     });
-    const response = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: timeoutMs
-    });
+    const gotoStartedAtMs = Date.now();
+    logPhase('goto_start', gotoStartedAtMs, { completedAt: null, durationMs: null });
+    let response = null;
+    try {
+      response = await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: timeoutMs
+      });
+      logPhase('goto_complete', gotoStartedAtMs);
+    } catch (gotoErr) {
+      logPhase('goto_error', gotoStartedAtMs, {
+        errorName: gotoErr && gotoErr.name ? String(gotoErr.name).slice(0, 80) : null,
+        errorMessage: String(gotoErr && (gotoErr.message || gotoErr) || '').slice(0, 200)
+      });
+      throw gotoErr;
+    }
     const status = response && typeof response.status === 'function' ? response.status() : null;
     const finalUrl = page && typeof page.url === 'function' ? page.url() : (response && response.url ? response.url : url);
     let finalParsed = null;
@@ -3681,6 +3729,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'content_length_too_large'
       };
     }
+    const contentStartedAtMs = Date.now();
+    logPhase('content_start', contentStartedAtMs, { completedAt: null, durationMs: null });
     const hydrationMetrics = await collectBalancedHydrationMetrics(page, 3500, { shortFastMode: false });
     let webdriverValue = '__unavailable__';
     try {
@@ -3736,6 +3786,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       await page.waitForTimeout(1000);
       waitStrategyParts.push('post_poll_wait_1000ms');
     } catch (_) {}
+    logPhase('content_complete', contentStartedAtMs);
+    const extractStartedAtMs = Date.now();
+    logPhase('extract_start', extractStartedAtMs, { completedAt: null, durationMs: null });
     const observed = await page.evaluate(() => {
       const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
       const queryAllDeep = (selector, opts = {}) => {
@@ -3905,6 +3958,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
     const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
     const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
+    logPhase('extract_complete', extractStartedAtMs);
+    logPhase('return', fetchStartedAtMs);
     return {
       url,
       finalUrl: observedFinalUrl || finalUrl || url,
@@ -3963,6 +4018,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       parseErrors
     };
   } catch (e) {
+    logPhase('return', fetchStartedAtMs, {
+      errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+      errorMessage: String(e && (e.message || e) || '').slice(0, 200)
+    });
     return {
       url,
       finalUrl: url,
@@ -3983,7 +4042,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       error: e && e.name === 'AbortError' ? 'timeout' : String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
     };
   } finally {
+    const closeStartedAtMs = Date.now();
+    logPhase('close_start', closeStartedAtMs, { completedAt: null, durationMs: null });
     try { if (page) await page.close(); } catch (_) {}
+    logPhase('close_complete', closeStartedAtMs);
   }
 }
 
@@ -5205,7 +5267,14 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           itemStartedAt = new Date().toISOString();
           itemStartedAtMs = Date.now();
           logItem('start');
-          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout: pageTimeout, context });
+          pages[index] = await fetchSubpageJsonLdLight(url, {
+            siteMode,
+            timeout: pageTimeout,
+            context,
+            phase11: {
+              debugRunId: phase11 && phase11.debugRunId
+            }
+          });
           logItem(pages[index] && pages[index].ok === false ? 'error' : 'complete', {
             completedAt: new Date().toISOString(),
             durationMs: Date.now() - itemStartedAtMs,
