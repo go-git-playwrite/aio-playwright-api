@@ -4628,6 +4628,25 @@ function logBuildGeoSignalsPhase11_(payload = {}) {
   } catch (_) {}
 }
 
+function logBuildGeoSignalsSummaryPhase11_(payload = {}) {
+  try {
+    console.log('[DEBUG][BUILD_GEO_SIGNALS_SUMMARY_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      url: String(payload.url || '').slice(0, 240),
+      origin: String(payload.origin || '').slice(0, 180),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      mode: payload.mode || null,
+      signalsMode: payload.signalsMode || null,
+      detail: payload.detail && typeof payload.detail === 'object' ? payload.detail : {},
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 function logSubpageObservationItemPhase11_(payload = {}) {
   try {
     console.log('[DEBUG][SUBPAGE_OBSERVATION_ITEM_PHASE11]', JSON.stringify({
@@ -7472,6 +7491,47 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       durationMs: null,
       detail: { source: 'node_summary_assembly' }
     });
+    const logSummaryPhase = (phase, phaseStartedAt, extra = {}) => {
+      const completedAt = extra && Object.prototype.hasOwnProperty.call(extra, 'completedAt')
+        ? extra.completedAt
+        : new Date().toISOString();
+      const durationMs = typeof extra.durationMs === 'number'
+        ? extra.durationMs
+        : (typeof phaseStartedAt === 'number' && completedAt ? Math.max(0, Date.now() - phaseStartedAt) : null);
+      logBuildGeoSignalsSummaryPhase11_(Object.assign({
+        debugRunId,
+        url: phase11Url,
+        origin: phase11Origin,
+        phase,
+        startedAt: typeof phaseStartedAt === 'number' ? new Date(phaseStartedAt).toISOString() : phaseStartedAt,
+        completedAt,
+        durationMs,
+        mode: phase11Mode,
+        signalsMode: phase11SignalsMode
+      }, extra || {}));
+    };
+    logSummaryPhase('summary_start', summaryBuildStartedAt, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        linkCount: observedPhaseDetail.linkCount,
+        navTextCount: observedPhaseDetail.navTextCount,
+        imageCount: observedPhaseDetail.imageCount,
+        textLength: observedPhaseDetail.textLength,
+        jsonLdCount: observedPhaseDetail.jsonLdCount
+      }
+    });
+    const textSummaryStartedAt = Date.now();
+    logSummaryPhase('build_text_summary_start', textSummaryStartedAt, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        h1Count: Array.isArray(observed.h1) ? observed.h1.length : null,
+        h2Count: Array.isArray(observed.h2) ? observed.h2.length : null,
+        h3Count: Array.isArray(observed.h3) ? observed.h3.length : null,
+        textLength: observedPhaseDetail.textLength
+      }
+    });
     const normalizeHeadingText = (v) => String(v || '').replace(/\s+/g, ' ').trim();
     const uniqueHeadingTexts = (arr, limitCount) => {
       const out = [];
@@ -7554,6 +7614,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     if (shortFastMode) {
       a11yHeadings.error = 'skipped_short_fast';
     } else {
+      const a11yHeadingStartedAt = Date.now();
+      logSummaryPhase('build_text_a11y_heading_start', a11yHeadingStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        detail: { source: 'page_get_by_role_heading' }
+      });
       try {
         const allText = await page.getByRole('heading').allTextContents().catch(() => []);
         const h1Text = await page.getByRole('heading', { level: 1 }).allTextContents().catch(() => []);
@@ -7566,6 +7632,22 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         a11yHeadings.observed = true;
       } catch (e) {
         a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+        logSummaryPhase('build_text_a11y_heading_complete', a11yHeadingStartedAt, {
+          detail: { source: 'page_get_by_role_heading' },
+          errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+      }
+      if (a11yHeadings.observed || !a11yHeadings.error) {
+        logSummaryPhase('build_text_a11y_heading_complete', a11yHeadingStartedAt, {
+          detail: {
+            source: 'page_get_by_role_heading',
+            h1Count: a11yHeadings.h1.length,
+            h2Count: a11yHeadings.h2.length,
+            h3Count: a11yHeadings.h3.length,
+            allCount: a11yHeadings.all.length
+          }
+        });
       }
     }
     const filteredDomH1 = filterHeadingTexts(domH1);
@@ -7696,6 +7778,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     if (shortFastMode) {
       a11yMain.error = 'skipped_short_fast';
     } else {
+      const a11yMainStartedAt = Date.now();
+      logSummaryPhase('build_text_a11y_main_start', a11yMainStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        detail: { source: 'page_get_by_role_main' }
+      });
       try {
         const mainLocator = page.getByRole('main');
         const mainTexts = await mainLocator.allTextContents().catch(() => []);
@@ -7704,6 +7792,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         a11yMain.observed = true;
       } catch (e) {
         a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+        logSummaryPhase('build_text_a11y_main_complete', a11yMainStartedAt, {
+          detail: { source: 'page_get_by_role_main' },
+          errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+      }
+      if (a11yMain.observed || !a11yMain.error) {
+        logSummaryPhase('build_text_a11y_main_complete', a11yMainStartedAt, {
+          detail: {
+            source: 'page_get_by_role_main',
+            mainTextCount: a11yMain.count
+          }
+        });
       }
     }
     const hasDomMain = domLandmarks.hasMainLandmark === true;
@@ -7727,7 +7828,28 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       ? true
       : null;
     const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
+    logSummaryPhase('build_text_summary_complete', textSummaryStartedAt, {
+      detail: {
+        h1Count: mergedH1.length,
+        h2Count: mergedH2.length,
+        h3Count: mergedH3.length,
+        headingTextsCount: headingTextsMerged.length,
+        h1Source,
+        a11yHeadingObserved: !!a11yHeadings.observed,
+        a11yMainObserved: !!a11yMain.observed,
+        a11yMainCount: a11yMain.count
+      }
+    });
     const structuredDataStart = Date.now();
+    logSummaryPhase('build_schema_summary_start', structuredDataStart, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        balancedMode,
+        renderedJsonLdCount: observedPhaseDetail.jsonLdCount,
+        jsonLdTypesCount: observedPhaseDetail.jsonLdTypesCount
+      }
+    });
     logBuildPhase('jsonld_collect_start', structuredDataStart, {
       completedAt: null,
       durationMs: null,
@@ -7895,6 +8017,28 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
       htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
+
+    logSummaryPhase('build_schema_summary_complete', structuredDataStart, {
+      detail: {
+        rawCount: structuredDataLight.rawCount,
+        parseableCount: structuredDataLight.parseableCount,
+        jsonLdTypesCount: Array.isArray(structuredDataLight.types) ? structuredDataLight.types.length : null,
+        hasJsonLd: structuredDataLight.hasJsonLd,
+        hasSeoJsonLd: structuredDataLight.hasSeoJsonLd,
+        structuredDataMs: phaseTimings.structuredDataMs
+      }
+    });
+    const finalAssemblyStartedAt = Date.now();
+    logSummaryPhase('final_assembly_start', finalAssemblyStartedAt, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        linkCount: observedPhaseDetail.linkCount,
+        navTextCount: observedPhaseDetail.navTextCount,
+        textLength: observedPhaseDetail.textLength,
+        imageCount: observedPhaseDetail.imageCount
+      }
+    });
 
     const geoSignalsV1 = {
       version: 'geoSignalsV1',
@@ -8250,10 +8394,32 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         })
       }
     };
+    logSummaryPhase('final_assembly_complete', finalAssemblyStartedAt, {
+      detail: {
+        linkCount: geoSignalsV1.observed && geoSignalsV1.observed.links && Array.isArray(geoSignalsV1.observed.links.internalLinksSample)
+          ? geoSignalsV1.observed.links.internalLinksSample.length
+          : null,
+        navTextCount: geoSignalsV1.observed && geoSignalsV1.observed.links && Array.isArray(geoSignalsV1.observed.links.navTextsSample)
+          ? geoSignalsV1.observed.links.navTextsSample.length
+          : null,
+        textLength: geoSignalsV1.observed && geoSignalsV1.observed.body && geoSignalsV1.observed.body.textLength,
+        jsonLdCount: geoSignalsV1.observed && geoSignalsV1.observed.structuredData && geoSignalsV1.observed.structuredData.rawCount
+      }
+    });
     logBuildPhase('summary_build_complete', summaryBuildStartedAt, {
       detail: {
         h1Count: geoSignalsV1.headings && geoSignalsV1.headings.h1Count,
         h2Count: geoSignalsV1.headings && geoSignalsV1.headings.h2Count,
+        jsonLdCount: geoSignalsV1.observed && geoSignalsV1.observed.structuredData && geoSignalsV1.observed.structuredData.rawCount,
+        linkCount: geoSignalsV1.observed && geoSignalsV1.observed.links && Array.isArray(geoSignalsV1.observed.links.internalLinksSample)
+          ? geoSignalsV1.observed.links.internalLinksSample.length
+          : null,
+        textLength: geoSignalsV1.observed && geoSignalsV1.observed.body && geoSignalsV1.observed.body.textLength
+      }
+    });
+    logSummaryPhase('summary_complete', summaryBuildStartedAt, {
+      detail: {
+        h1Count: geoSignalsV1.headings && geoSignalsV1.headings.h1Count,
         jsonLdCount: geoSignalsV1.observed && geoSignalsV1.observed.structuredData && geoSignalsV1.observed.structuredData.rawCount,
         linkCount: geoSignalsV1.observed && geoSignalsV1.observed.links && Array.isArray(geoSignalsV1.observed.links.internalLinksSample)
           ? geoSignalsV1.observed.links.internalLinksSample.length
