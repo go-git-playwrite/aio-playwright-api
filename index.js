@@ -3498,9 +3498,11 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
 // Render check:
 // curl -sS -X POST "https://aio-playwright-api-2.onrender.com/discover-subpage-candidates-light" -H "content-type: application/json" --max-time 180 -d '{"topUrl":"https://www.fork.co.jp/","limit":20}' | jq
 
+const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
+
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
-  const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
   const context = opts.context;
   let page = null;
   const jsErrors = [];
@@ -4875,7 +4877,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     });
     const observed = await withSubpageTimeout(observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
-      timeout: 8000,
+      timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
       concurrency: reuseContextForObserve ? 1 : 3,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
