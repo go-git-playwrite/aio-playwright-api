@@ -4700,8 +4700,9 @@ function getCoverageRepresentativePriority_(page) {
   const path = (() => {
     try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
   })();
-  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 0;
-  if (/\/(?:business|service|services|solution|solutions|case|works|collections|faq|guide|support|cycle-support|ranking|shop|shops|store|stores|maintenance|uketori|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
+  if (/\/(?:business|service|services|solution|solutions|case|works|collections|faq|guide|support|cycle-support|ranking|shop|shops|store|stores|maintenance|uketori|products|product|recruit|career|careers)(?:\/|$|-|_)/i.test(path)) return 0;
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 1;
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 3;
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
   return 2;
 }
@@ -4731,6 +4732,33 @@ function sortCoverageObserveCandidates_(candidates) {
     if (aScore !== bScore) return bScore - aScore;
     return String(a && a.url || '').localeCompare(String(b && b.url || ''));
   });
+}
+
+function getCoverageRepresentativeRejectReason_(candidate) {
+  const url = String(candidate && candidate.url || '');
+  const path = getCoverageCandidatePath_(candidate).toLowerCase();
+  const source = String(candidate && candidate.source || '').toLowerCase();
+  const sources = Array.isArray(candidate && candidate.sources)
+    ? candidate.sources.map(item => String(item || '').toLowerCase()).filter(Boolean)
+    : (source ? [source] : []);
+  const hasSource = (name) => sources.includes(String(name || '').toLowerCase());
+  const pageType = getCoverageCandidatePageType_(candidate);
+  if (!url || !path || path === '/') return 'top_or_empty_path';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path) || pageType === 'legal' || pageType === 'sitemap') return 'legal_or_utility_path';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path) || pageType === 'contact') return 'contact_only_path';
+  if (/\/(?:cart|account|accounts|login|signin|sign-in|mypage|my-page|auth|search)(?:\/|$|-|_)/i.test(path)) return 'auth_or_utility_path';
+  if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?)(?:$|[?#])/i.test(url)) return 'asset_or_document_url';
+  if (source === 'footer' && sources.length === 1) return 'footer_only_source';
+  if (!hasSource('nav') && !hasSource('sitemap') && !hasSource('htmlsitemap')) return 'non_primary_source';
+  return '';
+}
+
+function isCoverageRepresentativeCandidate_(candidate) {
+  return !getCoverageRepresentativeRejectReason_(candidate);
+}
+
+function filterCoverageRepresentativeCandidates_(candidates) {
+  return (Array.isArray(candidates) ? candidates : []).filter(isCoverageRepresentativeCandidate_);
 }
 
 function getCoverageCandidatePageType_(candidate) {
@@ -4780,7 +4808,7 @@ function buildCoverageCandidatePageTypes_(candidates) {
 }
 
 function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 2) {
-  return sortCoverageObserveCandidates_(Array.isArray(candidates) ? candidates : [])
+  return sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(candidates))
     .slice(0, Math.max(0, Math.min(10, Number(limit || 2) || 2)))
     .map(candidate => {
       const url = String(candidate && candidate.url || '');
@@ -5699,7 +5727,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       debugRunId: phase11DebugRunId
     }), subpageGuardMs, 'subpage_discovery');
     lastDiscoveredForCoverage = discovered;
-    const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const allPrioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const prioritizedCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(discovered.candidates));
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
@@ -5715,11 +5744,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'representative_select_start',
       source: 'coverage',
       reason: 'coverage observe candidate selection',
-      beforeCount: prioritizedCandidates.length,
+      beforeCount: allPrioritizedCandidates.length,
       afterCount: selectedCandidates.length
     });
-    prioritizedCandidates.slice(0, 50).forEach((candidate, index) => {
+    allPrioritizedCandidates.slice(0, 50).forEach((candidate, index) => {
       const selected = selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || ''));
+      const rejectReason = selected
+        ? null
+        : (getCoverageRepresentativeRejectReason_(candidate) || 'lower_representative_priority');
       logCandidateGenerationPhase11_(candidateAudit, {
         origin: normalized.origin,
         url: candidate && candidate.url,
@@ -5734,8 +5766,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
         added: selected,
         rejected: !selected,
-        rejectReason: selected ? null : 'lower_representative_priority',
-        beforeCount: prioritizedCandidates.length,
+        rejectReason,
+        beforeCount: allPrioritizedCandidates.length,
         afterCount: selectedCandidates.length
       });
     });
@@ -5745,7 +5777,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'representative_select_complete',
       source: 'coverage',
       reason: 'coverage observe candidate selection complete',
-      beforeCount: prioritizedCandidates.length,
+      beforeCount: allPrioritizedCandidates.length,
       afterCount: selectedCandidates.length
     });
     logSubpageCandidateDiscoveryAudit_({
@@ -5759,8 +5791,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       hasSubpageSignals: !!(geoSignalsV1 && geoSignalsV1.subpageSignals)
     });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
-    const skippedUtilityPaths = prioritizedCandidates
-      .slice(maxObserve)
+    const skippedUtilityPaths = allPrioritizedCandidates
+      .filter(candidate => !selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || '')))
       .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
       .map(getCoverageCandidatePath_)
       .filter(Boolean)
