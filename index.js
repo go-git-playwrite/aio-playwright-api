@@ -3134,6 +3134,19 @@ function logCandidateGenerationPhase11_(audit, payload = {}) {
     const path = payload.path || (() => {
       try { return new URL(rawUrl).pathname || ''; } catch (_) { return ''; }
     })();
+    const canonicalPageFamily = payload.canonicalPageFamily || (() => {
+      try {
+        return getCoverageCanonicalPageFamily_({
+          url: rawUrl,
+          path,
+          pageType: payload.pageType,
+          text: payload.text,
+          _text: payload.text
+        });
+      } catch (_) {
+        return '';
+      }
+    })();
     console.log('[DEBUG][CANDIDATE_GENERATION_PHASE11]', JSON.stringify({
       debugRunId: audit && audit.debugRunId || payload.debugRunId || null,
       origin: String(payload.origin || '').slice(0, 180),
@@ -3142,6 +3155,7 @@ function logCandidateGenerationPhase11_(audit, payload = {}) {
       source: String(payload.source || '').slice(0, 80),
       path: String(path || '').slice(0, 160),
       pageType: String(payload.pageType || '').slice(0, 80),
+      canonicalPageFamily: String(canonicalPageFamily || '').slice(0, 80),
       href: String(payload.href || '').slice(0, 240),
       text: sampleDiscoverLinkText_(payload.text),
       score: typeof payload.score === 'number' ? payload.score : null,
@@ -3258,6 +3272,7 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
     }
     existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources);
     existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    if (!existing._text && meta && meta.text) existing._text = sampleDiscoverLinkText_(meta.text);
     if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
     logCandidateGenerationPhase11_(audit, {
       origin,
@@ -3284,7 +3299,8 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
     source,
     sources: [source],
     score: scoreDiscoverSubpageCandidate(url, source, [source]),
-    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason
+    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason,
+    _text: meta && meta.text ? sampleDiscoverLinkText_(meta.text) : ''
   };
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
@@ -4695,16 +4711,51 @@ function isCoverageSignalsAboutPath_(value) {
   return /\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path);
 }
 
+function getCoverageCandidateText_(candidate) {
+  return String(candidate && (candidate._text || candidate.text || candidate.label || candidate.anchorText || candidate.reason) || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function getCoverageCanonicalPageFamily_(candidate) {
+  const path = getCoverageCandidatePath_(candidate).toLowerCase();
+  const text = getCoverageCandidateText_(candidate);
+  const haystack = `${path} ${text}`;
+  const pageType = getCoverageCandidatePageType_(candidate);
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path) || /プライバシー|規約|法務|セキュリティ|サイトマップ|privacy|policy|terms|legal|security|sitemap/i.test(haystack) || pageType === 'legal' || pageType === 'sitemap') return 'legal';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path) || /問い合わせ|お問い合わせ|contact|inquiry/i.test(haystack) || pageType === 'contact') return 'contact';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path) || /採用|求人|recruit|career|jobs/i.test(haystack) || pageType === 'recruit') return 'recruit';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path) || /事業|business/i.test(haystack) || pageType === 'business') return 'business';
+  if (/\/(?:service|services|solution|solutions|plan|plans|flow|features?)(?:\/|$|-|_)/i.test(path) || /サービス|料金|申し込み|申込|流れ|プラン|機能|service|solution|plan|flow|feature/i.test(haystack) || pageType === 'service') return 'service';
+  if (/\/(?:support|cycle-support|help)(?:\/|$|-|_)/i.test(path) || /サポート|ヘルプ|support|help/i.test(haystack) || pageType === 'support') return 'support';
+  if (/\/(?:shop|shops|store|stores|maintenance|uketori|products|product|collections)(?:\/|$|-|_)/i.test(path) || /商品|製品|店舗|ショップ|ストア|受取|メンテ|products?|store|shop|collection/i.test(haystack) || pageType === 'store' || pageType === 'category') return 'store';
+  if (/\/(?:faq)(?:\/|$|-|_)/i.test(path) || /よくある質問|faq/i.test(haystack) || pageType === 'faq') return 'support';
+  if (/\/(?:guide|guides|shopping-guide|user-guide)(?:\/|$|-|_)/i.test(path) || /ガイド|guide/i.test(haystack) || pageType === 'guide') return 'guide';
+  if (/\/(?:blogs\/news|news|topics|blog|column)(?:\/|$|-|_)/i.test(path) || /お知らせ|ニュース|news|topics|blog|column/i.test(haystack) || pageType === 'news') return 'news';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path) || /事例|実績|works|case|portfolio|project/i.test(haystack) || pageType === 'case') return 'business';
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path) || /会社|企業|概要|about|company|corporate|profile/i.test(haystack) || pageType === 'about') return 'about';
+  return pageType && pageType !== 'unknown' ? pageType : 'unknown';
+}
+
+function getCoverageCanonicalFamilyPriority_(family) {
+  const priority = {
+    business: 0,
+    service: 0,
+    support: 0,
+    store: 0,
+    guide: 0,
+    news: 0,
+    about: 1,
+    recruit: 2,
+    contact: 4,
+    legal: 5
+  };
+  return Object.prototype.hasOwnProperty.call(priority, family) ? priority[family] : 3;
+}
+
 function getCoverageRepresentativePriority_(page) {
-  const raw = String(page && (page.finalUrl || page.url || page.path) || '').toLowerCase();
-  const path = (() => {
-    try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
-  })();
-  if (/\/(?:business|service|services|solution|solutions|case|works|collections|faq|guide|support|cycle-support|ranking|shop|shops|store|stores|maintenance|uketori|products|product|recruit|career|careers)(?:\/|$|-|_)/i.test(path)) return 0;
-  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 1;
-  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 3;
-  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
-  return 2;
+  return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page));
 }
 
 function getCoverageCandidatePath_(candidate) {
@@ -4742,10 +4793,10 @@ function getCoverageRepresentativeRejectReason_(candidate) {
     ? candidate.sources.map(item => String(item || '').toLowerCase()).filter(Boolean)
     : (source ? [source] : []);
   const hasSource = (name) => sources.includes(String(name || '').toLowerCase());
-  const pageType = getCoverageCandidatePageType_(candidate);
+  const family = getCoverageCanonicalPageFamily_(candidate);
   if (!url || !path || path === '/') return 'top_or_empty_path';
-  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path) || pageType === 'legal' || pageType === 'sitemap') return 'legal_or_utility_path';
-  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path) || pageType === 'contact') return 'contact_only_path';
+  if (family === 'legal') return 'legal_or_utility_path';
+  if (family === 'contact') return 'contact_only_path';
   if (/\/(?:cart|account|accounts|login|signin|sign-in|mypage|my-page|auth|search)(?:\/|$|-|_)/i.test(path)) return 'auth_or_utility_path';
   if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?)(?:$|[?#])/i.test(url)) return 'asset_or_document_url';
   if (source === 'footer' && sources.length === 1) return 'footer_only_source';
@@ -4817,6 +4868,7 @@ function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 
         url,
         path,
         pageType: getCoverageCandidatePageType_(candidate),
+        canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
         source: String(candidate && candidate.source || ''),
         sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 8) : [],
         score: Number(candidate && candidate.score || 0) || 0,
@@ -4997,6 +5049,11 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         finalUrl,
         path,
         pageType,
+        canonicalPageFamily: getCoverageCanonicalPageFamily_(Object.assign({}, candidate, {
+          url: finalUrl || page.url || '',
+          path,
+          pageType
+        })),
         source: candidate.source || '',
         score: Number(candidate.score || 0) || 0,
         candidateOnly: false,
@@ -5085,6 +5142,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
       pageType: page && page.pageType || '',
+      canonicalPageFamily: page && page.canonicalPageFamily || getCoverageCanonicalPageFamily_(page),
       source: page && page.source || '',
       candidateOnly: page && page.candidateOnly === true,
       reached: page && page.reached === true,
