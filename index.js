@@ -4032,6 +4032,14 @@ function getCoverageCandidatePath_(candidate) {
   try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
 }
 
+function normalizeCoveragePathKey_(value) {
+  const path = (() => {
+    try { return new URL(String(value || '')).pathname || '/'; } catch (_) { return String(value || ''); }
+  })();
+  const normalized = String(path || '').split('?')[0].split('#')[0].replace(/\/+$/, '');
+  return normalized || '/';
+}
+
 function sortCoverageObserveCandidates_(candidates) {
   return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
     const aPriority = getCoverageRepresentativePriority_(a);
@@ -4225,9 +4233,11 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
   const candidateByUrl = new Map();
+  const candidateByPath = new Map();
   candidates.forEach(candidate => {
     if (!candidate || !candidate.url) return;
     candidateByUrl.set(String(candidate.url), candidate);
+    candidateByPath.set(normalizeCoveragePathKey_(candidate.url), candidate);
   });
   const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
     ? payload.candidateSummary.sourceSummary
@@ -4261,7 +4271,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   };
   const observedRepresentativePages = observedPages
     .map(page => {
-      const candidate = candidateByUrl.get(String(page.url || '')) || {};
+      const candidate = candidateByUrl.get(String(page.url || '')) ||
+        candidateByUrl.get(String(page.finalUrl || '')) ||
+        candidateByPath.get(normalizeCoveragePathKey_(page.finalUrl || page.url || '')) ||
+        {};
       const finalUrl = page.finalUrl || page.url || '';
       const path = (() => {
         try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
@@ -4270,9 +4283,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
       const candidatePageType = getCoverageCandidatePageType_(candidate);
       const observedPageType = normalizeSubpageJsonLdText(page.pageType);
-      const pageType = observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail'
-        ? observedPageType
-        : (candidatePageType && candidatePageType !== 'unknown' ? candidatePageType : observedPageType || '');
+      const pageType = candidatePageType && candidatePageType !== 'unknown'
+        ? candidatePageType
+        : (observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail' ? observedPageType : observedPageType || '');
       return {
         url: page.url || '',
         finalUrl,
@@ -5231,9 +5244,11 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           });
           const observedPageType = normalizeSubpageJsonLdText(observedPage && observedPage.pageType);
           pages[index] = Object.assign({}, observedPage || {}, {
-            pageType: observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail'
-              ? observedPageType
-              : candidatePageTypeOrInferred
+            pageType: candidatePageType && candidatePageType !== 'unknown'
+              ? candidatePageType
+              : (observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail'
+                ? observedPageType
+                : candidatePageTypeOrInferred)
           });
           logItem(pages[index] && pages[index].ok === false ? 'error' : 'complete', {
             completedAt: new Date().toISOString(),
