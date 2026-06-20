@@ -3732,7 +3732,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     }
     const contentStartedAtMs = Date.now();
     logPhase('content_start', contentStartedAtMs, { completedAt: null, durationMs: null });
-    const hydrationMetrics = await collectBalancedHydrationMetrics(page, 3500, { shortFastMode: false });
+    const hydrationMetrics = null;
     let webdriverValue = '__unavailable__';
     try {
       const rawWebdriverValue = await page.evaluate(() => navigator.webdriver);
@@ -3740,93 +3740,45 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     } catch (_) {}
     const waitStartedAt = Date.now();
     const waitStrategyParts = [];
-    try {
-      await page.waitForLoadState('networkidle', { timeout: Math.min(1800, Math.max(800, timeoutMs - 1000)) });
-      waitStrategyParts.push('networkidle');
-    } catch (_) {
-      waitStrategyParts.push('networkidle_timeout');
-    }
     const countJsonLdScripts = async () => page.evaluate(() => {
-      const queryAllDeep = (selector, opts = {}) => {
-        const out = [];
-        const seen = new Set();
-        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
-        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
-        const walk = (root, depth = 0) => {
-          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
-          try {
-            Array.from(root.querySelectorAll(selector)).forEach((el) => {
-              if (!el || seen.has(el) || out.length >= maxNodes) return;
-              seen.add(el);
-              out.push(el);
-            });
-            Array.from(root.querySelectorAll('*')).forEach((el) => {
-              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
-            });
-          } catch (_) {}
-        };
-        walk(document, 0);
-        return out;
-      };
       return {
         domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
-        deepJsonLdScriptCount: queryAllDeep('script[type*="ld+json" i]', { maxNodes: 80 }).length
+        deepJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length
       };
     }).catch(() => ({ domJsonLdScriptCount: 0, deepJsonLdScriptCount: 0 }));
     let jsonLdCountProbe = await countJsonLdScripts();
     const pollStartedAt = Date.now();
     while (
       Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) <= 0 &&
-      Date.now() - pollStartedAt < 2500
+      Date.now() - pollStartedAt < 2000
     ) {
       try { await page.waitForTimeout(250); } catch (_) {}
       jsonLdCountProbe = await countJsonLdScripts();
     }
     waitStrategyParts.push(Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) > 0 ? 'jsonld_poll_found' : 'jsonld_poll_timeout');
     try {
-      await page.waitForTimeout(1000);
-      waitStrategyParts.push('post_poll_wait_1000ms');
+      await page.waitForTimeout(500);
+      waitStrategyParts.push('post_poll_wait_500ms');
     } catch (_) {}
     logPhase('content_complete', contentStartedAtMs);
     const extractStartedAtMs = Date.now();
     logPhase('extract_start', extractStartedAtMs, { completedAt: null, durationMs: null });
     const observed = await page.evaluate(() => {
       const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-      const queryAllDeep = (selector, opts = {}) => {
-        const out = [];
-        const seen = new Set();
-        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
-        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
-        const walk = (root, depth = 0) => {
-          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
-          try {
-            Array.from(root.querySelectorAll(selector)).forEach((el) => {
-              if (!el || seen.has(el) || out.length >= maxNodes) return;
-              seen.add(el);
-              out.push(el);
-            });
-            Array.from(root.querySelectorAll('*')).forEach((el) => {
-              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
-            });
-          } catch (_) {}
-        };
-        walk(document, 0);
-        return out;
-      };
       const h1Texts = [];
-      queryAllDeep('h1', { maxNodes: 50 }).forEach((el) => {
+      Array.from(document.querySelectorAll('h1')).slice(0, 5).forEach((el) => {
         const text = clean(el.innerText || el.textContent);
         if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
       });
       const h2Sample = [];
-      queryAllDeep('h2', { maxNodes: 80 }).forEach((el) => {
+      Array.from(document.querySelectorAll('h2')).slice(0, 5).forEach((el) => {
         const text = clean(el.innerText || el.textContent);
         if (text && !h2Sample.includes(text) && h2Sample.length < 5) h2Sample.push(text.slice(0, 160));
       });
-      const jsonldTexts = queryAllDeep('script[type*="ld+json" i]', { maxNodes: 50 })
+      const jsonldTexts = Array.from(document.querySelectorAll('script[type*="ld+json" i]')).slice(0, 20)
         .map(el => String(el.textContent || '').trim())
         .filter(Boolean);
-      const breadcrumbCandidates = queryAllDeep([
+      const breadcrumbCandidates = Array.from(document.querySelectorAll([
         'nav[aria-label*="breadcrumb" i]',
         '[aria-label*="パンくず"]',
         '.breadcrumb',
@@ -3836,10 +3788,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         '[class*="breadcrumbs" i]',
         '[id*="breadcrumbs" i]',
         '[class*="pankuzu" i]',
-        '[id*="pankuzu" i]',
-        'ol',
-        'ul'
-      ].join(','), { maxNodes: 200 });
+        '[id*="pankuzu" i]'
+      ].join(','))).slice(0, 40);
       let hasBreadcrumbUi = false;
       for (const el of breadcrumbCandidates) {
         const attrs = [
@@ -3861,8 +3811,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       const ogTitle = clean((document.querySelector('meta[property="og:title" i]') || {}).content || '').slice(0, 180);
       const ogDescription = clean((document.querySelector('meta[property="og:description" i]') || {}).content || '').slice(0, 240);
       const ogImageExists = !!clean((document.querySelector('meta[property="og:image" i]') || {}).content || '');
-      const mainCandidates = queryAllDeep('main,[role="main"]', { maxNodes: 20 });
-      const anchorEls = queryAllDeep('a[href]', { maxNodes: 1200 });
+      const mainCandidates = Array.from(document.querySelectorAll('main,[role="main"]')).slice(0, 5);
+      const anchorEls = Array.from(document.querySelectorAll('a[href]')).slice(0, 200);
       let internalLinkCount = 0;
       let externalLinkCount = 0;
       anchorEls.forEach((a) => {
@@ -3874,26 +3824,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           else externalLinkCount += 1;
         } catch (_) {}
       });
-      let sampledText = '';
-      try {
-        const clone = document.body ? document.body.cloneNode(true) : null;
-        if (clone && clone.querySelectorAll) {
-          clone.querySelectorAll('script,style,noscript,svg,nav,footer').forEach(el => el.remove());
-          sampledText = clean(clone.innerText || clone.textContent || '').slice(0, 500);
-        }
-      } catch (_) {}
-      if (!sampledText) {
-        const textParts = [];
-        queryAllDeep('main,[role="main"],article,section,p,li', { maxNodes: 160 }).forEach((el) => {
-          if (textParts.join(' ').length >= 600) return;
-          const text = clean(el.innerText || el.textContent);
-          if (text && text.length >= 12 && !textParts.includes(text)) textParts.push(text);
-        });
-        sampledText = clean(textParts.join(' ')).slice(0, 500);
-      }
-      if (!sampledText) sampledText = clean((document.body && document.body.innerText) || '').slice(0, 500);
-      const allNodes = Array.from(document.querySelectorAll('*')).slice(0, 3000);
-      const shadowHostCount = allNodes.filter(el => !!el.shadowRoot).length;
+      const sampleEl = document.querySelector('main,[role="main"],article') || document.body;
+      const sampledText = clean((sampleEl && (sampleEl.innerText || sampleEl.textContent)) || '').slice(0, 500);
+      const shadowHostCount = 0;
       return {
         finalUrl: location.href,
         readyState: document.readyState || '',
@@ -3912,7 +3845,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         nuxtDataExists: !!(window.__NUXT__ || document.querySelector('#__NUXT_DATA__')),
         shadowHostCount,
         bodyTextLength: String((document.body && document.body.innerText) || '').length,
-        h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
+        h1Count: document.querySelectorAll('h1').length,
         h1Texts,
         h2Sample,
         jsonldTexts,
@@ -3922,7 +3855,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         internalLinkCount,
         externalLinkCount,
         sampledText,
-        htmlLength: String((document.documentElement && document.documentElement.outerHTML) || '').length
+        htmlLength: 0
       };
     });
     if (Number(observed && observed.htmlLength || 0) > maxHtmlBytes) {
