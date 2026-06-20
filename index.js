@@ -4688,6 +4688,7 @@ function logMemoryGuardPhase11_(payload = {}) {
       memoryGuardTriggered: payload.memoryGuardTriggered === true,
       fallbackReason: payload.fallbackReason || null,
       reason: payload.reason || null,
+      hostGuardBypassed: payload.hostGuardBypassed === true,
       beforeCoverageAttach: payload.beforeCoverageAttach === true,
       beforeSubpageObservation: payload.beforeSubpageObservation === true,
       hasGeoSignalsV1: payload.hasGeoSignalsV1 === true,
@@ -4998,20 +4999,25 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   const normalizedHost = (() => {
     try { return new URL(String(normalized && normalized.topUrl || topUrl || '')).hostname.toLowerCase(); } catch (_) { return ''; }
   })();
+  const hostMemoryGuardMatched = memoryGuardHosts.includes(normalizedHost);
+  const bypassHostMemoryGuardForSignalsLight = hostMemoryGuardMatched && phase11SignalsMode === 'light';
   const memoryGuardEvalStartedAt = Date.now();
   logCoverageMemoryGuard('memory_guard_eval_start', memoryGuardEvalStartedAt, {
     beforeCoverageAttach: true,
     reason: 'host_pre_response_memory_guard_check',
     threshold: null
   });
-  const shouldSkipSubpageForMemoryGuard = memoryGuardHosts.includes(normalizedHost);
+  const shouldSkipSubpageForMemoryGuard = hostMemoryGuardMatched && !bypassHostMemoryGuardForSignalsLight;
   logCoverageMemoryGuard('memory_guard_eval_complete', memoryGuardEvalStartedAt, {
     beforeCoverageAttach: true,
     memoryGuardTriggered: shouldSkipSubpageForMemoryGuard,
     fallbackReason: shouldSkipSubpageForMemoryGuard ? 'pre_response_memory_guard' : null,
-    reason: shouldSkipSubpageForMemoryGuard
-      ? 'host_pre_response_memory_guard_match'
-      : 'host_pre_response_memory_guard_not_matched',
+    reason: bypassHostMemoryGuardForSignalsLight
+      ? 'host_pre_response_memory_guard_bypassed_for_signals_light'
+      : (shouldSkipSubpageForMemoryGuard
+        ? 'host_pre_response_memory_guard_match'
+        : 'host_pre_response_memory_guard_not_matched'),
+    hostGuardBypassed: bypassHostMemoryGuardForSignalsLight,
     threshold: null
   });
   let lastDiscoveredForCoverage = null;
