@@ -3904,6 +3904,25 @@ function getCoverageRepresentativePriority_(page) {
   return 2;
 }
 
+function getCoverageCandidatePath_(candidate) {
+  try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
+}
+
+function sortCoverageObserveCandidates_(candidates) {
+  return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
+    const aPriority = getCoverageRepresentativePriority_(a);
+    const bPriority = getCoverageRepresentativePriority_(b);
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    const aSources = Array.isArray(a && a.sources) ? a.sources.length : (a && a.source ? 1 : 0);
+    const bSources = Array.isArray(b && b.sources) ? b.sources.length : (b && b.source ? 1 : 0);
+    if (aSources !== bSources) return bSources - aSources;
+    const aScore = Number(a && a.score || 0);
+    const bScore = Number(b && b.score || 0);
+    if (aScore !== bScore) return bScore - aScore;
+    return String(a && a.url || '').localeCompare(String(b && b.url || ''));
+  });
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -4103,7 +4122,24 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       context: opts && opts.context,
       reuseBrowser: reusePageForDiscover || reuseContextForObserve
     });
-    const selectedCandidates = discovered.candidates.slice(0, maxObserve);
+    const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
+    const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    const skippedUtilityPaths = prioritizedCandidates
+      .slice(maxObserve)
+      .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
+      .map(getCoverageCandidatePath_)
+      .filter(Boolean)
+      .slice(0, 10);
+    try {
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_OBSERVE_SELECTION]', JSON.stringify({
+        url: normalized.topUrl,
+        maxObserve,
+        selectedPaths,
+        skippedUtilityPaths,
+        candidateCount: discovered.totalCandidates
+      }));
+    } catch (_) {}
     traceCoverageMemory('discover_after', {
       browserCreated: !reusePageForDiscover,
       contextCreated: true,
@@ -10978,7 +11014,7 @@ async function scrapeOnce(req, res) {
         page,
         context,
         reuseBrowser: true,
-        maxObserve: 3
+        maxObserve: 2
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
