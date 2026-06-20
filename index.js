@@ -4268,10 +4268,19 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       })();
       const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
       const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      const candidatePageType = getCoverageCandidatePageType_(candidate);
+      const observedPageType = normalizeSubpageJsonLdText(page.pageType);
+      const pageType = observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail'
+        ? observedPageType
+        : (candidatePageType && candidatePageType !== 'unknown' ? candidatePageType : observedPageType || '');
       return {
         url: page.url || '',
         finalUrl,
         path,
+        pageType,
+        source: candidate.source || '',
+        score: Number(candidate.score || 0) || 0,
+        candidateOnly: false,
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
@@ -4471,6 +4480,13 @@ function inferSubpageSignalsPageType_(page) {
   if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
   if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
   if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:faq)(?:\/|$|-|_)/i.test(path)) return 'faq';
+  if (/\/(?:guide|guides|shopping-guide|user-guide)(?:\/|$|-|_)/i.test(path)) return 'guide';
+  if (/\/(?:blogs\/news|news)(?:\/|$|-|_)/i.test(path)) return 'news';
+  if (/\/(?:collections)(?:\/|$|-|_)/i.test(path)) return 'category';
+  if (/\/(?:ranking|rankings)(?:\/|$|-|_)/i.test(path)) return 'ranking';
+  if (/\/(?:support|cycle-support|help)(?:\/|$|-|_)/i.test(path)) return 'support';
+  if (/\/(?:shop|shops|store|stores|maintenance|uketori)(?:\/|$|-|_)/i.test(path)) return 'store';
   if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
   if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
@@ -5092,6 +5108,10 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
         const index = nextIndex++;
         const url = normalizedUrls[index];
         const candidate = phase11Candidates[index] || { url };
+        const candidatePageType = getCoverageCandidatePageType_(candidate);
+        const candidatePageTypeOrInferred = candidatePageType && candidatePageType !== 'unknown'
+          ? candidatePageType
+          : inferSubpageJsonLdPageType(url, siteMode, []);
         let itemStartedAt = null;
         let itemStartedAtMs = null;
         const logItem = (phase, extra = {}) => {
@@ -5124,7 +5144,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               finalUrl: url,
               status: null,
               ok: false,
-              pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+              pageType: candidatePageTypeOrInferred,
               title: '',
               canonical: '',
               h1Count: 0,
@@ -5160,7 +5180,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               finalUrl: url,
               status: null,
               ok: false,
-              pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+              pageType: candidatePageTypeOrInferred,
               title: '',
               canonical: '',
               h1Count: 0,
@@ -5201,13 +5221,19 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           itemStartedAt = new Date().toISOString();
           itemStartedAtMs = Date.now();
           logItem('start');
-          pages[index] = await fetchSubpageJsonLdLight(url, {
+          const observedPage = await fetchSubpageJsonLdLight(url, {
             siteMode,
             timeout: pageTimeout,
             context,
             phase11: {
               debugRunId: phase11 && phase11.debugRunId
             }
+          });
+          const observedPageType = normalizeSubpageJsonLdText(observedPage && observedPage.pageType);
+          pages[index] = Object.assign({}, observedPage || {}, {
+            pageType: observedPageType && observedPageType !== 'unknown' && observedPageType !== 'category_or_detail'
+              ? observedPageType
+              : candidatePageTypeOrInferred
           });
           logItem(pages[index] && pages[index].ok === false ? 'error' : 'complete', {
             completedAt: new Date().toISOString(),
@@ -5237,7 +5263,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
             finalUrl: url,
             status: null,
             ok: false,
-            pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+            pageType: candidatePageTypeOrInferred,
             title: '',
             canonical: '',
             h1Count: 0,
