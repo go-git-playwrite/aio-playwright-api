@@ -3073,6 +3073,55 @@ function normalizeDiscoverSubpageUrl(rawUrl, origin) {
   return parsed.toString().replace(/\/$/, '');
 }
 
+function getDiscoverSubpageDroppedReason_(rawUrl, origin) {
+  if (!rawUrl) return 'empty_href';
+  let parsed = null;
+  try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return 'invalid_url'; }
+  if (!/^https?:$/.test(parsed.protocol)) return `unsupported_protocol:${parsed.protocol || 'unknown'}`;
+  if (origin && parsed.origin !== origin) return 'external_origin';
+  parsed.hash = '';
+  parsed.search = '';
+  const path = parsed.pathname || '/';
+  const lowerPath = path.toLowerCase();
+  if (isBlockedSubpageJsonLdHost(parsed.hostname)) return 'blocked_private_or_metadata_host';
+  if (lowerPath === '/' || lowerPath === '') return 'top_page';
+  if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?|xml)(?:$|\/)/i.test(lowerPath)) return 'asset_or_document_url';
+  if (/\/(?:wp-json|feed)(?:\/|$)/i.test(lowerPath)) return 'feed_or_api_url';
+  if (/\/(?:tag|category|author|page)\//i.test(lowerPath)) return 'excluded_archive_url';
+  return 'unknown_normalization_drop';
+}
+
+function sampleDiscoverLinkText_(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+function appendDiscoverCandidateAuditLinks_(audit, links, origin, source) {
+  if (!audit || !Array.isArray(links)) return;
+  audit.rawLinksCount += links.length;
+  links.slice(0, 50).forEach(link => {
+    if (audit.rawLinks.length < 50) {
+      audit.rawLinks.push({
+        href: String(link && link.href || '').slice(0, 240),
+        text: sampleDiscoverLinkText_(link && link.text)
+      });
+    }
+    if (audit.normalizedLinks.length >= 50) return;
+    const href = String(link && link.href || '');
+    const normalizedUrl = normalizeDiscoverSubpageUrl(href, origin);
+    let path = '';
+    try { path = normalizedUrl ? new URL(normalizedUrl).pathname : ''; } catch (_) {}
+    audit.normalizedLinks.push({
+      href: href.slice(0, 240),
+      normalizedUrl: normalizedUrl || '',
+      path,
+      text: sampleDiscoverLinkText_(link && link.text),
+      source: source || 'top',
+      keep: !!normalizedUrl,
+      droppedReason: normalizedUrl ? null : getDiscoverSubpageDroppedReason_(href, origin)
+    });
+  });
+}
+
 function discoverSubpageCandidateKey(url) {
   try {
     const u = new URL(String(url || ''));
@@ -3280,6 +3329,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
         await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
       }
       const topLinks = await collectDiscoverLinksFromPage(page);
+      appendDiscoverCandidateAuditLinks_(opts && opts.__candidateAudit, topLinks.allLinks || [], origin, 'top');
       if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
         for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
           const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
@@ -3345,6 +3395,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
     await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
     const topLinks = await collectDiscoverLinksFromPage(page);
+    appendDiscoverCandidateAuditLinks_(opts && opts.__candidateAudit, topLinks.allLinks || [], origin, 'top');
     if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
       for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
         const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
@@ -3397,8 +3448,14 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0 };
   const errors = [];
   const candidateMap = new Map();
+  const audit = {
+    rawLinksCount: 0,
+    rawLinks: [],
+    normalizedLinks: []
+  };
+  const fallbackOpts = Object.assign({}, opts || {}, { __candidateAudit: audit });
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
-  await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts);
+  await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, fallbackOpts);
   const allCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
@@ -3408,11 +3465,13 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       reason: item.reason
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  audit.allCandidates = allCandidates.slice(0, 100);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
     totalCandidates: allCandidates.length,
     sourceSummary,
-    errors
+    errors,
+    _audit: audit
   };
 }
 
@@ -4039,6 +4098,115 @@ function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 
     });
 }
 
+function logSubpageCandidateDiscoveryAudit_(payload = {}) {
+  try {
+    const origin = String(payload.origin || '');
+    const finalUrl = String(payload.finalUrl || payload.topUrl || '');
+    const audit = payload.audit && typeof payload.audit === 'object' ? payload.audit : {};
+    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+    const representativePages = Array.isArray(payload.representativePages) ? payload.representativePages : [];
+    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
+    const rawLinks = Array.isArray(audit.rawLinks) ? audit.rawLinks : [];
+    const normalizedLinks = Array.isArray(audit.normalizedLinks) ? audit.normalizedLinks : [];
+    const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
+    const countsByMatchedType = {};
+    const sampledMatched = [];
+    const sampledUnmatched = [];
+    candidates.forEach(candidate => {
+      const pageType = getCoverageCandidatePageType_(candidate);
+      const path = getCoverageCandidatePath_(candidate);
+      if (pageType && pageType !== 'unknown') {
+        countsByMatchedType[pageType] = (countsByMatchedType[pageType] || 0) + 1;
+        if (sampledMatched.length < 50) {
+          sampledMatched.push({
+            path,
+            text: '',
+            matchedType: pageType,
+            reason: String(candidate && candidate.reason || '').slice(0, 160)
+          });
+        }
+      } else if (sampledUnmatched.length < 50) {
+        sampledUnmatched.push({
+          path,
+          text: '',
+          reason: String(candidate && candidate.reason || 'no_page_type_match').slice(0, 160)
+        });
+      }
+    });
+    const selectedTypes = selectedCandidates
+      .map(getCoverageCandidatePageType_)
+      .filter(type => type && type !== 'unknown');
+    const selectedUrls = new Set(selectedCandidates.map(candidate => String(candidate && candidate.url || '')));
+    const droppedTypeCounts = {};
+    candidates.forEach(candidate => {
+      const url = String(candidate && candidate.url || '');
+      if (!url || selectedUrls.has(url)) return;
+      const pageType = getCoverageCandidatePageType_(candidate);
+      droppedTypeCounts[pageType || 'unknown'] = (droppedTypeCounts[pageType || 'unknown'] || 0) + 1;
+    });
+    const normalizedInternalCount = normalizedLinks.filter(link => link && link.keep === true).length;
+    const classifiedCount = candidates.filter(candidate => getCoverageCandidatePageType_(candidate) !== 'unknown').length;
+    let likelyReason = 'unknown';
+    if (!rawLinks.length && !candidates.length) likelyReason = 'no_anchor_links_observed';
+    else if (rawLinks.length && normalizedInternalCount === 0 && !candidates.length) likelyReason = 'no_internal_links_after_normalization';
+    else if (candidates.length && classifiedCount === 0) likelyReason = 'internal_links_exist_but_no_page_type_matched';
+    else if (classifiedCount > 0 && representativePages.length === 0) likelyReason = 'page_types_matched_but_no_representative_selected';
+    else if (representativePages.length > 0) likelyReason = 'representative_pages_selected';
+
+    console.log('[DEBUG][SUBPAGE_CANDIDATE_LINKS_RAW]', JSON.stringify({
+      origin,
+      finalUrl,
+      totalAnchors: Number(audit.rawLinksCount || rawLinks.length || 0),
+      sampled: rawLinks.slice(0, 50)
+    }));
+    console.log('[DEBUG][SUBPAGE_CANDIDATE_LINKS_NORMALIZED]', JSON.stringify({
+      origin,
+      totalInternalCandidates: normalizedInternalCount,
+      sampled: normalizedLinks.slice(0, 50)
+    }));
+    console.log('[DEBUG][SUBPAGE_CANDIDATE_TYPE_CLASSIFICATION_AUDIT]', JSON.stringify({
+      origin,
+      candidatePageTypes,
+      countsByMatchedType,
+      unmatchedCount: candidates.length - classifiedCount,
+      sampledMatched,
+      sampledUnmatched
+    }));
+    console.log('[DEBUG][SUBPAGE_REPRESENTATIVE_SELECTION_AUDIT]', JSON.stringify({
+      origin,
+      representativePagesCount: representativePages.length,
+      representativePages: representativePages.slice(0, 10).map(page => ({
+        url: String(page && page.url || '').slice(0, 240),
+        path: String(page && page.path || '').slice(0, 160),
+        pageType: String(page && page.pageType || '').slice(0, 80),
+        source: String(page && page.source || '').slice(0, 80),
+        score: Number(page && page.score || 0) || 0,
+        candidateOnly: page && page.candidateOnly === true
+      })),
+      selectedTypes: Array.from(new Set(selectedTypes)).slice(0, 20),
+      droppedTypeCounts,
+      reason: representativePages.length ? 'representative_pages_selected' : likelyReason
+    }));
+    console.log('[DEBUG][SUBPAGE_CANDIDATE_EMPTY_REASON_AUDIT]', JSON.stringify({
+      origin,
+      hasSubpageSignals: payload.hasSubpageSignals === true,
+      rawLinksCount: Number(audit.rawLinksCount || rawLinks.length || 0),
+      normalizedInternalCount,
+      classifiedCount,
+      representativePagesCount: representativePages.length,
+      likelyReason
+    }));
+  } catch (e) {
+    try {
+      console.log('[DEBUG][SUBPAGE_CANDIDATE_EMPTY_REASON_AUDIT]', JSON.stringify({
+        origin: String(payload && payload.origin || ''),
+        likelyReason: 'audit_log_failed',
+        error: String(e && (e.message || e) || '').slice(0, 160)
+      }));
+    } catch (_) {}
+  }
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -4470,6 +4638,20 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     }), subpageGuardMs, 'subpage_discovery');
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
+    const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
+      ? discovered._audit.allCandidates
+      : discovered.candidates;
+    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2);
+    logSubpageCandidateDiscoveryAudit_({
+      origin: normalized.origin,
+      topUrl: normalized.topUrl,
+      finalUrl: normalized.topUrl,
+      audit: discovered && discovered._audit,
+      candidates: auditCandidates,
+      selectedCandidates,
+      representativePages: auditRepresentativePages,
+      hasSubpageSignals: !!(geoSignalsV1 && geoSignalsV1.subpageSignals)
+    });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = prioritizedCandidates
       .slice(maxObserve)
