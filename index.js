@@ -3609,6 +3609,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     }, extra));
   };
   let page = null;
+  let navigationCommitted = false;
+  let reached = false;
   const jsErrors = [];
   const failedRequests = [];
   const consoleErrors = [];
@@ -3751,9 +3753,13 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         hasArticleJsonLd: false,
         hasBlogPostingJsonLd: false,
         hasBreadcrumbUi: false,
+        reached: false,
+        navigationCommitted: false,
         error: status ? `HTTP ${status}` : 'fetch_failed'
       };
     }
+    navigationCommitted = true;
+    reached = true;
     const headers = response && typeof response.headers === 'function' ? response.headers() : {};
     const contentType = headers && typeof headers === 'object'
       ? String(headers['content-type'] || '')
@@ -3776,6 +3782,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         hasArticleJsonLd: false,
         hasBlogPostingJsonLd: false,
         hasBreadcrumbUi: false,
+        reached: false,
+        navigationCommitted: false,
         error: 'unsupported_content_type'
       };
     }
@@ -3800,6 +3808,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         hasArticleJsonLd: false,
         hasBlogPostingJsonLd: false,
         hasBreadcrumbUi: false,
+        reached: false,
+        navigationCommitted: false,
         error: 'content_length_too_large'
       };
     }
@@ -4136,6 +4146,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         externalLinkCount: 0,
         sampledText: '',
         error: extractTimedOut ? `subpage_extract_timeout_${SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS}ms` : 'subpage_extract_unavailable',
+        reached,
+        navigationCommitted,
         pageBudgetExceeded,
         extractTimedOut,
         returnedPartial: true
@@ -4293,6 +4305,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       error: null,
       parseErrors,
+      reached,
+      navigationCommitted,
       pageBudgetExceeded,
       extractTimedOut,
       closeTimedOut,
@@ -4339,6 +4353,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       hasArticleJsonLd: false,
       hasBlogPostingJsonLd: false,
       hasBreadcrumbUi: false,
+      reached,
+      navigationCommitted,
       pageBudgetExceeded,
       extractTimedOut,
       closeTimedOut,
@@ -4390,6 +4406,9 @@ function compactSubpageJsonLdObservation_(page) {
   return Object.assign({}, page || {}, {
     url: page && page.url || '',
     ok: !!(page && page.ok),
+    reached: page && page.reached === true,
+    navigationCommitted: page && page.navigationCommitted === true,
+    returnedPartial: page && page.returnedPartial === true,
     finalUrl: page && page.finalUrl || page && page.url || '',
     status: page && typeof page.status !== 'undefined' ? page.status : null,
     h1Count: Number(page && page.h1Count || 0),
@@ -4398,6 +4417,12 @@ function compactSubpageJsonLdObservation_(page) {
     breadcrumbListCount,
     listItemCount
   });
+}
+
+function isReachedSubpageObservation_(page) {
+  if (!page) return false;
+  if (page.ok === true) return true;
+  return page.reached === true || page.navigationCommitted === true;
 }
 
 function isCoverageSignalsAboutPath_(value) {
@@ -4650,7 +4675,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         return acc;
       }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
   const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
-  const observedPages = observations.filter(page => page && page.ok === true);
+  const observedPages = observations.filter(page => isReachedSubpageObservation_(page));
   const hasBreadcrumb = page => {
     const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
     return page && (
@@ -4684,6 +4709,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         source: candidate.source || '',
         score: Number(candidate.score || 0) || 0,
         candidateOnly: false,
+        reached: page.reached === true || page.navigationCommitted === true || page.ok === true,
+        navigationCommitted: page.navigationCommitted === true,
+        returnedPartial: page.returnedPartial === true,
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
@@ -4768,6 +4796,9 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       pageType: page && page.pageType || '',
       source: page && page.source || '',
       candidateOnly: page && page.candidateOnly === true,
+      reached: page && page.reached === true,
+      navigationCommitted: page && page.navigationCommitted === true,
+      returnedPartial: page && page.returnedPartial === true,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
         : []
@@ -5035,7 +5066,7 @@ function buildSubpageSignalsSummary_(pages) {
 function buildSubpageSignalsV1FromSubpageObservation_(payload) {
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
   const pages = observations
-    .filter(page => page && page.ok === true)
+    .filter(page => isReachedSubpageObservation_(page))
     .slice(0, 5)
     .map(page => {
       const finalUrl = page.finalUrl || page.url || '';
@@ -5050,6 +5081,9 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         finalUrl,
         path,
         pageType,
+        reached: page.reached === true || page.navigationCommitted === true || page.ok === true,
+        navigationCommitted: page.navigationCommitted === true,
+        returnedPartial: page.returnedPartial === true,
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || '').slice(0, 180),
         h1Count: Number(page.h1Count || 0),
@@ -5847,7 +5881,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           logItem(pages[index] && pages[index].ok === false ? 'error' : 'complete', {
             completedAt: new Date().toISOString(),
             durationMs: Date.now() - itemStartedAtMs,
-            observed: !!(pages[index] && pages[index].ok === true),
+            observed: isReachedSubpageObservation_(pages[index]),
             errorName: pages[index] && pages[index].error ? 'Error' : null,
             errorMessage: pages[index] && pages[index].error ? String(pages[index].error).slice(0, 200) : null
           });
