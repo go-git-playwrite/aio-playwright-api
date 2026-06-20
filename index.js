@@ -4483,7 +4483,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   ]);
   const attachEmptySignals = (reason, discovered) => {
     const sourceSummary = discovered && discovered.sourceSummary || { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, other: 0 };
-    const candidates = Array.isArray(discovered && discovered.candidates) ? discovered.candidates : [];
+    const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
+      ? discovered._audit.allCandidates
+      : null;
+    const candidates = auditCandidates || (Array.isArray(discovered && discovered.candidates) ? discovered.candidates : []);
     const emptyPayload = {
       topUrl: normalized && normalized.topUrl || String(topUrl || ''),
       origin: normalized && normalized.origin || '',
@@ -4657,6 +4660,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
       : discovered.candidates;
+    const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
+      ? auditCandidates
+      : discovered.candidates;
     const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2);
     logSubpageCandidateDiscoveryAudit_({
       origin: normalized.origin,
@@ -4761,7 +4767,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       } catch (_) {}
     }
     const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
-      candidates: discovered.candidates
+      candidates: coverageCandidates
     }));
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
@@ -4786,6 +4792,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return null;
     }
     geoSignalsV1.coverageSignals = coverageSignals;
+    try {
+      console.log('[DEBUG][SUBPAGE_COVERAGE_SIGNALS_FINAL_AUDIT]', JSON.stringify({
+        origin: normalized.origin,
+        hasSubpageSignals: !!geoSignalsV1.subpageSignals,
+        observedCount: coverageSignals.observedSubpageCount,
+        candidatePageTypes: coverageSignals.candidatePageTypes,
+        representativePagesCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
+        representativePages: (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : []).slice(0, 10).map(page => ({
+          path: String(page && page.path || '').slice(0, 160),
+          pageType: String(page && page.pageType || '').slice(0, 80),
+          score: Number(page && page.score || 0) || 0,
+          candidateOnly: page && page.candidateOnly === true
+        }))
+      }));
+    } catch (_) {}
     traceCoverageMemory('attach_done', {
       browserCreated: !(reusePageForDiscover && reuseContextForObserve),
       contextCreated: true,
