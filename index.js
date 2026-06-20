@@ -4442,6 +4442,27 @@ function logSubpageObservationPhase11_(payload = {}) {
   } catch (_) {}
 }
 
+function logSubpageObservationItemPhase11_(payload = {}) {
+  try {
+    console.log('[DEBUG][SUBPAGE_OBSERVATION_ITEM_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      origin: String(payload.origin || ''),
+      targetUrl: String(payload.targetUrl || '').slice(0, 240),
+      path: String(payload.path || '').slice(0, 160),
+      pageType: String(payload.pageType || '').slice(0, 80),
+      index: Number(payload.index || 0),
+      total: Number(payload.total || 0),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      observed: typeof payload.observed === 'boolean' ? payload.observed : null,
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 function inferSubpageSignalsPageType_(page) {
   const existing = normalizeSubpageJsonLdText(page && page.pageType);
   if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
@@ -4673,6 +4694,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   })();
   const shouldSkipSubpageForMemoryGuard = memoryGuardHosts.includes(normalizedHost);
   let lastDiscoveredForCoverage = null;
+  let phase11ObservationItems = [];
   try {
     traceCoverageMemory('attach_start', {
       candidateCount: 0,
@@ -4823,6 +4845,33 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     setPhase11State({ observationStarted: true });
+    phase11ObservationItems = selectedCandidates.map((candidate, index) => {
+      const startedAt = new Date().toISOString();
+      const item = {
+        candidate,
+        index: index + 1,
+        total: selectedCandidates.length,
+        startedAt,
+        startedAtMs: Date.now()
+      };
+      logSubpageObservationItemPhase11_({
+        debugRunId: phase11State && phase11State.debugRunId,
+        origin: normalized.origin,
+        targetUrl: candidate && candidate.url,
+        path: getCoverageCandidatePath_(candidate),
+        pageType: getCoverageCandidatePageType_(candidate),
+        index: item.index,
+        total: item.total,
+        phase: 'start',
+        startedAt,
+        completedAt: null,
+        durationMs: null,
+        observed: null,
+        errorName: null,
+        errorMessage: null
+      });
+      return item;
+    });
     const observed = await withSubpageTimeout(observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: 8000,
@@ -4840,6 +4889,26 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    phase11ObservationItems.forEach((item, index) => {
+      const page = observations[index] || {};
+      const completedAt = new Date().toISOString();
+      logSubpageObservationItemPhase11_({
+        debugRunId: phase11State && phase11State.debugRunId,
+        origin: normalized.origin,
+        targetUrl: item.candidate && item.candidate.url,
+        path: getCoverageCandidatePath_(item.candidate),
+        pageType: getCoverageCandidatePageType_(item.candidate),
+        index: item.index,
+        total: item.total,
+        phase: page && page.ok === false ? 'error' : 'complete',
+        startedAt: item.startedAt,
+        completedAt,
+        durationMs: Date.now() - item.startedAtMs,
+        observed: !!(page && page.ok === true),
+        errorName: null,
+        errorMessage: page && page.error ? String(page.error).slice(0, 200) : null
+      });
+    });
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
@@ -4933,6 +5002,24 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     return coverageSignals;
   } catch (e) {
     logPayload.reason = String(e && (e.message || e) || 'coverage_integration_failed').slice(0, 160);
+    phase11ObservationItems.forEach(item => {
+      logSubpageObservationItemPhase11_({
+        debugRunId: phase11State && phase11State.debugRunId,
+        origin: normalized && normalized.origin || '',
+        targetUrl: item.candidate && item.candidate.url,
+        path: getCoverageCandidatePath_(item.candidate),
+        pageType: getCoverageCandidatePageType_(item.candidate),
+        index: item.index,
+        total: item.total,
+        phase: 'error',
+        startedAt: item.startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - item.startedAtMs,
+        observed: false,
+        errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+        errorMessage: String(e && (e.message || e) || '').slice(0, 200)
+      });
+    });
     setPhase11State({
       fallbackReason: logPayload.reason || 'pre_response_fallback',
       timeoutTriggered: /timeout/i.test(String(logPayload.reason || '')),
