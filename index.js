@@ -3701,6 +3701,11 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         const text = clean(el.innerText || el.textContent);
         if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
       });
+      const h2Sample = [];
+      queryAllDeep('h2', { maxNodes: 80 }).forEach((el) => {
+        const text = clean(el.innerText || el.textContent);
+        if (text && !h2Sample.includes(text) && h2Sample.length < 5) h2Sample.push(text.slice(0, 160));
+      });
       const jsonldTexts = queryAllDeep('script[type*="ld+json" i]', { maxNodes: 50 })
         .map(el => String(el.textContent || '').trim())
         .filter(Boolean);
@@ -3735,6 +3740,41 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       const canonicalEl = document.querySelector('link[rel~="canonical" i]');
       const title = clean(document.title || '').slice(0, 180);
       const canonical = canonicalEl && canonicalEl.href ? String(canonicalEl.href || '').trim() : '';
+      const metaDescription = clean((document.querySelector('meta[name="description" i]') || {}).content || '').slice(0, 240);
+      const ogTitle = clean((document.querySelector('meta[property="og:title" i]') || {}).content || '').slice(0, 180);
+      const ogDescription = clean((document.querySelector('meta[property="og:description" i]') || {}).content || '').slice(0, 240);
+      const ogImageExists = !!clean((document.querySelector('meta[property="og:image" i]') || {}).content || '');
+      const mainCandidates = queryAllDeep('main,[role="main"]', { maxNodes: 20 });
+      const anchorEls = queryAllDeep('a[href]', { maxNodes: 1200 });
+      let internalLinkCount = 0;
+      let externalLinkCount = 0;
+      anchorEls.forEach((a) => {
+        try {
+          const href = a.href || a.getAttribute('href') || '';
+          if (!href || /^(?:mailto:|tel:|javascript:|#)/i.test(href)) return;
+          const u = new URL(href, location.href);
+          if (u.origin === location.origin) internalLinkCount += 1;
+          else externalLinkCount += 1;
+        } catch (_) {}
+      });
+      let sampledText = '';
+      try {
+        const clone = document.body ? document.body.cloneNode(true) : null;
+        if (clone && clone.querySelectorAll) {
+          clone.querySelectorAll('script,style,noscript,svg,nav,footer').forEach(el => el.remove());
+          sampledText = clean(clone.innerText || clone.textContent || '').slice(0, 500);
+        }
+      } catch (_) {}
+      if (!sampledText) {
+        const textParts = [];
+        queryAllDeep('main,[role="main"],article,section,p,li', { maxNodes: 160 }).forEach((el) => {
+          if (textParts.join(' ').length >= 600) return;
+          const text = clean(el.innerText || el.textContent);
+          if (text && text.length >= 12 && !textParts.includes(text)) textParts.push(text);
+        });
+        sampledText = clean(textParts.join(' ')).slice(0, 500);
+      }
+      if (!sampledText) sampledText = clean((document.body && document.body.innerText) || '').slice(0, 500);
       const allNodes = Array.from(document.querySelectorAll('*')).slice(0, 3000);
       const shadowHostCount = allNodes.filter(el => !!el.shadowRoot).length;
       return {
@@ -3743,6 +3783,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         locationHref: location.href,
         title,
         canonical,
+        metaDescription,
+        ogTitle,
+        ogDescription,
+        ogImageExists,
         domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
         deepJsonLdScriptCount: jsonldTexts.length,
         scriptCount: document.querySelectorAll('script').length,
@@ -3753,8 +3797,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         bodyTextLength: String((document.body && document.body.innerText) || '').length,
         h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
         h1Texts,
+        h2Sample,
         jsonldTexts,
+        hasMain: mainCandidates.length > 0,
+        hasMainLandmark: mainCandidates.length > 0,
         hasBreadcrumbUi,
+        internalLinkCount,
+        externalLinkCount,
+        sampledText,
         htmlLength: String((document.documentElement && document.documentElement.outerHTML) || '').length
       };
     });
@@ -3800,9 +3850,15 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       pageType: inferSubpageJsonLdPageType(observedFinalUrl || finalUrl || url, opts.siteMode, uniqueTypes),
       title: normalizeSubpageJsonLdText(observed && observed.title).slice(0, 180),
       canonical: normalizeSubpageJsonLdText(observed && observed.canonical),
+      metaDescription: normalizeSubpageJsonLdText(observed && observed.metaDescription).slice(0, 240),
+      ogTitle: normalizeSubpageJsonLdText(observed && observed.ogTitle).slice(0, 180),
+      ogDescription: normalizeSubpageJsonLdText(observed && observed.ogDescription).slice(0, 240),
+      ogImageExists: !!(observed && observed.ogImageExists),
       h1Count: Number(observed && observed.h1Count || 0),
       h1Texts: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
+      h2Sample: Array.isArray(observed && observed.h2Sample) ? observed.h2Sample.slice(0, 5) : [],
       jsonldTypes: uniqueTypes,
+      jsonLdCount: Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts.length : uniqueTypes.length,
       jsonldTypeCounts,
       breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
       listItemCount: Number(jsonldTypeCounts.ListItem || 0),
@@ -3825,12 +3881,21 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       consoleErrors,
       waitedMs: Math.max(0, Date.now() - waitStartedAt),
       waitStrategy: waitStrategyParts.join('+'),
+      hasJsonLd: uniqueTypes.length > 0,
       hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
       hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
       hasFaqJsonLd: lowerTypes.has('faqpage'),
       hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
       hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
+      hasOrganization: lowerTypes.has('organization') || lowerTypes.has('corporation') || lowerTypes.has('localbusiness'),
+      hasWebPage: lowerTypes.has('webpage') || lowerTypes.has('aboutpage') || lowerTypes.has('contactpage') || lowerTypes.has('collectionpage'),
+      hasService: lowerTypes.has('service'),
       hasBreadcrumbUi: !!(observed && observed.hasBreadcrumbUi),
+      hasMain: !!(observed && observed.hasMain),
+      hasMainLandmark: !!(observed && observed.hasMainLandmark),
+      internalLinkCount: Number(observed && observed.internalLinkCount || 0),
+      externalLinkCount: Number(observed && observed.externalLinkCount || 0),
+      sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       error: null,
       parseErrors
     };
@@ -4081,6 +4146,109 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   };
 }
 
+function inferSubpageSignalsPageType_(page) {
+  const existing = normalizeSubpageJsonLdText(page && page.pageType);
+  if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
+  const path = (() => {
+    try { return new URL(String(page && (page.finalUrl || page.url) || '')).pathname.toLowerCase(); } catch (_) { return ''; }
+  })();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 'about';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
+  if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
+  return existing || 'unknown';
+}
+
+function buildSubpageSignalsSummary_(pages) {
+  const okPages = (Array.isArray(pages) ? pages : []).filter(page => page && page.ok !== false);
+  const pageTypes = Array.from(new Set(okPages.map(page => normalizeSubpageJsonLdText(page.pageType)).filter(Boolean))).slice(0, 20);
+  const jsonLdTypesAll = Array.from(new Set([].concat(...okPages.map(page => (
+    Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes : (Array.isArray(page.jsonldTypes) ? page.jsonldTypes : [])
+  ))).map(normalizeSubpageJsonLdType).filter(Boolean))).slice(0, 50);
+  return {
+    observedPageTypes: pageTypes,
+    hasAnyJsonLd: okPages.some(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0),
+    hasAnyBreadcrumbList: okPages.some(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0),
+    hasAnyMain: okPages.some(page => page.hasMain === true || page.hasMainLandmark === true),
+    jsonLdTypesAll,
+    pagesWithH1Count: okPages.filter(page => Number(page.h1Count || 0) > 0 || !!normalizeSubpageJsonLdText(page.h1)).length,
+    pagesWithJsonLdCount: okPages.filter(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0).length,
+    pagesWithBreadcrumbListCount: okPages.filter(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0).length
+  };
+}
+
+function buildSubpageSignalsV1FromSubpageObservation_(payload) {
+  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const pages = observations
+    .filter(page => page && page.ok === true)
+    .slice(0, 5)
+    .map(page => {
+      const finalUrl = page.finalUrl || page.url || '';
+      const path = (() => {
+        try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
+      })();
+      const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
+      const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      const pageType = inferSubpageSignalsPageType_(page);
+      return {
+        url: page.url || '',
+        finalUrl,
+        path,
+        pageType,
+        title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
+        h1: normalizeSubpageJsonLdText(h1Texts[0] || '').slice(0, 180),
+        h1Count: Number(page.h1Count || 0),
+        h2Sample: Array.isArray(page.h2Sample) ? page.h2Sample.slice(0, 5).map(v => normalizeSubpageJsonLdText(v).slice(0, 160)).filter(Boolean) : [],
+        canonical: normalizeSubpageJsonLdText(page.canonical).slice(0, 240),
+        jsonLdTypes,
+        jsonLdCount: Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || jsonLdTypes.length || 0),
+        hasJsonLd: page.hasJsonLd === true || jsonLdTypes.length > 0,
+        hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
+        hasBreadcrumbUi: page.hasBreadcrumbUi === true,
+        hasOrganization: page.hasOrganization === true,
+        hasWebPage: page.hasWebPage === true,
+        hasService: page.hasService === true,
+        hasFAQPage: page.hasFaqJsonLd === true,
+        hasArticle: page.hasArticleJsonLd === true || page.hasBlogPostingJsonLd === true,
+        hasMain: page.hasMain === true || page.hasMainLandmark === true,
+        hasMainLandmark: page.hasMainLandmark === true,
+        metaDescription: normalizeSubpageJsonLdText(page.metaDescription).slice(0, 240),
+        ogTitle: normalizeSubpageJsonLdText(page.ogTitle).slice(0, 180),
+        ogDescription: normalizeSubpageJsonLdText(page.ogDescription).slice(0, 240),
+        ogImageExists: page.ogImageExists === true,
+        internalLinkCount: Number(page.internalLinkCount || 0),
+        externalLinkCount: Number(page.externalLinkCount || 0),
+        sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500)
+      };
+    });
+  if (!pages.length) return null;
+  const summary = buildSubpageSignalsSummary_(pages);
+  return {
+    version: 'subpageSignalsV1',
+    observedCount: pages.length,
+    pages,
+    summary
+  };
+}
+
+function buildLightweightSubpageSignalsSummary_(subpageSignals) {
+  if (!subpageSignals || typeof subpageSignals !== 'object') return null;
+  const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
+  return {
+    observedCount: Number(subpageSignals.observedCount || 0),
+    observedPageTypes: Array.isArray(summary.observedPageTypes) ? summary.observedPageTypes.slice(0, 20) : [],
+    hasAnyJsonLd: summary.hasAnyJsonLd === true,
+    hasAnyBreadcrumbList: summary.hasAnyBreadcrumbList === true,
+    jsonLdTypesAll: Array.isArray(summary.jsonLdTypesAll) ? summary.jsonLdTypesAll.slice(0, 50) : [],
+    pagesWithH1Count: Number(summary.pagesWithH1Count || 0),
+    pagesWithJsonLdCount: Number(summary.pagesWithJsonLdCount || 0),
+    pagesWithBreadcrumbListCount: Number(summary.pagesWithBreadcrumbListCount || 0)
+  };
+}
+
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
   const traceCoverageMemory = (phase, extra = {}) => {
@@ -4222,6 +4390,27 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidates: selectedCandidates,
       observations
     };
+    const subpageSignals = buildSubpageSignalsV1FromSubpageObservation_(payload);
+    if (subpageSignals) {
+      geoSignalsV1.subpageSignals = subpageSignals;
+      try {
+        console.log('[DEBUG][SUBPAGE_SIGNALS_LIGHT]', JSON.stringify({
+          observedCount: subpageSignals.observedCount,
+          observedPageTypes: subpageSignals.summary && subpageSignals.summary.observedPageTypes,
+          pages: subpageSignals.pages.map(page => ({
+            path: page.path,
+            pageType: page.pageType,
+            title: page.title,
+            h1: page.h1,
+            jsonLdTypes: page.jsonLdTypes,
+            hasBreadcrumbList: page.hasBreadcrumbList,
+            hasBreadcrumbUi: page.hasBreadcrumbUi,
+            hasMain: page.hasMain
+          })),
+          summary: subpageSignals.summary
+        }));
+      } catch (_) {}
+    }
     const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
       candidates: discovered.candidates
     }));
@@ -11195,6 +11384,9 @@ async function scrapeOnce(req, res) {
         termsLinkSource: trustObserved.termsLinkSource || linksObserved.termsLinkSource || null,
         contactConfidence: trustObserved.contactConfidence || null
       };
+      if (geoSignalsV1 && geoSignalsV1.subpageSignals) {
+        lightweightSummary.subpageSignals = buildLightweightSubpageSignalsSummary_(geoSignalsV1.subpageSignals);
+      }
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
           ? geoSignalsV1.diagnostics.evaluateCount
