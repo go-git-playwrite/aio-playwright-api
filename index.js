@@ -3517,6 +3517,22 @@ function logSubpageFetchPhase11_(payload = {}) {
   } catch (_) {}
 }
 
+function logSubpageFetchDetailPhase11_(payload = {}) {
+  try {
+    console.log('[DEBUG][SUBPAGE_FETCH_DETAIL_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      targetUrl: String(payload.targetUrl || '').slice(0, 240),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      detail: payload.detail && typeof payload.detail === 'object' ? payload.detail : {},
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
@@ -3534,6 +3550,19 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       durationMs: startedAtMs ? Date.now() - startedAtMs : null,
       timeoutMs,
       waitUntil: subpageWaitUntil,
+      errorName: null,
+      errorMessage: null
+    }, extra));
+  };
+  const logDetail = (phase, startedAtMs, extra = {}) => {
+    logSubpageFetchDetailPhase11_(Object.assign({
+      debugRunId: phase11.debugRunId || null,
+      targetUrl: url,
+      phase,
+      startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+      completedAt: startedAtMs ? new Date().toISOString() : null,
+      durationMs: startedAtMs ? Date.now() - startedAtMs : null,
+      detail: {},
       errorName: null,
       errorMessage: null
     }, extra));
@@ -3734,10 +3763,19 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     logPhase('content_start', contentStartedAtMs, { completedAt: null, durationMs: null });
     const hydrationMetrics = null;
     let webdriverValue = '__unavailable__';
+    const contentWaitStartedAtMs = Date.now();
+    logDetail('content_wait_start', contentWaitStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: { waitMs: 0 }
+    });
     try {
       const rawWebdriverValue = await page.evaluate(() => navigator.webdriver);
       webdriverValue = typeof rawWebdriverValue === 'undefined' ? '__undefined__' : rawWebdriverValue;
     } catch (_) {}
+    logDetail('content_wait_complete', contentWaitStartedAtMs, {
+      detail: { waitMs: Date.now() - contentWaitStartedAtMs }
+    });
     const waitStartedAt = Date.now();
     const waitStrategyParts = [];
     const countJsonLdScripts = async () => page.evaluate(() => {
@@ -3746,6 +3784,12 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         deepJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length
       };
     }).catch(() => ({ domJsonLdScriptCount: 0, deepJsonLdScriptCount: 0 }));
+    const jsonLdPollStartedAtMs = Date.now();
+    logDetail('jsonld_poll_start', jsonLdPollStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: { pollMaxMs: 2000 }
+    });
     let jsonLdCountProbe = await countJsonLdScripts();
     const pollStartedAt = Date.now();
     while (
@@ -3756,14 +3800,37 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       jsonLdCountProbe = await countJsonLdScripts();
     }
     waitStrategyParts.push(Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) > 0 ? 'jsonld_poll_found' : 'jsonld_poll_timeout');
+    logDetail('jsonld_poll_complete', jsonLdPollStartedAtMs, {
+      detail: {
+        pollMaxMs: 2000,
+        scriptCount: Number(jsonLdCountProbe && jsonLdCountProbe.domJsonLdScriptCount || 0),
+        jsonLdCount: Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0)
+      }
+    });
+    const postWaitStartedAtMs = Date.now();
+    logDetail('post_wait_start', postWaitStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: { postWaitMs: 500 }
+    });
     try {
       await page.waitForTimeout(500);
       waitStrategyParts.push('post_poll_wait_500ms');
     } catch (_) {}
+    logDetail('post_wait_complete', postWaitStartedAtMs, {
+      detail: { postWaitMs: Date.now() - postWaitStartedAtMs }
+    });
     logPhase('content_complete', contentStartedAtMs);
     const extractStartedAtMs = Date.now();
     logPhase('extract_start', extractStartedAtMs, { completedAt: null, durationMs: null });
+    const evaluateStartedAtMs = Date.now();
+    logDetail('evaluate_start', evaluateStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: {}
+    });
     const observed = await page.evaluate(() => {
+      const detailTimings = {};
       const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
       const h1Texts = [];
       Array.from(document.querySelectorAll('h1')).slice(0, 5).forEach((el) => {
@@ -3825,7 +3892,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         } catch (_) {}
       });
       const sampleEl = document.querySelector('main,[role="main"],article') || document.body;
+      const textSampleStartedAt = Date.now();
       const sampledText = clean((sampleEl && (sampleEl.innerText || sampleEl.textContent)) || '').slice(0, 500);
+      detailTimings.textSampleMs = Date.now() - textSampleStartedAt;
       const shadowHostCount = 0;
       return {
         finalUrl: location.href,
@@ -3855,8 +3924,19 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         internalLinkCount,
         externalLinkCount,
         sampledText,
-        htmlLength: 0
+        htmlLength: 0,
+        __detail: {
+          jsonLdCount: jsonldTexts.length,
+          scriptCount: document.querySelectorAll('script').length,
+          textLength: sampledText.length,
+          linkCount: anchorEls.length,
+          h2Count: h2Sample.length,
+          textSampleMs: detailTimings.textSampleMs
+        }
       };
+    });
+    logDetail('evaluate_complete', evaluateStartedAtMs, {
+      detail: observed && observed.__detail || {}
     });
     if (Number(observed && observed.htmlLength || 0) > maxHtmlBytes) {
       return {
@@ -3879,6 +3959,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         error: 'html_too_large'
       };
     }
+    const jsonLdParseStartedAtMs = Date.now();
+    logDetail('jsonld_parse_start', jsonLdParseStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        jsonLdCount: Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts.length : 0
+      }
+    });
     const jsonldTypes = [];
     let parseErrors = 0;
     (Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts : []).forEach(raw => {
@@ -3888,13 +3976,43 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         parseErrors += 1;
       }
     });
+    logDetail('jsonld_parse_complete', jsonLdParseStartedAtMs, {
+      detail: {
+        jsonLdCount: Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts.length : 0,
+        parseErrors
+      }
+    });
+    const textSampleStartedAtMs = Date.now();
+    logDetail('text_sample_start', textSampleStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        textLength: normalizeSubpageJsonLdText(observed && observed.sampledText).length
+      }
+    });
+    logDetail('text_sample_complete', textSampleStartedAtMs, {
+      detail: {
+        textLength: normalizeSubpageJsonLdText(observed && observed.sampledText).length,
+        textSampleMs: observed && observed.__detail && typeof observed.__detail.textSampleMs === 'number' ? observed.__detail.textSampleMs : null
+      }
+    });
     const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
     const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
     const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
     const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
     logPhase('extract_complete', extractStartedAtMs);
-    logPhase('return', fetchStartedAtMs);
-    return {
+    const returnBuildStartedAtMs = Date.now();
+    logDetail('return_build_start', returnBuildStartedAtMs, {
+      completedAt: null,
+      durationMs: null,
+      detail: {
+        jsonLdCount: uniqueTypes.length,
+        textLength: normalizeSubpageJsonLdText(observed && observed.sampledText).length,
+        linkCount: Number(observed && observed.internalLinkCount || 0) + Number(observed && observed.externalLinkCount || 0),
+        h2Count: Array.isArray(observed && observed.h2Sample) ? observed.h2Sample.length : 0
+      }
+    });
+    const resultPayload = {
       url,
       finalUrl: observedFinalUrl || finalUrl || url,
       status,
@@ -3951,6 +4069,16 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       error: null,
       parseErrors
     };
+    logDetail('return_build_complete', returnBuildStartedAtMs, {
+      detail: {
+        jsonLdCount: resultPayload.jsonLdCount,
+        textLength: resultPayload.sampledText.length,
+        linkCount: resultPayload.internalLinkCount + resultPayload.externalLinkCount,
+        h2Count: resultPayload.h2Sample.length
+      }
+    });
+    logPhase('return', fetchStartedAtMs);
+    return resultPayload;
   } catch (e) {
     logPhase('return', fetchStartedAtMs, {
       errorName: e && e.name ? String(e.name).slice(0, 80) : null,
