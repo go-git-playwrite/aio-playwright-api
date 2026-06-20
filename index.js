@@ -4875,14 +4875,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       });
       return item;
     });
-    const observed = await withSubpageTimeout(observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
       concurrency: reuseContextForObserve ? 1 : 3,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
-      sequential: reuseContextForObserve
-    }), subpageGuardMs, 'subpage_observation');
+      sequential: true,
+      maxTotalMs: subpageGuardMs
+    });
     setPhase11State({ observationCompleted: true });
     traceCoverageMemory('observe_after', {
       browserCreated: !reuseContextForObserve,
@@ -4892,6 +4893,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    if (observations.some(page => /timeout/i.test(String(page && page.error || '')))) {
+      setPhase11State({
+        timeoutTriggered: true,
+        fallbackReason: 'partial_subpage_observation_timeout'
+      });
+    }
     phase11ObservationItems.forEach((item, index) => {
       const page = observations[index] || {};
       const completedAt = new Date().toISOString();
@@ -5056,6 +5063,9 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
   const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const maxTotalMs = Number(opts.maxTotalMs || 0) > 0
+    ? Math.max(1000, Number(opts.maxTotalMs || 0))
+    : 0;
   const reuseContext = !!(opts && opts.context);
   const concurrency = reuseContext
     ? 1
@@ -5142,6 +5152,32 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
         const index = nextIndex++;
         const url = normalizedUrls[index];
         try {
+          const elapsedMs = Date.now() - started;
+          const remainingMs = maxTotalMs ? maxTotalMs - elapsedMs : 0;
+          if (maxTotalMs && remainingMs <= 500) {
+            pages[index] = {
+              url,
+              finalUrl: url,
+              status: null,
+              ok: false,
+              pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+              title: '',
+              canonical: '',
+              h1Count: 0,
+              h1Texts: [],
+              jsonldTypes: [],
+              breadcrumbListCount: 0,
+              listItemCount: 0,
+              hasBreadcrumbJsonLd: false,
+              hasProductJsonLd: false,
+              hasFaqJsonLd: false,
+              hasArticleJsonLd: false,
+              hasBlogPostingJsonLd: false,
+              hasBreadcrumbUi: false,
+              error: `subpage_observation_timeout_${maxTotalMs}ms`
+            };
+            continue;
+          }
           let origin = '';
           try { origin = new URL(url).origin; } catch (_) {}
           if (baseOrigin && origin !== baseOrigin) {
@@ -5178,7 +5214,10 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               observeCount: normalizedUrls.length
             }));
           } catch (_) {}
-          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+          const pageTimeout = maxTotalMs
+            ? Math.max(1000, Math.min(timeout, remainingMs || timeout))
+            : timeout;
+          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout: pageTimeout, context });
           try {
             console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
               phase: 'observe_page_after',
