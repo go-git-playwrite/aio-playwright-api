@@ -3946,6 +3946,118 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   };
 }
 
+function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
+  if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return null;
+  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0) return null;
+  return {
+    version: 'coverageSignalsV1',
+    source: 'discover-and-observe-subpages-light',
+    checked: true,
+    observedSubpageCount: Number(coverageSignalsV1.observedSubpageCount || 0),
+    observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
+    observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
+    hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
+    hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
+    hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
+    candidateSourceSummary: coverageSignalsV1.candidateSourceSummary || {
+      sitemap: 0,
+      nav: 0,
+      footer: 0,
+      other: 0
+    },
+    representativePages: (Array.isArray(coverageSignalsV1.representativePages)
+      ? coverageSignalsV1.representativePages
+      : []
+    ).slice(0, 5).map(page => ({
+      url: page && page.url || '',
+      path: page && page.path || '',
+      title: page && page.title || '',
+      h1: page && page.h1 || '',
+      hasH1: !!(page && page.hasH1),
+      hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
+      jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
+      matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
+        ? page.matchedCandidateSources.slice(0, 8)
+        : []
+    }))
+  };
+}
+
+async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl) {
+  const normalized = normalizeDiscoverTopUrl(topUrl);
+  const logPayload = {
+    url: String(topUrl || ''),
+    origin: normalized && normalized.origin || '',
+    attached: false,
+    observedSubpageCount: 0,
+    observedH1PageCount: 0,
+    observedBreadcrumbPageCount: 0,
+    hasObservedAboutPage: false,
+    hasObservedBreadcrumbList: false,
+    reason: ''
+  };
+  try {
+    if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') {
+      logPayload.reason = 'missing_geo_signals';
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    if (!normalized.ok) {
+      logPayload.reason = normalized.error || 'invalid_top_url';
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20);
+    const selectedCandidates = discovered.candidates.slice(0, 5);
+    if (!selectedCandidates.length) {
+      logPayload.origin = normalized.origin;
+      logPayload.reason = 'no_subpage_candidates';
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+      siteMode: 'generic',
+      timeout: 8000,
+      concurrency: 3
+    });
+    const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    const payload = {
+      topUrl: normalized.topUrl,
+      origin: normalized.origin,
+      candidateSummary: {
+        sourceSummary: discovered.sourceSummary,
+        totalCandidates: discovered.totalCandidates,
+        observedCount: observations.length
+      },
+      candidates: selectedCandidates,
+      observations
+    };
+    const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(payload);
+    const coverageSignals = buildGeoSignalsCoverageSignals_(coverageSignalsV1);
+    if (!coverageSignals) {
+      logPayload.origin = normalized.origin;
+      logPayload.reason = 'no_observed_subpages';
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    geoSignalsV1.coverageSignals = coverageSignals;
+    logPayload.origin = normalized.origin;
+    logPayload.attached = true;
+    logPayload.observedSubpageCount = coverageSignals.observedSubpageCount;
+    logPayload.observedH1PageCount = coverageSignals.observedH1PageCount;
+    logPayload.observedBreadcrumbPageCount = coverageSignals.observedBreadcrumbPageCount;
+    logPayload.hasObservedAboutPage = coverageSignals.hasObservedAboutPage;
+    logPayload.hasObservedBreadcrumbList = coverageSignals.hasObservedBreadcrumbList;
+    logPayload.reason = 'attached';
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+    return coverageSignals;
+  } catch (e) {
+    logPayload.reason = String(e && (e.message || e) || 'coverage_integration_failed').slice(0, 160);
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+    return null;
+  }
+}
+
 async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const started = Date.now();
   const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
@@ -10634,6 +10746,7 @@ async function scrapeOnce(req, res) {
           ? scrapeTiming.gotoMs
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
       });
+      await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch);
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
       const headingsObserved = observed.headings || {};
