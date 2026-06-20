@@ -3923,6 +3923,32 @@ function sortCoverageObserveCandidates_(candidates) {
   });
 }
 
+function buildCoverageCandidatePageTypes_(candidates) {
+  const out = {
+    about: false,
+    business: false,
+    service: false,
+    case: false,
+    recruit: false,
+    contact: false,
+    legal: false,
+    sitemap: false
+  };
+  (Array.isArray(candidates) ? candidates : []).forEach(candidate => {
+    const path = getCoverageCandidatePath_(candidate).toLowerCase();
+    if (!path) return;
+    if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) out.about = true;
+    if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) out.business = true;
+    if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) out.service = true;
+    if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) out.case = true;
+    if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) out.recruit = true;
+    if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) out.contact = true;
+    if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) out.legal = true;
+    if (/\/(?:sitemap)(?:\/|$|-|_)/i.test(path)) out.sitemap = true;
+  });
+  return out;
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -3951,6 +3977,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         });
         return acc;
       }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
+  const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
   const observedPages = observations.filter(page => page && page.ok === true);
   const hasBreadcrumb = page => {
     const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
@@ -4004,6 +4031,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     topUrl: payload && payload.topUrl || '',
     origin: payload && payload.origin || '',
     candidateSourceSummary,
+    candidatePageTypes,
     observedSubpageCount: observedPages.length,
     observedH1PageCount,
     observedBreadcrumbPageCount,
@@ -4034,6 +4062,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       footer: 0,
       other: 0
     },
+    candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
     representativePages: (Array.isArray(coverageSignalsV1.representativePages)
       ? coverageSignalsV1.representativePages
       : []
@@ -4193,7 +4222,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidates: selectedCandidates,
       observations
     };
-    const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(payload);
+    const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
+      candidates: discovered.candidates
+    }));
+    try {
+      console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
+        url: normalized.topUrl,
+        candidateCount: discovered.totalCandidates,
+        candidatePageTypes: coverageSignalsV1.candidatePageTypes
+      }));
+    } catch (_) {}
     const coverageSignals = buildGeoSignalsCoverageSignals_(coverageSignalsV1);
     if (!coverageSignals) {
       logPayload.origin = normalized.origin;
@@ -4784,7 +4822,9 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     observations,
     errors: [].concat(discovered.errors || [], observationErrors)
   };
-  payload.coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(payload);
+  payload.coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
+    candidates: discovered.candidates
+  }));
   console.log('[DEBUG][COVERAGE_SIGNALS_V1_SUMMARY]', JSON.stringify({
     topUrl: payload.topUrl,
     origin: payload.origin,
