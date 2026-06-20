@@ -5227,7 +5227,19 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return coverageSignalsV1;
   const selectedRepresentativePages = (Array.isArray(selectedCandidates) ? selectedCandidates : [])
     .map(buildCoverageRepresentativePageFromCandidate_);
-  if (!selectedRepresentativePages.length) return coverageSignalsV1;
+  if (!selectedRepresentativePages.length) {
+    logRepresentativeObservationQualitySourceAuditPhase12_({
+      origin: opts && opts.origin,
+      selectedCandidates,
+      preservedRepresentativePages: [],
+      observedSubpages: opts && opts.observedSubpages,
+      finalRepresentativePages: Array.isArray(coverageSignalsV1.representativePages) ? coverageSignalsV1.representativePages : [],
+      observedCount: Array.isArray(coverageSignalsV1.representativePages)
+        ? coverageSignalsV1.representativePages.filter(page => page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false)).length
+        : 0
+    });
+    return coverageSignalsV1;
+  }
   const observedRepresentatives = Array.isArray(coverageSignalsV1.representativePages)
     ? coverageSignalsV1.representativePages
     : [];
@@ -5285,7 +5297,49 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     afterCount: preserved.length
   });
   coverageSignalsV1.representativePages = preserved;
+  logRepresentativeObservationQualitySourceAuditPhase12_({
+    origin: opts && opts.origin,
+    selectedCandidates,
+    preservedRepresentativePages: preserved,
+    observedSubpages: opts && opts.observedSubpages,
+    finalRepresentativePages: coverageSignalsV1.representativePages,
+    observedCount: preserved.filter(page => page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false)).length
+  });
   return coverageSignalsV1;
+}
+
+function representativePathList_(items) {
+  return (Array.isArray(items) ? items : []).map(item => {
+    if (!item) return '';
+    if (typeof item === 'string') return item;
+    return getCoverageCandidatePath_(item) || String(item.path || item.finalUrl || item.url || '');
+  }).filter(Boolean).slice(0, 12);
+}
+
+function logRepresentativeObservationQualitySourceAuditPhase12_(payload = {}) {
+  try {
+    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
+    const preservedRepresentativePages = Array.isArray(payload.preservedRepresentativePages) ? payload.preservedRepresentativePages : [];
+    const observedSubpages = Array.isArray(payload.observedSubpages) ? payload.observedSubpages : [];
+    const finalRepresentativePages = Array.isArray(payload.finalRepresentativePages) ? payload.finalRepresentativePages : [];
+    console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_PHASE12_SOURCE_AUDIT]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      selectedCandidatesCount: selectedCandidates.length,
+      preservedRepresentativePagesCount: preservedRepresentativePages.length,
+      observedSubpagesCount: observedSubpages.length,
+      finalRepresentativePagesCount: finalRepresentativePages.length,
+      observedCount: typeof payload.observedCount === 'number'
+        ? payload.observedCount
+        : finalRepresentativePages.filter(page => page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false)).length,
+      representativePagesCount: finalRepresentativePages.length,
+      paths: {
+        selectedCandidates: representativePathList_(selectedCandidates),
+        preservedRepresentativePages: representativePathList_(preservedRepresentativePages),
+        observedSubpages: representativePathList_(observedSubpages),
+        finalRepresentativePages: representativePathList_(finalRepresentativePages)
+      }
+    }));
+  } catch (_) {}
 }
 
 function buildRepresentativeObservationQuality_(page) {
@@ -5373,6 +5427,8 @@ function attachRepresentativeObservationQuality_(coverageSignals) {
   }, { total: 0, attempted: 0, reached: 0, good: 0, partial: 0, weak: 0, failed: 0, candidateOnly: 0, observed: 0 });
   coverageSignals.representativeObservationQuality = summary;
   coverageSignals.representativePagesCount = coverageSignals.representativePages.length;
+  coverageSignals.observedSubpageCount = summary.reached;
+  coverageSignals.observedCount = summary.reached;
   return coverageSignals;
 }
 
@@ -6526,7 +6582,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     coverageSignalsV1 = preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
-      observationAttempted: true
+      observationAttempted: true,
+      observedSubpages: observations
     });
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
