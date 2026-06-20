@@ -5493,6 +5493,7 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     afterCount: preserved.length
   });
   coverageSignalsV1.representativePages = preserved;
+  attachRepresentativeObservationQuality_(coverageSignalsV1);
   logRepresentativeObservationQualitySourceAuditPhase12_({
     origin: opts && opts.origin,
     selectedCandidates,
@@ -5500,6 +5501,13 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     observedSubpages: opts && opts.observedSubpages,
     finalRepresentativePages: coverageSignalsV1.representativePages,
     observedCount: preserved.filter(page => page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false)).length
+  });
+  logSubpageLightExtractionFinalMergeAuditPhase13_({
+    origin: opts && opts.origin,
+    responseMode: opts && opts.responseMode || null,
+    selectedCandidates,
+    observedSubpages: opts && opts.observedSubpages,
+    finalRepresentativePages: coverageSignalsV1.representativePages
   });
   return coverageSignalsV1;
 }
@@ -5534,6 +5542,68 @@ function logRepresentativeObservationQualitySourceAuditPhase12_(payload = {}) {
         observedSubpages: representativePathList_(observedSubpages),
         finalRepresentativePages: representativePathList_(finalRepresentativePages)
       }
+    }));
+  } catch (_) {}
+}
+
+function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
+  try {
+    const observedSubpages = Array.isArray(payload.observedSubpages) ? payload.observedSubpages : [];
+    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
+    const finalRepresentativePages = Array.isArray(payload.finalRepresentativePages) ? payload.finalRepresentativePages : [];
+    const observedByPath = new Map();
+    observedSubpages.forEach(page => {
+      const key = normalizeCoveragePathKey_(page && (page.finalUrl || page.url || page.path) || '');
+      if (key) observedByPath.set(key, page);
+    });
+    const candidateKeys = new Set(selectedCandidates.map(candidate => normalizeCoveragePathKey_(candidate && (candidate.url || candidate.path) || '')).filter(Boolean));
+    const metricSummary = (page = {}) => ({
+      contentTextLength: Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length,
+      h1Count: Number(page.h1Count || 0),
+      usedFallbackExtraction: page.usedFallbackExtraction === true,
+      extractionError: page.extractionError ? String(page.extractionError).slice(0, 160) : null
+    });
+    console.log('[DEBUG][SUBPAGE_LIGHT_EXTRACTION_PHASE13_FINAL_MERGE_AUDIT]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      responseMode: payload.responseMode || null,
+      observedResultsCount: observedSubpages.length,
+      selectedCandidatesCount: selectedCandidates.length,
+      finalRepresentativePagesCount: finalRepresentativePages.length,
+      pages: finalRepresentativePages.slice(0, 8).map(page => {
+        const key = normalizeCoveragePathKey_(page && (page.finalUrl || page.url || page.path) || '');
+        const observed = key ? observedByPath.get(key) : null;
+        const q = page && page.observationQuality || buildRepresentativeObservationQuality_(page);
+        const fallbackAttempted = page && page.usedFallbackExtraction === true || observed && observed.usedFallbackExtraction === true;
+        const fallbackContentLength = observed
+          ? (Number(observed.bodyTextLength || 0) || normalizeSubpageJsonLdText(observed.sampledText).length)
+          : 0;
+        return {
+          path: String(page && page.path || '').slice(0, 160),
+          reached: page && page.reached === true,
+          navigationCommitted: page && page.navigationCommitted === true,
+          source: observed ? 'observed' : (candidateKeys.has(key) ? 'selectedCandidate' : (page && page.candidateOnly === true ? 'fallbackPreserved' : 'unknown')),
+          hasObservedMatch: !!observed,
+          preMerge: metricSummary(observed || {}),
+          fallbackResult: {
+            attempted: fallbackAttempted,
+            success: fallbackAttempted && !((page && page.extractionError) || (observed && observed.extractionError)),
+            contentTextLength: fallbackContentLength,
+            h1Count: Number(observed && observed.h1Count || 0),
+            titlePresent: !!normalizeSubpageJsonLdText(observed && observed.title),
+            jsonLdCount: Number(observed && (observed.jsonLdCount || observed.jsonldCount || observed.deepJsonLdScriptCount) || 0),
+            error: (page && page.extractionError) || (observed && observed.extractionError) || null
+          },
+          postMerge: metricSummary(page || {}),
+          finalObservationQuality: {
+            contentTextLength: Number(q.contentTextLength || 0),
+            titlePresent: q.titlePresent === true,
+            h1Count: Number(q.h1Count || 0),
+            jsonLdCount: Number(q.jsonLdCount || 0),
+            level: q.level || null,
+            reasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 8) : []
+          }
+        };
+      })
     }));
   } catch (_) {}
 }
@@ -5875,9 +5945,22 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         returnedPartial: page.returnedPartial === true,
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
+        h1Count: Number(page.h1Count || 0),
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
         hasBreadcrumbList: hasBreadcrumb(page),
         jsonLdTypes,
+        jsonLdCount: Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || jsonLdTypes.length || 0),
+        bodyTextLength: Number(page.bodyTextLength || 0) || 0,
+        sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500),
+        hasMain: page.hasMain === true,
+        hasMainLandmark: page.hasMainLandmark === true,
+        hasNavLike: page.hasNavLike === true || page.navLikeFound === true,
+        hasFooterLike: page.hasFooterLike === true || page.footerLikeFound === true,
+        internalLinkCount: Number(page.internalLinkCount || 0) || 0,
+        externalLinkCount: Number(page.externalLinkCount || 0) || 0,
+        sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
+        usedFallbackExtraction: page.usedFallbackExtraction === true,
+        extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
         matchedCandidateSources: Array.isArray(candidate.sources)
           ? candidate.sources.slice(0, 8)
           : (candidate.source ? [candidate.source] : [])
@@ -6361,6 +6444,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       preserveSelectedCoverageRepresentatives_(emptyCoverageSignalsV1, selectedCandidatesForFallback, {
         debugRunId: phase11DebugRunId,
         origin: normalized && normalized.origin || '',
+        responseMode: phase11ResponseMode,
         observationAttempted: false,
         observedSubpages: []
       });
@@ -6823,6 +6907,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     coverageSignalsV1 = preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
+      responseMode: phase11ResponseMode,
       observationAttempted: true,
       observedSubpages: observations
     });
