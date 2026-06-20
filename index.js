@@ -8982,6 +8982,29 @@ async function scrapeOnce(req, res) {
       errorMessage: null
     }, extra));
   };
+  let topObservationCallIndex = 0;
+  const logTopObservationCall = (caller, functionName, phase, startedAtMs, extra = {}) => {
+    try {
+      console.log('[DEBUG][TOP_OBSERVATION_CALL_PHASE11]', JSON.stringify(Object.assign({
+        debugRunId,
+        url: String(urlToFetch || '').slice(0, 240),
+        origin: watchdogOrigin(),
+        caller,
+        callIndex: extra.callIndex || topObservationCallIndex,
+        phase,
+        startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+        completedAt: startedAtMs && phase !== 'before_call' ? new Date().toISOString() : null,
+        durationMs: startedAtMs && phase !== 'before_call' ? Date.now() - startedAtMs : null,
+        mode: signalsFirstBalanced ? 'signalsFirstBalanced' : (signalsFirstLight ? 'signalsFirstLight' : (signalsOnly ? 'signalsOnly' : 'scrape')),
+        signalsMode,
+        responseMode: watchdogResponseMode,
+        functionName,
+        reason: extra.reason || null,
+        errorName: extra.errorName || null,
+        errorMessage: extra.errorMessage || null
+      })));
+    } catch (_) {}
+  };
   const scrapeWatchdogStartedAt = Date.now();
   logWatchdog('scrape_start', scrapeWatchdogStartedAt, { completedAt: null, durationMs: null });
 
@@ -11371,7 +11394,27 @@ async function scrapeOnce(req, res) {
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
     logWatchdog('top_observation_start', __timingInitialWaitStart, { completedAt: null, durationMs: null });
-    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    const initialGotoCallIndex = ++topObservationCallIndex;
+    logTopObservationCall('signals_light_primary', 'page.goto', 'before_call', __timingInitialWaitStart, {
+      callIndex: initialGotoCallIndex,
+      reason: 'initial_top_page_goto'
+    });
+    let resp = null;
+    try {
+      resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      logTopObservationCall('signals_light_primary', 'page.goto', 'after_call', __timingInitialWaitStart, {
+        callIndex: initialGotoCallIndex,
+        reason: 'initial_top_page_goto'
+      });
+    } catch (e) {
+      logTopObservationCall('signals_light_primary', 'page.goto', 'error', __timingInitialWaitStart, {
+        callIndex: initialGotoCallIndex,
+        reason: 'initial_top_page_goto',
+        errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+        errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+      });
+      throw e;
+    }
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
     logWatchdog('top_observation_complete', __timingInitialWaitStart);
     logSf('AFTER_GOTO', {
@@ -12069,7 +12112,27 @@ async function scrapeOnce(req, res) {
       const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
       const hydrationWatchdogStartedAt = Date.now();
       logWatchdog('top_observation_start', hydrationWatchdogStartedAt, { completedAt: null, durationMs: null });
-      const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+      const hydrationCallIndex = ++topObservationCallIndex;
+      logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'before_call', hydrationWatchdogStartedAt, {
+        callIndex: hydrationCallIndex,
+        reason: 'signals_light_hydration_metrics'
+      });
+      let hydrationMetrics = null;
+      try {
+        hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+        logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'after_call', hydrationWatchdogStartedAt, {
+          callIndex: hydrationCallIndex,
+          reason: 'signals_light_hydration_metrics'
+        });
+      } catch (e) {
+        logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'error', hydrationWatchdogStartedAt, {
+          callIndex: hydrationCallIndex,
+          reason: 'signals_light_hydration_metrics',
+          errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+        throw e;
+      }
       logWatchdog('top_observation_complete', hydrationWatchdogStartedAt);
       if (signalsFirstBalanced || signalsFirstLight) {
         logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_HYDRATION_WAIT' : 'SIGNALS_FIRST_LIGHT_HYDRATION_WAIT', {
@@ -12087,15 +12150,35 @@ async function scrapeOnce(req, res) {
       }
       const geoSignalsWatchdogStartedAt = Date.now();
       logWatchdog('top_observation_start', geoSignalsWatchdogStartedAt, { completedAt: null, durationMs: null });
-      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
-        balancedMode: signalsFirstBalanced,
-        shortFastMode: balancedShortFastResponse,
-        boundedHydrationWaitMs,
-        hydrationMetrics,
-        gotoMs: typeof scrapeTiming.gotoMs === 'number'
-          ? scrapeTiming.gotoMs
-          : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
+      const geoSignalsCallIndex = ++topObservationCallIndex;
+      logTopObservationCall('signals_light_primary', 'buildGeoSignalsV1', 'before_call', geoSignalsWatchdogStartedAt, {
+        callIndex: geoSignalsCallIndex,
+        reason: 'signals_light_geo_signals_build'
       });
+      let geoSignalsV1 = null;
+      try {
+        geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
+          balancedMode: signalsFirstBalanced,
+          shortFastMode: balancedShortFastResponse,
+          boundedHydrationWaitMs,
+          hydrationMetrics,
+          gotoMs: typeof scrapeTiming.gotoMs === 'number'
+            ? scrapeTiming.gotoMs
+            : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
+        });
+        logTopObservationCall('signals_light_primary', 'buildGeoSignalsV1', 'after_call', geoSignalsWatchdogStartedAt, {
+          callIndex: geoSignalsCallIndex,
+          reason: 'signals_light_geo_signals_build'
+        });
+      } catch (e) {
+        logTopObservationCall('signals_light_primary', 'buildGeoSignalsV1', 'error', geoSignalsWatchdogStartedAt, {
+          callIndex: geoSignalsCallIndex,
+          reason: 'signals_light_geo_signals_build',
+          errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+        throw e;
+      }
       logWatchdog('top_observation_complete', geoSignalsWatchdogStartedAt);
       const subpageObservationPhase11State = {
         debugRunId,
@@ -12480,7 +12563,28 @@ async function scrapeOnce(req, res) {
       logSfMemory('signals_only_early_enter');
       logSf('SIGNALS_ONLY_EARLY_BEFORE_GEO_SIGNALS');
       logSfMemory('signals_only_early_before_geo_signals');
-      const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+      const signalsOnlyGeoSignalsStartedAt = Date.now();
+      const signalsOnlyGeoSignalsCallIndex = ++topObservationCallIndex;
+      logTopObservationCall('signals_only_early', 'buildGeoSignalsV1', 'before_call', signalsOnlyGeoSignalsStartedAt, {
+        callIndex: signalsOnlyGeoSignalsCallIndex,
+        reason: 'signals_only_geo_signals_build'
+      });
+      let geoSignalsV1 = null;
+      try {
+        geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch);
+        logTopObservationCall('signals_only_early', 'buildGeoSignalsV1', 'after_call', signalsOnlyGeoSignalsStartedAt, {
+          callIndex: signalsOnlyGeoSignalsCallIndex,
+          reason: 'signals_only_geo_signals_build'
+        });
+      } catch (e) {
+        logTopObservationCall('signals_only_early', 'buildGeoSignalsV1', 'error', signalsOnlyGeoSignalsStartedAt, {
+          callIndex: signalsOnlyGeoSignalsCallIndex,
+          reason: 'signals_only_geo_signals_build',
+          errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+          errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+        });
+        throw e;
+      }
       logSf('SIGNALS_ONLY_EARLY_AFTER_GEO_SIGNALS', {
         hasGeoSignals: !!geoSignalsV1,
         error: geoSignalsV1 && geoSignalsV1.error ? true : false
@@ -14754,7 +14858,28 @@ async function scrapeOnce(req, res) {
 
   logSf('BEFORE_GEO_SIGNALS');
   logSfMemory('before_geo_signals');
-  const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+  const legacyGeoSignalsStartedAt = Date.now();
+  const legacyGeoSignalsCallIndex = ++topObservationCallIndex;
+  logTopObservationCall('legacy_scrape_payload_rebuild', 'buildGeoSignalsV1', 'before_call', legacyGeoSignalsStartedAt, {
+    callIndex: legacyGeoSignalsCallIndex,
+    reason: 'legacy_scrape_payload_rebuild'
+  });
+  let geoSignalsV1 = null;
+  try {
+    geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+    logTopObservationCall('legacy_scrape_payload_rebuild', 'buildGeoSignalsV1', 'after_call', legacyGeoSignalsStartedAt, {
+      callIndex: legacyGeoSignalsCallIndex,
+      reason: 'legacy_scrape_payload_rebuild'
+    });
+  } catch (e) {
+    logTopObservationCall('legacy_scrape_payload_rebuild', 'buildGeoSignalsV1', 'error', legacyGeoSignalsStartedAt, {
+      callIndex: legacyGeoSignalsCallIndex,
+      reason: 'legacy_scrape_payload_rebuild',
+      errorName: e && e.name ? String(e.name).slice(0, 80) : null,
+      errorMessage: String(e && (e.message || e) || '').slice(0, 240)
+    });
+    throw e;
+  }
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
