@@ -155,6 +155,7 @@ Rules:
 const express = require('express');
 const { chromium } = require('playwright');
 const PQueue = require('p-queue').default;
+const v8 = require('v8');
 
 const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
@@ -4665,6 +4666,48 @@ function logResponseBuildPhase11_(payload = {}) {
   } catch (_) {}
 }
 
+function logMemoryGuardPhase11_(payload = {}) {
+  try {
+    const m = process.memoryUsage ? process.memoryUsage() : {};
+    const heapStats = (() => {
+      try {
+        if (v8 && typeof v8.getHeapStatistics === 'function') return v8.getHeapStatistics();
+      } catch (_) {}
+      return {};
+    })();
+    console.log('[DEBUG][MEMORY_GUARD_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      url: String(payload.url || '').slice(0, 240),
+      origin: String(payload.origin || '').slice(0, 180),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      signalsMode: payload.signalsMode || null,
+      responseMode: payload.responseMode || null,
+      memoryGuardTriggered: payload.memoryGuardTriggered === true,
+      fallbackReason: payload.fallbackReason || null,
+      reason: payload.reason || null,
+      beforeCoverageAttach: payload.beforeCoverageAttach === true,
+      beforeSubpageObservation: payload.beforeSubpageObservation === true,
+      hasGeoSignalsV1: payload.hasGeoSignalsV1 === true,
+      hasCoverageSignals: payload.hasCoverageSignals === true,
+      representativePagesCount: typeof payload.representativePagesCount === 'number' ? payload.representativePagesCount : null,
+      candidateOnlyCount: typeof payload.candidateOnlyCount === 'number' ? payload.candidateOnlyCount : null,
+      observedCount: typeof payload.observedCount === 'number' ? payload.observedCount : null,
+      heapUsed: typeof m.heapUsed === 'number' ? m.heapUsed : null,
+      heapTotal: typeof m.heapTotal === 'number' ? m.heapTotal : null,
+      rss: typeof m.rss === 'number' ? m.rss : null,
+      heapLimit: typeof heapStats.heap_size_limit === 'number' ? heapStats.heap_size_limit : null,
+      estimatedPayloadBytes: typeof payload.estimatedPayloadBytes === 'number' ? payload.estimatedPayloadBytes : null,
+      htmlEstimate: typeof payload.htmlEstimate === 'number' ? payload.htmlEstimate : null,
+      threshold: typeof payload.threshold === 'number' ? payload.threshold : null,
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 function logSubpageObservationItemPhase11_(payload = {}) {
   try {
     console.log('[DEBUG][SUBPAGE_OBSERVATION_ITEM_PHASE11]', JSON.stringify({
@@ -4910,6 +4953,38 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   const reusePageForDiscover = !!(opts && opts.page);
   const reuseContextForObserve = !!(opts && opts.context);
   const maxObserve = Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
+  const phase11DebugRunId = opts && opts.debugRunId ? opts.debugRunId : null;
+  const phase11SignalsMode = opts && opts.signalsMode ? opts.signalsMode : null;
+  const phase11ResponseMode = opts && opts.responseMode ? opts.responseMode : null;
+  const logCoverageMemoryGuard = (phase, startedAtMs, extra = {}) => {
+    logMemoryGuardPhase11_(Object.assign({
+      debugRunId: phase11DebugRunId,
+      url: String(topUrl || ''),
+      origin: normalized && normalized.origin || '',
+      phase,
+      startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+      completedAt: startedAtMs ? new Date().toISOString() : null,
+      durationMs: startedAtMs ? Math.max(0, Date.now() - startedAtMs) : null,
+      signalsMode: phase11SignalsMode,
+      responseMode: phase11ResponseMode,
+      memoryGuardTriggered: false,
+      fallbackReason: null,
+      reason: null,
+      beforeCoverageAttach: false,
+      beforeSubpageObservation: true,
+      hasGeoSignalsV1: !!(geoSignalsV1 && typeof geoSignalsV1 === 'object'),
+      hasCoverageSignals: !!(geoSignalsV1 && geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'),
+      representativePagesCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages.length
+        : 0,
+      candidateOnlyCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages.filter(page => page && page.candidateOnly === true).length
+        : 0,
+      observedCount: geoSignalsV1 && geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals.observedCount === 'number'
+        ? geoSignalsV1.coverageSignals.observedCount
+        : null
+    }, extra || {}));
+  };
   const auditPayload = {
     url: String(topUrl || ''),
     reusePageForDiscover,
@@ -4923,7 +4998,22 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   const normalizedHost = (() => {
     try { return new URL(String(normalized && normalized.topUrl || topUrl || '')).hostname.toLowerCase(); } catch (_) { return ''; }
   })();
+  const memoryGuardEvalStartedAt = Date.now();
+  logCoverageMemoryGuard('memory_guard_eval_start', memoryGuardEvalStartedAt, {
+    beforeCoverageAttach: true,
+    reason: 'host_pre_response_memory_guard_check',
+    threshold: null
+  });
   const shouldSkipSubpageForMemoryGuard = memoryGuardHosts.includes(normalizedHost);
+  logCoverageMemoryGuard('memory_guard_eval_complete', memoryGuardEvalStartedAt, {
+    beforeCoverageAttach: true,
+    memoryGuardTriggered: shouldSkipSubpageForMemoryGuard,
+    fallbackReason: shouldSkipSubpageForMemoryGuard ? 'pre_response_memory_guard' : null,
+    reason: shouldSkipSubpageForMemoryGuard
+      ? 'host_pre_response_memory_guard_match'
+      : 'host_pre_response_memory_guard_not_matched',
+    threshold: null
+  });
   let lastDiscoveredForCoverage = null;
   try {
     traceCoverageMemory('attach_start', {
@@ -4951,9 +5041,26 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return null;
     }
     if (shouldSkipSubpageForMemoryGuard) {
+      const memoryGuardTriggeredAt = Date.now();
+      logCoverageMemoryGuard('memory_guard_triggered', memoryGuardTriggeredAt, {
+        memoryGuardTriggered: true,
+        fallbackReason: 'pre_response_memory_guard',
+        reason: 'host_pre_response_memory_guard_match',
+        beforeCoverageAttach: false,
+        beforeSubpageObservation: true,
+        threshold: null
+      });
       setPhase11State({
         memoryGuardTriggered: true,
         fallbackReason: 'pre_response_memory_guard'
+      });
+      logCoverageMemoryGuard('pre_response_memory_guard_branch', memoryGuardTriggeredAt, {
+        memoryGuardTriggered: true,
+        fallbackReason: 'pre_response_memory_guard',
+        reason: 'host_pre_response_memory_guard_match',
+        beforeCoverageAttach: false,
+        beforeSubpageObservation: true,
+        threshold: null
       });
       let lightweightDiscovered = null;
       try {
@@ -4977,6 +5084,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       if (geoSignalsV1 && geoSignalsV1.subpageSignals && typeof geoSignalsV1.subpageSignals === 'object') {
         geoSignalsV1.subpageSignals.candidateOnly = true;
       }
+      const candidateOnlyRepresentativePages = geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages
+        : [];
+      logCoverageMemoryGuard('subpage_observation_skipped_by_memory_guard', memoryGuardTriggeredAt, {
+        memoryGuardTriggered: true,
+        fallbackReason: 'pre_response_memory_guard',
+        reason: 'subpage_observation_skipped_memory_guard',
+        beforeCoverageAttach: false,
+        beforeSubpageObservation: true,
+        hasCoverageSignals: !!(geoSignalsV1 && geoSignalsV1.coverageSignals),
+        representativePagesCount: candidateOnlyRepresentativePages.length,
+        candidateOnlyCount: candidateOnlyRepresentativePages.filter(page => page && page.candidateOnly === true).length,
+        observedCount: 0,
+        estimatedPayloadBytes: null,
+        htmlEstimate: null,
+        threshold: null
+      });
       logPayload.origin = normalized.origin;
       logPayload.reason = 'subpage_observation_skipped_memory_guard';
       traceCoverageMemory('attach_skip_memory_guard', {
@@ -9475,14 +9599,81 @@ async function scrapeOnce(req, res) {
   const RSS_HARD_LIMIT = Number(process.env.RSS_HARD_LIMIT || 900 * 1024 * 1024); // ~900MB 目安
   const memoryGuardCheckStartedAt = Date.now();
   logWatchdog('memory_guard_check_start', memoryGuardCheckStartedAt, { completedAt: null, durationMs: null });
-  logWatchdog('memory_guard_check_complete', memoryGuardCheckStartedAt, {
-    memoryGuardTriggered: process.memoryUsage().rss > RSS_HARD_LIMIT,
-    fallbackReason: process.memoryUsage().rss > RSS_HARD_LIMIT ? 'over_memory_limit' : null
+  logMemoryGuardPhase11_({
+    debugRunId,
+    url: urlToFetch,
+    origin: watchdogOrigin(),
+    phase: 'memory_guard_eval_start',
+    startedAt: new Date(memoryGuardCheckStartedAt).toISOString(),
+    completedAt: null,
+    durationMs: null,
+    signalsMode: signalsMode || null,
+    responseMode: watchdogResponseMode,
+    memoryGuardTriggered: false,
+    fallbackReason: null,
+    reason: 'rss_hard_limit_check',
+    beforeCoverageAttach: true,
+    beforeSubpageObservation: true,
+    hasGeoSignalsV1: false,
+    hasCoverageSignals: false,
+    representativePagesCount: 0,
+    candidateOnlyCount: 0,
+    observedCount: null,
+    threshold: RSS_HARD_LIMIT
   });
-  if (process.memoryUsage().rss > RSS_HARD_LIMIT) {
+  const rssMemoryGuardTriggered = process.memoryUsage().rss > RSS_HARD_LIMIT;
+  logWatchdog('memory_guard_check_complete', memoryGuardCheckStartedAt, {
+    memoryGuardTriggered: rssMemoryGuardTriggered,
+    fallbackReason: rssMemoryGuardTriggered ? 'over_memory_limit' : null
+  });
+  logMemoryGuardPhase11_({
+    debugRunId,
+    url: urlToFetch,
+    origin: watchdogOrigin(),
+    phase: 'memory_guard_eval_complete',
+    startedAt: new Date(memoryGuardCheckStartedAt).toISOString(),
+    completedAt: new Date().toISOString(),
+    durationMs: Math.max(0, Date.now() - memoryGuardCheckStartedAt),
+    signalsMode: signalsMode || null,
+    responseMode: watchdogResponseMode,
+    memoryGuardTriggered: rssMemoryGuardTriggered,
+    fallbackReason: rssMemoryGuardTriggered ? 'over_memory_limit' : null,
+    reason: rssMemoryGuardTriggered ? 'rss_hard_limit_exceeded' : 'rss_hard_limit_ok',
+    beforeCoverageAttach: true,
+    beforeSubpageObservation: true,
+    hasGeoSignalsV1: false,
+    hasCoverageSignals: false,
+    representativePagesCount: 0,
+    candidateOnlyCount: 0,
+    observedCount: null,
+    threshold: RSS_HARD_LIMIT
+  });
+  if (rssMemoryGuardTriggered) {
     logWatchdog('memory_guard_triggered', memoryGuardCheckStartedAt, {
       memoryGuardTriggered: true,
       fallbackReason: 'over_memory_limit'
+    });
+    logMemoryGuardPhase11_({
+      debugRunId,
+      url: urlToFetch,
+      origin: watchdogOrigin(),
+      phase: 'memory_guard_triggered',
+      startedAt: new Date(memoryGuardCheckStartedAt).toISOString(),
+      completedAt: new Date().toISOString(),
+      durationMs: Math.max(0, Date.now() - memoryGuardCheckStartedAt),
+      signalsMode: signalsMode || null,
+      responseMode: watchdogResponseMode,
+      memoryGuardTriggered: true,
+      fallbackReason: 'over_memory_limit',
+      reason: 'rss_hard_limit_exceeded',
+      beforeCoverageAttach: true,
+      beforeSubpageObservation: true,
+      hasGeoSignalsV1: false,
+      hasCoverageSignals: false,
+      representativePagesCount: 0,
+      candidateOnlyCount: 0,
+      observedCount: null,
+      threshold: RSS_HARD_LIMIT
     });
     return res.status(503).json({ error: 'over_memory_limit', hint: 'reduce concurrency or upgrade instance' });
   }
@@ -12634,6 +12825,9 @@ async function scrapeOnce(req, res) {
         context,
         reuseBrowser: true,
         maxObserve: 2,
+        debugRunId,
+        signalsMode: signalsMode || null,
+        responseMode: watchdogResponseMode,
         phase11State: subpageObservationPhase11State
       });
       logWatchdog('subpage_observation_complete', coverageAttachWatchdogStartedAt, {
