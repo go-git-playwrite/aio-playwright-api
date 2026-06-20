@@ -4590,6 +4590,25 @@ function logSubpageObservationPhase11_(payload = {}) {
   } catch (_) {}
 }
 
+function logScrapePhase11Watchdog_(payload = {}) {
+  try {
+    console.log('[DEBUG][SCRAPE_PHASE11_WATCHDOG]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      url: String(payload.url || '').slice(0, 240),
+      origin: String(payload.origin || '').slice(0, 180),
+      phase: payload.phase || '',
+      startedAt: payload.startedAt || null,
+      completedAt: payload.completedAt || null,
+      durationMs: typeof payload.durationMs === 'number' ? payload.durationMs : null,
+      responseMode: payload.responseMode || null,
+      memoryGuardTriggered: payload.memoryGuardTriggered === true,
+      fallbackReason: payload.fallbackReason || null,
+      errorName: payload.errorName || null,
+      errorMessage: payload.errorMessage || null
+    }));
+  } catch (_) {}
+}
+
 function logSubpageObservationItemPhase11_(payload = {}) {
   try {
     console.log('[DEBUG][SUBPAGE_OBSERVATION_ITEM_PHASE11]', JSON.stringify({
@@ -8942,6 +8961,29 @@ async function scrapeOnce(req, res) {
     ? Math.floor(probeMaxSubpageFetchRaw)
     : 3
   ));
+  const debugRunId = req && req.query && req.query.debugRunId ? String(req.query.debugRunId).slice(0, 120) : null;
+  const watchdogResponseMode = balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : (signalsFirstBalanced ? 'balanced' : (signalsFirstLight ? 'light' : responseMode || 'default')));
+  const watchdogOrigin = () => {
+    try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return ''; }
+  };
+  const logWatchdog = (phase, startedAtMs, extra = {}) => {
+    logScrapePhase11Watchdog_(Object.assign({
+      debugRunId,
+      url: urlToFetch,
+      origin: watchdogOrigin(),
+      phase,
+      startedAt: startedAtMs ? new Date(startedAtMs).toISOString() : null,
+      completedAt: startedAtMs ? new Date().toISOString() : null,
+      durationMs: startedAtMs ? Date.now() - startedAtMs : null,
+      responseMode: watchdogResponseMode,
+      memoryGuardTriggered: false,
+      fallbackReason: null,
+      errorName: null,
+      errorMessage: null
+    }, extra));
+  };
+  const scrapeWatchdogStartedAt = Date.now();
+  logWatchdog('scrape_start', scrapeWatchdogStartedAt, { completedAt: null, durationMs: null });
 
   logSf('SCRAPE_ENTER', {
     stage: 'scrapeOnce',
@@ -8979,7 +9021,17 @@ async function scrapeOnce(req, res) {
 
   // メモリが既に逼迫している場合はソフトフェイル（Render の再起動ループ回避）
   const RSS_HARD_LIMIT = Number(process.env.RSS_HARD_LIMIT || 900 * 1024 * 1024); // ~900MB 目安
+  const memoryGuardCheckStartedAt = Date.now();
+  logWatchdog('memory_guard_check_start', memoryGuardCheckStartedAt, { completedAt: null, durationMs: null });
+  logWatchdog('memory_guard_check_complete', memoryGuardCheckStartedAt, {
+    memoryGuardTriggered: process.memoryUsage().rss > RSS_HARD_LIMIT,
+    fallbackReason: process.memoryUsage().rss > RSS_HARD_LIMIT ? 'over_memory_limit' : null
+  });
   if (process.memoryUsage().rss > RSS_HARD_LIMIT) {
+    logWatchdog('memory_guard_triggered', memoryGuardCheckStartedAt, {
+      memoryGuardTriggered: true,
+      fallbackReason: 'over_memory_limit'
+    });
     return res.status(503).json({ error: 'over_memory_limit', hint: 'reduce concurrency or upgrade instance' });
   }
 
@@ -11318,8 +11370,10 @@ async function scrapeOnce(req, res) {
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
+    logWatchdog('top_observation_start', __timingInitialWaitStart, { completedAt: null, durationMs: null });
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
+    logWatchdog('top_observation_complete', __timingInitialWaitStart);
     logSf('AFTER_GOTO', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
@@ -12013,7 +12067,10 @@ async function scrapeOnce(req, res) {
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
       const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      const hydrationWatchdogStartedAt = Date.now();
+      logWatchdog('top_observation_start', hydrationWatchdogStartedAt, { completedAt: null, durationMs: null });
       const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+      logWatchdog('top_observation_complete', hydrationWatchdogStartedAt);
       if (signalsFirstBalanced || signalsFirstLight) {
         logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_HYDRATION_WAIT' : 'SIGNALS_FIRST_LIGHT_HYDRATION_WAIT', {
           waitMs: hydrationMetrics && hydrationMetrics.waitMs,
@@ -12028,6 +12085,8 @@ async function scrapeOnce(req, res) {
           warningTextAfterWait: hydrationMetrics && hydrationMetrics.warningTextAfterWait
         });
       }
+      const geoSignalsWatchdogStartedAt = Date.now();
+      logWatchdog('top_observation_start', geoSignalsWatchdogStartedAt, { completedAt: null, durationMs: null });
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
         shortFastMode: balancedShortFastResponse,
@@ -12037,8 +12096,9 @@ async function scrapeOnce(req, res) {
           ? scrapeTiming.gotoMs
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
       });
+      logWatchdog('top_observation_complete', geoSignalsWatchdogStartedAt);
       const subpageObservationPhase11State = {
-        debugRunId: req && req.query && req.query.debugRunId ? String(req.query.debugRunId).slice(0, 120) : null,
+        debugRunId,
         observationStarted: false,
         observationCompleted: false,
         fallbackReason: null,
@@ -12047,12 +12107,46 @@ async function scrapeOnce(req, res) {
         errorName: null,
         errorMessage: null
       };
+      const coverageAttachWatchdogStartedAt = Date.now();
+      logWatchdog('coverage_attach_start', coverageAttachWatchdogStartedAt, { completedAt: null, durationMs: null });
+      logWatchdog('subpage_observation_start', coverageAttachWatchdogStartedAt, { completedAt: null, durationMs: null });
       await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch, {
         page,
         context,
         reuseBrowser: true,
         maxObserve: 2,
         phase11State: subpageObservationPhase11State
+      });
+      logWatchdog('subpage_observation_complete', coverageAttachWatchdogStartedAt, {
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null,
+        errorName: subpageObservationPhase11State.errorName || null,
+        errorMessage: subpageObservationPhase11State.errorMessage || null
+      });
+      logWatchdog('coverage_attach_complete', coverageAttachWatchdogStartedAt, {
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null,
+        errorName: subpageObservationPhase11State.errorName || null,
+        errorMessage: subpageObservationPhase11State.errorMessage || null
+      });
+      if (subpageObservationPhase11State.memoryGuardTriggered === true) {
+        logWatchdog('pre_response_memory_guard_start', Date.now(), {
+          memoryGuardTriggered: true,
+          fallbackReason: subpageObservationPhase11State.fallbackReason || 'pre_response_memory_guard'
+        });
+      } else if (subpageObservationPhase11State.fallbackReason) {
+        logWatchdog('pre_response_fallback_start', Date.now(), {
+          fallbackReason: subpageObservationPhase11State.fallbackReason,
+          errorName: subpageObservationPhase11State.errorName || null,
+          errorMessage: subpageObservationPhase11State.errorMessage || null
+        });
+      }
+      const responseBuildWatchdogStartedAt = Date.now();
+      logWatchdog('response_build_start', responseBuildWatchdogStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
@@ -12279,6 +12373,10 @@ async function scrapeOnce(req, res) {
         diagnostics,
         memoryHints
       };
+      logWatchdog('response_build_complete', responseBuildWatchdogStartedAt, {
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null
+      });
       if (balancedShortResponse) {
         const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
         if (balancedShortFastResponse) {
@@ -12325,7 +12423,21 @@ async function scrapeOnce(req, res) {
           coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
           subpageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.subpageSignals
         });
-        return res.status(200).json(shortPayload);
+        const responseSendStartedAt = Date.now();
+        logWatchdog('response_send_start', responseSendStartedAt, {
+          completedAt: null,
+          durationMs: null,
+          responseMode: shortPayload && shortPayload.responseMode,
+          memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+          fallbackReason: subpageObservationPhase11State.fallbackReason || null
+        });
+        const response = res.status(200).json(shortPayload);
+        logWatchdog('response_send_complete', responseSendStartedAt, {
+          responseMode: shortPayload && shortPayload.responseMode,
+          memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+          fallbackReason: subpageObservationPhase11State.fallbackReason || null
+        });
+        return response;
       }
       logSubpageCoverageSignalsFinalAudit_({
         route: '/scrape',
@@ -12344,7 +12456,19 @@ async function scrapeOnce(req, res) {
         coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
         subpageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.subpageSignals
       });
-      return res.status(200).json(signalsResponsePayload);
+      const responseSendStartedAt = Date.now();
+      logWatchdog('response_send_start', responseSendStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null
+      });
+      const response = res.status(200).json(signalsResponsePayload);
+      logWatchdog('response_send_complete', responseSendStartedAt, {
+        memoryGuardTriggered: subpageObservationPhase11State.memoryGuardTriggered === true,
+        fallbackReason: subpageObservationPhase11State.fallbackReason || null
+      });
+      return response;
     }
     if (signalsOnly) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
@@ -14938,6 +15062,11 @@ async function scrapeOnce(req, res) {
   return res.status(200).json(out);
 
   } catch (err) {
+    logWatchdog('pre_response_fallback_start', Date.now(), {
+      fallbackReason: 'scrape_catch',
+      errorName: err && err.name ? String(err.name).slice(0, 80) : null,
+      errorMessage: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240)
+    });
     logSf('SCRAPE_CATCH', {
       name: err && err.name ? String(err.name).slice(0, 80) : '',
       message: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240)
@@ -14951,6 +15080,8 @@ async function scrapeOnce(req, res) {
       elapsedMs
     });
   } finally {
+    const finallyCleanupStartedAt = Date.now();
+    logWatchdog('finally_cleanup_start', finallyCleanupStartedAt, { completedAt: null, durationMs: null });
     logSf('SCRAPE_FINALLY');
     logSfMemory('scrape_finally');
     try {
@@ -14969,6 +15100,7 @@ async function scrapeOnce(req, res) {
     try { if (page)    await page.close(); } catch(_) {}
     try { if (context) await context.close(); } catch(_) {}
     try { if (browser) await browser.close(); } catch(_) {}
+    logWatchdog('finally_cleanup_complete', finallyCleanupStartedAt);
   }
 }
 
