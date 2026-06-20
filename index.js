@@ -3893,6 +3893,17 @@ function isCoverageSignalsAboutPath_(value) {
   return /\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path);
 }
 
+function getCoverageRepresentativePriority_(page) {
+  const raw = String(page && (page.finalUrl || page.url || page.path) || '').toLowerCase();
+  const path = (() => {
+    try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
+  })();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 0;
+  if (/\/(?:business|service|services|solution|solutions|case|works|products|product|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
+  return 2;
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -3954,11 +3965,11 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       };
     })
     .sort((a, b) => {
+      const aPriority = getCoverageRepresentativePriority_(a);
+      const bPriority = getCoverageRepresentativePriority_(b);
+      if (aPriority !== bPriority) return aPriority - bPriority;
       if (a.hasBreadcrumbList !== b.hasBreadcrumbList) return a.hasBreadcrumbList ? -1 : 1;
       if (a.hasH1 !== b.hasH1) return a.hasH1 ? -1 : 1;
-      const aAbout = isCoverageSignalsAboutPath_(a.finalUrl || a.url || a.path);
-      const bAbout = isCoverageSignalsAboutPath_(b.finalUrl || b.url || b.path);
-      if (aAbout !== bAbout) return aAbout ? -1 : 1;
       if (a.matchedCandidateSources.length !== b.matchedCandidateSources.length) {
         return b.matchedCandidateSources.length - a.matchedCandidateSources.length;
       }
