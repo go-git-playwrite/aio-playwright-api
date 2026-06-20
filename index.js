@@ -8325,6 +8325,31 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
   }
 }
 
+function buildEmptyHydrationMetrics_(reason) {
+  return {
+    waitMs: 0,
+    bodyTextBeforeWait: 0,
+    bodyTextAfterWait: 0,
+    anchorCountBeforeWait: 0,
+    anchorCountAfterWait: 0,
+    navLinkCountBeforeWait: 0,
+    navLinkCountAfterWait: 0,
+    shadowHostCountBeforeWait: 0,
+    shadowHostCountAfterWait: 0,
+    shadowJsonLdCountBeforeWait: 0,
+    shadowJsonLdCountAfterWait: 0,
+    shadowH1CountBeforeWait: 0,
+    shadowH1CountAfterWait: 0,
+    improvedBodyText: false,
+    improvedLinks: false,
+    warningTextBeforeWait: false,
+    warningTextAfterWait: false,
+    skipped: true,
+    reason: reason || 'skipped',
+    error: null
+  };
+}
+
 function analyzeHtmlBasics(html) {
   const $ = cheerio.load(html || '');
   const title = $('head > title').text().trim();
@@ -12115,14 +12140,18 @@ async function scrapeOnce(req, res) {
       const hydrationCallIndex = ++topObservationCallIndex;
       logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'before_call', hydrationWatchdogStartedAt, {
         callIndex: hydrationCallIndex,
-        reason: 'signals_light_hydration_metrics'
+        reason: signalsFirstLight && !signalsFirstBalanced ? 'signals_light_hydration_metrics_skipped' : 'signals_light_hydration_metrics'
       });
       let hydrationMetrics = null;
       try {
-        hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+        if (signalsFirstLight && !signalsFirstBalanced) {
+          hydrationMetrics = buildEmptyHydrationMetrics_('signals_light_skip_balanced_hydration');
+        } else {
+          hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+        }
         logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'after_call', hydrationWatchdogStartedAt, {
           callIndex: hydrationCallIndex,
-          reason: 'signals_light_hydration_metrics'
+          reason: signalsFirstLight && !signalsFirstBalanced ? 'signals_light_hydration_metrics_skipped' : 'signals_light_hydration_metrics'
         });
       } catch (e) {
         logTopObservationCall('signals_light_primary', 'collectBalancedHydrationMetrics', 'error', hydrationWatchdogStartedAt, {
