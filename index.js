@@ -3173,6 +3173,39 @@ function logCandidateGenerationPhase11_(audit, payload = {}) {
   } catch (_) {}
 }
 
+function logRepresentativeSelectionPhase11_(payload = {}) {
+  try {
+    const sources = Array.isArray(payload.sources)
+      ? payload.sources.slice(0, 8)
+      : (payload.source ? [payload.source] : []);
+    console.log('[DEBUG][REPRESENTATIVE_SELECTION_PHASE11]', JSON.stringify({
+      debugRunId: payload.debugRunId || null,
+      origin: String(payload.origin || '').slice(0, 180),
+      phase: String(payload.phase || '').slice(0, 80),
+      path: String(payload.path || '').slice(0, 160),
+      pageType: String(payload.pageType || '').slice(0, 80),
+      canonicalPageFamily: String(payload.canonicalPageFamily || '').slice(0, 80),
+      source: String(payload.source || '').slice(0, 80),
+      sources,
+      matchedCandidateSources: Array.isArray(payload.matchedCandidateSources)
+        ? payload.matchedCandidateSources.slice(0, 8)
+        : sources,
+      score: typeof payload.score === 'number' ? payload.score : null,
+      reason: String(payload.reason || '').slice(0, 180),
+      selected: payload.selected === true,
+      rejected: payload.rejected === true,
+      rejectReason: payload.rejectReason || null,
+      candidateCount: typeof payload.candidateCount === 'number' ? payload.candidateCount : null,
+      eligibleCount: typeof payload.eligibleCount === 'number' ? payload.eligibleCount : null,
+      selectedCount: typeof payload.selectedCount === 'number' ? payload.selectedCount : null,
+      backfillCount: typeof payload.backfillCount === 'number' ? payload.backfillCount : null,
+      finalCount: typeof payload.finalCount === 'number' ? payload.finalCount : null,
+      beforeCount: typeof payload.beforeCount === 'number' ? payload.beforeCount : null,
+      afterCount: typeof payload.afterCount === 'number' ? payload.afterCount : null
+    }));
+  } catch (_) {}
+}
+
 function buildCandidateGenerationAuditMeta_(rawUrl, origin) {
   const normalizedUrl = normalizeDiscoverSubpageUrl(rawUrl, origin);
   let path = '';
@@ -4805,22 +4838,176 @@ function filterCoverageRepresentativeCandidates_(candidates) {
   return (Array.isArray(candidates) ? candidates : []).filter(isCoverageRepresentativeCandidate_);
 }
 
-function selectCoverageRepresentativeCandidates_(candidates, limit = 2) {
+function selectCoverageRepresentativeCandidates_(candidates, limit = 2, opts = {}) {
   const max = Math.max(0, Math.min(10, Number(limit || 2) || 2));
   const allSorted = sortCoverageObserveCandidates_(Array.isArray(candidates) ? candidates : []);
-  const primary = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(candidates)).slice(0, max);
+  const eligible = filterCoverageRepresentativeCandidates_(candidates);
+  logRepresentativeSelectionPhase11_({
+    debugRunId: opts && opts.debugRunId,
+    origin: opts && opts.origin,
+    phase: 'selection_start',
+    reason: opts && opts.reason || 'select coverage representative candidates',
+    candidateCount: allSorted.length,
+    eligibleCount: eligible.length,
+    selectedCount: 0,
+    backfillCount: 0,
+    finalCount: 0,
+    beforeCount: allSorted.length,
+    afterCount: 0
+  });
+  allSorted.slice(0, 50).forEach(candidate => {
+    const rejectReason = getCoverageRepresentativeRejectReason_(candidate);
+    const basePayload = {
+      debugRunId: opts && opts.debugRunId,
+      origin: opts && opts.origin,
+      path: getCoverageCandidatePath_(candidate),
+      pageType: getCoverageCandidatePageType_(candidate),
+      canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
+      source: candidate && candidate.source,
+      sources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      score: Number(candidate && candidate.score || 0) || 0,
+      reason: candidate && candidate.reason || '',
+      candidateCount: allSorted.length,
+      eligibleCount: eligible.length,
+      beforeCount: allSorted.length,
+      afterCount: eligible.length
+    };
+    logRepresentativeSelectionPhase11_(Object.assign({}, basePayload, {
+      phase: 'candidate_seen',
+      selected: false,
+      rejected: false,
+      rejectReason: null
+    }));
+    logRepresentativeSelectionPhase11_(Object.assign({}, basePayload, {
+      phase: rejectReason ? 'hard_exclude' : 'eligible_candidate',
+      selected: false,
+      rejected: !!rejectReason,
+      rejectReason: rejectReason || null
+    }));
+  });
+  const primary = sortCoverageObserveCandidates_(eligible).slice(0, max);
+  const primaryKeys = new Set(primary.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
+  sortCoverageObserveCandidates_(eligible).slice(0, 50).forEach(candidate => {
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const selected = primaryKeys.has(key);
+    logRepresentativeSelectionPhase11_({
+      debugRunId: opts && opts.debugRunId,
+      origin: opts && opts.origin,
+      phase: selected ? 'primary_selected' : 'primary_not_selected',
+      path: getCoverageCandidatePath_(candidate),
+      pageType: getCoverageCandidatePageType_(candidate),
+      canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
+      source: candidate && candidate.source,
+      sources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      score: Number(candidate && candidate.score || 0) || 0,
+      reason: selected ? 'primary_selection' : 'lower_primary_priority',
+      selected,
+      rejected: !selected,
+      rejectReason: selected ? null : 'lower_primary_priority',
+      candidateCount: allSorted.length,
+      eligibleCount: eligible.length,
+      selectedCount: primary.length,
+      backfillCount: 0,
+      finalCount: primary.length,
+      beforeCount: eligible.length,
+      afterCount: primary.length
+    });
+  });
   if (primary.length >= max) return primary;
   const selectedKeys = new Set(primary.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
   const backfill = [];
+  logRepresentativeSelectionPhase11_({
+    debugRunId: opts && opts.debugRunId,
+    origin: opts && opts.origin,
+    phase: 'backfill_start',
+    reason: 'representative_backfill_to_min_count',
+    candidateCount: allSorted.length,
+    eligibleCount: eligible.length,
+    selectedCount: primary.length,
+    backfillCount: 0,
+    finalCount: primary.length,
+    beforeCount: primary.length,
+    afterCount: primary.length
+  });
   allSorted.forEach(candidate => {
-    if (primary.length + backfill.length >= max) return;
+    if (primary.length + backfill.length >= max) {
+      return;
+    }
     const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
-    if (!key || selectedKeys.has(key)) return;
-    if (getCoverageRepresentativeRejectReason_(candidate)) return;
+    const rejectReason = !key
+      ? 'missing_candidate_key'
+      : (selectedKeys.has(key)
+        ? 'already_selected'
+        : getCoverageRepresentativeRejectReason_(candidate));
+    if (rejectReason) {
+      logRepresentativeSelectionPhase11_({
+        debugRunId: opts && opts.debugRunId,
+        origin: opts && opts.origin,
+        phase: 'backfill_not_selected',
+        path: getCoverageCandidatePath_(candidate),
+        pageType: getCoverageCandidatePageType_(candidate),
+        canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
+        source: candidate && candidate.source,
+        sources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+        matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+        score: Number(candidate && candidate.score || 0) || 0,
+        reason: 'representative_backfill_to_min_count',
+        selected: false,
+        rejected: true,
+        rejectReason,
+        candidateCount: allSorted.length,
+        eligibleCount: eligible.length,
+        selectedCount: primary.length,
+        backfillCount: backfill.length,
+        finalCount: primary.length + backfill.length,
+        beforeCount: primary.length,
+        afterCount: primary.length + backfill.length
+      });
+      return;
+    }
     selectedKeys.add(key);
     backfill.push(candidate);
+    logRepresentativeSelectionPhase11_({
+      debugRunId: opts && opts.debugRunId,
+      origin: opts && opts.origin,
+      phase: 'backfill_selected',
+      path: getCoverageCandidatePath_(candidate),
+      pageType: getCoverageCandidatePageType_(candidate),
+      canonicalPageFamily: getCoverageCanonicalPageFamily_(candidate),
+      source: candidate && candidate.source,
+      sources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+      score: Number(candidate && candidate.score || 0) || 0,
+      reason: 'representative_backfill_to_min_count',
+      selected: true,
+      rejected: false,
+      rejectReason: null,
+      candidateCount: allSorted.length,
+      eligibleCount: eligible.length,
+      selectedCount: primary.length,
+      backfillCount: backfill.length,
+      finalCount: primary.length + backfill.length,
+      beforeCount: primary.length,
+      afterCount: primary.length + backfill.length
+    });
   });
-  return primary.concat(backfill).slice(0, max);
+  const out = primary.concat(backfill).slice(0, max);
+  logRepresentativeSelectionPhase11_({
+    debugRunId: opts && opts.debugRunId,
+    origin: opts && opts.origin,
+    phase: 'selection_return',
+    reason: out.length < max ? 'selection_return_below_target_count' : 'selection_return_target_count',
+    candidateCount: allSorted.length,
+    eligibleCount: eligible.length,
+    selectedCount: primary.length,
+    backfillCount: backfill.length,
+    finalCount: out.length,
+    beforeCount: allSorted.length,
+    afterCount: out.length
+  });
+  return out;
 }
 
 function getCoverageCandidatePageType_(candidate) {
@@ -4869,8 +5056,8 @@ function buildCoverageCandidatePageTypes_(candidates) {
   return out;
 }
 
-function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 2) {
-  return selectCoverageRepresentativeCandidates_(candidates, limit)
+function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 2, opts = {}) {
+  return selectCoverageRepresentativeCandidates_(candidates, limit, opts)
     .map(candidate => {
       const url = String(candidate && candidate.url || '');
       const path = getCoverageCandidatePath_(candidate);
@@ -5737,7 +5924,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         geoSignalsV1.coverageSignals.source = 'lightweight_candidate_only';
         geoSignalsV1.coverageSignals.representativePages = buildLightweightRepresentativePagesFromCandidates_(
           lightweightDiscovered && lightweightDiscovered.candidates || [],
-          2
+          2,
+          {
+            debugRunId: phase11DebugRunId,
+            origin: normalized.origin,
+            reason: 'memory_guard_candidate_only_representatives'
+          }
         );
         geoSignalsV1.coverageSignals.candidatePageTypes = buildCoverageCandidatePageTypes_(lightweightDiscovered && lightweightDiscovered.candidates || []);
       }
@@ -5797,7 +5989,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     lastDiscoveredForCoverage = discovered;
     const allPrioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
     const primaryRepresentativeCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(discovered.candidates)).slice(0, maxObserve);
-    const selectedCandidates = selectCoverageRepresentativeCandidates_(discovered.candidates, maxObserve);
+    const selectedCandidates = selectCoverageRepresentativeCandidates_(discovered.candidates, maxObserve, {
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin,
+      reason: 'coverage_observe_selection'
+    });
     const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
@@ -5805,7 +6001,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
       ? auditCandidates
       : discovered.candidates;
-    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2);
+    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2, {
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin,
+      reason: 'audit_representative_preview'
+    });
     const candidateAudit = discovered && discovered._audit;
     logCandidateGenerationPhase11_(candidateAudit, {
       origin: normalized.origin,
@@ -5995,7 +6195,39 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
+    logRepresentativeSelectionPhase11_({
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin,
+      phase: 'coverage_representative_assign_start',
+      reason: 'assign coverageSignals representativePages',
+      candidateCount: discovered.totalCandidates,
+      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
+      selectedCount: selectedCandidates.length,
+      backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
+      finalCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
+      beforeCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages.length
+        : 0,
+      afterCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0
+    });
     geoSignalsV1.coverageSignals = coverageSignals;
+    logRepresentativeSelectionPhase11_({
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin,
+      phase: 'coverage_representative_assign_complete',
+      reason: 'assigned coverageSignals representativePages',
+      candidateCount: discovered.totalCandidates,
+      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
+      selectedCount: selectedCandidates.length,
+      backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
+      finalCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages.length
+        : 0,
+      beforeCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
+      afterCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages.length
+        : 0
+    });
     logSubpageCoverageSignalsFinalAudit_({
       route: '/scrape',
       mode: 'signalsMode=light',
