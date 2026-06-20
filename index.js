@@ -6763,6 +6763,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     ? opts.mode
     : (balancedMode ? 'balanced' : 'light');
   const phase11SignalsMode = opts && opts.signalsMode ? opts.signalsMode : null;
+  const skipA11yRoleQueriesForLight = phase11SignalsMode === 'light' || phase11Mode === 'signals_first_light';
   const logBuildPhase = (phase, phaseStartedAt, extra = {}) => {
     const completedAt = extra && Object.prototype.hasOwnProperty.call(extra, 'completedAt')
       ? extra.completedAt
@@ -7613,6 +7614,29 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     };
     if (shortFastMode) {
       a11yHeadings.error = 'skipped_short_fast';
+    } else if (skipA11yRoleQueriesForLight) {
+      const a11yHeadingStartedAt = Date.now();
+      logSummaryPhase('build_text_a11y_heading_start', a11yHeadingStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        detail: {
+          source: 'page_get_by_role_heading',
+          skipped: true,
+          reason: 'signals_light_skip_get_by_role_heading'
+        }
+      });
+      a11yHeadings.error = 'skipped_signals_light';
+      logSummaryPhase('build_text_a11y_heading_complete', a11yHeadingStartedAt, {
+        detail: {
+          source: 'page_get_by_role_heading',
+          skipped: true,
+          reason: 'signals_light_skip_get_by_role_heading',
+          h1Count: 0,
+          h2Count: 0,
+          h3Count: 0,
+          allCount: 0
+        }
+      });
     } else {
       const a11yHeadingStartedAt = Date.now();
       logSummaryPhase('build_text_a11y_heading_start', a11yHeadingStartedAt, {
@@ -7777,6 +7801,26 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     };
     if (shortFastMode) {
       a11yMain.error = 'skipped_short_fast';
+    } else if (skipA11yRoleQueriesForLight) {
+      const a11yMainStartedAt = Date.now();
+      logSummaryPhase('build_text_a11y_main_start', a11yMainStartedAt, {
+        completedAt: null,
+        durationMs: null,
+        detail: {
+          source: 'page_get_by_role_main',
+          skipped: true,
+          reason: 'signals_light_skip_get_by_role_main'
+        }
+      });
+      a11yMain.error = 'skipped_signals_light';
+      logSummaryPhase('build_text_a11y_main_complete', a11yMainStartedAt, {
+        detail: {
+          source: 'page_get_by_role_main',
+          skipped: true,
+          reason: 'signals_light_skip_get_by_role_main',
+          mainTextCount: 0
+        }
+      });
     } else {
       const a11yMainStartedAt = Date.now();
       logSummaryPhase('build_text_a11y_main_start', a11yMainStartedAt, {
