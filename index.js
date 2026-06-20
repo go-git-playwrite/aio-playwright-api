@@ -3132,12 +3132,14 @@ function discoverSubpageCandidateKey(url) {
 }
 
 function isDiscoverImportantPath(path) {
-  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|access|sitemap)(?:\/|$|-|_)/i.test(String(path || ''));
+  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|guide|support|cycle-support|collections|ranking|shop|shops|store|stores|maintenance|uketori|access|sitemap)(?:\/|$|-|_)/i.test(String(path || ''));
 }
 
 function isDiscoverDetailLikePath(path) {
   const p = String(path || '').toLowerCase();
   if (/\/(?:case|cases|works|news|topics|blog|column)\/.+/i.test(p)) return true;
+  if (/\/blogs\/news\/.+/i.test(p)) return true;
+  if (/\/products\/[^/]+/i.test(p)) return true;
   if (/\/\d{4}\/\d{1,2}(?:\/|$)/.test(p)) return true;
   if (/(?:\/|[-_])\d{3,}(?:\.html)?$/i.test(p)) return true;
   if (/\/[^/]+\.html$/i.test(p) && !/\/index\.html$/i.test(p) && p.split('/').filter(Boolean).length >= 2) return true;
@@ -4023,7 +4025,7 @@ function getCoverageRepresentativePriority_(page) {
     try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
   })();
   if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 0;
-  if (/\/(?:business|service|services|solution|solutions|case|works|products|product|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
+  if (/\/(?:business|service|services|solution|solutions|case|works|collections|faq|guide|support|cycle-support|ranking|shop|shops|store|stores|maintenance|uketori|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
   return 2;
 }
@@ -4054,6 +4056,13 @@ function getCoverageCandidatePageType_(candidate) {
   if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
   if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
   if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:faq)(?:\/|$|-|_)/i.test(path)) return 'faq';
+  if (/\/(?:guide|guides|shopping-guide|user-guide)(?:\/|$|-|_)/i.test(path)) return 'guide';
+  if (/\/(?:blogs\/news|news)(?:\/|$|-|_)/i.test(path)) return 'news';
+  if (/\/(?:collections)(?:\/|$|-|_)/i.test(path)) return 'category';
+  if (/\/(?:ranking|rankings)(?:\/|$|-|_)/i.test(path)) return 'ranking';
+  if (/\/(?:support|cycle-support|help)(?:\/|$|-|_)/i.test(path)) return 'support';
+  if (/\/(?:shop|shops|store|stores|maintenance|uketori)(?:\/|$|-|_)/i.test(path)) return 'store';
   if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
   if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
@@ -4067,6 +4076,13 @@ function buildCoverageCandidatePageTypes_(candidates) {
     business: false,
     service: false,
     case: false,
+    faq: false,
+    guide: false,
+    news: false,
+    category: false,
+    ranking: false,
+    support: false,
+    store: false,
     recruit: false,
     contact: false,
     legal: false,
