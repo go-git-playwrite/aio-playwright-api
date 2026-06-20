@@ -3123,6 +3123,54 @@ function appendDiscoverCandidateAuditLinks_(audit, links, origin, source) {
   });
 }
 
+function logCandidateGenerationPhase11_(audit, payload = {}) {
+  try {
+    if (audit && typeof audit === 'object') {
+      audit.phase11LogCount = Number(audit.phase11LogCount || 0);
+      if (audit.phase11LogCount >= 220) return;
+      audit.phase11LogCount += 1;
+    }
+    const rawUrl = String(payload.url || payload.href || '');
+    const path = payload.path || (() => {
+      try { return new URL(rawUrl).pathname || ''; } catch (_) { return ''; }
+    })();
+    console.log('[DEBUG][CANDIDATE_GENERATION_PHASE11]', JSON.stringify({
+      debugRunId: audit && audit.debugRunId || payload.debugRunId || null,
+      origin: String(payload.origin || '').slice(0, 180),
+      url: String(payload.url || '').slice(0, 240),
+      phase: String(payload.phase || '').slice(0, 80),
+      source: String(payload.source || '').slice(0, 80),
+      path: String(path || '').slice(0, 160),
+      pageType: String(payload.pageType || '').slice(0, 80),
+      href: String(payload.href || '').slice(0, 240),
+      text: sampleDiscoverLinkText_(payload.text),
+      score: typeof payload.score === 'number' ? payload.score : null,
+      reason: String(payload.reason || '').slice(0, 180),
+      candidateOnly: payload.candidateOnly === true,
+      matchedCandidateSources: Array.isArray(payload.matchedCandidateSources)
+        ? payload.matchedCandidateSources.slice(0, 8)
+        : [],
+      added: payload.added === true,
+      rejected: payload.rejected === true,
+      rejectReason: payload.rejectReason || null,
+      beforeCount: typeof payload.beforeCount === 'number' ? payload.beforeCount : null,
+      afterCount: typeof payload.afterCount === 'number' ? payload.afterCount : null
+    }));
+  } catch (_) {}
+}
+
+function buildCandidateGenerationAuditMeta_(rawUrl, origin) {
+  const normalizedUrl = normalizeDiscoverSubpageUrl(rawUrl, origin);
+  let path = '';
+  if (normalizedUrl) {
+    try { path = new URL(normalizedUrl).pathname || ''; } catch (_) {}
+  }
+  const pageType = normalizedUrl
+    ? getCoverageCandidatePageType_({ url: normalizedUrl })
+    : 'unknown';
+  return { normalizedUrl, path, pageType };
+}
+
 function discoverSubpageCandidateKey(url) {
   try {
     const u = new URL(String(url || ''));
@@ -3180,9 +3228,26 @@ function scoreDiscoverSubpageCandidate(url, source, sources) {
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
-function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary) {
+function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary, audit, meta = {}) {
+  const beforeCount = map && typeof map.size === 'number' ? map.size : null;
   const url = normalizeDiscoverSubpageUrl(rawUrl, origin);
-  if (!url) return false;
+  if (!url) {
+    logCandidateGenerationPhase11_(audit, {
+      origin,
+      url: String(rawUrl || ''),
+      phase: `${source || 'unknown'}_candidate_added`,
+      source,
+      href: rawUrl,
+      text: meta && meta.text,
+      reason,
+      added: false,
+      rejected: true,
+      rejectReason: getDiscoverSubpageDroppedReason_(rawUrl, origin),
+      beforeCount,
+      afterCount: beforeCount
+    });
+    return false;
+  }
   const key = discoverSubpageCandidateKey(url);
   const sourcePriority = { sitemap: 1, htmlSitemap: 2, footer: 3, nav: 4 };
   const existing = map.get(key);
@@ -3194,6 +3259,24 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
     existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources);
     existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
     if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
+    logCandidateGenerationPhase11_(audit, {
+      origin,
+      url,
+      phase: 'candidate_merge_item',
+      source,
+      path: buildCandidateGenerationAuditMeta_(url, origin).path,
+      pageType: getCoverageCandidatePageType_(existing),
+      href: rawUrl,
+      text: meta && meta.text,
+      score: existing.score,
+      reason: existing.reason,
+      candidateOnly: true,
+      matchedCandidateSources: existing.sources,
+      added: false,
+      rejected: false,
+      beforeCount,
+      afterCount: map.size
+    });
     return false;
   }
   const item = {
@@ -3205,6 +3288,30 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   };
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
+  logCandidateGenerationPhase11_(audit, {
+    origin,
+    url,
+    phase: source === 'nav'
+      ? 'nav_candidate_added'
+      : (source === 'footer'
+        ? 'footer_candidate_added'
+        : (source === 'sitemap'
+          ? 'sitemap_candidate_added'
+          : (source === 'htmlSitemap' ? 'sitemap_candidate_added' : 'fallback_candidate_added'))),
+    source,
+    path: buildCandidateGenerationAuditMeta_(url, origin).path,
+    pageType: getCoverageCandidatePageType_(item),
+    href: rawUrl,
+    text: meta && meta.text,
+    score: item.score,
+    reason: item.reason || reason,
+    candidateOnly: true,
+    matchedCandidateSources: item.sources,
+    added: true,
+    rejected: false,
+    beforeCount,
+    afterCount: map.size
+  });
   return true;
 }
 
@@ -3247,7 +3354,7 @@ function parseDiscoverSitemapXml(xml) {
   return { sitemapLocs, urlLocs };
 }
 
-async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors) {
+async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, audit) {
   const roots = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'].map(path => origin.replace(/\/$/, '') + path);
   for (const sitemapUrl of roots) {
     const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000);
@@ -3257,7 +3364,25 @@ async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSumm
     }
     const parsed = parseDiscoverSitemapXml(rootRes.text);
     if (parsed.urlLocs.length) {
-      parsed.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+      parsed.urlLocs.forEach(loc => {
+        const meta = buildCandidateGenerationAuditMeta_(loc, origin);
+        logCandidateGenerationPhase11_(audit, {
+          origin,
+          url: meta.normalizedUrl || loc,
+          phase: 'sitemap_link_seen',
+          source: 'sitemap',
+          path: meta.path,
+          pageType: meta.pageType,
+          href: loc,
+          reason: 'sitemap url loc observed',
+          added: false,
+          rejected: !meta.normalizedUrl,
+          rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(loc, origin),
+          beforeCount: candidateMap.size,
+          afterCount: candidateMap.size
+        });
+        addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary, audit);
+      });
       return;
     }
     if (parsed.sitemapLocs.length) {
@@ -3276,7 +3401,25 @@ async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSumm
           continue;
         }
         const childParsedXml = parseDiscoverSitemapXml(childRes.text);
-        childParsedXml.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+        childParsedXml.urlLocs.forEach(loc => {
+          const meta = buildCandidateGenerationAuditMeta_(loc, origin);
+          logCandidateGenerationPhase11_(audit, {
+            origin,
+            url: meta.normalizedUrl || loc,
+            phase: 'sitemap_link_seen',
+            source: 'sitemap',
+            path: meta.path,
+            pageType: meta.pageType,
+            href: loc,
+            reason: 'child sitemap url loc observed',
+            added: false,
+            rejected: !meta.normalizedUrl,
+            rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(loc, origin),
+            beforeCount: candidateMap.size,
+            afterCount: candidateMap.size
+          });
+          addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary, audit);
+        });
       }
       return;
     }
@@ -3323,6 +3466,7 @@ async function collectDiscoverLinksFromPage(page) {
 }
 
 async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts = {}) {
+  const candidateAudit = opts && opts.__candidateAudit;
   if (opts && opts.page) {
     const page = opts.page;
     try {
@@ -3342,7 +3486,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
             await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
             const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
             (htmlSitemapLinks.allLinks || []).forEach(link => {
-              addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+              addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary, candidateAudit, {
+                text: link && link.text
+              });
             });
           } catch (e) {
             errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
@@ -3353,10 +3499,48 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       }
       const navFooterLinks = await collectDiscoverLinksFromPage(page);
       (navFooterLinks.navLinks || []).forEach(link => {
-        addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+        const meta = buildCandidateGenerationAuditMeta_(link && link.href, origin);
+        logCandidateGenerationPhase11_(candidateAudit, {
+          origin,
+          url: meta.normalizedUrl || '',
+          phase: 'nav_link_seen',
+          source: 'nav',
+          path: meta.path,
+          pageType: meta.pageType,
+          href: link && link.href,
+          text: link && link.text,
+          reason: 'nav link extracted from top page',
+          added: false,
+          rejected: !meta.normalizedUrl,
+          rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(link && link.href, origin),
+          beforeCount: candidateMap.size,
+          afterCount: candidateMap.size
+        });
+        addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary, candidateAudit, {
+          text: link && link.text
+        });
       });
       (navFooterLinks.footerLinks || []).forEach(link => {
-        addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+        const meta = buildCandidateGenerationAuditMeta_(link && link.href, origin);
+        logCandidateGenerationPhase11_(candidateAudit, {
+          origin,
+          url: meta.normalizedUrl || '',
+          phase: 'footer_link_seen',
+          source: 'footer',
+          path: meta.path,
+          pageType: meta.pageType,
+          href: link && link.href,
+          text: link && link.text,
+          reason: 'footer link extracted from top page',
+          added: false,
+          rejected: !meta.normalizedUrl,
+          rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(link && link.href, origin),
+          beforeCount: candidateMap.size,
+          afterCount: candidateMap.size
+        });
+        addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary, candidateAudit, {
+          text: link && link.text
+        });
       });
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
@@ -3408,7 +3592,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
           await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
           const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
           (htmlSitemapLinks.allLinks || []).forEach(link => {
-            addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+            addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary, candidateAudit, {
+              text: link && link.text
+            });
           });
         } catch (e) {
           errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
@@ -3419,10 +3605,48 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     }
     const navFooterLinks = await collectDiscoverLinksFromPage(page);
     (navFooterLinks.navLinks || []).forEach(link => {
-      addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+      const meta = buildCandidateGenerationAuditMeta_(link && link.href, origin);
+      logCandidateGenerationPhase11_(candidateAudit, {
+        origin,
+        url: meta.normalizedUrl || '',
+        phase: 'nav_link_seen',
+        source: 'nav',
+        path: meta.path,
+        pageType: meta.pageType,
+        href: link && link.href,
+        text: link && link.text,
+        reason: 'nav link extracted from top page',
+        added: false,
+        rejected: !meta.normalizedUrl,
+        rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(link && link.href, origin),
+        beforeCount: candidateMap.size,
+        afterCount: candidateMap.size
+      });
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary, candidateAudit, {
+        text: link && link.text
+      });
     });
     (navFooterLinks.footerLinks || []).forEach(link => {
-      addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+      const meta = buildCandidateGenerationAuditMeta_(link && link.href, origin);
+      logCandidateGenerationPhase11_(candidateAudit, {
+        origin,
+        url: meta.normalizedUrl || '',
+        phase: 'footer_link_seen',
+        source: 'footer',
+        path: meta.path,
+        pageType: meta.pageType,
+        href: link && link.href,
+        text: link && link.text,
+        reason: 'footer link extracted from top page',
+        added: false,
+        rejected: !meta.normalizedUrl,
+        rejectReason: meta.normalizedUrl ? null : getDiscoverSubpageDroppedReason_(link && link.href, origin),
+        beforeCount: candidateMap.size,
+        afterCount: candidateMap.size
+      });
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary, candidateAudit, {
+        text: link && link.text
+      });
     });
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
@@ -3452,13 +3676,24 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const errors = [];
   const candidateMap = new Map();
   const audit = {
+    debugRunId: opts && opts.debugRunId || null,
+    phase11LogCount: 0,
     rawLinksCount: 0,
     rawLinks: [],
     normalizedLinks: []
   };
   const fallbackOpts = Object.assign({}, opts || {}, { __candidateAudit: audit });
-  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
+  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors, audit);
   await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, fallbackOpts);
+  logCandidateGenerationPhase11_(audit, {
+    origin,
+    url: topUrl,
+    phase: 'candidate_merge_start',
+    source: 'all',
+    reason: 'candidate map to sorted list',
+    beforeCount: candidateMap.size,
+    afterCount: candidateMap.size
+  });
   const allCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
@@ -3468,6 +3703,34 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       reason: item.reason
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  allCandidates.slice(0, 50).forEach(candidate => {
+    logCandidateGenerationPhase11_(audit, {
+      origin,
+      url: candidate.url,
+      phase: 'candidate_merge_item',
+      source: candidate.source,
+      path: getCoverageCandidatePath_(candidate),
+      pageType: getCoverageCandidatePageType_(candidate),
+      href: candidate.url,
+      score: candidate.score,
+      reason: candidate.reason,
+      candidateOnly: true,
+      matchedCandidateSources: Array.isArray(candidate.sources) ? candidate.sources : [],
+      added: false,
+      rejected: false,
+      beforeCount: candidateMap.size,
+      afterCount: allCandidates.length
+    });
+  });
+  logCandidateGenerationPhase11_(audit, {
+    origin,
+    url: topUrl,
+    phase: 'candidate_merge_complete',
+    source: 'all',
+    reason: 'candidate map sorted',
+    beforeCount: candidateMap.size,
+    afterCount: allCandidates.length
+  });
   audit.allCandidates = allCandidates.slice(0, 100);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
@@ -5432,7 +5695,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const discovered = await withSubpageTimeout(discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 10, {
       page: opts && opts.page,
       context: opts && opts.context,
-      reuseBrowser: reusePageForDiscover || reuseContextForObserve
+      reuseBrowser: reusePageForDiscover || reuseContextForObserve,
+      debugRunId: phase11DebugRunId
     }), subpageGuardMs, 'subpage_discovery');
     lastDiscoveredForCoverage = discovered;
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
@@ -5444,6 +5708,46 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       ? auditCandidates
       : discovered.candidates;
     const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 2);
+    const candidateAudit = discovered && discovered._audit;
+    logCandidateGenerationPhase11_(candidateAudit, {
+      origin: normalized.origin,
+      url: normalized.topUrl,
+      phase: 'representative_select_start',
+      source: 'coverage',
+      reason: 'coverage observe candidate selection',
+      beforeCount: prioritizedCandidates.length,
+      afterCount: selectedCandidates.length
+    });
+    prioritizedCandidates.slice(0, 50).forEach((candidate, index) => {
+      const selected = selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || ''));
+      logCandidateGenerationPhase11_(candidateAudit, {
+        origin: normalized.origin,
+        url: candidate && candidate.url,
+        phase: 'representative_select_item',
+        source: candidate && candidate.source,
+        path: getCoverageCandidatePath_(candidate),
+        pageType: getCoverageCandidatePageType_(candidate),
+        href: candidate && candidate.url,
+        score: Number(candidate && candidate.score || 0) || 0,
+        reason: selected ? `selected_index_${index}` : `not_selected_index_${index}`,
+        candidateOnly: true,
+        matchedCandidateSources: Array.isArray(candidate && candidate.sources) ? candidate.sources : [],
+        added: selected,
+        rejected: !selected,
+        rejectReason: selected ? null : 'lower_representative_priority',
+        beforeCount: prioritizedCandidates.length,
+        afterCount: selectedCandidates.length
+      });
+    });
+    logCandidateGenerationPhase11_(candidateAudit, {
+      origin: normalized.origin,
+      url: normalized.topUrl,
+      phase: 'representative_select_complete',
+      source: 'coverage',
+      reason: 'coverage observe candidate selection complete',
+      beforeCount: prioritizedCandidates.length,
+      afterCount: selectedCandidates.length
+    });
     logSubpageCandidateDiscoveryAudit_({
       origin: normalized.origin,
       topUrl: normalized.topUrl,
