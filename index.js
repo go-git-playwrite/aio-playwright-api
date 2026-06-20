@@ -3520,6 +3520,7 @@ function logSubpageFetchPhase11_(payload = {}) {
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
+  const subpageWaitUntil = 'commit';
   const context = opts.context;
   const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : {};
   const fetchStartedAtMs = Date.now();
@@ -3532,7 +3533,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       completedAt: startedAtMs ? new Date().toISOString() : null,
       durationMs: startedAtMs ? Date.now() - startedAtMs : null,
       timeoutMs,
-      waitUntil: 'domcontentloaded',
+      waitUntil: subpageWaitUntil,
       errorName: null,
       errorMessage: null
     }, extra));
@@ -3602,7 +3603,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     let response = null;
     try {
       response = await page.goto(url, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: subpageWaitUntil,
         timeout: timeoutMs
       });
       logPhase('goto_complete', gotoStartedAtMs);
