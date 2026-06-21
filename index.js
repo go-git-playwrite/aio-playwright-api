@@ -6466,6 +6466,91 @@ function logSignalsLightFinalResponsePathAudit_(payload = {}) {
   } catch (_) {}
 }
 
+function summarizeGeoSignalsTopSignalsForPartialMerge_(geoSignalsV1) {
+  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const structuredData = geo.structuredData && typeof geo.structuredData === 'object' ? geo.structuredData : {};
+  const headings = geo.headings && typeof geo.headings === 'object' ? geo.headings : {};
+  return {
+    structuredDataHasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
+    structuredDataHasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
+    structuredDataHasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
+    headingsH1Count: typeof headings.h1Count === 'number' ? headings.h1Count : null,
+    headingsSource: headings.source || headings.h1Source || null
+  };
+}
+
+function cloneGeoSignalsBranchForPartialMerge_(value) {
+  if (!value || typeof value !== 'object') return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    if (Array.isArray(value)) return value.slice();
+    return Object.assign({}, value);
+  }
+}
+
+function snapshotGeoSignalsTopBranchesForPartialMerge_(geoSignalsV1) {
+  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const keys = [
+    'structuredData',
+    'headings',
+    'trustSignals',
+    'multimodalSignals',
+    'landmarks',
+    'clarity',
+    'coverage',
+    'observed',
+    'balanced',
+    'aioCheck',
+    'diagnostics'
+  ];
+  return keys.reduce((acc, key) => {
+    if (Object.prototype.hasOwnProperty.call(geo, key)) {
+      acc[key] = cloneGeoSignalsBranchForPartialMerge_(geo[key]);
+    }
+    return acc;
+  }, {});
+}
+
+function restoreGeoSignalsTopBranchesForPartialReturn_(geoSignalsV1, snapshot) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !snapshot || typeof snapshot !== 'object') {
+    return geoSignalsV1;
+  }
+  Object.keys(snapshot).forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(snapshot, key)) {
+      geoSignalsV1[key] = cloneGeoSignalsBranchForPartialMerge_(snapshot[key]);
+    }
+  });
+  return geoSignalsV1;
+}
+
+function logSignalsLightPartialReturnMergeAudit_(payload = {}) {
+  try {
+    const afterGeo = payload.geoSignalsV1 && typeof payload.geoSignalsV1 === 'object' ? payload.geoSignalsV1 : {};
+    const coverageSignals = afterGeo.coverageSignals && typeof afterGeo.coverageSignals === 'object'
+      ? afterGeo.coverageSignals
+      : {};
+    const representativePages = Array.isArray(coverageSignals.representativePages)
+      ? coverageSignals.representativePages
+      : [];
+    console.log('[DEBUG][SIGNALS_LIGHT_PARTIAL_RETURN_MERGE_AUDIT]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      earlyReturnReason: payload.earlyReturnReason || null,
+      hasBaseGeoSignals: payload.hasBaseGeoSignals === true,
+      hasCoverageSignals: !!(afterGeo.coverageSignals && typeof afterGeo.coverageSignals === 'object'),
+      beforeMerge: payload.beforeMerge || summarizeGeoSignalsTopSignalsForPartialMerge_(null),
+      afterMerge: Object.assign(summarizeGeoSignalsTopSignalsForPartialMerge_(afterGeo), {
+        coverageObservedCount: typeof coverageSignals.observedCount === 'number'
+          ? coverageSignals.observedCount
+          : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+        representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
+          ? coverageSignals.representativePagesCount
+          : representativePages.length
+      })
+    }));
+  } catch (_) {}
+}
+
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -15324,6 +15409,8 @@ async function scrapeOnce(req, res) {
         });
         throw e;
       }
+      const baseGeoSignalsForPartialReturn = snapshotGeoSignalsTopBranchesForPartialMerge_(geoSignalsV1);
+      const baseGeoSignalsPartialReturnSummary = summarizeGeoSignalsTopSignalsForPartialMerge_(geoSignalsV1);
       logWatchdog('top_observation_complete', geoSignalsWatchdogStartedAt);
       const subpageObservationPhase11State = {
         debugRunId,
@@ -15361,6 +15448,24 @@ async function scrapeOnce(req, res) {
         errorName: subpageObservationPhase11State.errorName || null,
         errorMessage: subpageObservationPhase11State.errorMessage || null
       });
+      if (subpageObservationPhase11State.fallbackReason === 'partial_subpage_observation_timeout') {
+        const coverageSignalsForPartialReturn = geoSignalsV1 && geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'
+          ? geoSignalsV1.coverageSignals
+          : null;
+        const subpageSignalsForPartialReturn = geoSignalsV1 && geoSignalsV1.subpageSignals && typeof geoSignalsV1.subpageSignals === 'object'
+          ? geoSignalsV1.subpageSignals
+          : null;
+        restoreGeoSignalsTopBranchesForPartialReturn_(geoSignalsV1, baseGeoSignalsForPartialReturn);
+        if (coverageSignalsForPartialReturn) geoSignalsV1.coverageSignals = coverageSignalsForPartialReturn;
+        if (subpageSignalsForPartialReturn) geoSignalsV1.subpageSignals = subpageSignalsForPartialReturn;
+        logSignalsLightPartialReturnMergeAudit_({
+          origin: watchdogOrigin(),
+          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
+          hasBaseGeoSignals: !!baseGeoSignalsForPartialReturn,
+          beforeMerge: baseGeoSignalsPartialReturnSummary,
+          geoSignalsV1
+        });
+      }
       if (subpageObservationPhase11State.memoryGuardTriggered === true) {
         logWatchdog('pre_response_memory_guard_start', Date.now(), {
           memoryGuardTriggered: true,
