@@ -4016,8 +4016,9 @@ function buildCoverageCandidatePageTypes_(candidates) {
 
 const REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS = 15000;
 const REPRESENTATIVE_OBSERVATION_QUALITY_PAGE_BUDGET_MS = 6000;
-const REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS = 120000;
+const REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS = 130000;
 const REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS = 8000;
+const REPRESENTATIVE_OBSERVATION_PAGE_BUDGET_MS = 12000;
 
 function getCoverageCandidatePageType_(candidate) {
   const existing = normalizeSubpageJsonLdText(candidate && candidate.pageType);
@@ -4720,10 +4721,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeObservationPromise = observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS,
-      concurrency: reuseContextForObserve ? 1 : 2,
+      concurrency: 1,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
-      sequential: reuseContextForObserve
+      sequential: true,
+      maxTotalMs: Math.min(110000, representativeObservationBudgetMs - 5000),
+      perPageBudgetMs: REPRESENTATIVE_OBSERVATION_PAGE_BUDGET_MS
     }).catch(error => ({
       pages: [],
       __representativeObservationError: String(error && (error.message || error) || 'representative_observation_failed').slice(0, 160)
@@ -4939,13 +4942,50 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
   const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
   const reuseContext = !!(opts && opts.context);
+  const maxTotalMs = Math.max(0, Math.min(120000, Number(opts.maxTotalMs || 0) || 0));
+  const deadlineAt = maxTotalMs > 0 ? started + maxTotalMs : 0;
+  const perPageBudgetMs = Math.max(timeout + 500, Math.min(20000, Number(opts.perPageBudgetMs || timeout + 4000) || timeout + 4000));
   const concurrency = reuseContext
     ? 1
-    : Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4));
+    : (opts.sequential ? 1 : Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4)));
   const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
   let browser = null;
   let context = opts && opts.context || null;
   const pages = new Array(normalizedUrls.length);
+  const timeoutPage = (url, error) => ({
+    url,
+    finalUrl: url,
+    status: null,
+    ok: false,
+    pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+    title: '',
+    canonical: '',
+    h1Count: 0,
+    h1Texts: [],
+    jsonldTypes: [],
+    breadcrumbListCount: 0,
+    listItemCount: 0,
+    hasBreadcrumbJsonLd: false,
+    hasProductJsonLd: false,
+    hasFaqJsonLd: false,
+    hasArticleJsonLd: false,
+    hasBlogPostingJsonLd: false,
+    hasBreadcrumbUi: false,
+    error: error || 'representative_observation_timeout'
+  });
+  const withTimeout = async (promise, ms, fallback) => {
+    let timer = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise(resolve => {
+          timer = setTimeout(() => resolve(fallback), Math.max(1, ms));
+        })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   try {
     try {
       console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
@@ -5024,6 +5064,10 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
         const index = nextIndex++;
         const url = normalizedUrls[index];
         try {
+          if (deadlineAt && Date.now() >= deadlineAt) {
+            pages[index] = timeoutPage(url, 'representative_observation_total_timeout');
+            continue;
+          }
           let origin = '';
           try { origin = new URL(url).origin; } catch (_) {}
           if (baseOrigin && origin !== baseOrigin) {
@@ -5060,7 +5104,13 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               observeCount: normalizedUrls.length
             }));
           } catch (_) {}
-          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+          const remainingMs = deadlineAt ? Math.max(1, deadlineAt - Date.now()) : perPageBudgetMs;
+          const pageBudgetMs = Math.max(1, Math.min(perPageBudgetMs, remainingMs));
+          pages[index] = await withTimeout(
+            fetchSubpageJsonLdLight(url, { siteMode, timeout, context }),
+            pageBudgetMs,
+            timeoutPage(url, 'representative_observation_page_timeout')
+          );
           try {
             console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
               phase: 'observe_page_after',
@@ -5122,8 +5172,8 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
       };
     });
   } finally {
-    try { if (context && !reuseContext) await context.close(); } catch (_) {}
-    try { if (browser) await browser.close(); } catch (_) {}
+    try { if (context && !reuseContext) await withTimeout(context.close(), 1500, null); } catch (_) {}
+    try { if (browser) await withTimeout(browser.close(), 1500, null); } catch (_) {}
     try {
       console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
         phase: 'observe_closed',
