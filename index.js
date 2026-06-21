@@ -5408,6 +5408,31 @@ function getCoverageCanonicalFamilyPriority_(family, siteShape = 'generic') {
   return Object.prototype.hasOwnProperty.call(priority, family) ? priority[family] : 4;
 }
 
+function getCoverageRepresentativeCandidatePriorityAdjustment_(candidate) {
+  const path = getCoverageCandidatePath_(candidate).toLowerCase();
+  const family = getCoverageCanonicalPageFamily_(candidate);
+  const segments = path.split('/').filter(Boolean);
+  let adjustment = 0;
+  const rootLandingByFamily = {
+    business: /\/(?:business|solution|solutions|consulting)$/i,
+    service: /\/(?:service|services|plan|plans|price|pricing|fee|fees)$/i,
+    guide: /\/(?:flow|guide|guides|howto|how-to|usage|shopping-guide|user-guide)$/i,
+    support: /\/(?:support|cycle-support|help|faq)$/i,
+    store: /\/(?:shop|shops|store|stores|products|product|collections|category|categories)$/i,
+    case: /\/(?:case|cases|works|work|portfolio|projects)$/i,
+    about: /\/(?:about|company|corporate|profile|outline|about-us|company-profile|philosophy|message)$/i,
+    recruit: /\/(?:recruit|career|careers|jobs)$/i,
+    news: /\/(?:blogs\/news|news|topics|blog|column)$/i,
+    contact: /\/(?:contact|inquiry|inquiries)$/i
+  };
+  if (rootLandingByFamily[family] && rootLandingByFamily[family].test(path)) adjustment -= 4;
+  if (segments.length > 1) adjustment += Math.min(12, (segments.length - 1) * 3);
+  if (/^\/(?:access|entry|download|event|seminar|campaign|lp|landing)(?:\/|$)/i.test(path)) adjustment += 35;
+  if (/\/(?:detail|article|entry|entrance|thanks|complete)(?:\/|$|-|_)/i.test(path)) adjustment += 8;
+  if (/\d{4}\/\d{1,2}|\d{6,}|\/(?:case|cases|works|news|topics|blog|column)\/[^/]+/i.test(path)) adjustment += 10;
+  return adjustment;
+}
+
 function getCoverageRepresentativePriority_(page) {
   return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page), 'generic');
 }
@@ -5463,8 +5488,8 @@ function sortCoverageObserveCandidates_(candidates) {
     return 2;
   };
   return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
-    const aPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(a), siteShape);
-    const bPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(b), siteShape);
+    const aPriority = (getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(a), siteShape) * 10) + getCoverageRepresentativeCandidatePriorityAdjustment_(a);
+    const bPriority = (getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(b), siteShape) * 10) + getCoverageRepresentativeCandidatePriorityAdjustment_(b);
     if (aPriority !== bPriority) return aPriority - bPriority;
     const aSourcePriority = sourcePriority(a);
     const bSourcePriority = sourcePriority(b);
