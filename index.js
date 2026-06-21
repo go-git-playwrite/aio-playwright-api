@@ -4622,6 +4622,39 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       reuseBrowser: reuseContextForObserve,
       sequential: reuseContextForObserve
     });
+    try {
+      const observedItems = Array.isArray(observed && observed.pages)
+        ? observed.pages
+        : (Array.isArray(observed && observed.observations) ? observed.observations : []);
+      console.log('[DEBUG][SUBPAGE_OBSERVATION_RESULT_AUDIT]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        selectedCandidates: selectedCandidates.slice(0, 5).map(candidate => ({
+          url: candidate && candidate.url || '',
+          path: candidate && candidate.path || '',
+          pageType: candidate && candidate.pageType || '',
+          score: candidate && candidate.score,
+          source: candidate && candidate.source || '',
+          candidateOnly: candidate && candidate.candidateOnly === true
+        })),
+        observedCount: observedItems.length,
+        observedSample: observedItems.slice(0, 5).map(page => ({
+          url: page && page.url || '',
+          finalUrl: page && page.finalUrl || '',
+          ok: page && page.ok,
+          status: page && page.status,
+          title: page && page.title || '',
+          h1Count: page && page.h1Count,
+          h1Texts: Array.isArray(page && page.h1Texts) ? page.h1Texts.slice(0, 3) : [],
+          jsonLdCount: page && (page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount) || 0,
+          jsonldTypes: page && (page.jsonldTypes || page.jsonLdTypes) || [],
+          internalLinkCount: page && page.internalLinkCount,
+          bodyTextLength: page && page.bodyTextLength,
+          error: page && page.error || null
+        }))
+      }));
+    } catch (_) {}
     traceCoverageMemory('observe_after', {
       browserCreated: !reuseContextForObserve,
       contextCreated: true,
