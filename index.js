@@ -4635,7 +4635,8 @@ function buildLightweightSubpageSignalsSummary_(subpageSignals) {
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
   const subpageObservationMode = String(opts && opts.subpageObservationMode || '').toLowerCase();
-  const htmlFetchOnlySubpageObservation = subpageObservationMode === 'htmlfetchonly' || subpageObservationMode === 'html-fetch-only';
+  const normalizedSubpageObservationMode = subpageObservationMode.replace(/[^a-z]/g, '');
+  const htmlFetchOnlySubpageObservation = normalizedSubpageObservationMode === 'htmlfetchonly';
   const traceCoverageMemory = (phase, extra = {}) => {
     try {
       console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify(Object.assign({
@@ -4697,6 +4698,17 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const guardHost = (() => {
       try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
     })();
+    if (htmlFetchOnlySubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
+      try {
+        console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_MEMORY_GUARD_BYPASS]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          subpageObservationMode: opts && opts.subpageObservationMode || '',
+          reason: 'html_fetch_only'
+        }));
+      } catch (_) {}
+    }
     if (!htmlFetchOnlySubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
       const skipReason = 'memory_guard_ahamo_representative_observation';
       const coverageSignals = {
