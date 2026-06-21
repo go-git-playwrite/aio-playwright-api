@@ -5281,7 +5281,7 @@ function isCoverageSignalsAboutPath_(value) {
 }
 
 function getCoverageCandidateText_(candidate) {
-  return String(candidate && (candidate._text || candidate.text || candidate.label || candidate.anchorText) || '')
+  return String(candidate && (candidate._text || candidate.text || candidate.label || candidate.anchorText || candidate.reason) || '')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
@@ -5408,64 +5408,12 @@ function getCoverageCanonicalFamilyPriority_(family, siteShape = 'generic') {
   return Object.prototype.hasOwnProperty.call(priority, family) ? priority[family] : 4;
 }
 
-function getCoverageRepresentativeCandidatePriorityAdjustment_(candidate) {
-  const path = getCoverageCandidatePath_(candidate).toLowerCase();
-  const family = getCoverageCanonicalPageFamily_(candidate);
-  const segments = path.split('/').filter(Boolean);
-  let adjustment = 0;
-  const rootLandingByFamily = {
-    business: /\/(?:business|solution|solutions|consulting)$/i,
-    service: /\/(?:service|services|plan|plans|price|pricing|fee|fees)$/i,
-    guide: /\/(?:flow|guide|guides|howto|how-to|usage|shopping-guide|user-guide)$/i,
-    support: /\/(?:support|cycle-support|help|faq)$/i,
-    store: /\/(?:shop|shops|store|stores|products|product|collections|category|categories)$/i,
-    case: /\/(?:case|cases|works|work|portfolio|projects)$/i,
-    about: /\/(?:about|company|corporate|profile|outline|about-us|company-profile|philosophy|message)$/i,
-    recruit: /\/(?:recruit|career|careers|jobs)$/i,
-    news: /\/(?:blogs\/news|news|topics|blog|column)$/i,
-    contact: /\/(?:contact|inquiry|inquiries)$/i
-  };
-  if (rootLandingByFamily[family] && rootLandingByFamily[family].test(path)) adjustment -= 4;
-  if (segments.length > 1) adjustment += Math.min(12, (segments.length - 1) * 3);
-  if (/^\/(?:access|entry|download|event|seminar|campaign|lp|landing)(?:\/|$)/i.test(path)) adjustment += 35;
-  if (/\/(?:detail|article|entry|entrance|thanks|complete)(?:\/|$|-|_)/i.test(path)) adjustment += 8;
-  if (/\d{4}\/\d{1,2}|\d{6,}|\/(?:case|cases|works|news|topics|blog|column)\/[^/]+/i.test(path)) adjustment += 10;
-  return adjustment;
-}
-
 function getCoverageRepresentativePriority_(page) {
   return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page), 'generic');
 }
 
-function getCoverageCandidateUrl_(candidate) {
-  if (!candidate) return '';
-  if (typeof candidate === 'string') return String(candidate || '').trim();
-  return String(
-    candidate.url ||
-    candidate.normalizedUrl ||
-    candidate.finalUrl ||
-    candidate.href ||
-    candidate.loc ||
-    candidate.path ||
-    ''
-  ).trim();
-}
-
 function getCoverageCandidatePath_(candidate) {
-  const raw = getCoverageCandidateUrl_(candidate);
-  if (!raw) return '';
-  const normalizePath = (value) => {
-    const trimmed = String(value || '').split('?')[0].split('#')[0].trim();
-    if (!trimmed) return '';
-    const withSlash = trimmed.charAt(0) === '/' ? trimmed : `/${trimmed.replace(/^\/+/, '')}`;
-    return withSlash.replace(/\/+$/, '') || '/';
-  };
-  try {
-    if (/^https?:\/\//i.test(raw)) return normalizePath(new URL(raw).pathname || '/');
-    return normalizePath(new URL(raw, 'https://candidate.local').pathname || raw);
-  } catch (_) {
-    return normalizePath(raw);
-  }
+  try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
 }
 
 function normalizeCoveragePathKey_(value) {
@@ -5488,8 +5436,8 @@ function sortCoverageObserveCandidates_(candidates) {
     return 2;
   };
   return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
-    const aPriority = (getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(a), siteShape) * 10) + getCoverageRepresentativeCandidatePriorityAdjustment_(a);
-    const bPriority = (getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(b), siteShape) * 10) + getCoverageRepresentativeCandidatePriorityAdjustment_(b);
+    const aPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(a), siteShape);
+    const bPriority = getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(b), siteShape);
     if (aPriority !== bPriority) return aPriority - bPriority;
     const aSourcePriority = sourcePriority(a);
     const bSourcePriority = sourcePriority(b);
@@ -5500,12 +5448,12 @@ function sortCoverageObserveCandidates_(candidates) {
     const aScore = Number(a && a.score || 0);
     const bScore = Number(b && b.score || 0);
     if (aScore !== bScore) return bScore - aScore;
-    return getCoverageCandidateUrl_(a).localeCompare(getCoverageCandidateUrl_(b));
+    return String(a && a.url || '').localeCompare(String(b && b.url || ''));
   });
 }
 
 function buildCoverageRepresentativePageFromCandidate_(candidate) {
-  const url = getCoverageCandidateUrl_(candidate);
+  const url = String(candidate && candidate.url || '');
   const path = getCoverageCandidatePath_(candidate);
   return {
     url,
@@ -5521,7 +5469,7 @@ function buildCoverageRepresentativePageFromCandidate_(candidate) {
 }
 
 function getCoverageRepresentativeRejectReason_(candidate) {
-  const url = getCoverageCandidateUrl_(candidate);
+  const url = String(candidate && candidate.url || '');
   const path = getCoverageCandidatePath_(candidate).toLowerCase();
   const family = getCoverageCanonicalPageFamily_(candidate);
   if (!url || !path || path === '/') return 'top_or_empty_path';
@@ -5590,7 +5538,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   });
   const primaryPool = sortCoverageObserveCandidates_(eligible);
   sortCoverageObserveCandidates_(eligible).slice(0, 50).forEach((candidate, index) => {
-    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
     const selected = index < max;
     logRepresentativeSelectionPhase11_({
       debugRunId: opts && opts.debugRunId,
@@ -5619,11 +5567,11 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   const selected = [];
   const selectedKeys = new Set();
   const hasAlternativeNonNewsCandidate = () => primaryPool.some(candidate => {
-    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
     return key && !selectedKeys.has(key) && getCoverageCanonicalPageFamily_(candidate) !== 'news';
   });
   const addSelected = (candidate) => {
-    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
     if (!key || selectedKeys.has(key) || selected.length >= max) return false;
     if (
       getCoverageCanonicalPageFamily_(candidate) === 'news' &&
@@ -5640,7 +5588,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   while (selected.length < max) {
     const selectedFamilies = new Set(selected.map(getCoverageCanonicalPageFamily_));
     const diverseCandidate = primaryPool.find(candidate => {
-      const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+      const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
       if (!key || selectedKeys.has(key)) return false;
       return !selectedFamilies.has(getCoverageCanonicalPageFamily_(candidate));
     });
@@ -5685,7 +5633,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
     if (selected.length + backfill.length >= max) {
       return;
     }
-    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
     const rejectReason = !key
       ? 'missing_candidate_key'
       : (selectedKeys.has(key)
@@ -5975,7 +5923,7 @@ function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
       const key = normalizeCoveragePathKey_(page && (page.finalUrl || page.url || page.path) || '');
       if (key) observedByPath.set(key, page);
     });
-    const candidateKeys = new Set(selectedCandidates.map(candidate => normalizeCoveragePathKey_(getCoverageCandidateUrl_(candidate) || candidate && candidate.path || '')).filter(Boolean));
+    const candidateKeys = new Set(selectedCandidates.map(candidate => normalizeCoveragePathKey_(candidate && (candidate.url || candidate.path) || '')).filter(Boolean));
     const metricSummary = (page = {}) => ({
       contentTextLength: Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length,
       h1Count: Number(page.h1Count || 0),
@@ -6451,283 +6399,6 @@ function logRepresentativeFinalResponsePhase12Audit_(payload = {}) {
   } catch (_) {}
 }
 
-function logSignalsLightFinalResponsePathAudit_(payload = {}) {
-  try {
-    const responsePayload = payload.responsePayload && typeof payload.responsePayload === 'object'
-      ? payload.responsePayload
-      : {};
-    const geoSignalsV1 = responsePayload.geoSignalsV1 && typeof responsePayload.geoSignalsV1 === 'object'
-      ? responsePayload.geoSignalsV1
-      : {};
-    const observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object'
-      ? geoSignalsV1.observed
-      : {};
-    const structuredData = geoSignalsV1.structuredData && typeof geoSignalsV1.structuredData === 'object'
-      ? geoSignalsV1.structuredData
-      : (observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {});
-    const headings = geoSignalsV1.headings && typeof geoSignalsV1.headings === 'object'
-      ? geoSignalsV1.headings
-      : (observed.headings && typeof observed.headings === 'object' ? observed.headings : {});
-    const observedH1 = observed.h1 && typeof observed.h1 === 'object' ? observed.h1 : {};
-    const coverageSignals = geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'
-      ? geoSignalsV1.coverageSignals
-      : {};
-    let origin = payload.origin || '';
-    if (!origin) {
-      try { origin = new URL(String(responsePayload.finalUrl || responsePayload.url || '')).origin; } catch (_) {}
-    }
-    console.log('[DEBUG][SIGNALS_LIGHT_FINAL_RESPONSE_PATH_AUDIT]', JSON.stringify({
-      origin: String(origin || '').slice(0, 180),
-      route: payload.route || '/scrape',
-      mode: responsePayload.mode || payload.mode || null,
-      responseMode: responsePayload.responseMode || payload.responseMode || null,
-      earlyReturnReason: responsePayload.earlyReturnReason || payload.earlyReturnReason || null,
-      guardReason: responsePayload.guardReason || payload.guardReason || null,
-      elapsedMs: typeof payload.elapsedMs === 'number' ? payload.elapsedMs : null,
-      hasGeoSignalsV1: !!responsePayload.geoSignalsV1,
-      structuredData: {
-        hasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
-        hasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
-        hasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
-        rawCount: typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null,
-        renderedDomRawCount: typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null,
-        htmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'htmlScanSkipped') ? structuredData.htmlScanSkipped : null,
-        jsScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'jsScanSkipped') ? structuredData.jsScanSkipped : null,
-        chunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'chunkScanSkipped') ? structuredData.chunkScanSkipped : null
-      },
-      headings: {
-        h1Count: typeof headings.h1Count === 'number'
-          ? headings.h1Count
-          : (typeof observedH1.count === 'number' ? observedH1.count : null),
-        source: headings.source || headings.h1Source || observedH1.source || null,
-        headingObservationLimited: Object.prototype.hasOwnProperty.call(headings, 'headingObservationLimited')
-          ? headings.headingObservationLimited
-          : (Object.prototype.hasOwnProperty.call(observedH1, 'headingObservationLimited') ? observedH1.headingObservationLimited : null)
-      },
-      coverageSignals: {
-        observedCount: typeof coverageSignals.observedCount === 'number'
-          ? coverageSignals.observedCount
-          : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
-        representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
-          ? coverageSignals.representativePagesCount
-          : (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : null),
-        reason: coverageSignals.reason || coverageSignals.error || null,
-        candidateSourceSummary: coverageSignals.candidateSourceSummary || null
-      }
-    }));
-  } catch (_) {}
-}
-
-function summarizeGeoSignalsTopSignalsForPartialMerge_(geoSignalsV1) {
-  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
-  const structuredData = geo.structuredData && typeof geo.structuredData === 'object' ? geo.structuredData : {};
-  const headings = geo.headings && typeof geo.headings === 'object' ? geo.headings : {};
-  return {
-    structuredDataHasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
-    structuredDataHasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
-    structuredDataHasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
-    headingsH1Count: typeof headings.h1Count === 'number' ? headings.h1Count : null,
-    headingsSource: headings.source || headings.h1Source || null
-  };
-}
-
-function cloneGeoSignalsBranchForPartialMerge_(value) {
-  if (!value || typeof value !== 'object') return value;
-  try {
-    return JSON.parse(JSON.stringify(value));
-  } catch (_) {
-    if (Array.isArray(value)) return value.slice();
-    return Object.assign({}, value);
-  }
-}
-
-function snapshotGeoSignalsTopBranchesForPartialMerge_(geoSignalsV1) {
-  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
-  const keys = [
-    'structuredData',
-    'headings',
-    'trustSignals',
-    'multimodalSignals',
-    'landmarks',
-    'clarity',
-    'coverage',
-    'observed',
-    'balanced',
-    'aioCheck',
-    'diagnostics'
-  ];
-  return keys.reduce((acc, key) => {
-    if (Object.prototype.hasOwnProperty.call(geo, key)) {
-      acc[key] = cloneGeoSignalsBranchForPartialMerge_(geo[key]);
-    }
-    return acc;
-  }, {});
-}
-
-function restoreGeoSignalsTopBranchesForPartialReturn_(geoSignalsV1, snapshot) {
-  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !snapshot || typeof snapshot !== 'object') {
-    return geoSignalsV1;
-  }
-  Object.keys(snapshot).forEach(key => {
-    if (Object.prototype.hasOwnProperty.call(snapshot, key)) {
-      geoSignalsV1[key] = cloneGeoSignalsBranchForPartialMerge_(snapshot[key]);
-    }
-  });
-  return geoSignalsV1;
-}
-
-function logSignalsLightPartialReturnMergeAudit_(payload = {}) {
-  try {
-    const afterGeo = payload.geoSignalsV1 && typeof payload.geoSignalsV1 === 'object' ? payload.geoSignalsV1 : {};
-    const coverageSignals = afterGeo.coverageSignals && typeof afterGeo.coverageSignals === 'object'
-      ? afterGeo.coverageSignals
-      : {};
-    const representativePages = Array.isArray(coverageSignals.representativePages)
-      ? coverageSignals.representativePages
-      : [];
-    console.log('[DEBUG][SIGNALS_LIGHT_PARTIAL_RETURN_MERGE_AUDIT]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      earlyReturnReason: payload.earlyReturnReason || null,
-      hasBaseGeoSignals: payload.hasBaseGeoSignals === true,
-      hasCoverageSignals: !!(afterGeo.coverageSignals && typeof afterGeo.coverageSignals === 'object'),
-      beforeMerge: payload.beforeMerge || summarizeGeoSignalsTopSignalsForPartialMerge_(null),
-      afterMerge: Object.assign(summarizeGeoSignalsTopSignalsForPartialMerge_(afterGeo), {
-        coverageObservedCount: typeof coverageSignals.observedCount === 'number'
-          ? coverageSignals.observedCount
-          : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
-        representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
-          ? coverageSignals.representativePagesCount
-          : representativePages.length
-      })
-    }));
-  } catch (_) {}
-}
-
-function summarizeTopSignalSnapshotPhase16B_(geoSignalsV1) {
-  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
-  const structuredData = geo.structuredData && typeof geo.structuredData === 'object' ? geo.structuredData : {};
-  const headings = geo.headings && typeof geo.headings === 'object' ? geo.headings : {};
-  const coverageSignals = geo.coverageSignals && typeof geo.coverageSignals === 'object' ? geo.coverageSignals : {};
-  const representativePages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
-  return {
-    structuredData: {
-      hasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
-      hasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
-      hasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
-      rawCount: typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null,
-      renderedDomRawCount: typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null,
-      source: structuredData.source || null,
-      observationLimited: Object.prototype.hasOwnProperty.call(structuredData, 'observationLimited') ? structuredData.observationLimited : null
-    },
-    headings: {
-      h1Count: typeof headings.h1Count === 'number' ? headings.h1Count : null,
-      hasH1: Object.prototype.hasOwnProperty.call(headings, 'hasH1') ? headings.hasH1 : null,
-      source: headings.source || null,
-      h1Source: headings.h1Source || null,
-      headingObservationLimited: Object.prototype.hasOwnProperty.call(headings, 'headingObservationLimited') ? headings.headingObservationLimited : null,
-      primaryHeadingCandidate: headings.primaryHeadingCandidate || null
-    },
-    coverageSignals: {
-      observedCount: typeof coverageSignals.observedCount === 'number'
-        ? coverageSignals.observedCount
-        : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
-      representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
-        ? coverageSignals.representativePagesCount
-        : representativePages.length,
-      reason: coverageSignals.reason || coverageSignals.error || null
-    }
-  };
-}
-
-function logSignalsLightTopSignalSnapshotPhase16B_(payload = {}) {
-  try {
-    const summary = summarizeTopSignalSnapshotPhase16B_(payload.geoSignalsV1);
-    console.log('[DEBUG][SIGNALS_LIGHT_TOP_SIGNAL_SNAPSHOT_PHASE16B]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      stage: payload.stage || '',
-      earlyReturnReason: payload.earlyReturnReason || null,
-      structuredData: summary.structuredData,
-      headings: summary.headings,
-      coverageSignals: summary.coverageSignals
-    }));
-  } catch (_) {}
-}
-
-function normalizePartialReturnStructuredDataUnknownSafe_(structuredData) {
-  if (!structuredData || typeof structuredData !== 'object') return structuredData;
-  const rawCount = typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null;
-  const renderedDomRawCount = typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null;
-  const htmlScanSkipped = structuredData.htmlScanSkipped === true;
-  const jsScanSkipped = structuredData.jsScanSkipped === true;
-  const chunkScanSkipped = structuredData.chunkScanSkipped === true;
-  const limitedRenderedOnly = structuredData.observationLimited === true && htmlScanSkipped && jsScanSkipped && chunkScanSkipped;
-  const emptyRenderedOnly = limitedRenderedOnly && Number(rawCount || 0) === 0 && Number(renderedDomRawCount || 0) === 0;
-  if (!emptyRenderedOnly) return structuredData;
-  [
-    'hasJsonLd',
-    'hasSeoJsonLd',
-    'hasWebsite',
-    'hasOrganization',
-    'hasBreadcrumbList',
-    'hasFAQPage',
-    'breadcrumbObserved',
-    'breadcrumbMissing'
-  ].forEach(key => {
-    if (Object.prototype.hasOwnProperty.call(structuredData, key)) structuredData[key] = null;
-  });
-  structuredData.rawCount = null;
-  structuredData.parseableCount = null;
-  structuredData.partialReturnUnknownSafe = true;
-  if (structuredData.organizationSummary && typeof structuredData.organizationSummary === 'object') {
-    structuredData.organizationSummary = Object.assign({}, structuredData.organizationSummary, {
-      observed: null,
-      hasOrganization: null,
-      partialReturnUnknownSafe: true
-    });
-  }
-  if (structuredData.sameAsSummary && typeof structuredData.sameAsSummary === 'object') {
-    structuredData.sameAsSummary = Object.assign({}, structuredData.sameAsSummary, {
-      observed: null,
-      count: null,
-      externalCount: null,
-      hasOrganizationSameAs: null,
-      hasWebSiteSameAs: null,
-      hasPersonSameAs: null,
-      partialReturnUnknownSafe: true
-    });
-  }
-  return structuredData;
-}
-
-function normalizePartialReturnHeadingsUnknownSafe_(headings) {
-  if (!headings || typeof headings !== 'object') return headings;
-  const h1Count = typeof headings.h1Count === 'number' ? headings.h1Count : null;
-  const notObserved = (headings.source === 'not_observed' || headings.h1Source === 'not_observed') && headings.headingObservationLimited === true;
-  if (h1Count === 0 && notObserved) {
-    headings.h1Count = null;
-    headings.hasH1 = null;
-    headings.hasSingleH1 = null;
-    headings.partialReturnUnknownSafe = true;
-  }
-  return headings;
-}
-
-function normalizeGeoSignalsPartialReturnUnknownSafe_(geoSignalsV1) {
-  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return geoSignalsV1;
-  normalizePartialReturnStructuredDataUnknownSafe_(geoSignalsV1.structuredData);
-  normalizePartialReturnHeadingsUnknownSafe_(geoSignalsV1.headings);
-  if (geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object') {
-    normalizePartialReturnStructuredDataUnknownSafe_(geoSignalsV1.observed.structuredData);
-    if (geoSignalsV1.observed.h1 && typeof geoSignalsV1.observed.h1 === 'object' && geoSignalsV1.observed.h1.count === 0 && geoSignalsV1.observed.h1.source === 'not_observed') {
-      geoSignalsV1.observed.h1.count = null;
-      geoSignalsV1.observed.h1.hasH1 = null;
-      geoSignalsV1.observed.h1.hasSingleH1 = null;
-      geoSignalsV1.observed.h1.partialReturnUnknownSafe = true;
-    }
-  }
-  return geoSignalsV1;
-}
-
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -6766,10 +6437,10 @@ function logSubpageCandidateDiscoveryAudit_(payload = {}) {
     const selectedTypes = selectedCandidates
       .map(getCoverageCandidatePageType_)
       .filter(type => type && type !== 'unknown');
-    const selectedUrls = new Set(selectedCandidates.map(getCoverageCandidateUrl_));
+    const selectedUrls = new Set(selectedCandidates.map(candidate => String(candidate && candidate.url || '')));
     const droppedTypeCounts = {};
     candidates.forEach(candidate => {
-      const url = getCoverageCandidateUrl_(candidate);
+      const url = String(candidate && candidate.url || '');
       if (!url || selectedUrls.has(url)) return;
       const pageType = getCoverageCandidatePageType_(candidate);
       droppedTypeCounts[pageType || 'unknown'] = (droppedTypeCounts[pageType || 'unknown'] || 0) + 1;
@@ -6869,94 +6540,15 @@ function logRepresentativeCandidateSourcePhase16BAudit_(payload = {}) {
   } catch (_) {}
 }
 
-function logRepresentativeHardExcludeAuditPhase16B_(payload = {}) {
-  try {
-    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
-    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
-    const normalized = candidates.map(candidate => {
-      const url = getCoverageCandidateUrl_(candidate);
-      const path = getCoverageCandidatePath_(candidate);
-      const family = getCoverageCanonicalPageFamily_(candidate);
-      const rejectReason = getCoverageRepresentativeRejectReason_(candidate);
-      const sources = Array.isArray(candidate && candidate.sources)
-        ? candidate.sources
-        : (candidate && candidate.source ? [candidate.source] : []);
-      return {
-        candidate,
-        url,
-        path,
-        pageType: getCoverageCandidatePageType_(candidate),
-        canonicalPageFamily: family,
-        source: String(candidate && candidate.source || '').slice(0, 80),
-        sources: sources.map(source => String(source || '').slice(0, 80)).slice(0, 8),
-        score: Number(candidate && candidate.score || 0) || 0,
-        reason: String(candidate && candidate.reason || '').slice(0, 160),
-        rejectReason
-      };
-    });
-    const hardExcludeReasonCounts = {};
-    const includedFamilyCounts = {};
-    normalized.forEach(item => {
-      if (item.rejectReason) {
-        hardExcludeReasonCounts[item.rejectReason] = (hardExcludeReasonCounts[item.rejectReason] || 0) + 1;
-      } else {
-        includedFamilyCounts[item.canonicalPageFamily || 'unknown'] = (includedFamilyCounts[item.canonicalPageFamily || 'unknown'] || 0) + 1;
-      }
-    });
-    const countBySource = (sourceName) => normalized.filter(item => {
-      const sources = Array.isArray(item.sources) ? item.sources : [];
-      return sources.includes(sourceName) || item.source === sourceName;
-    }).length;
-    const sampleBeforeNormalize = candidates.slice(0, 10).map(candidate => ({
-      url: getCoverageCandidateUrl_(candidate).slice(0, 220),
-      path: String(candidate && candidate.path || '').slice(0, 160),
-      source: String(candidate && candidate.source || '').slice(0, 80),
-      sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 6) : [],
-      reason: String(candidate && candidate.reason || '').slice(0, 120)
-    }));
-    const sampleAfterNormalize = normalized.slice(0, 10).map(item => ({
-      url: item.url.slice(0, 220),
-      path: item.path.slice(0, 160),
-      pageType: item.pageType,
-      canonicalPageFamily: item.canonicalPageFamily,
-      source: item.source,
-      sources: item.sources,
-      reason: item.reason,
-      rejectReason: item.rejectReason || null
-    }));
-    console.log('[DEBUG][REPRESENTATIVE_HARD_EXCLUDE_AUDIT_PHASE16B]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      rawCandidateCount: candidates.length,
-      sitemapCandidateCount: countBySource('sitemap'),
-      afterNormalizeCount: normalized.filter(item => !!item.path).length,
-      afterHardExcludeCount: normalized.filter(item => !item.rejectReason).length,
-      selectedCandidatesCount: selectedCandidates.length,
-      sampleBeforeNormalize,
-      sampleAfterNormalize,
-      hardExcludeReasonCounts,
-      includedFamilyCounts,
-      selectedPaths: selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean).slice(0, 10)
-    }));
-  } catch (e) {
-    try {
-      console.log('[DEBUG][REPRESENTATIVE_HARD_EXCLUDE_AUDIT_PHASE16B]', JSON.stringify({
-        origin: String(payload && payload.origin || '').slice(0, 180),
-        error: String(e && (e.message || e) || '').slice(0, 180)
-      }));
-    } catch (_) {}
-  }
-}
-
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
   const candidateByUrl = new Map();
   const candidateByPath = new Map();
   candidates.forEach(candidate => {
-    const candidateUrl = getCoverageCandidateUrl_(candidate);
-    if (!candidate || !candidateUrl) return;
-    candidateByUrl.set(candidateUrl, candidate);
-    candidateByPath.set(normalizeCoveragePathKey_(candidateUrl), candidate);
+    if (!candidate || !candidate.url) return;
+    candidateByUrl.set(String(candidate.url), candidate);
+    candidateByPath.set(normalizeCoveragePathKey_(candidate.url), candidate);
   });
   const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
     ? payload.candidateSummary.sourceSummary
@@ -7843,7 +7435,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       reason: 'coverage_observe_selection'
     });
     lastSelectedCandidatesForCoverage = selectedCandidates;
-    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate))));
+    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
     const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(coverageCandidates, 4, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
@@ -7860,20 +7452,19 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       afterCount: selectedCandidates.length
     });
     allPrioritizedCandidates.slice(0, 50).forEach((candidate, index) => {
-      const candidateKey = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
-      const selected = selectedCandidates.some(item => discoverSubpageCandidateKey(getCoverageCandidateUrl_(item)) === candidateKey);
-      const selectedByBackfill = selected && !primaryRepresentativeKeys.has(candidateKey);
+      const selected = selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || ''));
+      const selectedByBackfill = selected && !primaryRepresentativeKeys.has(discoverSubpageCandidateKey(candidate && candidate.url || ''));
       const rejectReason = selected
         ? null
         : (getCoverageRepresentativeRejectReason_(candidate) || 'lower_representative_priority');
       logCandidateGenerationPhase11_(candidateAudit, {
         origin: normalized.origin,
-        url: getCoverageCandidateUrl_(candidate),
+        url: candidate && candidate.url,
         phase: 'representative_select_item',
         source: candidate && candidate.source,
         path: getCoverageCandidatePath_(candidate),
         pageType: getCoverageCandidatePageType_(candidate),
-        href: getCoverageCandidateUrl_(candidate),
+        href: candidate && candidate.url,
         score: Number(candidate && candidate.score || 0) || 0,
         reason: selected
           ? (selectedByBackfill ? 'representative_backfill_to_min_count' : `selected_index_${index}`)
@@ -7917,14 +7508,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       finalRepresentativePages: auditRepresentativePages,
       reason: 'after_representative_selection'
     });
-    logRepresentativeHardExcludeAuditPhase16B_({
-      origin: normalized.origin,
-      candidates: coverageCandidates,
-      selectedCandidates
-    });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = allPrioritizedCandidates
-      .filter(candidate => !selectedCandidates.some(item => discoverSubpageCandidateKey(getCoverageCandidateUrl_(item)) === discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate))))
+      .filter(candidate => !selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || '')))
       .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
       .map(getCoverageCandidatePath_)
       .filter(Boolean)
@@ -7946,9 +7532,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     if (!selectedCandidates.length) {
-      const afterHardExcludeCount = filterCoverageRepresentativeCandidates_(coverageCandidates).length;
       const noCandidateReason = coverageCandidates.length
-        ? (afterHardExcludeCount === 0 ? 'no_representative_candidates_after_hard_exclude' : 'representative_selection_empty')
+        ? 'no_representative_candidates_after_hard_exclude'
         : 'no_subpage_candidates';
       const emptyCoverageSignals = attachEmptySignals(noCandidateReason, discovered, auditRepresentativePages.length ? coverageCandidates : []);
       logPayload.origin = normalized.origin;
@@ -7958,7 +7543,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         origin: normalized.origin,
         candidateSourceSummary: discovered.sourceSummary,
         candidates: coverageCandidates,
-        afterHardExcludeCount,
+        afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
         selectionInputCount: coverageCandidates.length,
         selectedCandidates,
         preservedRepresentativePages: auditRepresentativePages,
@@ -7966,11 +7551,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           ? geoSignalsV1.coverageSignals.representativePages
           : [],
         reason: noCandidateReason
-      });
-      logRepresentativeHardExcludeAuditPhase16B_({
-        origin: normalized.origin,
-        candidates: coverageCandidates,
-        selectedCandidates
       });
       traceCoverageMemory('attach_skip_no_candidates', {
         candidateCount: discovered.totalCandidates
@@ -7990,7 +7570,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     setPhase11State({ observationStarted: true });
-    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(getCoverageCandidateUrl_).filter(Boolean), {
+    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
       extractionTimeoutMs: subpageExtractTimeoutMs,
@@ -8833,7 +8413,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
   const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
   const selectedCandidates = discovered.candidates.slice(0, limit);
-  const urls = selectedCandidates.map(getCoverageCandidateUrl_).filter(Boolean);
+  const urls = selectedCandidates.map(candidate => candidate.url);
   const observed = await observeSubpageJsonLdLightUrls_(urls, {
     siteMode,
     timeout: req.body && req.body.timeout,
@@ -8845,7 +8425,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
       if (page && page.ok === true) return null;
       const candidate = selectedCandidates[index] || {};
       return {
-        url: page && page.url || getCoverageCandidateUrl_(candidate) || '',
+        url: page && page.url || candidate.url || '',
         source: candidate.source || '',
         message: String(page && page.error || 'observation_failed').slice(0, 160)
       };
@@ -12275,8 +11855,6 @@ function buildBalancedShortResponsePayload(fullPayload) {
     ok: true,
     mode: fullPayload.mode,
     responseMode: 'short',
-    earlyReturnReason: fullPayload.earlyReturnReason || null,
-    guardReason: fullPayload.guardReason || null,
     shortMode: true,
     url: fullPayload.url,
     finalUrl: fullPayload.finalUrl,
@@ -15677,14 +15255,6 @@ async function scrapeOnce(req, res) {
         });
         throw e;
       }
-      const baseGeoSignalsForPartialReturn = snapshotGeoSignalsTopBranchesForPartialMerge_(geoSignalsV1);
-      const baseGeoSignalsPartialReturnSummary = summarizeGeoSignalsTopSignalsForPartialMerge_(geoSignalsV1);
-      logSignalsLightTopSignalSnapshotPhase16B_({
-        origin: watchdogOrigin(),
-        stage: 'after_build_geo',
-        earlyReturnReason: null,
-        geoSignalsV1
-      });
       logWatchdog('top_observation_complete', geoSignalsWatchdogStartedAt);
       const subpageObservationPhase11State = {
         debugRunId,
@@ -15722,37 +15292,6 @@ async function scrapeOnce(req, res) {
         errorName: subpageObservationPhase11State.errorName || null,
         errorMessage: subpageObservationPhase11State.errorMessage || null
       });
-      if (subpageObservationPhase11State.fallbackReason === 'partial_subpage_observation_timeout') {
-        logSignalsLightTopSignalSnapshotPhase16B_({
-          origin: watchdogOrigin(),
-          stage: 'before_partial_restore',
-          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
-          geoSignalsV1
-        });
-        const coverageSignalsForPartialReturn = geoSignalsV1 && geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'
-          ? geoSignalsV1.coverageSignals
-          : null;
-        const subpageSignalsForPartialReturn = geoSignalsV1 && geoSignalsV1.subpageSignals && typeof geoSignalsV1.subpageSignals === 'object'
-          ? geoSignalsV1.subpageSignals
-          : null;
-        restoreGeoSignalsTopBranchesForPartialReturn_(geoSignalsV1, baseGeoSignalsForPartialReturn);
-        if (coverageSignalsForPartialReturn) geoSignalsV1.coverageSignals = coverageSignalsForPartialReturn;
-        if (subpageSignalsForPartialReturn) geoSignalsV1.subpageSignals = subpageSignalsForPartialReturn;
-        normalizeGeoSignalsPartialReturnUnknownSafe_(geoSignalsV1);
-        logSignalsLightTopSignalSnapshotPhase16B_({
-          origin: watchdogOrigin(),
-          stage: 'after_partial_restore',
-          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
-          geoSignalsV1
-        });
-        logSignalsLightPartialReturnMergeAudit_({
-          origin: watchdogOrigin(),
-          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
-          hasBaseGeoSignals: !!baseGeoSignalsForPartialReturn,
-          beforeMerge: baseGeoSignalsPartialReturnSummary,
-          geoSignalsV1
-        });
-      }
       if (subpageObservationPhase11State.memoryGuardTriggered === true) {
         logWatchdog('pre_response_memory_guard_start', Date.now(), {
           memoryGuardTriggered: true,
@@ -16157,11 +15696,6 @@ async function scrapeOnce(req, res) {
       const signalsResponsePayload = {
         ok: true,
         mode: signalsFirstBalanced ? 'signalsFirstBalanced' : 'signalsFirstLight',
-        responseMode: watchdogResponseMode,
-        earlyReturnReason: subpageObservationPhase11State.fallbackReason || null,
-        guardReason: subpageObservationPhase11State.memoryGuardTriggered === true
-          ? (subpageObservationPhase11State.fallbackReason || 'pre_response_memory_guard')
-          : null,
         url: urlToFetch,
         finalUrl,
         status: resp && typeof resp.status === 'function' ? resp.status() : null,
@@ -16284,15 +15818,6 @@ async function scrapeOnce(req, res) {
           coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
           earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
         });
-        logSignalsLightFinalResponsePathAudit_({
-          route: '/scrape',
-          mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
-          responseMode: shortPayload && shortPayload.responseMode,
-          earlyReturnReason: shortPayload && shortPayload.earlyReturnReason || subpageObservationPhase11State.fallbackReason || null,
-          guardReason: shortPayload && shortPayload.guardReason || null,
-          elapsedMs: Math.max(0, Date.now() - scrapeWatchdogStartedAt),
-          responsePayload: shortPayload
-        });
         const responseSendStartedAt = Date.now();
         logWatchdog('response_send_start', responseSendStartedAt, {
           completedAt: null,
@@ -16329,12 +15854,6 @@ async function scrapeOnce(req, res) {
       if (signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals) {
         attachRepresentativeObservationQuality_(signalsResponsePayload.geoSignalsV1.coverageSignals);
       }
-      logSignalsLightTopSignalSnapshotPhase16B_({
-        origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
-        stage: 'before_final_response',
-        earlyReturnReason: signalsResponsePayload && signalsResponsePayload.earlyReturnReason || null,
-        geoSignalsV1: signalsResponsePayload && signalsResponsePayload.geoSignalsV1
-      });
       logRepresentativeFinalResponsePhase12Audit_({
         route: '/scrape',
         mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
@@ -16342,15 +15861,6 @@ async function scrapeOnce(req, res) {
         origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
         coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
         earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
-      });
-      logSignalsLightFinalResponsePathAudit_({
-        route: '/scrape',
-        mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
-        responseMode: signalsResponsePayload && signalsResponsePayload.responseMode || 'default',
-        earlyReturnReason: signalsResponsePayload && signalsResponsePayload.earlyReturnReason || null,
-        guardReason: signalsResponsePayload && signalsResponsePayload.guardReason || null,
-        elapsedMs: Math.max(0, Date.now() - scrapeWatchdogStartedAt),
-        responsePayload: signalsResponsePayload
       });
       const responseSendStartedAt = Date.now();
       logWatchdog('response_send_start', responseSendStartedAt, {
