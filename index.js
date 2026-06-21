@@ -3096,7 +3096,8 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
         hasBreadcrumbJsonLd: false,
         hasBreadcrumbUi: false,
         error: 'blocked_private_or_metadata_host',
-        observationSource: 'html-fetch-light'
+        observationSource: 'html-fetch-light',
+        observationMethod: 'html_fetch_light'
       };
     }
     const response = await fetch(url, {
@@ -3126,7 +3127,8 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
         hasBreadcrumbJsonLd: false,
         hasBreadcrumbUi: false,
         error: 'redirect_origin_mismatch',
-        observationSource: 'html-fetch-light'
+        observationSource: 'html-fetch-light',
+        observationMethod: 'html_fetch_light'
       };
     }
     if (!response || !response.ok) {
@@ -3144,7 +3146,8 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
         hasBreadcrumbJsonLd: false,
         hasBreadcrumbUi: false,
         error: status ? `HTTP ${status}` : 'fetch_failed',
-        observationSource: 'html-fetch-light'
+        observationSource: 'html-fetch-light',
+        observationMethod: 'html_fetch_light'
       };
     }
     const contentType = String(response.headers && response.headers.get && response.headers.get('content-type') || '');
@@ -3163,12 +3166,14 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
         hasBreadcrumbJsonLd: false,
         hasBreadcrumbUi: false,
         error: 'unsupported_content_type',
-        observationSource: 'html-fetch-light'
+        observationSource: 'html-fetch-light',
+        observationMethod: 'html_fetch_light'
       };
     }
     const html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
     return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode), {
-      observationSource: 'html-fetch-light'
+      observationSource: 'html-fetch-light',
+      observationMethod: 'html_fetch_light'
     });
   } catch (e) {
     return {
@@ -3185,7 +3190,8 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
       hasBreadcrumbJsonLd: false,
       hasBreadcrumbUi: false,
       error: String(e && (e.message || e) || 'html_fetch_failed').slice(0, 160),
-      observationSource: 'html-fetch-light'
+      observationSource: 'html-fetch-light',
+      observationMethod: 'html_fetch_light'
     };
   }
 }
@@ -4123,6 +4129,10 @@ function compactSubpageJsonLdObservation_(page) {
     externalLinkCount: Number(page && page.externalLinkCount || 0),
     bodyTextLength: Number(page && page.bodyTextLength || 0),
     sampledText: normalizeSubpageJsonLdText(String(page && page.sampledText || '').slice(0, 500)),
+    observationMethod: page && page.observationMethod
+      ? String(page.observationMethod).slice(0, 80)
+      : (page && page.observationSource === 'html-fetch-light' ? 'html_fetch_light' : ''),
+    observationSource: page && page.observationSource ? String(page.observationSource).slice(0, 80) : '',
     error: page && page.error ? String(page.error).slice(0, 160) : null
   };
 }
@@ -4271,6 +4281,13 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
         0
       );
       const timedOut = /timeout/i.test(errorText);
+      const method = (() => {
+        const raw = normalizeSubpageJsonLdText(observed && observed.observationMethod);
+        if (raw) return raw;
+        if (observed && observed.observationSource === 'html-fetch-light') return 'html_fetch_light';
+        if (observed && observed.ok === true) return 'playwright_light';
+        return 'unknown';
+      })();
       const fallbackUsed = observed && (
         observed.usedFallbackExtraction === true ||
         observed.returnedPartial === true ||
@@ -4297,6 +4314,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       if (observedSignals.bodyText) reasons.push('has_body_text');
       if (observedSignals.jsonLd) reasons.push('has_jsonld');
       if (observedSignals.links) reasons.push('has_links');
+      if (method === 'html_fetch_light') reasons.push('method_html_fetch_light');
       if (fallbackUsed) reasons.push('fallback_used');
       if (shadowTimedOut) reasons.push('shadow_timeout');
       if (timedOut) reasons.push('timeout');
@@ -4305,7 +4323,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       if (timedOut) quality = 'timeout';
       else if (observed && observed.ok === false) quality = 'failed';
       else if (!observedSignals.title && !observedSignals.h1 && bodyTextLength < 80 && !observedSignals.links && !observedSignals.jsonLd) quality = 'failed';
-      else if (observedSignals.title && observedSignals.bodyText && observedSignals.h1 && !fallbackUsed && !errorText) quality = 'strong';
+      else if (method !== 'unknown' && observedSignals.title && observedSignals.bodyText && observedSignals.h1 && !fallbackUsed && !errorText) quality = 'strong';
       else if ((observedSignals.title || observedSignals.h1 || observedSignals.jsonLd) && (bodyTextLength >= 100 || observedSignals.links || observedSignals.jsonLd)) quality = 'partial';
       if (!reasons.length) reasons.push(quality === 'failed' ? 'no_observed_content' : 'limited_observed_content');
       summary[quality] += 1;
@@ -4323,6 +4341,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
         observed: observedSignals,
         diagnostics: {
           source: observed && observed.ok === true ? 'observed' : 'representative',
+          method,
           fallbackUsed: !!fallbackUsed,
           shadowAttempted: !!shadowAttempted,
           shadowTimedOut: !!shadowTimedOut,
@@ -4801,7 +4820,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           sequential: reuseContextForObserve
         })
       : { pages: [] };
-    const playwrightPages = Array.isArray(playwrightObserved && playwrightObserved.pages) ? playwrightObserved.pages : [];
+    const playwrightPages = (Array.isArray(playwrightObserved && playwrightObserved.pages) ? playwrightObserved.pages : [])
+      .map(page => Object.assign({}, page || {}, {
+        observationMethod: 'playwright_light',
+        observationSource: page && page.observationSource || 'playwright-light'
+      }));
     const playwrightByUrl = new Map();
     playwrightPages.forEach(page => {
       if (page && page.url) playwrightByUrl.set(String(page.url), page);
@@ -4811,7 +4834,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         const htmlPage = htmlPages[index];
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
         if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
-        if (htmlPage && htmlPage.ok === true) return htmlPage;
+        if (htmlPage && htmlPage.ok === true) return Object.assign({}, htmlPage, {
+          observationMethod: 'html_fetch_light'
+        });
         return playwrightPage || htmlPage || {
           url: candidate && candidate.url || '',
           finalUrl: candidate && candidate.url || '',
@@ -4825,6 +4850,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           jsonldTypes: [],
           hasBreadcrumbJsonLd: false,
           hasBreadcrumbUi: false,
+          observationMethod: 'unknown',
           error: 'subpage_observation_not_available'
         };
       })
