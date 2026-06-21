@@ -4422,7 +4422,6 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           sampledText,
           htmlLength: 0,
           __detail: {
-            fallbackReason: reason,
             jsonLdCount: jsonldTexts.length,
             scriptCount: document.querySelectorAll('script').length,
             textLength: sampledText.length,
