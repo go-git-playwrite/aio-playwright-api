@@ -4016,8 +4016,8 @@ function buildCoverageCandidatePageTypes_(candidates) {
 
 const REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS = 15000;
 const REPRESENTATIVE_OBSERVATION_QUALITY_PAGE_BUDGET_MS = 6000;
-const REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS = 20000;
-const REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS = 6000;
+const REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS = 120000;
+const REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS = 8000;
 
 function getCoverageCandidatePageType_(candidate) {
   const existing = normalizeSubpageJsonLdText(candidate && candidate.pageType);
