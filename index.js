@@ -4014,6 +4014,147 @@ function buildCoverageCandidatePageTypes_(candidates) {
   return out;
 }
 
+function buildRepresentativeObservationQualityAudit_(representativePages, observations) {
+  const emptySummary = { strong: 0, partial: 0, weak: 0, failed: 0, timeout: 0 };
+  const emptyDiagnostics = {
+    total: 0,
+    observed: 0,
+    strong: 0,
+    partial: 0,
+    weak: 0,
+    failed: 0,
+    timeout: 0,
+    fallbackUsed: 0,
+    shadowAttempted: 0,
+    shadowTimedOut: 0,
+    errors: 0
+  };
+  try {
+    const pages = Array.isArray(representativePages) ? representativePages : [];
+    const observedPages = Array.isArray(observations) ? observations : [];
+    const byKey = new Map();
+    const addObservationKey = (key, page) => {
+      const normalized = normalizeSubpageJsonLdText(key).toLowerCase();
+      if (normalized && !byKey.has(normalized)) byKey.set(normalized, page);
+    };
+    const pathFromUrl = value => {
+      try { return new URL(String(value || '')).pathname || ''; } catch (_) { return String(value || ''); }
+    };
+    observedPages.forEach(page => {
+      if (!page) return;
+      addObservationKey(page.url, page);
+      addObservationKey(page.finalUrl, page);
+      addObservationKey(pathFromUrl(page.finalUrl || page.url), page);
+    });
+    const summary = Object.assign({}, emptySummary);
+    const diagnostics = Object.assign({}, emptyDiagnostics, { total: pages.length });
+    const qualityPages = pages.map(page => {
+      const path = page && page.path || pathFromUrl(page && (page.finalUrl || page.url) || '');
+      const observed = byKey.get(normalizeSubpageJsonLdText(page && page.url).toLowerCase()) ||
+        byKey.get(normalizeSubpageJsonLdText(page && page.finalUrl).toLowerCase()) ||
+        byKey.get(normalizeSubpageJsonLdText(path).toLowerCase()) ||
+        {};
+      const titleText = normalizeSubpageJsonLdText((observed && observed.title) || (page && page.title) || '').slice(0, 500);
+      const h1Texts = Array.isArray(observed && observed.h1Texts) ? observed.h1Texts : [];
+      const h1Text = normalizeSubpageJsonLdText(
+        h1Texts[0] || (observed && observed.h1) || (page && page.h1) || ''
+      ).slice(0, 500);
+      const sampledText = normalizeSubpageJsonLdText(observed && observed.sampledText || '').slice(0, 2000);
+      const errorText = normalizeSubpageJsonLdText(observed && observed.error || '').slice(0, 500);
+      const bodyTextLength = Math.max(Number(observed && observed.bodyTextLength || 0), sampledText.length);
+      const h1Count = Math.max(
+        Number(observed && observed.h1Count || 0),
+        h1Texts.length,
+        h1Text ? 1 : 0,
+        page && page.hasH1 ? 1 : 0
+      );
+      const jsonLdTypes = Array.isArray(observed && observed.jsonldTypes)
+        ? observed.jsonldTypes
+        : (Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes : []);
+      const jsonLdCount = Math.max(
+        Number(observed && (observed.jsonLdCount || observed.jsonldCount || observed.deepJsonLdScriptCount) || 0),
+        jsonLdTypes.length
+      );
+      const internalLinkCount = Number(
+        observed && observed.internalLinkCount ||
+        page && page.internalLinkCount ||
+        0
+      );
+      const timedOut = /timeout/i.test(errorText);
+      const fallbackUsed = observed && (
+        observed.usedFallbackExtraction === true ||
+        observed.returnedPartial === true ||
+        observed.partial === true
+      );
+      const shadowAttempted = observed && (
+        observed.usedShadowDomExtraction === true ||
+        observed.shadowAttempted === true
+      );
+      const shadowTimedOut = observed && (
+        observed.shadowTimedOut === true ||
+        /shadow.*timeout/i.test(errorText)
+      );
+      const observedSignals = {
+        title: !!titleText,
+        h1: h1Count > 0,
+        bodyText: bodyTextLength >= 100,
+        jsonLd: jsonLdCount > 0,
+        links: internalLinkCount > 0
+      };
+      const reasons = [];
+      if (observedSignals.title) reasons.push('has_title');
+      if (observedSignals.h1) reasons.push('has_h1');
+      if (observedSignals.bodyText) reasons.push('has_body_text');
+      if (observedSignals.jsonLd) reasons.push('has_jsonld');
+      if (observedSignals.links) reasons.push('has_links');
+      if (fallbackUsed) reasons.push('fallback_used');
+      if (shadowTimedOut) reasons.push('shadow_timeout');
+      if (timedOut) reasons.push('timeout');
+      if (errorText && !timedOut) reasons.push('error');
+      let quality = 'weak';
+      if (timedOut) quality = 'timeout';
+      else if (observed && observed.ok === false) quality = 'failed';
+      else if (!observedSignals.title && !observedSignals.h1 && bodyTextLength < 80 && !observedSignals.links && !observedSignals.jsonLd) quality = 'failed';
+      else if (observedSignals.title && observedSignals.bodyText && observedSignals.h1 && !fallbackUsed && !errorText) quality = 'strong';
+      else if ((observedSignals.title || observedSignals.h1 || observedSignals.jsonLd) && (bodyTextLength >= 100 || observedSignals.links || observedSignals.jsonLd)) quality = 'partial';
+      if (!reasons.length) reasons.push(quality === 'failed' ? 'no_observed_content' : 'limited_observed_content');
+      summary[quality] += 1;
+      diagnostics[quality] += 1;
+      if (observed && observed.ok === true) diagnostics.observed += 1;
+      if (fallbackUsed) diagnostics.fallbackUsed += 1;
+      if (shadowAttempted) diagnostics.shadowAttempted += 1;
+      if (shadowTimedOut) diagnostics.shadowTimedOut += 1;
+      if (errorText) diagnostics.errors += 1;
+      return {
+        path,
+        pageType: page && page.pageType || '',
+        quality,
+        reasons,
+        observed: observedSignals,
+        diagnostics: {
+          source: observed && observed.ok === true ? 'observed' : 'representative',
+          fallbackUsed: !!fallbackUsed,
+          shadowAttempted: !!shadowAttempted,
+          shadowTimedOut: !!shadowTimedOut,
+          error: errorText || null
+        }
+      };
+    });
+    return {
+      quality: { summary, pages: qualityPages },
+      diagnostics
+    };
+  } catch (e) {
+    return {
+      quality: { summary: emptySummary, pages: [] },
+      diagnostics: Object.assign({}, emptyDiagnostics, {
+        errors: 1,
+        error: 'representative_quality_helper_failed'
+      })
+    };
+  }
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -4089,6 +4230,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     .slice(0, 10);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
+  const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
   return {
     version: 'coverageSignalsV1',
     generatedAt: new Date().toISOString(),
@@ -4104,6 +4246,8 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     hasObservedBreadcrumbList: observedBreadcrumbPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
     representativePages,
+    representativeObservationQuality: representativeQualityAudit.quality,
+    representativeExtractionDiagnostics: representativeQualityAudit.diagnostics,
     notes: []
   };
 }
@@ -4142,7 +4286,24 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
         : []
-    }))
+    })),
+    representativeObservationQuality: coverageSignalsV1.representativeObservationQuality || {
+      summary: { strong: 0, partial: 0, weak: 0, failed: 0, timeout: 0 },
+      pages: []
+    },
+    representativeExtractionDiagnostics: coverageSignalsV1.representativeExtractionDiagnostics || {
+      total: 0,
+      observed: 0,
+      strong: 0,
+      partial: 0,
+      weak: 0,
+      failed: 0,
+      timeout: 0,
+      fallbackUsed: 0,
+      shadowAttempted: 0,
+      shadowTimedOut: 0,
+      errors: 0
+    }
   };
 }
 
@@ -4436,6 +4597,28 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
+    try {
+      const representativeQuality = coverageSignals.representativeObservationQuality || {};
+      console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        representativePagesCount: Array.isArray(coverageSignals.representativePages)
+          ? coverageSignals.representativePages.length
+          : 0,
+        qualitySummary: representativeQuality.summary || {},
+        pages: Array.isArray(representativeQuality.pages)
+          ? representativeQuality.pages.slice(0, 10).map(page => ({
+              path: page && page.path || '',
+              pageType: page && page.pageType || '',
+              quality: page && page.quality || '',
+              reasons: Array.isArray(page && page.reasons) ? page.reasons.slice(0, 10) : [],
+              observed: page && page.observed || {},
+              diagnostics: page && page.diagnostics || {}
+            }))
+          : []
+      }));
+    } catch (_) {}
     geoSignalsV1.coverageSignals = coverageSignals;
     traceCoverageMemory('attach_done', {
       browserCreated: !(reusePageForDiscover && reuseContextForObserve),
@@ -5014,6 +5197,28 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   payload.coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
     candidates: discovered.candidates
   }));
+  try {
+    const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
+    console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
+      route: '/discover-and-observe-subpages-light',
+      mode: payload.mode,
+      origin: payload.origin,
+      representativePagesCount: Array.isArray(payload.coverageSignalsV1.representativePages)
+        ? payload.coverageSignalsV1.representativePages.length
+        : 0,
+      qualitySummary: representativeQuality.summary || {},
+      pages: Array.isArray(representativeQuality.pages)
+        ? representativeQuality.pages.slice(0, 10).map(page => ({
+            path: page && page.path || '',
+            pageType: page && page.pageType || '',
+            quality: page && page.quality || '',
+            reasons: Array.isArray(page && page.reasons) ? page.reasons.slice(0, 10) : [],
+            observed: page && page.observed || {},
+            diagnostics: page && page.diagnostics || {}
+          }))
+        : []
+    }));
+  } catch (_) {}
   console.log('[DEBUG][COVERAGE_SIGNALS_V1_SUMMARY]', JSON.stringify({
     topUrl: payload.topUrl,
     origin: payload.origin,
