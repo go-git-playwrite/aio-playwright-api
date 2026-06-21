@@ -3938,17 +3938,41 @@ function compactSubpageJsonLdObservation_(page) {
       ? page.listItemCount
       : rawCounts.ListItem || 0
   );
-  return Object.assign({}, page || {}, {
+  return {
     url: page && page.url || '',
     ok: !!(page && page.ok),
     finalUrl: page && page.finalUrl || page && page.url || '',
     status: page && typeof page.status !== 'undefined' ? page.status : null,
+    pageType: page && page.pageType || '',
+    title: normalizeSubpageJsonLdText(page && page.title).slice(0, 240),
+    canonical: page && page.canonical || '',
     h1Count: Number(page && page.h1Count || 0),
     h1Texts: Array.isArray(page && page.h1Texts) ? page.h1Texts.slice(0, 5) : [],
     jsonldTypes: Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [],
+    jsonldTypeCounts: rawCounts,
     breadcrumbListCount,
-    listItemCount
-  });
+    listItemCount,
+    hasBreadcrumbJsonLd: page && page.hasBreadcrumbJsonLd === true,
+    hasProductJsonLd: page && page.hasProductJsonLd === true,
+    hasFaqJsonLd: page && page.hasFaqJsonLd === true,
+    hasArticleJsonLd: page && page.hasArticleJsonLd === true,
+    hasBlogPostingJsonLd: page && page.hasBlogPostingJsonLd === true,
+    hasOrganization: page && page.hasOrganization === true,
+    hasWebPage: page && page.hasWebPage === true,
+    hasService: page && page.hasService === true,
+    hasBreadcrumbUi: page && page.hasBreadcrumbUi === true,
+    hasMain: page && page.hasMain === true,
+    hasMainLandmark: page && page.hasMainLandmark === true,
+    metaDescription: normalizeSubpageJsonLdText(page && page.metaDescription).slice(0, 240),
+    ogTitle: normalizeSubpageJsonLdText(page && page.ogTitle).slice(0, 240),
+    ogDescription: normalizeSubpageJsonLdText(page && page.ogDescription).slice(0, 240),
+    ogImageExists: page && page.ogImageExists === true,
+    internalLinkCount: Number(page && page.internalLinkCount || 0),
+    externalLinkCount: Number(page && page.externalLinkCount || 0),
+    bodyTextLength: Number(page && page.bodyTextLength || 0),
+    sampledText: normalizeSubpageJsonLdText(String(page && page.sampledText || '').slice(0, 500)),
+    error: page && page.error ? String(page.error).slice(0, 160) : null
+  };
 }
 
 function isCoverageSignalsAboutPath_(value) {
@@ -4054,14 +4078,17 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
         byKey.get(normalizeSubpageJsonLdText(page && page.finalUrl).toLowerCase()) ||
         byKey.get(normalizeSubpageJsonLdText(path).toLowerCase()) ||
         {};
-      const titleText = normalizeSubpageJsonLdText((observed && observed.title) || (page && page.title) || '').slice(0, 500);
+      const titleText = normalizeSubpageJsonLdText(String((observed && observed.title) || (page && page.title) || '').slice(0, 500));
       const h1Texts = Array.isArray(observed && observed.h1Texts) ? observed.h1Texts : [];
       const h1Text = normalizeSubpageJsonLdText(
-        h1Texts[0] || (observed && observed.h1) || (page && page.h1) || ''
-      ).slice(0, 500);
-      const sampledText = normalizeSubpageJsonLdText(observed && observed.sampledText || '').slice(0, 2000);
-      const errorText = normalizeSubpageJsonLdText(observed && observed.error || '').slice(0, 500);
-      const bodyTextLength = Math.max(Number(observed && observed.bodyTextLength || 0), sampledText.length);
+        String(h1Texts[0] || (observed && observed.h1) || (page && page.h1) || '').slice(0, 500)
+      );
+      const bodyTextLengthNumber = Number(observed && observed.bodyTextLength || 0);
+      const sampledTextLength = bodyTextLengthNumber > 0
+        ? 0
+        : normalizeSubpageJsonLdText(String(observed && observed.sampledText || '').slice(0, 500)).length;
+      const errorText = normalizeSubpageJsonLdText(String(observed && observed.error || '').slice(0, 500));
+      const bodyTextLength = Math.max(bodyTextLengthNumber, sampledTextLength);
       const h1Count = Math.max(
         Number(observed && observed.h1Count || 0),
         h1Texts.length,
