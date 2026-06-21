@@ -3815,7 +3815,8 @@ const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
 const SUBPAGE_LIGHT_CONTENT_MAX_MS = 5000;
 const SUBPAGE_LIGHT_PAGE_BUDGET_MS = 12000;
 const SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS = 3000;
-const SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS = 1200;
+const SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS = 1200;
+const SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS = SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS;
 const SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS = 1500;
 
 function logSubpageFetchPhase11_(payload = {}) {
@@ -3901,6 +3902,7 @@ function logSubpageShadowExtractionPhase14_(payload = {}) {
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
+  const extractionTimeoutMs = Math.max(800, Math.min(2500, Number(opts.extractionTimeoutMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS));
   const subpageWaitUntil = 'commit';
   const context = opts.context;
   const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : {};
@@ -4588,14 +4590,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       });
       const fallback = await Promise.race([
         fallbackPromise,
-        new Promise(resolve => setTimeout(() => resolve(null), Math.min(SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
+        new Promise(resolve => setTimeout(() => resolve(null), Math.min(extractionTimeoutMs, Math.max(1, remainingPageBudgetMs()))))
       ]).catch(e => {
         extractionError = String(e && (e.message || e) || 'fallback_extraction_failed').slice(0, 200);
         errorType = 'evaluate_error';
         return null;
       });
       if (!fallback && !extractionError) {
-        extractionError = `fallback_extraction_timeout_${SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS}ms`;
+        extractionError = `fallback_extraction_timeout_${extractionTimeoutMs}ms`;
         errorType = 'timeout';
       }
       const durationMs = Math.max(0, Date.now() - fallbackStartedAtMs);
@@ -4610,7 +4612,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorType: null,
           errorMessage: null,
           durationMs,
-          emptyResult
+          emptyResult,
+          timeoutBudgetMs: extractionTimeoutMs
         };
         fallback.shadowExtraction = {
           attempted: true,
@@ -4620,6 +4623,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorMessage: null,
           durationMs,
           emptyResult: fallback.usedShadowDomExtraction !== true,
+          timeoutBudgetMs: extractionTimeoutMs,
           visitedNodes: fallback.__shadow && typeof fallback.__shadow.visitedNodes === 'number' ? fallback.__shadow.visitedNodes : null,
           capHit: fallback.__shadow && typeof fallback.__shadow.capHit === 'boolean' ? fallback.__shadow.capHit : null,
           depthLimitHit: fallback.__shadow && typeof fallback.__shadow.depthLimitHit === 'boolean' ? fallback.__shadow.depthLimitHit : null
@@ -4635,7 +4639,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorType,
           errorMessage: extractionError,
           durationMs,
-          emptyResult: true
+          emptyResult: true,
+          timeoutBudgetMs: extractionTimeoutMs
         },
         shadowExtraction: fallback && fallback.shadowExtraction || {
           attempted: true,
@@ -4645,6 +4650,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorMessage: extractionError,
           durationMs,
           emptyResult: true,
+          timeoutBudgetMs: extractionTimeoutMs,
           visitedNodes: null,
           capHit: null,
           depthLimitHit: null
@@ -4787,7 +4793,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         errorType: null,
         errorMessage: null,
         durationMs: null,
-        emptyResult: false
+        emptyResult: false,
+        timeoutBudgetMs: extractionTimeoutMs
       };
       shadowExtraction = {
         attempted: false,
@@ -4797,6 +4804,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         errorMessage: null,
         durationMs: null,
         emptyResult: false,
+        timeoutBudgetMs: extractionTimeoutMs,
         visitedNodes: null,
         capHit: null,
         depthLimitHit: null
@@ -4910,6 +4918,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         sampledText: '',
         usedFallbackExtraction,
         usedShadowDomExtraction: false,
+        extractionTimeoutBudgetMs: extractionTimeoutMs,
         primaryExtraction: primaryExtraction || {
           empty: true,
           partial: true,
@@ -4926,7 +4935,8 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorType: extractionError ? (/timeout/i.test(extractionError) ? 'timeout' : 'evaluate_error') : null,
           errorMessage: extractionError,
           durationMs: null,
-          emptyResult: true
+          emptyResult: true,
+          timeoutBudgetMs: extractionTimeoutMs
         },
         shadowExtraction: shadowExtraction || {
           attempted: usedFallbackExtraction === true,
@@ -4936,6 +4946,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           errorMessage: extractionError,
           durationMs: null,
           emptyResult: true,
+          timeoutBudgetMs: extractionTimeoutMs,
           visitedNodes: null,
           capHit: null,
           depthLimitHit: null
@@ -5104,6 +5115,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       usedFallbackExtraction,
       usedShadowDomExtraction: observed && observed.usedShadowDomExtraction === true,
+      extractionTimeoutBudgetMs: extractionTimeoutMs,
       shadowDomTextLength: Number(observed && observed.shadowDomTextLength || 0),
       shadowDomH1Count: Number(observed && observed.shadowDomH1Count || 0),
       shadowDomJsonLdCount: Number(observed && observed.shadowDomJsonLdCount || 0),
@@ -5781,6 +5793,7 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
       shadowDomH1Count: Number(observed.shadowDomH1Count || 0) || 0,
       shadowDomJsonLdCount: Number(observed.shadowDomJsonLdCount || 0) || 0,
       shadowDomLinkCount: Number(observed.shadowDomLinkCount || 0) || 0,
+      extractionTimeoutBudgetMs: Number(observed.extractionTimeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
       primaryExtraction: observed.primaryExtraction && typeof observed.primaryExtraction === 'object' ? observed.primaryExtraction : null,
       fallbackExtraction: observed.fallbackExtraction && typeof observed.fallbackExtraction === 'object' ? observed.fallbackExtraction : null,
       shadowExtraction: observed.shadowExtraction && typeof observed.shadowExtraction === 'object' ? observed.shadowExtraction : null,
@@ -5821,6 +5834,11 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     finalRepresentativePages: coverageSignalsV1.representativePages
   });
   logSubpageExtractionDiagnosticsPhase15_({
+    origin: opts && opts.origin,
+    responseMode: opts && opts.responseMode || null,
+    coverageSignals: coverageSignalsV1
+  });
+  logSubpageExtractionTimeoutTuningPhase16_({
     origin: opts && opts.origin,
     responseMode: opts && opts.responseMode || null,
     coverageSignals: coverageSignalsV1
@@ -5925,6 +5943,11 @@ function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
 }
 
 function buildSubpageExtractionDiagnostics_(page = {}) {
+  const timeoutBudgetMs = Math.max(800, Math.min(2500, Number(page.extractionTimeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS));
+  const ratioFor = (durationMs) => {
+    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || timeoutBudgetMs <= 0) return null;
+    return Math.round((durationMs / timeoutBudgetMs) * 100) / 100;
+  };
   const primarySource = page.primaryExtraction && typeof page.primaryExtraction === 'object'
     ? page.primaryExtraction
     : {};
@@ -5955,6 +5978,7 @@ function buildSubpageExtractionDiagnostics_(page = {}) {
   const finalContentTextLength = Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length;
   const finalJsonLdCount = Number(page.jsonLdCount || 0) || (Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes.length : 0);
   return {
+    timeoutBudgetMs,
     primary,
     fallback: {
       attempted: fallbackSource.attempted === true || page.usedFallbackExtraction === true,
@@ -5963,7 +5987,9 @@ function buildSubpageExtractionDiagnostics_(page = {}) {
       errorType: fallbackSource.errorType || null,
       errorMessage: fallbackSource.errorMessage ? String(fallbackSource.errorMessage).slice(0, 180) : null,
       durationMs: typeof fallbackSource.durationMs === 'number' ? fallbackSource.durationMs : null,
-      emptyResult: fallbackSource.emptyResult === true
+      emptyResult: fallbackSource.emptyResult === true,
+      nearTimeout: typeof fallbackSource.durationMs === 'number' ? fallbackSource.durationMs >= timeoutBudgetMs * 0.85 : false,
+      timeoutRatio: ratioFor(fallbackSource.durationMs)
     },
     shadow: {
       attempted: shadowSource.attempted === true || page.usedFallbackExtraction === true,
@@ -5973,6 +5999,8 @@ function buildSubpageExtractionDiagnostics_(page = {}) {
       errorMessage: shadowSource.errorMessage ? String(shadowSource.errorMessage).slice(0, 180) : null,
       durationMs: typeof shadowSource.durationMs === 'number' ? shadowSource.durationMs : null,
       emptyResult: shadowSource.emptyResult === true || (page.usedFallbackExtraction === true && page.usedShadowDomExtraction !== true),
+      nearTimeout: typeof shadowSource.durationMs === 'number' ? shadowSource.durationMs >= timeoutBudgetMs * 0.85 : false,
+      timeoutRatio: ratioFor(shadowSource.durationMs),
       visitedNodes: typeof shadowSource.visitedNodes === 'number' ? shadowSource.visitedNodes : (typeof page.shadowDomVisitedNodes === 'number' ? page.shadowDomVisitedNodes : null),
       capHit: typeof shadowSource.capHit === 'boolean' ? shadowSource.capHit : null,
       depthLimitHit: typeof shadowSource.depthLimitHit === 'boolean' ? shadowSource.depthLimitHit : null
@@ -5995,9 +6023,10 @@ function buildSubpageExtractionDiagnostics_(page = {}) {
 }
 
 function summarizeRepresentativeExtractionDiagnostics_(pages = []) {
-  return (Array.isArray(pages) ? pages : []).reduce((acc, page) => {
+  const summary = (Array.isArray(pages) ? pages : []).reduce((acc, page) => {
     const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
     acc.total += 1;
+    if (typeof d.timeoutBudgetMs === 'number') acc.timeoutBudgetMs = d.timeoutBudgetMs;
     if (d.primary && d.primary.empty === true) acc.primaryEmpty += 1;
     if (d.primary && d.primary.partial === true) acc.primaryPartial += 1;
     if (d.fallback && d.fallback.attempted === true) acc.fallbackAttempted += 1;
@@ -6005,31 +6034,61 @@ function summarizeRepresentativeExtractionDiagnostics_(pages = []) {
     if (d.fallback && d.fallback.errorType === 'timeout') acc.fallbackTimeout += 1;
     if (d.fallback && d.fallback.errorType === 'evaluate_error') acc.fallbackEvaluateError += 1;
     if (d.fallback && d.fallback.emptyResult === true) acc.fallbackEmptyResult += 1;
+    if (d.fallback && d.fallback.nearTimeout === true) acc.fallbackNearTimeout += 1;
+    if (d.fallback && typeof d.fallback.timeoutRatio === 'number') {
+      acc.__fallbackRatioSum += d.fallback.timeoutRatio;
+      acc.__fallbackRatioCount += 1;
+    }
     if (d.shadow && d.shadow.attempted === true) acc.shadowAttempted += 1;
     if (d.shadow && d.shadow.success === true) acc.shadowSuccess += 1;
     if (d.shadow && d.shadow.errorType === 'timeout') acc.shadowTimeout += 1;
     if (d.shadow && d.shadow.errorType === 'evaluate_error') acc.shadowEvaluateError += 1;
     if (d.shadow && d.shadow.emptyResult === true) acc.shadowEmptyResult += 1;
+    if (d.shadow && d.shadow.nearTimeout === true) acc.shadowNearTimeout += 1;
+    if (d.shadow && typeof d.shadow.timeoutRatio === 'number') {
+      acc.__shadowRatioSum += d.shadow.timeoutRatio;
+      acc.__shadowRatioCount += 1;
+    }
     if (d.final && d.final.source === 'observed') acc.finalObservedMatch += 1;
     if (d.final && (d.final.source === 'selectedCandidate' || d.final.source === 'fallbackPreserved')) acc.finalPreservedCandidate += 1;
     return acc;
   }, {
     total: 0,
+    timeoutBudgetMs: SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
     fallbackAttempted: 0,
     fallbackSuccess: 0,
     fallbackTimeout: 0,
     fallbackEvaluateError: 0,
     fallbackEmptyResult: 0,
+    fallbackNearTimeout: 0,
+    fallbackTimeoutRatioAvg: null,
     shadowAttempted: 0,
     shadowSuccess: 0,
     shadowTimeout: 0,
     shadowEvaluateError: 0,
     shadowEmptyResult: 0,
+    shadowNearTimeout: 0,
+    shadowTimeoutRatioAvg: null,
     primaryEmpty: 0,
     primaryPartial: 0,
     finalObservedMatch: 0,
-    finalPreservedCandidate: 0
+    finalPreservedCandidate: 0,
+    __fallbackRatioSum: 0,
+    __fallbackRatioCount: 0,
+    __shadowRatioSum: 0,
+    __shadowRatioCount: 0
   });
+  summary.fallbackTimeoutRatioAvg = summary.__fallbackRatioCount
+    ? Math.round((summary.__fallbackRatioSum / summary.__fallbackRatioCount) * 100) / 100
+    : null;
+  summary.shadowTimeoutRatioAvg = summary.__shadowRatioCount
+    ? Math.round((summary.__shadowRatioSum / summary.__shadowRatioCount) * 100) / 100
+    : null;
+  delete summary.__fallbackRatioSum;
+  delete summary.__fallbackRatioCount;
+  delete summary.__shadowRatioSum;
+  delete summary.__shadowRatioCount;
+  return summary;
 }
 
 function logSubpageExtractionDiagnosticsPhase15_(payload = {}) {
@@ -6060,6 +6119,64 @@ function logSubpageExtractionDiagnosticsPhase15_(payload = {}) {
           fallback: d.fallback,
           shadow: d.shadow,
           final: d.final
+        };
+      })
+    }));
+  } catch (_) {}
+}
+
+function logSubpageExtractionTimeoutTuningPhase16_(payload = {}) {
+  try {
+    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object' ? payload.coverageSignals : {};
+    const pages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
+    const summary = coverageSignals.representativeExtractionDiagnostics || summarizeRepresentativeExtractionDiagnostics_(pages);
+    console.log('[DEBUG][SUBPAGE_EXTRACTION_TIMEOUT_TUNING_PHASE16]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      responseMode: payload.responseMode || null,
+      timeoutBudgetMs: Number(summary.timeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS),
+      summary: {
+        total: Number(summary.total || 0),
+        fallbackAttempted: Number(summary.fallbackAttempted || 0),
+        fallbackSuccess: Number(summary.fallbackSuccess || 0),
+        fallbackTimeout: Number(summary.fallbackTimeout || 0),
+        fallbackNearTimeout: Number(summary.fallbackNearTimeout || 0),
+        fallbackTimeoutRatioAvg: typeof summary.fallbackTimeoutRatioAvg === 'number' ? summary.fallbackTimeoutRatioAvg : null,
+        shadowAttempted: Number(summary.shadowAttempted || 0),
+        shadowSuccess: Number(summary.shadowSuccess || 0),
+        shadowTimeout: Number(summary.shadowTimeout || 0),
+        shadowNearTimeout: Number(summary.shadowNearTimeout || 0),
+        shadowTimeoutRatioAvg: typeof summary.shadowTimeoutRatioAvg === 'number' ? summary.shadowTimeoutRatioAvg : null
+      },
+      pages: pages.slice(0, 8).map(page => {
+        const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
+        const q = page && page.observationQuality || {};
+        return {
+          path: String(page && page.path || '').slice(0, 160),
+          pageType: String(page && page.pageType || '').slice(0, 80),
+          canonicalPageFamily: String(page && page.canonicalPageFamily || '').slice(0, 80),
+          reached: page && page.reached === true,
+          candidateOnly: page && page.candidateOnly === true,
+          fallback: {
+            attempted: d.fallback && d.fallback.attempted === true,
+            success: d.fallback && d.fallback.success === true,
+            errorType: d.fallback && d.fallback.errorType || null,
+            durationMs: d.fallback && typeof d.fallback.durationMs === 'number' ? d.fallback.durationMs : null,
+            timeoutRatio: d.fallback && typeof d.fallback.timeoutRatio === 'number' ? d.fallback.timeoutRatio : null,
+            nearTimeout: d.fallback && d.fallback.nearTimeout === true
+          },
+          shadow: {
+            attempted: d.shadow && d.shadow.attempted === true,
+            success: d.shadow && d.shadow.success === true,
+            errorType: d.shadow && d.shadow.errorType || null,
+            durationMs: d.shadow && typeof d.shadow.durationMs === 'number' ? d.shadow.durationMs : null,
+            timeoutRatio: d.shadow && typeof d.shadow.timeoutRatio === 'number' ? d.shadow.timeoutRatio : null,
+            nearTimeout: d.shadow && d.shadow.nearTimeout === true,
+            visitedNodes: d.shadow && typeof d.shadow.visitedNodes === 'number' ? d.shadow.visitedNodes : null,
+            capHit: d.shadow && typeof d.shadow.capHit === 'boolean' ? d.shadow.capHit : null,
+            depthLimitHit: d.shadow && typeof d.shadow.depthLimitHit === 'boolean' ? d.shadow.depthLimitHit : null
+          },
+          finalQualityLevel: q.level || d.final && d.final.qualityLevel || null,
+          finalReasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 8) : (d.final && d.final.reasons || [])
         };
       })
     }));
@@ -6422,13 +6539,14 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         hasFooterLike: page.hasFooterLike === true || page.footerLikeFound === true,
         internalLinkCount: Number(page.internalLinkCount || 0) || 0,
         externalLinkCount: Number(page.externalLinkCount || 0) || 0,
-      sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
-      usedFallbackExtraction: page.usedFallbackExtraction === true,
-      usedShadowDomExtraction: page.usedShadowDomExtraction === true,
-      shadowDomTextLength: Number(page.shadowDomTextLength || 0) || 0,
+        sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
+        usedFallbackExtraction: page.usedFallbackExtraction === true,
+        usedShadowDomExtraction: page.usedShadowDomExtraction === true,
+        shadowDomTextLength: Number(page.shadowDomTextLength || 0) || 0,
         shadowDomH1Count: Number(page.shadowDomH1Count || 0) || 0,
         shadowDomJsonLdCount: Number(page.shadowDomJsonLdCount || 0) || 0,
         shadowDomLinkCount: Number(page.shadowDomLinkCount || 0) || 0,
+        extractionTimeoutBudgetMs: Number(page.extractionTimeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
         primaryExtraction: page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
         fallbackExtraction: page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
         shadowExtraction: page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
@@ -6535,6 +6653,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       shadowDomH1Count: Number(page && page.shadowDomH1Count || 0) || 0,
       shadowDomJsonLdCount: Number(page && page.shadowDomJsonLdCount || 0) || 0,
       shadowDomLinkCount: Number(page && page.shadowDomLinkCount || 0) || 0,
+      extractionTimeoutBudgetMs: Number(page && page.extractionTimeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
       primaryExtraction: page && page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
       fallbackExtraction: page && page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
       shadowExtraction: page && page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
@@ -6895,6 +7014,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     Object.assign(phase11State, patch);
   };
   const subpageGuardMs = Math.max(3000, Math.min(30000, Number(opts && opts.subpageGuardMs || SUBPAGE_OBSERVATION_TIMEOUT_MS) || SUBPAGE_OBSERVATION_TIMEOUT_MS));
+  const subpageExtractTimeoutMs = Math.max(800, Math.min(2500, Number(opts && opts.subpageExtractTimeoutMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS));
   const withSubpageTimeout = (promise, ms, label) => Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
@@ -7323,6 +7443,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
+      extractionTimeoutMs: subpageExtractTimeoutMs,
       concurrency: reuseContextForObserve ? 1 : 3,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
@@ -7523,6 +7644,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
   const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const extractionTimeoutMs = Math.max(800, Math.min(2500, Number(opts.extractionTimeoutMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS) || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS));
   const maxTotalMs = Number(opts.maxTotalMs || 0) > 0
     ? Math.max(1000, Number(opts.maxTotalMs || 0))
     : 0;
@@ -7733,6 +7855,7 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           const observedPage = await fetchSubpageJsonLdLight(url, {
             siteMode,
             timeout: pageTimeout,
+            extractionTimeoutMs,
             context,
             phase11: {
               debugRunId: phase11 && phase11.debugRunId
@@ -11684,6 +11807,10 @@ async function scrapeOnce(req, res) {
     : 3
   ));
   const debugRunId = req && req.query && req.query.debugRunId ? String(req.query.debugRunId).slice(0, 120) : null;
+  const subpageExtractTimeoutMsRaw = Number(req && req.query && req.query.subpageExtractTimeoutMs);
+  const subpageExtractTimeoutMs = Number.isFinite(subpageExtractTimeoutMsRaw) && subpageExtractTimeoutMsRaw > 0
+    ? Math.max(800, Math.min(2500, Math.floor(subpageExtractTimeoutMsRaw)))
+    : SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS;
   const watchdogResponseMode = balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : (signalsFirstBalanced ? 'balanced' : (signalsFirstLight ? 'light' : responseMode || 'default')));
   const watchdogOrigin = () => {
     try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return ''; }
@@ -14995,6 +15122,7 @@ async function scrapeOnce(req, res) {
         reuseBrowser: true,
         maxObserve: 4,
         debugRunId,
+        subpageExtractTimeoutMs,
         signalsMode: signalsMode || null,
         responseMode: watchdogResponseMode,
         phase11State: subpageObservationPhase11State
