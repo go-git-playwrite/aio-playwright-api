@@ -3206,12 +3206,15 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
 
 function isSubpageHtmlLightObservationSufficient_(page) {
   if (!page || page.ok !== true) return false;
-  if (normalizeSubpageJsonLdText(page.title)) return true;
-  if (Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)) return true;
-  if ((Array.isArray(page.jsonldTypes) && page.jsonldTypes.length > 0) || Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || 0) > 0) return true;
-  if (Number(page.bodyTextLength || 0) >= 100) return true;
-  if (Number(page.internalLinkCount || 0) > 0) return true;
-  return false;
+  const hasTitle = !!normalizeSubpageJsonLdText(page.title);
+  const hasH1 = Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0);
+  const hasJsonLd = (Array.isArray(page.jsonldTypes) && page.jsonldTypes.length > 0) ||
+    Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || 0) > 0;
+  const bodyTextLength = Number(page.bodyTextLength || 0);
+  const internalLinkCount = Number(page.internalLinkCount || 0);
+  const hasEnoughText = bodyTextLength >= 300;
+  const hasStrongLinks = internalLinkCount >= 5;
+  return hasTitle && hasEnoughText && (hasH1 || hasJsonLd || hasStrongLinks);
 }
 
 function normalizeDiscoverSubpageUrl(rawUrl, origin) {
@@ -4835,7 +4838,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
         if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
         if (htmlPage && htmlPage.ok === true) return Object.assign({}, htmlPage, {
-          observationMethod: 'html_fetch_light'
+          observationMethod: 'html_fetch_light',
+          observationSource: playwrightPage ? 'html-fetch-light-after-playwright-fallback' : 'html-fetch-light'
         });
         return playwrightPage || htmlPage || {
           url: candidate && candidate.url || '',
