@@ -4016,6 +4016,123 @@ function buildCoverageCandidatePageTypes_(candidates) {
 
 const REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS = 15000;
 const REPRESENTATIVE_OBSERVATION_QUALITY_PAGE_BUDGET_MS = 6000;
+const REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS = 20000;
+const REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS = 6000;
+
+function getCoverageCandidatePageType_(candidate) {
+  const existing = normalizeSubpageJsonLdText(candidate && candidate.pageType);
+  if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
+  const path = getCoverageCandidatePath_(candidate).toLowerCase();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 'about';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
+  if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
+  return existing || 'unknown';
+}
+
+function buildRepresentativeObservationTimeoutSignals_(payload = {}) {
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const sourceSummary = payload.sourceSummary || {};
+  const budgetMs = Number(payload.budgetMs || REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS);
+  const elapsedMs = Number(payload.elapsedMs || budgetMs);
+  const representativePages = candidates.slice(0, 5).map(candidate => ({
+    url: candidate && candidate.url || '',
+    path: getCoverageCandidatePath_(candidate),
+    pageType: getCoverageCandidatePageType_(candidate),
+    title: '',
+    h1: '',
+    hasH1: false,
+    hasBreadcrumbList: false,
+    jsonLdTypes: [],
+    candidateOnly: true,
+    reached: false,
+    matchedCandidateSources: Array.isArray(candidate && candidate.sources)
+      ? candidate.sources.slice(0, 8)
+      : (candidate && candidate.source ? [candidate.source] : [])
+  }));
+  const pages = representativePages.map(page => ({
+    path: page.path,
+    pageType: page.pageType || '',
+    quality: 'timeout',
+    reasons: ['representative_observation_timeout'],
+    observed: {
+      title: false,
+      h1: false,
+      bodyText: false,
+      jsonLd: false,
+      links: false
+    },
+    diagnostics: {
+      source: 'representative_observation_timeout',
+      fallbackUsed: false,
+      shadowAttempted: false,
+      shadowTimedOut: true,
+      error: 'representative_observation_timeout'
+    }
+  }));
+  return {
+    version: 'coverageSignalsV1',
+    source: 'discover-and-observe-subpages-light',
+    checked: true,
+    reason: 'representative_observation_timeout',
+    observedSubpageCount: 0,
+    observedH1PageCount: 0,
+    observedBreadcrumbPageCount: 0,
+    hasObservedSubpageH1: false,
+    hasObservedBreadcrumbList: false,
+    hasObservedAboutPage: false,
+    candidateSourceSummary: {
+      sitemap: Number(sourceSummary.sitemap || 0),
+      nav: Number(sourceSummary.nav || 0),
+      footer: Number(sourceSummary.footer || 0),
+      other: Number(sourceSummary.other || sourceSummary.htmlSitemap || 0)
+    },
+    candidatePageTypes: buildCoverageCandidatePageTypes_(candidates),
+    representativePages,
+    representativeObservationQuality: {
+      summary: {
+        strong: 0,
+        partial: 0,
+        weak: 0,
+        failed: 0,
+        timeout: pages.length
+      },
+      pages,
+      timedOut: true,
+      elapsedMs,
+      budgetMs,
+      timedOutPagesCount: pages.length,
+      representativeObservationTimedOut: true,
+      representativeObservationElapsedMs: elapsedMs,
+      representativeObservationBudgetMs: budgetMs
+    },
+    representativeExtractionDiagnostics: {
+      total: pages.length,
+      observed: 0,
+      strong: 0,
+      partial: 0,
+      weak: 0,
+      failed: 0,
+      timeout: pages.length,
+      fallbackUsed: 0,
+      shadowAttempted: 0,
+      shadowTimedOut: pages.length,
+      errors: pages.length,
+      timedOut: true,
+      elapsedMs,
+      budgetMs,
+      pageBudgetMs: REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS,
+      timedOutPagesCount: pages.length,
+      failedPagesCount: 0,
+      representativeObservationTimedOut: true,
+      representativeObservationElapsedMs: elapsedMs,
+      representativeObservationBudgetMs: budgetMs
+    }
+  };
+}
 
 function buildRepresentativeObservationQualityAudit_(representativePages, observations, opts = {}) {
   const startedAt = Date.now();
@@ -4053,7 +4170,8 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
     elapsedMs: 0,
     budgetMs,
     pageBudgetMs,
-    timedOutPagesCount: 0
+    timedOutPagesCount: 0,
+    failedPagesCount: 0
   };
   const qualityPages = [];
   const timeoutPage = (page) => ({
@@ -4089,6 +4207,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       extractionSummary.timedOut = true;
       extractionSummary.timedOutPagesCount += 1;
     }
+    if (quality === 'failed') extractionSummary.failedPagesCount += 1;
     qualityPages.push(row);
   };
 
@@ -4205,7 +4324,10 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       timedOut: extractionSummary.timedOut,
       elapsedMs: extractionSummary.elapsedMs,
       budgetMs,
-      timedOutPagesCount: extractionSummary.timedOutPagesCount
+      timedOutPagesCount: extractionSummary.timedOutPagesCount,
+      representativeObservationTimedOut: extractionSummary.timedOut,
+      representativeObservationElapsedMs: extractionSummary.elapsedMs,
+      representativeObservationBudgetMs: budgetMs
     },
     diagnostics: extractionSummary
   };
@@ -4349,7 +4471,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       timedOut: false,
       elapsedMs: 0,
       budgetMs: REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS,
-      timedOutPagesCount: 0
+      timedOutPagesCount: 0,
+      representativeObservationTimedOut: false,
+      representativeObservationElapsedMs: 0,
+      representativeObservationBudgetMs: REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS
     },
     representativeExtractionDiagnostics: coverageSignalsV1.representativeExtractionDiagnostics || {
       total: 0,
@@ -4367,7 +4492,8 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       elapsedMs: 0,
       budgetMs: REPRESENTATIVE_OBSERVATION_QUALITY_BUDGET_MS,
       pageBudgetMs: REPRESENTATIVE_OBSERVATION_QUALITY_PAGE_BUDGET_MS,
-      timedOutPagesCount: 0
+      timedOutPagesCount: 0,
+      failedPagesCount: 0
     }
   };
 }
@@ -4589,14 +4715,92 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length
     });
-    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+    const representativeObservationStartedAt = Date.now();
+    const representativeObservationBudgetMs = REPRESENTATIVE_OBSERVATION_TOTAL_BUDGET_MS;
+    const representativeObservationPromise = observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
-      timeout: 8000,
-      concurrency: reuseContextForObserve ? 1 : 3,
+      timeout: REPRESENTATIVE_OBSERVATION_PAGE_TIMEOUT_MS,
+      concurrency: reuseContextForObserve ? 1 : 2,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
       sequential: reuseContextForObserve
-    });
+    }).catch(error => ({
+      pages: [],
+      __representativeObservationError: String(error && (error.message || error) || 'representative_observation_failed').slice(0, 160)
+    }));
+    const observed = await Promise.race([
+      representativeObservationPromise,
+      new Promise(resolve => setTimeout(() => resolve({
+        pages: [],
+        __representativeObservationTimedOut: true,
+        __representativeObservationError: 'representative_observation_timeout'
+      }), representativeObservationBudgetMs))
+    ]);
+    const representativeObservationElapsedMs = Date.now() - representativeObservationStartedAt;
+    if (observed && (observed.__representativeObservationTimedOut || observed.__representativeObservationError)) {
+      const timeoutCoverageSignals = buildRepresentativeObservationTimeoutSignals_({
+        candidates: selectedCandidates,
+        sourceSummary: discovered.sourceSummary,
+        budgetMs: representativeObservationBudgetMs,
+        elapsedMs: representativeObservationElapsedMs
+      });
+      geoSignalsV1.coverageSignals = timeoutCoverageSignals;
+      traceCoverageMemory('observe_timeout_or_error', {
+        browserCreated: !reuseContextForObserve,
+        contextCreated: true,
+        pageCreated: true,
+        candidateCount: discovered.totalCandidates,
+        observeCount: selectedCandidates.length,
+        reason: observed.__representativeObservationError || 'representative_observation_timeout'
+      });
+      try {
+        console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_BUDGET_AUDIT]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          representativeObservationTimedOut: observed.__representativeObservationTimedOut === true,
+          representativeObservationElapsedMs,
+          representativeObservationBudgetMs,
+          timedOutPagesCount: timeoutCoverageSignals.representativeExtractionDiagnostics.timedOutPagesCount,
+          failedPagesCount: timeoutCoverageSignals.representativeExtractionDiagnostics.failedPagesCount || 0,
+          reason: observed.__representativeObservationError || 'representative_observation_timeout'
+        }));
+      } catch (_) {}
+      try {
+        const representativeQuality = timeoutCoverageSignals.representativeObservationQuality || {};
+        console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          representativePagesCount: Array.isArray(timeoutCoverageSignals.representativePages)
+            ? timeoutCoverageSignals.representativePages.length
+            : 0,
+          qualitySummary: representativeQuality.summary || {},
+          timedOut: true,
+          representativeObservationTimedOut: true,
+          elapsedMs: representativeObservationElapsedMs,
+          budgetMs: representativeObservationBudgetMs,
+          representativeObservationElapsedMs,
+          representativeObservationBudgetMs,
+          timedOutPagesCount: Number(representativeQuality.timedOutPagesCount || 0),
+          failedPagesCount: 0,
+          pages: Array.isArray(representativeQuality.pages)
+            ? representativeQuality.pages.slice(0, 10)
+            : []
+        }));
+      } catch (_) {}
+      logPayload.origin = normalized.origin;
+      logPayload.attached = true;
+      logPayload.reason = observed.__representativeObservationError || 'representative_observation_timeout';
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        newBrowserCreatedForCoverage: !(reusePageForDiscover && reuseContextForObserve),
+        observedSubpageCount: 0,
+        attached: true,
+        reason: logPayload.reason
+      })));
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return timeoutCoverageSignals;
+    }
     traceCoverageMemory('observe_after', {
       browserCreated: !reuseContextForObserve,
       contextCreated: true,
@@ -4673,9 +4877,13 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           : 0,
         qualitySummary: representativeQuality.summary || {},
         timedOut: representativeQuality.timedOut === true,
+        representativeObservationTimedOut: representativeQuality.representativeObservationTimedOut === true,
         elapsedMs: typeof representativeQuality.elapsedMs === 'number' ? representativeQuality.elapsedMs : null,
         budgetMs: typeof representativeQuality.budgetMs === 'number' ? representativeQuality.budgetMs : null,
+        representativeObservationElapsedMs: typeof representativeQuality.representativeObservationElapsedMs === 'number' ? representativeQuality.representativeObservationElapsedMs : null,
+        representativeObservationBudgetMs: typeof representativeQuality.representativeObservationBudgetMs === 'number' ? representativeQuality.representativeObservationBudgetMs : null,
         timedOutPagesCount: Number(representativeQuality.timedOutPagesCount || 0),
+        failedPagesCount: Number(coverageSignals.representativeExtractionDiagnostics && coverageSignals.representativeExtractionDiagnostics.failedPagesCount || 0),
         pages: Array.isArray(representativeQuality.pages)
           ? representativeQuality.pages.slice(0, 10).map(page => ({
               path: page && page.path || '',
