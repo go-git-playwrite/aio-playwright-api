@@ -5281,7 +5281,7 @@ function isCoverageSignalsAboutPath_(value) {
 }
 
 function getCoverageCandidateText_(candidate) {
-  return String(candidate && (candidate._text || candidate.text || candidate.label || candidate.anchorText || candidate.reason) || '')
+  return String(candidate && (candidate._text || candidate.text || candidate.label || candidate.anchorText) || '')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
@@ -5412,8 +5412,35 @@ function getCoverageRepresentativePriority_(page) {
   return getCoverageCanonicalFamilyPriority_(getCoverageCanonicalPageFamily_(page), 'generic');
 }
 
+function getCoverageCandidateUrl_(candidate) {
+  if (!candidate) return '';
+  if (typeof candidate === 'string') return String(candidate || '').trim();
+  return String(
+    candidate.url ||
+    candidate.normalizedUrl ||
+    candidate.finalUrl ||
+    candidate.href ||
+    candidate.loc ||
+    candidate.path ||
+    ''
+  ).trim();
+}
+
 function getCoverageCandidatePath_(candidate) {
-  try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
+  const raw = getCoverageCandidateUrl_(candidate);
+  if (!raw) return '';
+  const normalizePath = (value) => {
+    const trimmed = String(value || '').split('?')[0].split('#')[0].trim();
+    if (!trimmed) return '';
+    const withSlash = trimmed.charAt(0) === '/' ? trimmed : `/${trimmed.replace(/^\/+/, '')}`;
+    return withSlash.replace(/\/+$/, '') || '/';
+  };
+  try {
+    if (/^https?:\/\//i.test(raw)) return normalizePath(new URL(raw).pathname || '/');
+    return normalizePath(new URL(raw, 'https://candidate.local').pathname || raw);
+  } catch (_) {
+    return normalizePath(raw);
+  }
 }
 
 function normalizeCoveragePathKey_(value) {
@@ -5448,12 +5475,12 @@ function sortCoverageObserveCandidates_(candidates) {
     const aScore = Number(a && a.score || 0);
     const bScore = Number(b && b.score || 0);
     if (aScore !== bScore) return bScore - aScore;
-    return String(a && a.url || '').localeCompare(String(b && b.url || ''));
+    return getCoverageCandidateUrl_(a).localeCompare(getCoverageCandidateUrl_(b));
   });
 }
 
 function buildCoverageRepresentativePageFromCandidate_(candidate) {
-  const url = String(candidate && candidate.url || '');
+  const url = getCoverageCandidateUrl_(candidate);
   const path = getCoverageCandidatePath_(candidate);
   return {
     url,
@@ -5469,7 +5496,7 @@ function buildCoverageRepresentativePageFromCandidate_(candidate) {
 }
 
 function getCoverageRepresentativeRejectReason_(candidate) {
-  const url = String(candidate && candidate.url || '');
+  const url = getCoverageCandidateUrl_(candidate);
   const path = getCoverageCandidatePath_(candidate).toLowerCase();
   const family = getCoverageCanonicalPageFamily_(candidate);
   if (!url || !path || path === '/') return 'top_or_empty_path';
@@ -5538,7 +5565,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   });
   const primaryPool = sortCoverageObserveCandidates_(eligible);
   sortCoverageObserveCandidates_(eligible).slice(0, 50).forEach((candidate, index) => {
-    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
     const selected = index < max;
     logRepresentativeSelectionPhase11_({
       debugRunId: opts && opts.debugRunId,
@@ -5567,11 +5594,11 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   const selected = [];
   const selectedKeys = new Set();
   const hasAlternativeNonNewsCandidate = () => primaryPool.some(candidate => {
-    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
     return key && !selectedKeys.has(key) && getCoverageCanonicalPageFamily_(candidate) !== 'news';
   });
   const addSelected = (candidate) => {
-    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
     if (!key || selectedKeys.has(key) || selected.length >= max) return false;
     if (
       getCoverageCanonicalPageFamily_(candidate) === 'news' &&
@@ -5588,7 +5615,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
   while (selected.length < max) {
     const selectedFamilies = new Set(selected.map(getCoverageCanonicalPageFamily_));
     const diverseCandidate = primaryPool.find(candidate => {
-      const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+      const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
       if (!key || selectedKeys.has(key)) return false;
       return !selectedFamilies.has(getCoverageCanonicalPageFamily_(candidate));
     });
@@ -5633,7 +5660,7 @@ function selectCoverageRepresentativeCandidates_(candidates, limit = 4, opts = {
     if (selected.length + backfill.length >= max) {
       return;
     }
-    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    const key = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
     const rejectReason = !key
       ? 'missing_candidate_key'
       : (selectedKeys.has(key)
@@ -5923,7 +5950,7 @@ function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
       const key = normalizeCoveragePathKey_(page && (page.finalUrl || page.url || page.path) || '');
       if (key) observedByPath.set(key, page);
     });
-    const candidateKeys = new Set(selectedCandidates.map(candidate => normalizeCoveragePathKey_(candidate && (candidate.url || candidate.path) || '')).filter(Boolean));
+    const candidateKeys = new Set(selectedCandidates.map(candidate => normalizeCoveragePathKey_(getCoverageCandidateUrl_(candidate) || candidate && candidate.path || '')).filter(Boolean));
     const metricSummary = (page = {}) => ({
       contentTextLength: Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length,
       h1Count: Number(page.h1Count || 0),
@@ -6714,10 +6741,10 @@ function logSubpageCandidateDiscoveryAudit_(payload = {}) {
     const selectedTypes = selectedCandidates
       .map(getCoverageCandidatePageType_)
       .filter(type => type && type !== 'unknown');
-    const selectedUrls = new Set(selectedCandidates.map(candidate => String(candidate && candidate.url || '')));
+    const selectedUrls = new Set(selectedCandidates.map(getCoverageCandidateUrl_));
     const droppedTypeCounts = {};
     candidates.forEach(candidate => {
-      const url = String(candidate && candidate.url || '');
+      const url = getCoverageCandidateUrl_(candidate);
       if (!url || selectedUrls.has(url)) return;
       const pageType = getCoverageCandidatePageType_(candidate);
       droppedTypeCounts[pageType || 'unknown'] = (droppedTypeCounts[pageType || 'unknown'] || 0) + 1;
@@ -6817,15 +6844,94 @@ function logRepresentativeCandidateSourcePhase16BAudit_(payload = {}) {
   } catch (_) {}
 }
 
+function logRepresentativeHardExcludeAuditPhase16B_(payload = {}) {
+  try {
+    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
+    const normalized = candidates.map(candidate => {
+      const url = getCoverageCandidateUrl_(candidate);
+      const path = getCoverageCandidatePath_(candidate);
+      const family = getCoverageCanonicalPageFamily_(candidate);
+      const rejectReason = getCoverageRepresentativeRejectReason_(candidate);
+      const sources = Array.isArray(candidate && candidate.sources)
+        ? candidate.sources
+        : (candidate && candidate.source ? [candidate.source] : []);
+      return {
+        candidate,
+        url,
+        path,
+        pageType: getCoverageCandidatePageType_(candidate),
+        canonicalPageFamily: family,
+        source: String(candidate && candidate.source || '').slice(0, 80),
+        sources: sources.map(source => String(source || '').slice(0, 80)).slice(0, 8),
+        score: Number(candidate && candidate.score || 0) || 0,
+        reason: String(candidate && candidate.reason || '').slice(0, 160),
+        rejectReason
+      };
+    });
+    const hardExcludeReasonCounts = {};
+    const includedFamilyCounts = {};
+    normalized.forEach(item => {
+      if (item.rejectReason) {
+        hardExcludeReasonCounts[item.rejectReason] = (hardExcludeReasonCounts[item.rejectReason] || 0) + 1;
+      } else {
+        includedFamilyCounts[item.canonicalPageFamily || 'unknown'] = (includedFamilyCounts[item.canonicalPageFamily || 'unknown'] || 0) + 1;
+      }
+    });
+    const countBySource = (sourceName) => normalized.filter(item => {
+      const sources = Array.isArray(item.sources) ? item.sources : [];
+      return sources.includes(sourceName) || item.source === sourceName;
+    }).length;
+    const sampleBeforeNormalize = candidates.slice(0, 10).map(candidate => ({
+      url: getCoverageCandidateUrl_(candidate).slice(0, 220),
+      path: String(candidate && candidate.path || '').slice(0, 160),
+      source: String(candidate && candidate.source || '').slice(0, 80),
+      sources: Array.isArray(candidate && candidate.sources) ? candidate.sources.slice(0, 6) : [],
+      reason: String(candidate && candidate.reason || '').slice(0, 120)
+    }));
+    const sampleAfterNormalize = normalized.slice(0, 10).map(item => ({
+      url: item.url.slice(0, 220),
+      path: item.path.slice(0, 160),
+      pageType: item.pageType,
+      canonicalPageFamily: item.canonicalPageFamily,
+      source: item.source,
+      sources: item.sources,
+      reason: item.reason,
+      rejectReason: item.rejectReason || null
+    }));
+    console.log('[DEBUG][REPRESENTATIVE_HARD_EXCLUDE_AUDIT_PHASE16B]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      rawCandidateCount: candidates.length,
+      sitemapCandidateCount: countBySource('sitemap'),
+      afterNormalizeCount: normalized.filter(item => !!item.path).length,
+      afterHardExcludeCount: normalized.filter(item => !item.rejectReason).length,
+      selectedCandidatesCount: selectedCandidates.length,
+      sampleBeforeNormalize,
+      sampleAfterNormalize,
+      hardExcludeReasonCounts,
+      includedFamilyCounts,
+      selectedPaths: selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean).slice(0, 10)
+    }));
+  } catch (e) {
+    try {
+      console.log('[DEBUG][REPRESENTATIVE_HARD_EXCLUDE_AUDIT_PHASE16B]', JSON.stringify({
+        origin: String(payload && payload.origin || '').slice(0, 180),
+        error: String(e && (e.message || e) || '').slice(0, 180)
+      }));
+    } catch (_) {}
+  }
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
   const candidateByUrl = new Map();
   const candidateByPath = new Map();
   candidates.forEach(candidate => {
-    if (!candidate || !candidate.url) return;
-    candidateByUrl.set(String(candidate.url), candidate);
-    candidateByPath.set(normalizeCoveragePathKey_(candidate.url), candidate);
+    const candidateUrl = getCoverageCandidateUrl_(candidate);
+    if (!candidate || !candidateUrl) return;
+    candidateByUrl.set(candidateUrl, candidate);
+    candidateByPath.set(normalizeCoveragePathKey_(candidateUrl), candidate);
   });
   const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
     ? payload.candidateSummary.sourceSummary
@@ -7712,7 +7818,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       reason: 'coverage_observe_selection'
     });
     lastSelectedCandidatesForCoverage = selectedCandidates;
-    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
+    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate))));
     const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(coverageCandidates, 4, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
@@ -7729,19 +7835,20 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       afterCount: selectedCandidates.length
     });
     allPrioritizedCandidates.slice(0, 50).forEach((candidate, index) => {
-      const selected = selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || ''));
-      const selectedByBackfill = selected && !primaryRepresentativeKeys.has(discoverSubpageCandidateKey(candidate && candidate.url || ''));
+      const candidateKey = discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate));
+      const selected = selectedCandidates.some(item => discoverSubpageCandidateKey(getCoverageCandidateUrl_(item)) === candidateKey);
+      const selectedByBackfill = selected && !primaryRepresentativeKeys.has(candidateKey);
       const rejectReason = selected
         ? null
         : (getCoverageRepresentativeRejectReason_(candidate) || 'lower_representative_priority');
       logCandidateGenerationPhase11_(candidateAudit, {
         origin: normalized.origin,
-        url: candidate && candidate.url,
+        url: getCoverageCandidateUrl_(candidate),
         phase: 'representative_select_item',
         source: candidate && candidate.source,
         path: getCoverageCandidatePath_(candidate),
         pageType: getCoverageCandidatePageType_(candidate),
-        href: candidate && candidate.url,
+        href: getCoverageCandidateUrl_(candidate),
         score: Number(candidate && candidate.score || 0) || 0,
         reason: selected
           ? (selectedByBackfill ? 'representative_backfill_to_min_count' : `selected_index_${index}`)
@@ -7785,9 +7892,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       finalRepresentativePages: auditRepresentativePages,
       reason: 'after_representative_selection'
     });
+    logRepresentativeHardExcludeAuditPhase16B_({
+      origin: normalized.origin,
+      candidates: coverageCandidates,
+      selectedCandidates
+    });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = allPrioritizedCandidates
-      .filter(candidate => !selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || '')))
+      .filter(candidate => !selectedCandidates.some(item => discoverSubpageCandidateKey(getCoverageCandidateUrl_(item)) === discoverSubpageCandidateKey(getCoverageCandidateUrl_(candidate))))
       .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
       .map(getCoverageCandidatePath_)
       .filter(Boolean)
@@ -7809,8 +7921,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     if (!selectedCandidates.length) {
+      const afterHardExcludeCount = filterCoverageRepresentativeCandidates_(coverageCandidates).length;
       const noCandidateReason = coverageCandidates.length
-        ? 'no_representative_candidates_after_hard_exclude'
+        ? (afterHardExcludeCount === 0 ? 'no_representative_candidates_after_hard_exclude' : 'representative_selection_empty')
         : 'no_subpage_candidates';
       const emptyCoverageSignals = attachEmptySignals(noCandidateReason, discovered, auditRepresentativePages.length ? coverageCandidates : []);
       logPayload.origin = normalized.origin;
@@ -7820,7 +7933,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         origin: normalized.origin,
         candidateSourceSummary: discovered.sourceSummary,
         candidates: coverageCandidates,
-        afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+        afterHardExcludeCount,
         selectionInputCount: coverageCandidates.length,
         selectedCandidates,
         preservedRepresentativePages: auditRepresentativePages,
@@ -7828,6 +7941,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           ? geoSignalsV1.coverageSignals.representativePages
           : [],
         reason: noCandidateReason
+      });
+      logRepresentativeHardExcludeAuditPhase16B_({
+        origin: normalized.origin,
+        candidates: coverageCandidates,
+        selectedCandidates
       });
       traceCoverageMemory('attach_skip_no_candidates', {
         candidateCount: discovered.totalCandidates
@@ -7847,7 +7965,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     setPhase11State({ observationStarted: true });
-    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(getCoverageCandidateUrl_).filter(Boolean), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
       extractionTimeoutMs: subpageExtractTimeoutMs,
@@ -8690,7 +8808,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
   const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
   const selectedCandidates = discovered.candidates.slice(0, limit);
-  const urls = selectedCandidates.map(candidate => candidate.url);
+  const urls = selectedCandidates.map(getCoverageCandidateUrl_).filter(Boolean);
   const observed = await observeSubpageJsonLdLightUrls_(urls, {
     siteMode,
     timeout: req.body && req.body.timeout,
@@ -8702,7 +8820,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
       if (page && page.ok === true) return null;
       const candidate = selectedCandidates[index] || {};
       return {
-        url: page && page.url || candidate.url || '',
+        url: page && page.url || getCoverageCandidateUrl_(candidate) || '',
         source: candidate.source || '',
         message: String(page && page.error || 'observation_failed').slice(0, 160)
       };
