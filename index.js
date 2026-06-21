@@ -4689,7 +4689,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
-    if (normalized.origin === 'https://ahamo.com') {
+    const guardHost = (() => {
+      try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
+    })();
+    if (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com') {
       const skipReason = 'memory_guard_ahamo_representative_observation';
       const coverageSignals = {
         version: 'coverageSignalsV1',
