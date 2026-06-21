@@ -3882,6 +3882,22 @@ function logSubpageLightExtractionPhase13_(payload = {}) {
   } catch (_) {}
 }
 
+function logSubpageShadowExtractionPhase14_(payload = {}) {
+  try {
+    console.log('[DEBUG][SUBPAGE_SHADOW_EXTRACTION_PHASE14]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      url: String(payload.url || '').slice(0, 240),
+      path: String(payload.path || '').slice(0, 180),
+      usedFallbackExtraction: payload.usedFallbackExtraction === true,
+      usedShadowDomExtraction: payload.usedShadowDomExtraction === true,
+      normal: payload.normal && typeof payload.normal === 'object' ? payload.normal : {},
+      shadow: payload.shadow && typeof payload.shadow === 'object' ? payload.shadow : {},
+      final: payload.final && typeof payload.final === 'object' ? payload.final : {},
+      extractionError: payload.extractionError ? String(payload.extractionError).slice(0, 200) : null
+    }));
+  } catch (_) {}
+}
+
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
@@ -4358,6 +4374,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       let extractionError = null;
       const fallbackPromise = page.evaluate(() => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+        const normal = {};
         const titleFromDocument = clean(document.title || '').slice(0, 180);
         const h1Texts = Array.from(document.querySelectorAll('h1')).slice(0, 5)
           .map(el => clean(el && (el.innerText || el.textContent)).slice(0, 180))
@@ -4386,6 +4403,113 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         });
         const canonicalEl = document.querySelector('link[rel~="canonical" i]');
         const breadcrumbCandidates = document.querySelectorAll('nav[aria-label*="breadcrumb" i],[class*="breadcrumb" i],[id*="breadcrumb" i],[class*="pankuzu" i],[id*="pankuzu" i]');
+        normal.contentTextLength = bodyClean.length;
+        normal.h1Count = document.querySelectorAll('h1').length;
+        normal.h2Count = document.querySelectorAll('h2').length;
+        normal.jsonLdCount = jsonldTexts.length;
+        normal.mainLikeFound = !!document.querySelector('main,[role="main"]');
+        normal.navLikeFound = !!document.querySelector('nav,header [role="navigation"],[role="navigation"]');
+        normal.footerLikeFound = !!document.querySelector('footer,[role="contentinfo"]');
+        normal.linkCount = anchorEls.length;
+        const shadow = {
+          textLength: 0,
+          h1Count: 0,
+          h2Count: 0,
+          jsonLdCount: 0,
+          mainLikeFound: false,
+          navLikeFound: false,
+          footerLikeFound: false,
+          linkCount: 0,
+          sameOriginLinkCount: 0,
+          visitedNodes: 0,
+          depthLimitHit: false,
+          capHit: false,
+          h1Texts: [],
+          h2Sample: [],
+          jsonldTexts: [],
+          textSample: ''
+        };
+        const maxDepth = 4;
+        const maxNodes = 500;
+        const maxTextLength = 5000;
+        const visitShadowRoot = (root, depth) => {
+          if (!root || depth > maxDepth || shadow.visitedNodes >= maxNodes) {
+            if (depth > maxDepth) shadow.depthLimitHit = true;
+            if (shadow.visitedNodes >= maxNodes) shadow.capHit = true;
+            return;
+          }
+          let nodes = [];
+          try { nodes = Array.from(root.querySelectorAll('*')).slice(0, Math.max(0, maxNodes - shadow.visitedNodes)); } catch (_) { nodes = []; }
+          for (const node of nodes) {
+            if (shadow.visitedNodes >= maxNodes) {
+              shadow.capHit = true;
+              break;
+            }
+            shadow.visitedNodes += 1;
+            const tag = String(node && node.tagName || '').toLowerCase();
+            const role = String(node && node.getAttribute && node.getAttribute('role') || '').toLowerCase();
+            const cls = String(node && node.getAttribute && node.getAttribute('class') || '').toLowerCase();
+            const id = String(node && node.getAttribute && node.getAttribute('id') || '').toLowerCase();
+            if (tag === 'h1') {
+              shadow.h1Count += 1;
+              const text = clean(node.innerText || node.textContent).slice(0, 180);
+              if (text && shadow.h1Texts.length < 5) shadow.h1Texts.push(text);
+            }
+            if (tag === 'h2') {
+              shadow.h2Count += 1;
+              const text = clean(node.innerText || node.textContent).slice(0, 160);
+              if (text && shadow.h2Sample.length < 5) shadow.h2Sample.push(text);
+            }
+            if (tag === 'script' && /ld\+json/i.test(String(node.getAttribute && node.getAttribute('type') || ''))) {
+              const raw = String(node.textContent || '').trim();
+              if (raw && shadow.jsonldTexts.length < 20) shadow.jsonldTexts.push(raw);
+              shadow.jsonLdCount += raw ? 1 : 0;
+            }
+            if (tag === 'main' || role === 'main') shadow.mainLikeFound = true;
+            if (tag === 'nav' || role === 'navigation' || /(^|[-_\s])nav($|[-_\s])/.test(cls) || /(^|[-_\s])nav($|[-_\s])/.test(id)) shadow.navLikeFound = true;
+            if (tag === 'footer' || role === 'contentinfo' || /footer/.test(cls) || /footer/.test(id)) shadow.footerLikeFound = true;
+            if (tag === 'a') {
+              const href = node.href || (node.getAttribute && node.getAttribute('href')) || '';
+              if (href && !/^(?:mailto:|tel:|javascript:|#)/i.test(href)) {
+                shadow.linkCount += 1;
+                try {
+                  const u = new URL(href, location.href);
+                  if (u.origin === location.origin) shadow.sameOriginLinkCount += 1;
+                } catch (_) {}
+              }
+            }
+            if (shadow.textLength < maxTextLength && tag !== 'script' && tag !== 'style') {
+              const text = clean(node.innerText || node.textContent);
+              if (text) {
+                const next = clean([shadow.textSample, text].filter(Boolean).join(' ')).slice(0, maxTextLength);
+                shadow.textSample = next;
+                shadow.textLength = next.length;
+              }
+            }
+            if (node.shadowRoot) visitShadowRoot(node.shadowRoot, depth + 1);
+          }
+        };
+        try {
+          Array.from(document.querySelectorAll('*')).slice(0, 300).forEach(el => {
+            if (shadow.visitedNodes >= maxNodes) return;
+            if (el && el.shadowRoot) visitShadowRoot(el.shadowRoot, 1);
+          });
+        } catch (_) {}
+        const usedShadowDomExtraction = shadow.textLength > 0 ||
+          shadow.h1Count > 0 ||
+          shadow.h2Count > 0 ||
+          shadow.jsonLdCount > 0 ||
+          shadow.mainLikeFound ||
+          shadow.navLikeFound ||
+          shadow.footerLikeFound ||
+          shadow.linkCount > 0;
+        const finalH1Texts = h1Texts.length ? h1Texts : shadow.h1Texts.slice(0, 5);
+        const finalH2Sample = h2Sample.length ? h2Sample : shadow.h2Sample.slice(0, 5);
+        const finalJsonldTexts = jsonldTexts.length ? jsonldTexts : shadow.jsonldTexts.slice(0, 20);
+        const finalSampledText = sampledText || shadow.textSample.slice(0, 500);
+        const finalBodyTextLength = bodyClean.length || shadow.textLength;
+        const finalInternalLinkCount = internalLinkCount || shadow.sameOriginLinkCount;
+        const finalLinkCount = anchorEls.length || shadow.linkCount;
         return {
           finalUrl: location.href,
           readyState: document.readyState || '',
@@ -4398,35 +4522,56 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           ogDescription: clean((document.querySelector('meta[property="og:description" i]') || {}).content || '').slice(0, 240),
           ogImageExists: !!clean((document.querySelector('meta[property="og:image" i]') || {}).content || ''),
           domJsonLdScriptCount: jsonldTexts.length,
-          deepJsonLdScriptCount: jsonldTexts.length,
+          deepJsonLdScriptCount: finalJsonldTexts.length,
           scriptCount: document.querySelectorAll('script').length,
           moduleScriptCount: document.querySelectorAll('script[type="module"],script[type="module"][src]').length,
           nextDataExists: !!document.querySelector('#__NEXT_DATA__'),
           nuxtDataExists: !!(window.__NUXT__ || document.querySelector('#__NUXT_DATA__')),
           shadowHostCount: 0,
-          bodyTextLength: bodyClean.length,
+          bodyTextLength: finalBodyTextLength,
           bodyInnerTextLengthRaw: bodyRaw.length,
-          bodyInnerTextLengthCapped: bodyClean.length,
-          h1Count: document.querySelectorAll('h1').length,
-          h1Texts,
-          h2Sample,
-          jsonldTexts,
-          hasMain: !!document.querySelector('main,[role="main"]'),
-          hasMainLandmark: !!document.querySelector('main,[role="main"]'),
-          hasNavLike: !!document.querySelector('nav,header [role="navigation"],[role="navigation"]'),
-          hasFooterLike: !!document.querySelector('footer,[role="contentinfo"]'),
+          bodyInnerTextLengthCapped: finalBodyTextLength,
+          h1Count: normal.h1Count || shadow.h1Count,
+          h1Texts: finalH1Texts,
+          h2Sample: finalH2Sample,
+          jsonldTexts: finalJsonldTexts,
+          hasMain: normal.mainLikeFound || shadow.mainLikeFound,
+          hasMainLandmark: normal.mainLikeFound || shadow.mainLikeFound,
+          hasNavLike: normal.navLikeFound || shadow.navLikeFound,
+          hasFooterLike: normal.footerLikeFound || shadow.footerLikeFound,
           hasBreadcrumbUi: breadcrumbCandidates.length > 0,
-          internalLinkCount,
+          internalLinkCount: finalInternalLinkCount,
           externalLinkCount,
-          linkCount: anchorEls.length,
-          sampledText,
+          sameOriginLinkCount: finalInternalLinkCount,
+          linkCount: finalLinkCount,
+          sampledText: finalSampledText,
           htmlLength: 0,
+          usedShadowDomExtraction,
+          shadowDomTextLength: shadow.textLength,
+          shadowDomH1Count: shadow.h1Count,
+          shadowDomJsonLdCount: shadow.jsonLdCount,
+          shadowDomLinkCount: shadow.linkCount,
+          __shadow: {
+            textLength: shadow.textLength,
+            h1Count: shadow.h1Count,
+            h2Count: shadow.h2Count,
+            jsonLdCount: shadow.jsonLdCount,
+            mainLikeFound: shadow.mainLikeFound,
+            navLikeFound: shadow.navLikeFound,
+            footerLikeFound: shadow.footerLikeFound,
+            linkCount: shadow.linkCount,
+            sameOriginLinkCount: shadow.sameOriginLinkCount,
+            visitedNodes: shadow.visitedNodes,
+            depthLimitHit: shadow.depthLimitHit,
+            capHit: shadow.capHit
+          },
+          __normal: normal,
           __detail: {
             jsonLdCount: jsonldTexts.length,
             scriptCount: document.querySelectorAll('script').length,
-            textLength: sampledText.length,
-            linkCount: anchorEls.length,
-            h2Count: h2Sample.length
+            textLength: finalSampledText.length,
+            linkCount: finalLinkCount,
+            h2Count: finalH2Sample.length
           }
         };
       });
@@ -4582,6 +4727,31 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       }
     } catch (_) {}
     logSubpageLightExtractionPhase13_(buildExtractionAuditPayload(observed, usedFallbackExtraction, extractionError));
+    if (observed && usedFallbackExtraction) {
+      const finalLinkCount = Number(observed.linkCount || 0) || Number(observed.internalLinkCount || 0) + Number(observed.externalLinkCount || 0);
+      const finalContentTextLength = Number(observed.bodyTextLength || 0) || normalizeSubpageJsonLdText(observed.sampledText).length;
+      logSubpageShadowExtractionPhase14_({
+        origin: (() => { try { return new URL(String(observed.finalUrl || finalUrl || url || '')).origin; } catch (_) { return ''; } })(),
+        url,
+        path: (() => { try { return new URL(String(observed.finalUrl || finalUrl || url || '')).pathname || '/'; } catch (_) { return ''; } })(),
+        usedFallbackExtraction,
+        usedShadowDomExtraction: observed.usedShadowDomExtraction === true,
+        normal: observed.__normal || {},
+        shadow: observed.__shadow || {},
+        final: {
+          contentTextLength: finalContentTextLength,
+          h1Count: Number(observed.h1Count || 0),
+          h2Count: Array.isArray(observed.h2Sample) ? observed.h2Sample.length : 0,
+          jsonLdCount: Array.isArray(observed.jsonldTexts) ? observed.jsonldTexts.length : Number(observed.deepJsonLdScriptCount || 0),
+          mainLikeFound: observed.hasMain === true || observed.hasMainLandmark === true,
+          navLikeFound: observed.hasNavLike === true,
+          footerLikeFound: observed.hasFooterLike === true,
+          linkCount: finalLinkCount,
+          sameOriginLinkCount: Number(observed.sameOriginLinkCount || observed.internalLinkCount || 0)
+        },
+        extractionError
+      });
+    }
     if (!observed) {
       logDetail('evaluate_complete', evaluateStartedAtMs, {
         detail: {
@@ -4806,9 +4976,14 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       hasFooterLike: !!(observed && observed.hasFooterLike),
       internalLinkCount: Number(observed && observed.internalLinkCount || 0),
       externalLinkCount: Number(observed && observed.externalLinkCount || 0),
-      sameOriginLinkCount: Number(observed && observed.internalLinkCount || 0),
+      sameOriginLinkCount: Number(observed && observed.sameOriginLinkCount || observed && observed.internalLinkCount || 0),
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       usedFallbackExtraction,
+      usedShadowDomExtraction: observed && observed.usedShadowDomExtraction === true,
+      shadowDomTextLength: Number(observed && observed.shadowDomTextLength || 0),
+      shadowDomH1Count: Number(observed && observed.shadowDomH1Count || 0),
+      shadowDomJsonLdCount: Number(observed && observed.shadowDomJsonLdCount || 0),
+      shadowDomLinkCount: Number(observed && observed.shadowDomLinkCount || 0),
       extractionError,
       error: null,
       parseErrors,
@@ -5473,6 +5648,13 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
       internalLinkCount: Number(observed.internalLinkCount || 0) || 0,
       externalLinkCount: Number(observed.externalLinkCount || 0) || 0,
       sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
+      usedFallbackExtraction: observed.usedFallbackExtraction === true,
+      usedShadowDomExtraction: observed.usedShadowDomExtraction === true,
+      shadowDomTextLength: Number(observed.shadowDomTextLength || 0) || 0,
+      shadowDomH1Count: Number(observed.shadowDomH1Count || 0) || 0,
+      shadowDomJsonLdCount: Number(observed.shadowDomJsonLdCount || 0) || 0,
+      shadowDomLinkCount: Number(observed.shadowDomLinkCount || 0) || 0,
+      extractionError: observed.extractionError ? normalizeSubpageJsonLdText(observed.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(candidatePage.matchedCandidateSources)
         ? candidatePage.matchedCandidateSources.slice(0, 8)
         : (Array.isArray(candidatePage.sources) ? candidatePage.sources.slice(0, 8) : [])
@@ -5957,9 +6139,14 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         hasFooterLike: page.hasFooterLike === true || page.footerLikeFound === true,
         internalLinkCount: Number(page.internalLinkCount || 0) || 0,
         externalLinkCount: Number(page.externalLinkCount || 0) || 0,
-        sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
-        usedFallbackExtraction: page.usedFallbackExtraction === true,
-        extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
+      sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
+      usedFallbackExtraction: page.usedFallbackExtraction === true,
+      usedShadowDomExtraction: page.usedShadowDomExtraction === true,
+      shadowDomTextLength: Number(page.shadowDomTextLength || 0) || 0,
+      shadowDomH1Count: Number(page.shadowDomH1Count || 0) || 0,
+      shadowDomJsonLdCount: Number(page.shadowDomJsonLdCount || 0) || 0,
+      shadowDomLinkCount: Number(page.shadowDomLinkCount || 0) || 0,
+      extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
         matchedCandidateSources: Array.isArray(candidate.sources)
           ? candidate.sources.slice(0, 8)
           : (candidate.source ? [candidate.source] : [])
@@ -6057,6 +6244,11 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       internalLinkCount: Number(page && page.internalLinkCount || 0) || 0,
       sameOriginLinkCount: Number(page && page.sameOriginLinkCount || page && page.internalLinkCount || 0) || 0,
       usedFallbackExtraction: page && page.usedFallbackExtraction === true,
+      usedShadowDomExtraction: page && page.usedShadowDomExtraction === true,
+      shadowDomTextLength: Number(page && page.shadowDomTextLength || 0) || 0,
+      shadowDomH1Count: Number(page && page.shadowDomH1Count || 0) || 0,
+      shadowDomJsonLdCount: Number(page && page.shadowDomJsonLdCount || 0) || 0,
+      shadowDomLinkCount: Number(page && page.shadowDomLinkCount || 0) || 0,
       extractionError: page && page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
