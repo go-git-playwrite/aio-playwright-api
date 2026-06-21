@@ -4070,9 +4070,20 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       addObservationKey(page.finalUrl, page);
       addObservationKey(pathFromUrl(page.finalUrl || page.url), page);
     });
+    const qualityInputPages = pages.length
+      ? pages
+      : observedPages.map(page => ({
+          url: page && page.url || '',
+          finalUrl: page && page.finalUrl || page && page.url || '',
+          path: pathFromUrl(page && (page.finalUrl || page.url) || ''),
+          pageType: page && page.pageType || '',
+          title: page && page.title || '',
+          h1: Array.isArray(page && page.h1Texts) ? page.h1Texts[0] || '' : '',
+          hasH1: Number(page && page.h1Count || 0) > 0
+        }));
     const summary = Object.assign({}, emptySummary);
-    const diagnostics = Object.assign({}, emptyDiagnostics, { total: pages.length });
-    const qualityPages = pages.map(page => {
+    const diagnostics = Object.assign({}, emptyDiagnostics, { total: qualityInputPages.length });
+    const qualityPages = qualityInputPages.map(page => {
       const path = page && page.path || pathFromUrl(page && (page.finalUrl || page.url) || '');
       const observed = byKey.get(normalizeSubpageJsonLdText(page && page.url).toLowerCase()) ||
         byKey.get(normalizeSubpageJsonLdText(page && page.finalUrl).toLowerCase()) ||
@@ -4258,6 +4269,8 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
+  const notes = [];
+  if (observedPages.length === 0 && observations.length > 0) notes.push('no_observed_subpages_but_observation_attempted');
   return {
     version: 'coverageSignalsV1',
     generatedAt: new Date().toISOString(),
@@ -4275,13 +4288,20 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     representativePages,
     representativeObservationQuality: representativeQualityAudit.quality,
     representativeExtractionDiagnostics: representativeQualityAudit.diagnostics,
-    notes: []
+    notes
   };
 }
 
 function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return null;
-  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0) return null;
+  const representativePages = Array.isArray(coverageSignalsV1.representativePages)
+    ? coverageSignalsV1.representativePages
+    : [];
+  const qualityPages = coverageSignalsV1.representativeObservationQuality &&
+    Array.isArray(coverageSignalsV1.representativeObservationQuality.pages)
+    ? coverageSignalsV1.representativeObservationQuality.pages
+    : [];
+  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0 && !representativePages.length && !qualityPages.length) return null;
   return {
     version: 'coverageSignalsV1',
     source: 'discover-and-observe-subpages-light',
@@ -4299,10 +4319,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       other: 0
     },
     candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
-    representativePages: (Array.isArray(coverageSignalsV1.representativePages)
-      ? coverageSignalsV1.representativePages
-      : []
-    ).slice(0, 5).map(page => ({
+    representativePages: representativePages.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
       title: page && page.title || '',
@@ -4330,7 +4347,8 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       shadowAttempted: 0,
       shadowTimedOut: 0,
       errors: 0
-    }
+    },
+    notes: Array.isArray(coverageSignalsV1.notes) ? coverageSignalsV1.notes.slice(0, 10) : []
   };
 }
 
