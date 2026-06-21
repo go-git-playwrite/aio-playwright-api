@@ -3815,35 +3815,8 @@ const SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS = 15000;
 const SUBPAGE_LIGHT_CONTENT_MAX_MS = 5000;
 const SUBPAGE_LIGHT_PAGE_BUDGET_MS = 12000;
 const SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS = 3000;
-const SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS = 1200;
-const SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MIN_MS = 800;
-const SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MAX_MS = 2500;
-const SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS = SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS;
+const SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS = 1200;
 const SUBPAGE_LIGHT_CLOSE_TIMEOUT_MS = 1500;
-
-function normalizeSubpageLightExtractionTimeoutMs_(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric) || numeric <= 0) return SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS;
-  return Math.max(
-    SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MIN_MS,
-    Math.min(SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MAX_MS, Math.floor(numeric))
-  );
-}
-
-function logSubpageExtractionTimeoutConfigPhase16_(payload = {}) {
-  try {
-    console.log('[DEBUG][SUBPAGE_EXTRACTION_TIMEOUT_CONFIG_PHASE16]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      rawSubpageExtractTimeoutMs: payload.rawSubpageExtractTimeoutMs == null
-        ? null
-        : String(payload.rawSubpageExtractTimeoutMs).slice(0, 80),
-      effectiveSubpageExtractTimeoutMs: Number(payload.effectiveSubpageExtractTimeoutMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS),
-      defaultTimeoutMs: SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
-      clampMin: SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MIN_MS,
-      clampMax: SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MAX_MS
-    }));
-  } catch (_) {}
-}
 
 function logSubpageFetchPhase11_(payload = {}) {
   try {
@@ -3909,26 +3882,9 @@ function logSubpageLightExtractionPhase13_(payload = {}) {
   } catch (_) {}
 }
 
-function logSubpageShadowExtractionPhase14_(payload = {}) {
-  try {
-    console.log('[DEBUG][SUBPAGE_SHADOW_EXTRACTION_PHASE14]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      url: String(payload.url || '').slice(0, 240),
-      path: String(payload.path || '').slice(0, 180),
-      usedFallbackExtraction: payload.usedFallbackExtraction === true,
-      usedShadowDomExtraction: payload.usedShadowDomExtraction === true,
-      normal: payload.normal && typeof payload.normal === 'object' ? payload.normal : {},
-      shadow: payload.shadow && typeof payload.shadow === 'object' ? payload.shadow : {},
-      final: payload.final && typeof payload.final === 'object' ? payload.final : {},
-      extractionError: payload.extractionError ? String(payload.extractionError).slice(0, 200) : null
-    }));
-  } catch (_) {}
-}
-
 async function fetchSubpageJsonLdLight(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS) || SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS));
-  const extractionTimeoutMs = normalizeSubpageLightExtractionTimeoutMs_(opts.extractionTimeoutMs);
   const subpageWaitUntil = 'commit';
   const context = opts.context;
   const phase11 = opts && opts.phase11 && typeof opts.phase11 === 'object' ? opts.phase11 : {};
@@ -4398,22 +4354,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         normalizeSubpageJsonLdText(data.title).length === 0 ||
         Number(data.h1Count || 0) <= 0;
     };
-    const buildPrimaryExtractionDiagnostic = (data) => ({
-      empty: hasEmptyLightExtraction(data),
-      partial: data == null || extractTimedOut || returnedPartial,
-      bodyTextLength: Number(data && data.bodyTextLength || 0),
-      sampledTextLength: normalizeSubpageJsonLdText(data && data.sampledText).length,
-      titlePresent: !!normalizeSubpageJsonLdText(data && data.title),
-      h1Count: Number(data && data.h1Count || 0),
-      jsonLdCount: Array.isArray(data && data.jsonldTexts) ? data.jsonldTexts.length : Number(data && data.deepJsonLdScriptCount || 0)
-    });
     const runFallbackExtraction = async (reason) => {
       let extractionError = null;
-      let errorType = null;
-      const fallbackStartedAtMs = Date.now();
       const fallbackPromise = page.evaluate(() => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-        const normal = {};
         const titleFromDocument = clean(document.title || '').slice(0, 180);
         const h1Texts = Array.from(document.querySelectorAll('h1')).slice(0, 5)
           .map(el => clean(el && (el.innerText || el.textContent)).slice(0, 180))
@@ -4442,113 +4386,6 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         });
         const canonicalEl = document.querySelector('link[rel~="canonical" i]');
         const breadcrumbCandidates = document.querySelectorAll('nav[aria-label*="breadcrumb" i],[class*="breadcrumb" i],[id*="breadcrumb" i],[class*="pankuzu" i],[id*="pankuzu" i]');
-        normal.contentTextLength = bodyClean.length;
-        normal.h1Count = document.querySelectorAll('h1').length;
-        normal.h2Count = document.querySelectorAll('h2').length;
-        normal.jsonLdCount = jsonldTexts.length;
-        normal.mainLikeFound = !!document.querySelector('main,[role="main"]');
-        normal.navLikeFound = !!document.querySelector('nav,header [role="navigation"],[role="navigation"]');
-        normal.footerLikeFound = !!document.querySelector('footer,[role="contentinfo"]');
-        normal.linkCount = anchorEls.length;
-        const shadow = {
-          textLength: 0,
-          h1Count: 0,
-          h2Count: 0,
-          jsonLdCount: 0,
-          mainLikeFound: false,
-          navLikeFound: false,
-          footerLikeFound: false,
-          linkCount: 0,
-          sameOriginLinkCount: 0,
-          visitedNodes: 0,
-          depthLimitHit: false,
-          capHit: false,
-          h1Texts: [],
-          h2Sample: [],
-          jsonldTexts: [],
-          textSample: ''
-        };
-        const maxDepth = 4;
-        const maxNodes = 500;
-        const maxTextLength = 5000;
-        const visitShadowRoot = (root, depth) => {
-          if (!root || depth > maxDepth || shadow.visitedNodes >= maxNodes) {
-            if (depth > maxDepth) shadow.depthLimitHit = true;
-            if (shadow.visitedNodes >= maxNodes) shadow.capHit = true;
-            return;
-          }
-          let nodes = [];
-          try { nodes = Array.from(root.querySelectorAll('*')).slice(0, Math.max(0, maxNodes - shadow.visitedNodes)); } catch (_) { nodes = []; }
-          for (const node of nodes) {
-            if (shadow.visitedNodes >= maxNodes) {
-              shadow.capHit = true;
-              break;
-            }
-            shadow.visitedNodes += 1;
-            const tag = String(node && node.tagName || '').toLowerCase();
-            const role = String(node && node.getAttribute && node.getAttribute('role') || '').toLowerCase();
-            const cls = String(node && node.getAttribute && node.getAttribute('class') || '').toLowerCase();
-            const id = String(node && node.getAttribute && node.getAttribute('id') || '').toLowerCase();
-            if (tag === 'h1') {
-              shadow.h1Count += 1;
-              const text = clean(node.innerText || node.textContent).slice(0, 180);
-              if (text && shadow.h1Texts.length < 5) shadow.h1Texts.push(text);
-            }
-            if (tag === 'h2') {
-              shadow.h2Count += 1;
-              const text = clean(node.innerText || node.textContent).slice(0, 160);
-              if (text && shadow.h2Sample.length < 5) shadow.h2Sample.push(text);
-            }
-            if (tag === 'script' && /ld\+json/i.test(String(node.getAttribute && node.getAttribute('type') || ''))) {
-              const raw = String(node.textContent || '').trim();
-              if (raw && shadow.jsonldTexts.length < 20) shadow.jsonldTexts.push(raw);
-              shadow.jsonLdCount += raw ? 1 : 0;
-            }
-            if (tag === 'main' || role === 'main') shadow.mainLikeFound = true;
-            if (tag === 'nav' || role === 'navigation' || /(^|[-_\s])nav($|[-_\s])/.test(cls) || /(^|[-_\s])nav($|[-_\s])/.test(id)) shadow.navLikeFound = true;
-            if (tag === 'footer' || role === 'contentinfo' || /footer/.test(cls) || /footer/.test(id)) shadow.footerLikeFound = true;
-            if (tag === 'a') {
-              const href = node.href || (node.getAttribute && node.getAttribute('href')) || '';
-              if (href && !/^(?:mailto:|tel:|javascript:|#)/i.test(href)) {
-                shadow.linkCount += 1;
-                try {
-                  const u = new URL(href, location.href);
-                  if (u.origin === location.origin) shadow.sameOriginLinkCount += 1;
-                } catch (_) {}
-              }
-            }
-            if (shadow.textLength < maxTextLength && tag !== 'script' && tag !== 'style') {
-              const text = clean(node.innerText || node.textContent);
-              if (text) {
-                const next = clean([shadow.textSample, text].filter(Boolean).join(' ')).slice(0, maxTextLength);
-                shadow.textSample = next;
-                shadow.textLength = next.length;
-              }
-            }
-            if (node.shadowRoot) visitShadowRoot(node.shadowRoot, depth + 1);
-          }
-        };
-        try {
-          Array.from(document.querySelectorAll('*')).slice(0, 300).forEach(el => {
-            if (shadow.visitedNodes >= maxNodes) return;
-            if (el && el.shadowRoot) visitShadowRoot(el.shadowRoot, 1);
-          });
-        } catch (_) {}
-        const usedShadowDomExtraction = shadow.textLength > 0 ||
-          shadow.h1Count > 0 ||
-          shadow.h2Count > 0 ||
-          shadow.jsonLdCount > 0 ||
-          shadow.mainLikeFound ||
-          shadow.navLikeFound ||
-          shadow.footerLikeFound ||
-          shadow.linkCount > 0;
-        const finalH1Texts = h1Texts.length ? h1Texts : shadow.h1Texts.slice(0, 5);
-        const finalH2Sample = h2Sample.length ? h2Sample : shadow.h2Sample.slice(0, 5);
-        const finalJsonldTexts = jsonldTexts.length ? jsonldTexts : shadow.jsonldTexts.slice(0, 20);
-        const finalSampledText = sampledText || shadow.textSample.slice(0, 500);
-        const finalBodyTextLength = bodyClean.length || shadow.textLength;
-        const finalInternalLinkCount = internalLinkCount || shadow.sameOriginLinkCount;
-        const finalLinkCount = anchorEls.length || shadow.linkCount;
         return {
           finalUrl: location.href,
           readyState: document.readyState || '',
@@ -4561,134 +4398,54 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
           ogDescription: clean((document.querySelector('meta[property="og:description" i]') || {}).content || '').slice(0, 240),
           ogImageExists: !!clean((document.querySelector('meta[property="og:image" i]') || {}).content || ''),
           domJsonLdScriptCount: jsonldTexts.length,
-          deepJsonLdScriptCount: finalJsonldTexts.length,
+          deepJsonLdScriptCount: jsonldTexts.length,
           scriptCount: document.querySelectorAll('script').length,
           moduleScriptCount: document.querySelectorAll('script[type="module"],script[type="module"][src]').length,
           nextDataExists: !!document.querySelector('#__NEXT_DATA__'),
           nuxtDataExists: !!(window.__NUXT__ || document.querySelector('#__NUXT_DATA__')),
           shadowHostCount: 0,
-          bodyTextLength: finalBodyTextLength,
+          bodyTextLength: bodyClean.length,
           bodyInnerTextLengthRaw: bodyRaw.length,
-          bodyInnerTextLengthCapped: finalBodyTextLength,
-          h1Count: normal.h1Count || shadow.h1Count,
-          h1Texts: finalH1Texts,
-          h2Sample: finalH2Sample,
-          jsonldTexts: finalJsonldTexts,
-          hasMain: normal.mainLikeFound || shadow.mainLikeFound,
-          hasMainLandmark: normal.mainLikeFound || shadow.mainLikeFound,
-          hasNavLike: normal.navLikeFound || shadow.navLikeFound,
-          hasFooterLike: normal.footerLikeFound || shadow.footerLikeFound,
+          bodyInnerTextLengthCapped: bodyClean.length,
+          h1Count: document.querySelectorAll('h1').length,
+          h1Texts,
+          h2Sample,
+          jsonldTexts,
+          hasMain: !!document.querySelector('main,[role="main"]'),
+          hasMainLandmark: !!document.querySelector('main,[role="main"]'),
+          hasNavLike: !!document.querySelector('nav,header [role="navigation"],[role="navigation"]'),
+          hasFooterLike: !!document.querySelector('footer,[role="contentinfo"]'),
           hasBreadcrumbUi: breadcrumbCandidates.length > 0,
-          internalLinkCount: finalInternalLinkCount,
+          internalLinkCount,
           externalLinkCount,
-          sameOriginLinkCount: finalInternalLinkCount,
-          linkCount: finalLinkCount,
-          sampledText: finalSampledText,
+          linkCount: anchorEls.length,
+          sampledText,
           htmlLength: 0,
-          usedShadowDomExtraction,
-          shadowDomTextLength: shadow.textLength,
-          shadowDomH1Count: shadow.h1Count,
-          shadowDomJsonLdCount: shadow.jsonLdCount,
-          shadowDomLinkCount: shadow.linkCount,
-          __shadow: {
-            textLength: shadow.textLength,
-            h1Count: shadow.h1Count,
-            h2Count: shadow.h2Count,
-            jsonLdCount: shadow.jsonLdCount,
-            mainLikeFound: shadow.mainLikeFound,
-            navLikeFound: shadow.navLikeFound,
-            footerLikeFound: shadow.footerLikeFound,
-            linkCount: shadow.linkCount,
-            sameOriginLinkCount: shadow.sameOriginLinkCount,
-            visitedNodes: shadow.visitedNodes,
-            depthLimitHit: shadow.depthLimitHit,
-            capHit: shadow.capHit
-          },
-          __normal: normal,
           __detail: {
             jsonLdCount: jsonldTexts.length,
             scriptCount: document.querySelectorAll('script').length,
-            textLength: finalSampledText.length,
-            linkCount: finalLinkCount,
-            h2Count: finalH2Sample.length
+            textLength: sampledText.length,
+            linkCount: anchorEls.length,
+            h2Count: h2Sample.length
           }
         };
       });
-      const fallbackTimeoutBudgetMs = Math.min(extractionTimeoutMs, Math.max(1, remainingPageBudgetMs()));
       const fallback = await Promise.race([
         fallbackPromise,
-        new Promise(resolve => setTimeout(() => resolve(null), fallbackTimeoutBudgetMs))
+        new Promise(resolve => setTimeout(() => resolve(null), Math.min(SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
       ]).catch(e => {
         extractionError = String(e && (e.message || e) || 'fallback_extraction_failed').slice(0, 200);
-        errorType = 'evaluate_error';
         return null;
       });
-      if (!fallback && !extractionError) {
-        extractionError = `fallback_extraction_timeout_${fallbackTimeoutBudgetMs}ms`;
-        errorType = 'timeout';
-      }
-      const durationMs = Math.max(0, Date.now() - fallbackStartedAtMs);
-      const emptyResult = fallback ? hasEmptyLightExtraction(fallback) : true;
+      if (!fallback && !extractionError) extractionError = `fallback_extraction_timeout_${SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS}ms`;
       if (fallback) {
         fallback.__fallbackExtraction = true;
         fallback.__fallbackReason = reason;
-        fallback.fallbackExtraction = {
-          attempted: true,
-          success: !emptyResult,
-          skippedReason: null,
-          errorType: null,
-          errorMessage: null,
-          durationMs,
-          emptyResult,
-          timeoutBudgetMs: fallbackTimeoutBudgetMs
-        };
-        fallback.shadowExtraction = {
-          attempted: true,
-          success: fallback.usedShadowDomExtraction === true,
-          skippedReason: null,
-          errorType: null,
-          errorMessage: null,
-          durationMs,
-          emptyResult: fallback.usedShadowDomExtraction !== true,
-          timeoutBudgetMs: fallbackTimeoutBudgetMs,
-          visitedNodes: fallback.__shadow && typeof fallback.__shadow.visitedNodes === 'number' ? fallback.__shadow.visitedNodes : null,
-          capHit: fallback.__shadow && typeof fallback.__shadow.capHit === 'boolean' ? fallback.__shadow.capHit : null,
-          depthLimitHit: fallback.__shadow && typeof fallback.__shadow.depthLimitHit === 'boolean' ? fallback.__shadow.depthLimitHit : null
-        };
       }
-      return {
-        fallback,
-        extractionError,
-        fallbackExtraction: fallback && fallback.fallbackExtraction || {
-          attempted: true,
-          success: false,
-          skippedReason: null,
-          errorType,
-          errorMessage: extractionError,
-          durationMs,
-          emptyResult: true,
-          timeoutBudgetMs: fallbackTimeoutBudgetMs
-        },
-        shadowExtraction: fallback && fallback.shadowExtraction || {
-          attempted: true,
-          success: false,
-          skippedReason: null,
-          errorType,
-          errorMessage: extractionError,
-          durationMs,
-          emptyResult: true,
-          timeoutBudgetMs: fallbackTimeoutBudgetMs,
-          visitedNodes: null,
-          capHit: null,
-          depthLimitHit: null
-        }
-      };
+      return { fallback, extractionError };
     };
     let usedFallbackExtraction = false;
     let extractionError = null;
-    let primaryExtraction = null;
-    let fallbackExtraction = null;
-    let shadowExtraction = null;
     let observed = await Promise.race([
       page.evaluate(() => {
       const detailTimings = {};
@@ -4802,7 +4559,6 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         resolve(null);
       }, Math.min(SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
     ]);
-    primaryExtraction = buildPrimaryExtractionDiagnostic(observed);
     if (reached && navigationCommitted && hasEmptyLightExtraction(observed)) {
       usedFallbackExtraction = true;
       const fallbackResult = await runFallbackExtraction(observed ? 'primary_extraction_empty' : 'primary_extraction_unavailable');
@@ -4810,39 +4566,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         observed = Object.assign({}, observed || {}, fallbackResult.fallback);
       }
       extractionError = fallbackResult.extractionError;
-      fallbackExtraction = fallbackResult.fallbackExtraction;
-      shadowExtraction = fallbackResult.shadowExtraction;
-    } else {
-      fallbackExtraction = {
-        attempted: false,
-        success: false,
-        skippedReason: !reached ? 'fallback_skipped_not_reached' : (!navigationCommitted ? 'fallback_skipped_no_navigation_commit' : 'fallback_not_attempted'),
-        errorType: null,
-        errorMessage: null,
-        durationMs: null,
-        emptyResult: false,
-        timeoutBudgetMs: extractionTimeoutMs
-      };
-      shadowExtraction = {
-        attempted: false,
-        success: false,
-        skippedReason: 'shadow_not_attempted',
-        errorType: null,
-        errorMessage: null,
-        durationMs: null,
-        emptyResult: false,
-        timeoutBudgetMs: extractionTimeoutMs,
-        visitedNodes: null,
-        capHit: null,
-        depthLimitHit: null
-      };
     }
     if (observed) {
       observed.usedFallbackExtraction = usedFallbackExtraction;
       observed.extractionError = extractionError;
-      observed.primaryExtraction = primaryExtraction;
-      observed.fallbackExtraction = fallbackExtraction;
-      observed.shadowExtraction = shadowExtraction;
     }
     try {
       const pageTitleProbe = await Promise.race([
@@ -4855,31 +4582,6 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       }
     } catch (_) {}
     logSubpageLightExtractionPhase13_(buildExtractionAuditPayload(observed, usedFallbackExtraction, extractionError));
-    if (observed && usedFallbackExtraction) {
-      const finalLinkCount = Number(observed.linkCount || 0) || Number(observed.internalLinkCount || 0) + Number(observed.externalLinkCount || 0);
-      const finalContentTextLength = Number(observed.bodyTextLength || 0) || normalizeSubpageJsonLdText(observed.sampledText).length;
-      logSubpageShadowExtractionPhase14_({
-        origin: (() => { try { return new URL(String(observed.finalUrl || finalUrl || url || '')).origin; } catch (_) { return ''; } })(),
-        url,
-        path: (() => { try { return new URL(String(observed.finalUrl || finalUrl || url || '')).pathname || '/'; } catch (_) { return ''; } })(),
-        usedFallbackExtraction,
-        usedShadowDomExtraction: observed.usedShadowDomExtraction === true,
-        normal: observed.__normal || {},
-        shadow: observed.__shadow || {},
-        final: {
-          contentTextLength: finalContentTextLength,
-          h1Count: Number(observed.h1Count || 0),
-          h2Count: Array.isArray(observed.h2Sample) ? observed.h2Sample.length : 0,
-          jsonLdCount: Array.isArray(observed.jsonldTexts) ? observed.jsonldTexts.length : Number(observed.deepJsonLdScriptCount || 0),
-          mainLikeFound: observed.hasMain === true || observed.hasMainLandmark === true,
-          navLikeFound: observed.hasNavLike === true,
-          footerLikeFound: observed.hasFooterLike === true,
-          linkCount: finalLinkCount,
-          sameOriginLinkCount: Number(observed.sameOriginLinkCount || observed.internalLinkCount || 0)
-        },
-        extractionError
-      });
-    }
     if (!observed) {
       logDetail('evaluate_complete', evaluateStartedAtMs, {
         detail: {
@@ -4944,40 +4646,6 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         externalLinkCount: 0,
         sampledText: '',
         usedFallbackExtraction,
-        usedShadowDomExtraction: false,
-        extractionTimeoutBudgetMs: extractionTimeoutMs,
-        primaryExtraction: primaryExtraction || {
-          empty: true,
-          partial: true,
-          bodyTextLength: 0,
-          sampledTextLength: 0,
-          titlePresent: false,
-          h1Count: 0,
-          jsonLdCount: 0
-        },
-        fallbackExtraction: fallbackExtraction || {
-          attempted: usedFallbackExtraction === true,
-          success: false,
-          skippedReason: usedFallbackExtraction ? null : 'partial_return_before_extraction',
-          errorType: extractionError ? (/timeout/i.test(extractionError) ? 'timeout' : 'evaluate_error') : null,
-          errorMessage: extractionError,
-          durationMs: null,
-          emptyResult: true,
-          timeoutBudgetMs: extractionTimeoutMs
-        },
-        shadowExtraction: shadowExtraction || {
-          attempted: usedFallbackExtraction === true,
-          success: false,
-          skippedReason: usedFallbackExtraction ? null : 'shadow_not_attempted',
-          errorType: extractionError ? (/timeout/i.test(extractionError) ? 'timeout' : 'evaluate_error') : null,
-          errorMessage: extractionError,
-          durationMs: null,
-          emptyResult: true,
-          timeoutBudgetMs: extractionTimeoutMs,
-          visitedNodes: null,
-          capHit: null,
-          depthLimitHit: null
-        },
         extractionError,
         error: extractTimedOut ? `subpage_extract_timeout_${SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS}ms` : 'subpage_extract_unavailable',
         reached,
@@ -5138,18 +4806,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       hasFooterLike: !!(observed && observed.hasFooterLike),
       internalLinkCount: Number(observed && observed.internalLinkCount || 0),
       externalLinkCount: Number(observed && observed.externalLinkCount || 0),
-      sameOriginLinkCount: Number(observed && observed.sameOriginLinkCount || observed && observed.internalLinkCount || 0),
+      sameOriginLinkCount: Number(observed && observed.internalLinkCount || 0),
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
       usedFallbackExtraction,
-      usedShadowDomExtraction: observed && observed.usedShadowDomExtraction === true,
-      extractionTimeoutBudgetMs: extractionTimeoutMs,
-      shadowDomTextLength: Number(observed && observed.shadowDomTextLength || 0),
-      shadowDomH1Count: Number(observed && observed.shadowDomH1Count || 0),
-      shadowDomJsonLdCount: Number(observed && observed.shadowDomJsonLdCount || 0),
-      shadowDomLinkCount: Number(observed && observed.shadowDomLinkCount || 0),
-      primaryExtraction: observed && observed.primaryExtraction || primaryExtraction,
-      fallbackExtraction: observed && observed.fallbackExtraction || fallbackExtraction,
-      shadowExtraction: observed && observed.shadowExtraction || shadowExtraction,
       extractionError,
       error: null,
       parseErrors,
@@ -5761,11 +5420,6 @@ function buildLightweightRepresentativePagesFromCandidates_(candidates, limit = 
 
 function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, opts = {}) {
   if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return coverageSignalsV1;
-  coverageSignalsV1.extractionTimeoutBudgetMs = normalizeSubpageLightExtractionTimeoutMs_(
-    opts && opts.extractionTimeoutMs ||
-    coverageSignalsV1.extractionTimeoutBudgetMs ||
-    coverageSignalsV1.representativeExtractionDiagnostics && coverageSignalsV1.representativeExtractionDiagnostics.timeoutBudgetMs
-  );
   const selectedRepresentativePages = (Array.isArray(selectedCandidates) ? selectedCandidates : [])
     .map(buildCoverageRepresentativePageFromCandidate_);
   if (!selectedRepresentativePages.length) {
@@ -5793,8 +5447,7 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     const key = normalizeCoveragePathKey_(candidatePage && (candidatePage.url || candidatePage.path) || '');
     const observed = observedByPath.get(key);
     if (!observed) return Object.assign({}, candidatePage, {
-      observationAttempted: opts && opts.observationAttempted === true,
-      extractionTimeoutBudgetMs: coverageSignalsV1.extractionTimeoutBudgetMs
+      observationAttempted: opts && opts.observationAttempted === true
     });
     return Object.assign({}, candidatePage, observed, {
       url: observed.url || candidatePage.url || '',
@@ -5820,17 +5473,6 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
       internalLinkCount: Number(observed.internalLinkCount || 0) || 0,
       externalLinkCount: Number(observed.externalLinkCount || 0) || 0,
       sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
-      usedFallbackExtraction: observed.usedFallbackExtraction === true,
-      usedShadowDomExtraction: observed.usedShadowDomExtraction === true,
-      shadowDomTextLength: Number(observed.shadowDomTextLength || 0) || 0,
-      shadowDomH1Count: Number(observed.shadowDomH1Count || 0) || 0,
-      shadowDomJsonLdCount: Number(observed.shadowDomJsonLdCount || 0) || 0,
-      shadowDomLinkCount: Number(observed.shadowDomLinkCount || 0) || 0,
-      extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(observed.extractionTimeoutBudgetMs || coverageSignalsV1.extractionTimeoutBudgetMs),
-      primaryExtraction: observed.primaryExtraction && typeof observed.primaryExtraction === 'object' ? observed.primaryExtraction : null,
-      fallbackExtraction: observed.fallbackExtraction && typeof observed.fallbackExtraction === 'object' ? observed.fallbackExtraction : null,
-      shadowExtraction: observed.shadowExtraction && typeof observed.shadowExtraction === 'object' ? observed.shadowExtraction : null,
-      extractionError: observed.extractionError ? normalizeSubpageJsonLdText(observed.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(candidatePage.matchedCandidateSources)
         ? candidatePage.matchedCandidateSources.slice(0, 8)
         : (Array.isArray(candidatePage.sources) ? candidatePage.sources.slice(0, 8) : [])
@@ -5865,16 +5507,6 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     selectedCandidates,
     observedSubpages: opts && opts.observedSubpages,
     finalRepresentativePages: coverageSignalsV1.representativePages
-  });
-  logSubpageExtractionDiagnosticsPhase15_({
-    origin: opts && opts.origin,
-    responseMode: opts && opts.responseMode || null,
-    coverageSignals: coverageSignalsV1
-  });
-  logSubpageExtractionTimeoutTuningPhase16_({
-    origin: opts && opts.origin,
-    responseMode: opts && opts.responseMode || null,
-    coverageSignals: coverageSignalsV1
   });
   return coverageSignalsV1;
 }
@@ -5975,260 +5607,6 @@ function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
   } catch (_) {}
 }
 
-function buildSubpageExtractionDiagnostics_(page = {}) {
-  const timeoutBudgetMs = normalizeSubpageLightExtractionTimeoutMs_(
-    page.extractionTimeoutBudgetMs ||
-    page.timeoutBudgetMs ||
-    page.fallbackExtraction && page.fallbackExtraction.timeoutBudgetMs ||
-    page.shadowExtraction && page.shadowExtraction.timeoutBudgetMs
-  );
-  const primarySource = page.primaryExtraction && typeof page.primaryExtraction === 'object'
-    ? page.primaryExtraction
-    : {};
-  const primary = {
-    empty: primarySource.empty === true || (
-      Number(primarySource.bodyTextLength || page.bodyTextLength || 0) <= 0 &&
-      normalizeSubpageJsonLdText(primarySource.sampledText || page.sampledText).length <= 0 &&
-      !normalizeSubpageJsonLdText(primarySource.title || page.title) &&
-      Number(primarySource.h1Count || page.h1Count || 0) <= 0 &&
-      Number(primarySource.jsonLdCount || page.jsonLdCount || 0) <= 0
-    ),
-    partial: primarySource.partial === true || page.returnedPartial === true || page.extractTimedOut === true,
-    bodyTextLength: Number(primarySource.bodyTextLength || 0),
-    sampledTextLength: Number(primarySource.sampledTextLength || 0),
-    titlePresent: primarySource.titlePresent === true,
-    h1Count: Number(primarySource.h1Count || 0),
-    jsonLdCount: Number(primarySource.jsonLdCount || 0)
-  };
-  const fallbackSource = page.fallbackExtraction && typeof page.fallbackExtraction === 'object'
-    ? page.fallbackExtraction
-    : {};
-  const shadowSource = page.shadowExtraction && typeof page.shadowExtraction === 'object'
-    ? page.shadowExtraction
-    : {};
-  const fallbackTimeoutBudgetMs = normalizeSubpageLightExtractionTimeoutMs_(fallbackSource.timeoutBudgetMs || timeoutBudgetMs);
-  const shadowTimeoutBudgetMs = normalizeSubpageLightExtractionTimeoutMs_(shadowSource.timeoutBudgetMs || timeoutBudgetMs);
-  const fallbackRatioFor = (durationMs) => {
-    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || fallbackTimeoutBudgetMs <= 0) return null;
-    return Math.round((durationMs / fallbackTimeoutBudgetMs) * 100) / 100;
-  };
-  const shadowRatioFor = (durationMs) => {
-    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || shadowTimeoutBudgetMs <= 0) return null;
-    return Math.round((durationMs / shadowTimeoutBudgetMs) * 100) / 100;
-  };
-  const q = page.observationQuality && typeof page.observationQuality === 'object'
-    ? page.observationQuality
-    : buildRepresentativeObservationQuality_(page);
-  const finalContentTextLength = Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length;
-  const finalJsonLdCount = Number(page.jsonLdCount || 0) || (Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes.length : 0);
-  return {
-    timeoutBudgetMs,
-    primary,
-    fallback: {
-      attempted: fallbackSource.attempted === true || page.usedFallbackExtraction === true,
-      success: fallbackSource.success === true || (page.usedFallbackExtraction === true && !page.extractionError),
-      skippedReason: fallbackSource.skippedReason || null,
-      errorType: fallbackSource.errorType || null,
-      errorMessage: fallbackSource.errorMessage ? String(fallbackSource.errorMessage).slice(0, 180) : null,
-      durationMs: typeof fallbackSource.durationMs === 'number' ? fallbackSource.durationMs : null,
-      emptyResult: fallbackSource.emptyResult === true,
-      timeoutBudgetMs: fallbackTimeoutBudgetMs,
-      nearTimeout: typeof fallbackSource.durationMs === 'number' ? fallbackSource.durationMs >= fallbackTimeoutBudgetMs * 0.85 : false,
-      timeoutRatio: fallbackRatioFor(fallbackSource.durationMs)
-    },
-    shadow: {
-      attempted: shadowSource.attempted === true || page.usedFallbackExtraction === true,
-      success: shadowSource.success === true || page.usedShadowDomExtraction === true,
-      skippedReason: shadowSource.skippedReason || null,
-      errorType: shadowSource.errorType || null,
-      errorMessage: shadowSource.errorMessage ? String(shadowSource.errorMessage).slice(0, 180) : null,
-      durationMs: typeof shadowSource.durationMs === 'number' ? shadowSource.durationMs : null,
-      emptyResult: shadowSource.emptyResult === true || (page.usedFallbackExtraction === true && page.usedShadowDomExtraction !== true),
-      timeoutBudgetMs: shadowTimeoutBudgetMs,
-      nearTimeout: typeof shadowSource.durationMs === 'number' ? shadowSource.durationMs >= shadowTimeoutBudgetMs * 0.85 : false,
-      timeoutRatio: shadowRatioFor(shadowSource.durationMs),
-      visitedNodes: typeof shadowSource.visitedNodes === 'number' ? shadowSource.visitedNodes : (typeof page.shadowDomVisitedNodes === 'number' ? page.shadowDomVisitedNodes : null),
-      capHit: typeof shadowSource.capHit === 'boolean' ? shadowSource.capHit : null,
-      depthLimitHit: typeof shadowSource.depthLimitHit === 'boolean' ? shadowSource.depthLimitHit : null
-    },
-    final: {
-      source: page.finalMergeSource || (page.reached === true || page.navigationCommitted === true ? 'observed' : (page.candidateOnly === true ? 'fallbackPreserved' : 'selectedCandidate')),
-      contentTextLength: finalContentTextLength,
-      titlePresent: !!normalizeSubpageJsonLdText(page.title),
-      h1Count: Number(page.h1Count || 0),
-      jsonLdCount: finalJsonLdCount,
-      mainLikeFound: page.hasMain === true || page.hasMainLandmark === true,
-      navLikeFound: page.hasNavLike === true,
-      footerLikeFound: page.hasFooterLike === true,
-      internalLinkCount: Number(page.internalLinkCount || 0),
-      sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0),
-      qualityLevel: q.level || null,
-      reasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 12) : []
-    }
-  };
-}
-
-function summarizeRepresentativeExtractionDiagnostics_(pages = []) {
-  const summary = (Array.isArray(pages) ? pages : []).reduce((acc, page) => {
-    const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
-    acc.total += 1;
-    if (typeof d.timeoutBudgetMs === 'number') acc.timeoutBudgetMs = d.timeoutBudgetMs;
-    if (d.primary && d.primary.empty === true) acc.primaryEmpty += 1;
-    if (d.primary && d.primary.partial === true) acc.primaryPartial += 1;
-    if (d.fallback && d.fallback.attempted === true) acc.fallbackAttempted += 1;
-    if (d.fallback && d.fallback.success === true) acc.fallbackSuccess += 1;
-    if (d.fallback && d.fallback.errorType === 'timeout') acc.fallbackTimeout += 1;
-    if (d.fallback && d.fallback.errorType === 'evaluate_error') acc.fallbackEvaluateError += 1;
-    if (d.fallback && d.fallback.emptyResult === true) acc.fallbackEmptyResult += 1;
-    if (d.fallback && d.fallback.nearTimeout === true) acc.fallbackNearTimeout += 1;
-    if (d.fallback && typeof d.fallback.timeoutRatio === 'number') {
-      acc.__fallbackRatioSum += d.fallback.timeoutRatio;
-      acc.__fallbackRatioCount += 1;
-    }
-    if (d.shadow && d.shadow.attempted === true) acc.shadowAttempted += 1;
-    if (d.shadow && d.shadow.success === true) acc.shadowSuccess += 1;
-    if (d.shadow && d.shadow.errorType === 'timeout') acc.shadowTimeout += 1;
-    if (d.shadow && d.shadow.errorType === 'evaluate_error') acc.shadowEvaluateError += 1;
-    if (d.shadow && d.shadow.emptyResult === true) acc.shadowEmptyResult += 1;
-    if (d.shadow && d.shadow.nearTimeout === true) acc.shadowNearTimeout += 1;
-    if (d.shadow && typeof d.shadow.timeoutRatio === 'number') {
-      acc.__shadowRatioSum += d.shadow.timeoutRatio;
-      acc.__shadowRatioCount += 1;
-    }
-    if (d.final && d.final.source === 'observed') acc.finalObservedMatch += 1;
-    if (d.final && (d.final.source === 'selectedCandidate' || d.final.source === 'fallbackPreserved')) acc.finalPreservedCandidate += 1;
-    return acc;
-  }, {
-    total: 0,
-    timeoutBudgetMs: SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS,
-    fallbackAttempted: 0,
-    fallbackSuccess: 0,
-    fallbackTimeout: 0,
-    fallbackEvaluateError: 0,
-    fallbackEmptyResult: 0,
-    fallbackNearTimeout: 0,
-    fallbackTimeoutRatioAvg: null,
-    shadowAttempted: 0,
-    shadowSuccess: 0,
-    shadowTimeout: 0,
-    shadowEvaluateError: 0,
-    shadowEmptyResult: 0,
-    shadowNearTimeout: 0,
-    shadowTimeoutRatioAvg: null,
-    primaryEmpty: 0,
-    primaryPartial: 0,
-    finalObservedMatch: 0,
-    finalPreservedCandidate: 0,
-    __fallbackRatioSum: 0,
-    __fallbackRatioCount: 0,
-    __shadowRatioSum: 0,
-    __shadowRatioCount: 0
-  });
-  summary.fallbackTimeoutRatioAvg = summary.__fallbackRatioCount
-    ? Math.round((summary.__fallbackRatioSum / summary.__fallbackRatioCount) * 100) / 100
-    : null;
-  summary.shadowTimeoutRatioAvg = summary.__shadowRatioCount
-    ? Math.round((summary.__shadowRatioSum / summary.__shadowRatioCount) * 100) / 100
-    : null;
-  delete summary.__fallbackRatioSum;
-  delete summary.__fallbackRatioCount;
-  delete summary.__shadowRatioSum;
-  delete summary.__shadowRatioCount;
-  return summary;
-}
-
-function logSubpageExtractionDiagnosticsPhase15_(payload = {}) {
-  try {
-    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object' ? payload.coverageSignals : {};
-    const pages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
-    console.log('[DEBUG][SUBPAGE_EXTRACTION_DIAGNOSTICS_PHASE15]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      responseMode: payload.responseMode || null,
-      observedCount: typeof coverageSignals.observedCount === 'number'
-        ? coverageSignals.observedCount
-        : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
-      representativePagesCount: pages.length,
-      summary: coverageSignals.representativeExtractionDiagnostics || summarizeRepresentativeExtractionDiagnostics_(pages),
-      pages: pages.slice(0, 8).map(page => {
-        const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
-        const q = page && page.observationQuality || {};
-        return {
-          path: String(page && page.path || '').slice(0, 160),
-          pageType: String(page && page.pageType || '').slice(0, 80),
-          canonicalPageFamily: String(page && page.canonicalPageFamily || '').slice(0, 80),
-          candidateOnly: page && page.candidateOnly === true,
-          reached: page && page.reached === true,
-          navigationCommitted: page && page.navigationCommitted === true,
-          qualityLevel: q.level || d.final && d.final.qualityLevel || null,
-          reasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 8) : (d.final && d.final.reasons || []),
-          primary: d.primary,
-          fallback: d.fallback,
-          shadow: d.shadow,
-          final: d.final
-        };
-      })
-    }));
-  } catch (_) {}
-}
-
-function logSubpageExtractionTimeoutTuningPhase16_(payload = {}) {
-  try {
-    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object' ? payload.coverageSignals : {};
-    const pages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
-    const summary = coverageSignals.representativeExtractionDiagnostics || summarizeRepresentativeExtractionDiagnostics_(pages);
-    console.log('[DEBUG][SUBPAGE_EXTRACTION_TIMEOUT_TUNING_PHASE16]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      responseMode: payload.responseMode || null,
-      timeoutBudgetMs: Number(summary.timeoutBudgetMs || SUBPAGE_LIGHT_EXTRACTION_TIMEOUT_MS),
-      summary: {
-        total: Number(summary.total || 0),
-        fallbackAttempted: Number(summary.fallbackAttempted || 0),
-        fallbackSuccess: Number(summary.fallbackSuccess || 0),
-        fallbackTimeout: Number(summary.fallbackTimeout || 0),
-        fallbackNearTimeout: Number(summary.fallbackNearTimeout || 0),
-        fallbackTimeoutRatioAvg: typeof summary.fallbackTimeoutRatioAvg === 'number' ? summary.fallbackTimeoutRatioAvg : null,
-        shadowAttempted: Number(summary.shadowAttempted || 0),
-        shadowSuccess: Number(summary.shadowSuccess || 0),
-        shadowTimeout: Number(summary.shadowTimeout || 0),
-        shadowNearTimeout: Number(summary.shadowNearTimeout || 0),
-        shadowTimeoutRatioAvg: typeof summary.shadowTimeoutRatioAvg === 'number' ? summary.shadowTimeoutRatioAvg : null
-      },
-      pages: pages.slice(0, 8).map(page => {
-        const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
-        const q = page && page.observationQuality || {};
-        return {
-          path: String(page && page.path || '').slice(0, 160),
-          pageType: String(page && page.pageType || '').slice(0, 80),
-          canonicalPageFamily: String(page && page.canonicalPageFamily || '').slice(0, 80),
-          reached: page && page.reached === true,
-          candidateOnly: page && page.candidateOnly === true,
-          fallback: {
-            attempted: d.fallback && d.fallback.attempted === true,
-            success: d.fallback && d.fallback.success === true,
-            errorType: d.fallback && d.fallback.errorType || null,
-            durationMs: d.fallback && typeof d.fallback.durationMs === 'number' ? d.fallback.durationMs : null,
-            timeoutRatio: d.fallback && typeof d.fallback.timeoutRatio === 'number' ? d.fallback.timeoutRatio : null,
-            nearTimeout: d.fallback && d.fallback.nearTimeout === true
-          },
-          shadow: {
-            attempted: d.shadow && d.shadow.attempted === true,
-            success: d.shadow && d.shadow.success === true,
-            errorType: d.shadow && d.shadow.errorType || null,
-            durationMs: d.shadow && typeof d.shadow.durationMs === 'number' ? d.shadow.durationMs : null,
-            timeoutRatio: d.shadow && typeof d.shadow.timeoutRatio === 'number' ? d.shadow.timeoutRatio : null,
-            nearTimeout: d.shadow && d.shadow.nearTimeout === true,
-            visitedNodes: d.shadow && typeof d.shadow.visitedNodes === 'number' ? d.shadow.visitedNodes : null,
-            capHit: d.shadow && typeof d.shadow.capHit === 'boolean' ? d.shadow.capHit : null,
-            depthLimitHit: d.shadow && typeof d.shadow.depthLimitHit === 'boolean' ? d.shadow.depthLimitHit : null
-          },
-          finalQualityLevel: q.level || d.final && d.final.qualityLevel || null,
-          finalReasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 8) : (d.final && d.final.reasons || [])
-        };
-      })
-    }));
-  } catch (_) {}
-}
-
 function buildRepresentativeObservationQuality_(page) {
   const reached = page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false);
   const navigationCommitted = page && Object.prototype.hasOwnProperty.call(page, 'navigationCommitted')
@@ -6301,24 +5679,9 @@ function attachRepresentativeObservationQuality_(coverageSignals) {
   const pages = Array.isArray(coverageSignals.representativePages)
     ? coverageSignals.representativePages
     : [];
-  const effectiveExtractionTimeoutMs = normalizeSubpageLightExtractionTimeoutMs_(
-    coverageSignals.extractionTimeoutBudgetMs ||
-    coverageSignals.timeoutBudgetMs ||
-    coverageSignals.representativeExtractionDiagnostics && coverageSignals.representativeExtractionDiagnostics.timeoutBudgetMs
-  );
-  coverageSignals.extractionTimeoutBudgetMs = effectiveExtractionTimeoutMs;
-  coverageSignals.representativePages = pages.map(page => {
-    const pageWithTimeoutBudget = Object.assign({}, page, {
-      extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(page && page.extractionTimeoutBudgetMs || effectiveExtractionTimeoutMs)
-    });
-    const withQuality = Object.assign({}, pageWithTimeoutBudget, {
-      extractionTimeoutBudgetMs: pageWithTimeoutBudget.extractionTimeoutBudgetMs,
-      observationQuality: buildRepresentativeObservationQuality_(pageWithTimeoutBudget)
-    });
-    return Object.assign(withQuality, {
-      extractionDiagnostics: buildSubpageExtractionDiagnostics_(withQuality)
-    });
-  });
+  coverageSignals.representativePages = pages.map(page => Object.assign({}, page, {
+    observationQuality: buildRepresentativeObservationQuality_(page)
+  }));
   const summary = coverageSignals.representativePages.reduce((acc, page) => {
     const q = page && page.observationQuality || {};
     acc.total += 1;
@@ -6330,8 +5693,6 @@ function attachRepresentativeObservationQuality_(coverageSignals) {
     return acc;
   }, { total: 0, attempted: 0, reached: 0, good: 0, partial: 0, weak: 0, failed: 0, candidateOnly: 0, observed: 0 });
   coverageSignals.representativeObservationQuality = summary;
-  coverageSignals.representativeExtractionDiagnostics = summarizeRepresentativeExtractionDiagnostics_(coverageSignals.representativePages);
-  coverageSignals.representativeExtractionDiagnostics.timeoutBudgetMs = effectiveExtractionTimeoutMs;
   coverageSignals.representativePagesCount = coverageSignals.representativePages.length;
   coverageSignals.observedSubpageCount = summary.reached;
   coverageSignals.observedCount = summary.reached;
@@ -6508,38 +5869,6 @@ function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   }
 }
 
-function logRepresentativeCandidateSourcePhase16BAudit_(payload = {}) {
-  try {
-    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
-    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
-    const preservedRepresentativePages = Array.isArray(payload.preservedRepresentativePages) ? payload.preservedRepresentativePages : [];
-    const finalRepresentativePages = Array.isArray(payload.finalRepresentativePages) ? payload.finalRepresentativePages : [];
-    const countBySource = (sourceName) => candidates.filter(candidate => {
-      const sources = Array.isArray(candidate && candidate.sources)
-        ? candidate.sources
-        : (candidate && candidate.source ? [candidate.source] : []);
-      return sources.includes(sourceName);
-    }).length;
-    console.log('[DEBUG][REPRESENTATIVE_CANDIDATE_SOURCE_PHASE16B_AUDIT]', JSON.stringify({
-      origin: String(payload.origin || '').slice(0, 180),
-      candidateSourceSummary: payload.candidateSourceSummary || {},
-      rawCandidateCount: candidates.length,
-      sitemapCandidateCount: countBySource('sitemap'),
-      navCandidateCount: countBySource('nav'),
-      footerCandidateCount: countBySource('footer'),
-      otherCandidateCount: Math.max(0, candidates.length - countBySource('sitemap') - countBySource('nav') - countBySource('footer')),
-      afterHardExcludeCount: Number(payload.afterHardExcludeCount || 0),
-      selectionInputCount: Number(payload.selectionInputCount || 0),
-      selectedCandidatesCount: selectedCandidates.length,
-      preservedRepresentativePagesCount: preservedRepresentativePages.length,
-      finalRepresentativePagesCount: finalRepresentativePages.length,
-      reason: String(payload.reason || '').slice(0, 160),
-      selectedPaths: selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean).slice(0, 10),
-      finalPaths: finalRepresentativePages.map(page => String(page && page.path || '').slice(0, 160)).filter(Boolean).slice(0, 10)
-    }));
-  } catch (_) {}
-}
-
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -6630,15 +5959,6 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         externalLinkCount: Number(page.externalLinkCount || 0) || 0,
         sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0) || 0,
         usedFallbackExtraction: page.usedFallbackExtraction === true,
-        usedShadowDomExtraction: page.usedShadowDomExtraction === true,
-        shadowDomTextLength: Number(page.shadowDomTextLength || 0) || 0,
-        shadowDomH1Count: Number(page.shadowDomH1Count || 0) || 0,
-        shadowDomJsonLdCount: Number(page.shadowDomJsonLdCount || 0) || 0,
-        shadowDomLinkCount: Number(page.shadowDomLinkCount || 0) || 0,
-        extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(page.extractionTimeoutBudgetMs),
-        primaryExtraction: page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
-        fallbackExtraction: page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
-        shadowExtraction: page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
         extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
         matchedCandidateSources: Array.isArray(candidate.sources)
           ? candidate.sources.slice(0, 8)
@@ -6670,10 +5990,6 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     origin: payload && payload.origin || '',
     candidateSourceSummary,
     candidatePageTypes,
-    extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(
-      payload && payload.extractionTimeoutBudgetMs ||
-      observations[0] && observations[0].extractionTimeoutBudgetMs
-    ),
     observedSubpageCount: observedPages.length,
     observedH1PageCount,
     observedBreadcrumbPageCount,
@@ -6714,10 +6030,6 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       other: 0
     },
     candidatePageTypes: candidatePageTypesInput,
-    extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(
-      coverageSignalsV1.extractionTimeoutBudgetMs ||
-      coverageSignalsV1.representativeExtractionDiagnostics && coverageSignalsV1.representativeExtractionDiagnostics.timeoutBudgetMs
-    ),
     representativePages: representativePagesInput.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
@@ -6745,19 +6057,6 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       internalLinkCount: Number(page && page.internalLinkCount || 0) || 0,
       sameOriginLinkCount: Number(page && page.sameOriginLinkCount || page && page.internalLinkCount || 0) || 0,
       usedFallbackExtraction: page && page.usedFallbackExtraction === true,
-      usedShadowDomExtraction: page && page.usedShadowDomExtraction === true,
-      shadowDomTextLength: Number(page && page.shadowDomTextLength || 0) || 0,
-      shadowDomH1Count: Number(page && page.shadowDomH1Count || 0) || 0,
-      shadowDomJsonLdCount: Number(page && page.shadowDomJsonLdCount || 0) || 0,
-      shadowDomLinkCount: Number(page && page.shadowDomLinkCount || 0) || 0,
-      extractionTimeoutBudgetMs: normalizeSubpageLightExtractionTimeoutMs_(
-        page && page.extractionTimeoutBudgetMs ||
-        coverageSignalsV1.extractionTimeoutBudgetMs ||
-        coverageSignalsV1.representativeExtractionDiagnostics && coverageSignalsV1.representativeExtractionDiagnostics.timeoutBudgetMs
-      ),
-      primaryExtraction: page && page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
-      fallbackExtraction: page && page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
-      shadowExtraction: page && page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
       extractionError: page && page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
@@ -7115,7 +6414,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     Object.assign(phase11State, patch);
   };
   const subpageGuardMs = Math.max(3000, Math.min(30000, Number(opts && opts.subpageGuardMs || SUBPAGE_OBSERVATION_TIMEOUT_MS) || SUBPAGE_OBSERVATION_TIMEOUT_MS));
-  const subpageExtractTimeoutMs = normalizeSubpageLightExtractionTimeoutMs_(opts && opts.subpageExtractTimeoutMs);
   const withSubpageTimeout = (promise, ms, label) => Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}_timeout_${ms}ms`)), ms))
@@ -7129,7 +6427,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const emptyPayload = {
       topUrl: normalized && normalized.topUrl || String(topUrl || ''),
       origin: normalized && normalized.origin || '',
-      extractionTimeoutBudgetMs: subpageExtractTimeoutMs,
       candidateSummary: {
         sourceSummary,
         totalCandidates: Number(discovered && discovered.totalCandidates || candidates.length || 0),
@@ -7148,8 +6445,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         origin: normalized && normalized.origin || '',
         responseMode: phase11ResponseMode,
         observationAttempted: false,
-        observedSubpages: [],
-        extractionTimeoutMs: subpageExtractTimeoutMs
+        observedSubpages: []
       });
     }
     emptyCoverageSignalsV1.reason = reason;
@@ -7421,22 +6717,22 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       debugRunId: phase11DebugRunId
     }), subpageGuardMs, 'subpage_discovery');
     lastDiscoveredForCoverage = discovered;
-    const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
-      ? discovered._audit.allCandidates
-      : discovered.candidates;
-    const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
-      ? auditCandidates
-      : discovered.candidates;
-    const allPrioritizedCandidates = sortCoverageObserveCandidates_(coverageCandidates);
-    const primaryRepresentativeCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(coverageCandidates)).slice(0, maxObserve);
-    const selectedCandidates = selectCoverageRepresentativeCandidates_(coverageCandidates, maxObserve, {
+    const allPrioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const primaryRepresentativeCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(discovered.candidates)).slice(0, maxObserve);
+    const selectedCandidates = selectCoverageRepresentativeCandidates_(discovered.candidates, maxObserve, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
       reason: 'coverage_observe_selection'
     });
     lastSelectedCandidatesForCoverage = selectedCandidates;
     const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
-    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(coverageCandidates, 4, {
+    const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
+      ? discovered._audit.allCandidates
+      : discovered.candidates;
+    const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
+      ? auditCandidates
+      : discovered.candidates;
+    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 4, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
       reason: 'audit_representative_preview'
@@ -7497,17 +6793,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       representativePages: auditRepresentativePages,
       hasSubpageSignals: !!(geoSignalsV1 && geoSignalsV1.subpageSignals)
     });
-    logRepresentativeCandidateSourcePhase16BAudit_({
-      origin: normalized.origin,
-      candidateSourceSummary: discovered.sourceSummary,
-      candidates: coverageCandidates,
-      afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
-      selectionInputCount: coverageCandidates.length,
-      selectedCandidates,
-      preservedRepresentativePages: auditRepresentativePages,
-      finalRepresentativePages: auditRepresentativePages,
-      reason: 'after_representative_selection'
-    });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = allPrioritizedCandidates
       .filter(candidate => !selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || '')))
@@ -7532,26 +6817,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     if (!selectedCandidates.length) {
-      const noCandidateReason = coverageCandidates.length
-        ? 'no_representative_candidates_after_hard_exclude'
-        : 'no_subpage_candidates';
-      const emptyCoverageSignals = attachEmptySignals(noCandidateReason, discovered, auditRepresentativePages.length ? coverageCandidates : []);
+      const emptyCoverageSignals = attachEmptySignals('no_subpage_candidates', discovered);
       logPayload.origin = normalized.origin;
-      logPayload.reason = noCandidateReason;
-      setPhase11State({ fallbackReason: noCandidateReason });
-      logRepresentativeCandidateSourcePhase16BAudit_({
-        origin: normalized.origin,
-        candidateSourceSummary: discovered.sourceSummary,
-        candidates: coverageCandidates,
-        afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
-        selectionInputCount: coverageCandidates.length,
-        selectedCandidates,
-        preservedRepresentativePages: auditRepresentativePages,
-        finalRepresentativePages: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
-          ? geoSignalsV1.coverageSignals.representativePages
-          : [],
-        reason: noCandidateReason
-      });
+      logPayload.reason = 'no_subpage_candidates';
+      setPhase11State({ fallbackReason: 'no_subpage_candidates' });
       traceCoverageMemory('attach_skip_no_candidates', {
         candidateCount: discovered.totalCandidates
       });
@@ -7573,7 +6842,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic',
       timeout: SUBPAGE_OBSERVATION_GOTO_TIMEOUT_MS,
-      extractionTimeoutMs: subpageExtractTimeoutMs,
       concurrency: reuseContextForObserve ? 1 : 3,
       context: opts && opts.context,
       reuseBrowser: reuseContextForObserve,
@@ -7603,7 +6871,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
-      extractionTimeoutBudgetMs: subpageExtractTimeoutMs,
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
         totalCandidates: discovered.totalCandidates,
@@ -7634,16 +6901,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       } catch (_) {}
     }
     let coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
-      candidates: coverageCandidates,
-      extractionTimeoutBudgetMs: subpageExtractTimeoutMs
+      candidates: coverageCandidates
     }));
     coverageSignalsV1 = preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCandidates, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
       responseMode: phase11ResponseMode,
       observationAttempted: true,
-      observedSubpages: observations,
-      extractionTimeoutMs: subpageExtractTimeoutMs
+      observedSubpages: observations
     });
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
@@ -7674,7 +6939,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'coverage_representative_assign_start',
       reason: 'assign coverageSignals representativePages',
       candidateCount: discovered.totalCandidates,
-      eligibleCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
       selectedCount: selectedCandidates.length,
       backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
       finalCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
@@ -7695,7 +6960,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'coverage_representative_assign_complete',
       reason: 'assigned coverageSignals representativePages',
       candidateCount: discovered.totalCandidates,
-      eligibleCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
       selectedCount: selectedCandidates.length,
       backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
       finalCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
@@ -7705,21 +6970,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       afterCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
         ? geoSignalsV1.coverageSignals.representativePages.length
         : 0
-    });
-    logRepresentativeCandidateSourcePhase16BAudit_({
-      origin: normalized.origin,
-      candidateSourceSummary: discovered.sourceSummary,
-      candidates: coverageCandidates,
-      afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
-      selectionInputCount: coverageCandidates.length,
-      selectedCandidates,
-      preservedRepresentativePages: coverageSignalsV1 && Array.isArray(coverageSignalsV1.representativePages)
-        ? coverageSignalsV1.representativePages
-        : [],
-      finalRepresentativePages: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
-        ? geoSignalsV1.coverageSignals.representativePages
-        : [],
-      reason: 'final_coverage_assignment'
     });
     logSubpageCoverageSignalsFinalAudit_({
       route: '/scrape',
@@ -7792,7 +7042,6 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
   const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
   const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
-  const extractionTimeoutMs = normalizeSubpageLightExtractionTimeoutMs_(opts.extractionTimeoutMs);
   const maxTotalMs = Number(opts.maxTotalMs || 0) > 0
     ? Math.max(1000, Number(opts.maxTotalMs || 0))
     : 0;
@@ -8003,7 +7252,6 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
           const observedPage = await fetchSubpageJsonLdLight(url, {
             siteMode,
             timeout: pageTimeout,
-            extractionTimeoutMs,
             context,
             phase11: {
               debugRunId: phase11 && phase11.debugRunId
@@ -11955,19 +11203,10 @@ async function scrapeOnce(req, res) {
     : 3
   ));
   const debugRunId = req && req.query && req.query.debugRunId ? String(req.query.debugRunId).slice(0, 120) : null;
-  const subpageExtractTimeoutMsRaw = req && req.query ? req.query.subpageExtractTimeoutMs : null;
-  const subpageExtractTimeoutMs = normalizeSubpageLightExtractionTimeoutMs_(subpageExtractTimeoutMsRaw);
   const watchdogResponseMode = balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : (signalsFirstBalanced ? 'balanced' : (signalsFirstLight ? 'light' : responseMode || 'default')));
   const watchdogOrigin = () => {
     try { return new URL(String(urlToFetch || '')).origin; } catch (_) { return ''; }
   };
-  if (signalsFirstLight) {
-    logSubpageExtractionTimeoutConfigPhase16_({
-      origin: watchdogOrigin(),
-      rawSubpageExtractTimeoutMs: subpageExtractTimeoutMsRaw,
-      effectiveSubpageExtractTimeoutMs: subpageExtractTimeoutMs
-    });
-  }
   const logWatchdog = (phase, startedAtMs, extra = {}) => {
     logScrapePhase11Watchdog_(Object.assign({
       debugRunId,
@@ -15275,7 +14514,6 @@ async function scrapeOnce(req, res) {
         reuseBrowser: true,
         maxObserve: 4,
         debugRunId,
-        subpageExtractTimeoutMs,
         signalsMode: signalsMode || null,
         responseMode: watchdogResponseMode,
         phase11State: subpageObservationPhase11State
