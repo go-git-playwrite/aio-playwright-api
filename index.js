@@ -4497,6 +4497,69 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
+    if (normalized.origin === 'https://ahamo.com') {
+      const skipReason = 'memory_guard_ahamo_representative_observation';
+      const coverageSignals = {
+        version: 'coverageSignalsV1',
+        source: 'discover-and-observe-subpages-light',
+        checked: true,
+        skipped: true,
+        skipReason,
+        observedSubpageCount: 0,
+        observedH1PageCount: 0,
+        observedBreadcrumbPageCount: 0,
+        hasObservedSubpageH1: false,
+        hasObservedBreadcrumbList: false,
+        hasObservedAboutPage: false,
+        candidateSourceSummary: { sitemap: 0, nav: 0, footer: 0, other: 0 },
+        candidatePageTypes: buildCoverageCandidatePageTypes_([]),
+        representativePages: [],
+        representativeObservationQuality: {
+          summary: { strong: 0, partial: 0, weak: 0, failed: 0, timeout: 0 },
+          pages: []
+        },
+        representativeExtractionDiagnostics: {
+          total: 0,
+          observed: 0,
+          strong: 0,
+          partial: 0,
+          weak: 0,
+          failed: 0,
+          timeout: 0,
+          fallbackUsed: 0,
+          shadowAttempted: 0,
+          shadowTimedOut: 0,
+          errors: 0,
+          skipped: true,
+          skipReason
+        },
+        notes: [skipReason]
+      };
+      geoSignalsV1.coverageSignals = coverageSignals;
+      logPayload.origin = normalized.origin;
+      logPayload.attached = true;
+      logPayload.reason = skipReason;
+      auditPayload.attached = true;
+      try {
+        console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_MEMORY_GUARD]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          skipped: true,
+          reason: skipReason
+        }));
+      } catch (_) {}
+      try {
+        console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+          observedSubpageCount: 0,
+          reason: skipReason
+        })));
+      } catch (_) {}
+      try {
+        console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      } catch (_) {}
+      return coverageSignals;
+    }
     traceCoverageMemory('discover_before', {
       browserCreated: !reusePageForDiscover,
       contextCreated: true,
