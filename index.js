@@ -4370,8 +4370,19 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         normalizeSubpageJsonLdText(data.title).length === 0 ||
         Number(data.h1Count || 0) <= 0;
     };
+    const buildPrimaryExtractionDiagnostic = (data) => ({
+      empty: hasEmptyLightExtraction(data),
+      partial: data == null || extractTimedOut || returnedPartial,
+      bodyTextLength: Number(data && data.bodyTextLength || 0),
+      sampledTextLength: normalizeSubpageJsonLdText(data && data.sampledText).length,
+      titlePresent: !!normalizeSubpageJsonLdText(data && data.title),
+      h1Count: Number(data && data.h1Count || 0),
+      jsonLdCount: Array.isArray(data && data.jsonldTexts) ? data.jsonldTexts.length : Number(data && data.deepJsonLdScriptCount || 0)
+    });
     const runFallbackExtraction = async (reason) => {
       let extractionError = null;
+      let errorType = null;
+      const fallbackStartedAtMs = Date.now();
       const fallbackPromise = page.evaluate(() => {
         const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
         const normal = {};
@@ -4580,17 +4591,71 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         new Promise(resolve => setTimeout(() => resolve(null), Math.min(SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
       ]).catch(e => {
         extractionError = String(e && (e.message || e) || 'fallback_extraction_failed').slice(0, 200);
+        errorType = 'evaluate_error';
         return null;
       });
-      if (!fallback && !extractionError) extractionError = `fallback_extraction_timeout_${SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS}ms`;
+      if (!fallback && !extractionError) {
+        extractionError = `fallback_extraction_timeout_${SUBPAGE_LIGHT_FALLBACK_EXTRACT_TIMEOUT_MS}ms`;
+        errorType = 'timeout';
+      }
+      const durationMs = Math.max(0, Date.now() - fallbackStartedAtMs);
+      const emptyResult = fallback ? hasEmptyLightExtraction(fallback) : true;
       if (fallback) {
         fallback.__fallbackExtraction = true;
         fallback.__fallbackReason = reason;
+        fallback.fallbackExtraction = {
+          attempted: true,
+          success: !emptyResult,
+          skippedReason: null,
+          errorType: null,
+          errorMessage: null,
+          durationMs,
+          emptyResult
+        };
+        fallback.shadowExtraction = {
+          attempted: true,
+          success: fallback.usedShadowDomExtraction === true,
+          skippedReason: null,
+          errorType: null,
+          errorMessage: null,
+          durationMs,
+          emptyResult: fallback.usedShadowDomExtraction !== true,
+          visitedNodes: fallback.__shadow && typeof fallback.__shadow.visitedNodes === 'number' ? fallback.__shadow.visitedNodes : null,
+          capHit: fallback.__shadow && typeof fallback.__shadow.capHit === 'boolean' ? fallback.__shadow.capHit : null,
+          depthLimitHit: fallback.__shadow && typeof fallback.__shadow.depthLimitHit === 'boolean' ? fallback.__shadow.depthLimitHit : null
+        };
       }
-      return { fallback, extractionError };
+      return {
+        fallback,
+        extractionError,
+        fallbackExtraction: fallback && fallback.fallbackExtraction || {
+          attempted: true,
+          success: false,
+          skippedReason: null,
+          errorType,
+          errorMessage: extractionError,
+          durationMs,
+          emptyResult: true
+        },
+        shadowExtraction: fallback && fallback.shadowExtraction || {
+          attempted: true,
+          success: false,
+          skippedReason: null,
+          errorType,
+          errorMessage: extractionError,
+          durationMs,
+          emptyResult: true,
+          visitedNodes: null,
+          capHit: null,
+          depthLimitHit: null
+        }
+      };
     };
     let usedFallbackExtraction = false;
     let extractionError = null;
+    let primaryExtraction = null;
+    let fallbackExtraction = null;
+    let shadowExtraction = null;
     let observed = await Promise.race([
       page.evaluate(() => {
       const detailTimings = {};
@@ -4704,6 +4769,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         resolve(null);
       }, Math.min(SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS, Math.max(1, remainingPageBudgetMs()))))
     ]);
+    primaryExtraction = buildPrimaryExtractionDiagnostic(observed);
     if (reached && navigationCommitted && hasEmptyLightExtraction(observed)) {
       usedFallbackExtraction = true;
       const fallbackResult = await runFallbackExtraction(observed ? 'primary_extraction_empty' : 'primary_extraction_unavailable');
@@ -4711,10 +4777,37 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         observed = Object.assign({}, observed || {}, fallbackResult.fallback);
       }
       extractionError = fallbackResult.extractionError;
+      fallbackExtraction = fallbackResult.fallbackExtraction;
+      shadowExtraction = fallbackResult.shadowExtraction;
+    } else {
+      fallbackExtraction = {
+        attempted: false,
+        success: false,
+        skippedReason: !reached ? 'fallback_skipped_not_reached' : (!navigationCommitted ? 'fallback_skipped_no_navigation_commit' : 'fallback_not_attempted'),
+        errorType: null,
+        errorMessage: null,
+        durationMs: null,
+        emptyResult: false
+      };
+      shadowExtraction = {
+        attempted: false,
+        success: false,
+        skippedReason: 'shadow_not_attempted',
+        errorType: null,
+        errorMessage: null,
+        durationMs: null,
+        emptyResult: false,
+        visitedNodes: null,
+        capHit: null,
+        depthLimitHit: null
+      };
     }
     if (observed) {
       observed.usedFallbackExtraction = usedFallbackExtraction;
       observed.extractionError = extractionError;
+      observed.primaryExtraction = primaryExtraction;
+      observed.fallbackExtraction = fallbackExtraction;
+      observed.shadowExtraction = shadowExtraction;
     }
     try {
       const pageTitleProbe = await Promise.race([
@@ -4816,6 +4909,37 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         externalLinkCount: 0,
         sampledText: '',
         usedFallbackExtraction,
+        usedShadowDomExtraction: false,
+        primaryExtraction: primaryExtraction || {
+          empty: true,
+          partial: true,
+          bodyTextLength: 0,
+          sampledTextLength: 0,
+          titlePresent: false,
+          h1Count: 0,
+          jsonLdCount: 0
+        },
+        fallbackExtraction: fallbackExtraction || {
+          attempted: usedFallbackExtraction === true,
+          success: false,
+          skippedReason: usedFallbackExtraction ? null : 'partial_return_before_extraction',
+          errorType: extractionError ? (/timeout/i.test(extractionError) ? 'timeout' : 'evaluate_error') : null,
+          errorMessage: extractionError,
+          durationMs: null,
+          emptyResult: true
+        },
+        shadowExtraction: shadowExtraction || {
+          attempted: usedFallbackExtraction === true,
+          success: false,
+          skippedReason: usedFallbackExtraction ? null : 'shadow_not_attempted',
+          errorType: extractionError ? (/timeout/i.test(extractionError) ? 'timeout' : 'evaluate_error') : null,
+          errorMessage: extractionError,
+          durationMs: null,
+          emptyResult: true,
+          visitedNodes: null,
+          capHit: null,
+          depthLimitHit: null
+        },
         extractionError,
         error: extractTimedOut ? `subpage_extract_timeout_${SUBPAGE_LIGHT_EXTRACT_TIMEOUT_MS}ms` : 'subpage_extract_unavailable',
         reached,
@@ -4984,6 +5108,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       shadowDomH1Count: Number(observed && observed.shadowDomH1Count || 0),
       shadowDomJsonLdCount: Number(observed && observed.shadowDomJsonLdCount || 0),
       shadowDomLinkCount: Number(observed && observed.shadowDomLinkCount || 0),
+      primaryExtraction: observed && observed.primaryExtraction || primaryExtraction,
+      fallbackExtraction: observed && observed.fallbackExtraction || fallbackExtraction,
+      shadowExtraction: observed && observed.shadowExtraction || shadowExtraction,
       extractionError,
       error: null,
       parseErrors,
@@ -5654,6 +5781,9 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
       shadowDomH1Count: Number(observed.shadowDomH1Count || 0) || 0,
       shadowDomJsonLdCount: Number(observed.shadowDomJsonLdCount || 0) || 0,
       shadowDomLinkCount: Number(observed.shadowDomLinkCount || 0) || 0,
+      primaryExtraction: observed.primaryExtraction && typeof observed.primaryExtraction === 'object' ? observed.primaryExtraction : null,
+      fallbackExtraction: observed.fallbackExtraction && typeof observed.fallbackExtraction === 'object' ? observed.fallbackExtraction : null,
+      shadowExtraction: observed.shadowExtraction && typeof observed.shadowExtraction === 'object' ? observed.shadowExtraction : null,
       extractionError: observed.extractionError ? normalizeSubpageJsonLdText(observed.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(candidatePage.matchedCandidateSources)
         ? candidatePage.matchedCandidateSources.slice(0, 8)
@@ -5689,6 +5819,11 @@ function preserveSelectedCoverageRepresentatives_(coverageSignalsV1, selectedCan
     selectedCandidates,
     observedSubpages: opts && opts.observedSubpages,
     finalRepresentativePages: coverageSignalsV1.representativePages
+  });
+  logSubpageExtractionDiagnosticsPhase15_({
+    origin: opts && opts.origin,
+    responseMode: opts && opts.responseMode || null,
+    coverageSignals: coverageSignalsV1
   });
   return coverageSignalsV1;
 }
@@ -5789,6 +5924,148 @@ function logSubpageLightExtractionFinalMergeAuditPhase13_(payload = {}) {
   } catch (_) {}
 }
 
+function buildSubpageExtractionDiagnostics_(page = {}) {
+  const primarySource = page.primaryExtraction && typeof page.primaryExtraction === 'object'
+    ? page.primaryExtraction
+    : {};
+  const primary = {
+    empty: primarySource.empty === true || (
+      Number(primarySource.bodyTextLength || page.bodyTextLength || 0) <= 0 &&
+      normalizeSubpageJsonLdText(primarySource.sampledText || page.sampledText).length <= 0 &&
+      !normalizeSubpageJsonLdText(primarySource.title || page.title) &&
+      Number(primarySource.h1Count || page.h1Count || 0) <= 0 &&
+      Number(primarySource.jsonLdCount || page.jsonLdCount || 0) <= 0
+    ),
+    partial: primarySource.partial === true || page.returnedPartial === true || page.extractTimedOut === true,
+    bodyTextLength: Number(primarySource.bodyTextLength || 0),
+    sampledTextLength: Number(primarySource.sampledTextLength || 0),
+    titlePresent: primarySource.titlePresent === true,
+    h1Count: Number(primarySource.h1Count || 0),
+    jsonLdCount: Number(primarySource.jsonLdCount || 0)
+  };
+  const fallbackSource = page.fallbackExtraction && typeof page.fallbackExtraction === 'object'
+    ? page.fallbackExtraction
+    : {};
+  const shadowSource = page.shadowExtraction && typeof page.shadowExtraction === 'object'
+    ? page.shadowExtraction
+    : {};
+  const q = page.observationQuality && typeof page.observationQuality === 'object'
+    ? page.observationQuality
+    : buildRepresentativeObservationQuality_(page);
+  const finalContentTextLength = Number(page.bodyTextLength || 0) || normalizeSubpageJsonLdText(page.sampledText).length;
+  const finalJsonLdCount = Number(page.jsonLdCount || 0) || (Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes.length : 0);
+  return {
+    primary,
+    fallback: {
+      attempted: fallbackSource.attempted === true || page.usedFallbackExtraction === true,
+      success: fallbackSource.success === true || (page.usedFallbackExtraction === true && !page.extractionError),
+      skippedReason: fallbackSource.skippedReason || null,
+      errorType: fallbackSource.errorType || null,
+      errorMessage: fallbackSource.errorMessage ? String(fallbackSource.errorMessage).slice(0, 180) : null,
+      durationMs: typeof fallbackSource.durationMs === 'number' ? fallbackSource.durationMs : null,
+      emptyResult: fallbackSource.emptyResult === true
+    },
+    shadow: {
+      attempted: shadowSource.attempted === true || page.usedFallbackExtraction === true,
+      success: shadowSource.success === true || page.usedShadowDomExtraction === true,
+      skippedReason: shadowSource.skippedReason || null,
+      errorType: shadowSource.errorType || null,
+      errorMessage: shadowSource.errorMessage ? String(shadowSource.errorMessage).slice(0, 180) : null,
+      durationMs: typeof shadowSource.durationMs === 'number' ? shadowSource.durationMs : null,
+      emptyResult: shadowSource.emptyResult === true || (page.usedFallbackExtraction === true && page.usedShadowDomExtraction !== true),
+      visitedNodes: typeof shadowSource.visitedNodes === 'number' ? shadowSource.visitedNodes : (typeof page.shadowDomVisitedNodes === 'number' ? page.shadowDomVisitedNodes : null),
+      capHit: typeof shadowSource.capHit === 'boolean' ? shadowSource.capHit : null,
+      depthLimitHit: typeof shadowSource.depthLimitHit === 'boolean' ? shadowSource.depthLimitHit : null
+    },
+    final: {
+      source: page.finalMergeSource || (page.reached === true || page.navigationCommitted === true ? 'observed' : (page.candidateOnly === true ? 'fallbackPreserved' : 'selectedCandidate')),
+      contentTextLength: finalContentTextLength,
+      titlePresent: !!normalizeSubpageJsonLdText(page.title),
+      h1Count: Number(page.h1Count || 0),
+      jsonLdCount: finalJsonLdCount,
+      mainLikeFound: page.hasMain === true || page.hasMainLandmark === true,
+      navLikeFound: page.hasNavLike === true,
+      footerLikeFound: page.hasFooterLike === true,
+      internalLinkCount: Number(page.internalLinkCount || 0),
+      sameOriginLinkCount: Number(page.sameOriginLinkCount || page.internalLinkCount || 0),
+      qualityLevel: q.level || null,
+      reasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 12) : []
+    }
+  };
+}
+
+function summarizeRepresentativeExtractionDiagnostics_(pages = []) {
+  return (Array.isArray(pages) ? pages : []).reduce((acc, page) => {
+    const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
+    acc.total += 1;
+    if (d.primary && d.primary.empty === true) acc.primaryEmpty += 1;
+    if (d.primary && d.primary.partial === true) acc.primaryPartial += 1;
+    if (d.fallback && d.fallback.attempted === true) acc.fallbackAttempted += 1;
+    if (d.fallback && d.fallback.success === true) acc.fallbackSuccess += 1;
+    if (d.fallback && d.fallback.errorType === 'timeout') acc.fallbackTimeout += 1;
+    if (d.fallback && d.fallback.errorType === 'evaluate_error') acc.fallbackEvaluateError += 1;
+    if (d.fallback && d.fallback.emptyResult === true) acc.fallbackEmptyResult += 1;
+    if (d.shadow && d.shadow.attempted === true) acc.shadowAttempted += 1;
+    if (d.shadow && d.shadow.success === true) acc.shadowSuccess += 1;
+    if (d.shadow && d.shadow.errorType === 'timeout') acc.shadowTimeout += 1;
+    if (d.shadow && d.shadow.errorType === 'evaluate_error') acc.shadowEvaluateError += 1;
+    if (d.shadow && d.shadow.emptyResult === true) acc.shadowEmptyResult += 1;
+    if (d.final && d.final.source === 'observed') acc.finalObservedMatch += 1;
+    if (d.final && (d.final.source === 'selectedCandidate' || d.final.source === 'fallbackPreserved')) acc.finalPreservedCandidate += 1;
+    return acc;
+  }, {
+    total: 0,
+    fallbackAttempted: 0,
+    fallbackSuccess: 0,
+    fallbackTimeout: 0,
+    fallbackEvaluateError: 0,
+    fallbackEmptyResult: 0,
+    shadowAttempted: 0,
+    shadowSuccess: 0,
+    shadowTimeout: 0,
+    shadowEvaluateError: 0,
+    shadowEmptyResult: 0,
+    primaryEmpty: 0,
+    primaryPartial: 0,
+    finalObservedMatch: 0,
+    finalPreservedCandidate: 0
+  });
+}
+
+function logSubpageExtractionDiagnosticsPhase15_(payload = {}) {
+  try {
+    const coverageSignals = payload.coverageSignals && typeof payload.coverageSignals === 'object' ? payload.coverageSignals : {};
+    const pages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
+    console.log('[DEBUG][SUBPAGE_EXTRACTION_DIAGNOSTICS_PHASE15]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      responseMode: payload.responseMode || null,
+      observedCount: typeof coverageSignals.observedCount === 'number'
+        ? coverageSignals.observedCount
+        : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+      representativePagesCount: pages.length,
+      summary: coverageSignals.representativeExtractionDiagnostics || summarizeRepresentativeExtractionDiagnostics_(pages),
+      pages: pages.slice(0, 8).map(page => {
+        const d = page && page.extractionDiagnostics || buildSubpageExtractionDiagnostics_(page || {});
+        const q = page && page.observationQuality || {};
+        return {
+          path: String(page && page.path || '').slice(0, 160),
+          pageType: String(page && page.pageType || '').slice(0, 80),
+          canonicalPageFamily: String(page && page.canonicalPageFamily || '').slice(0, 80),
+          candidateOnly: page && page.candidateOnly === true,
+          reached: page && page.reached === true,
+          navigationCommitted: page && page.navigationCommitted === true,
+          qualityLevel: q.level || d.final && d.final.qualityLevel || null,
+          reasons: Array.isArray(q.reasons) ? q.reasons.slice(0, 8) : (d.final && d.final.reasons || []),
+          primary: d.primary,
+          fallback: d.fallback,
+          shadow: d.shadow,
+          final: d.final
+        };
+      })
+    }));
+  } catch (_) {}
+}
+
 function buildRepresentativeObservationQuality_(page) {
   const reached = page && (page.reached === true || page.navigationCommitted === true || page.candidateOnly === false);
   const navigationCommitted = page && Object.prototype.hasOwnProperty.call(page, 'navigationCommitted')
@@ -5861,9 +6138,14 @@ function attachRepresentativeObservationQuality_(coverageSignals) {
   const pages = Array.isArray(coverageSignals.representativePages)
     ? coverageSignals.representativePages
     : [];
-  coverageSignals.representativePages = pages.map(page => Object.assign({}, page, {
-    observationQuality: buildRepresentativeObservationQuality_(page)
-  }));
+  coverageSignals.representativePages = pages.map(page => {
+    const withQuality = Object.assign({}, page, {
+      observationQuality: buildRepresentativeObservationQuality_(page)
+    });
+    return Object.assign(withQuality, {
+      extractionDiagnostics: buildSubpageExtractionDiagnostics_(withQuality)
+    });
+  });
   const summary = coverageSignals.representativePages.reduce((acc, page) => {
     const q = page && page.observationQuality || {};
     acc.total += 1;
@@ -5875,6 +6157,7 @@ function attachRepresentativeObservationQuality_(coverageSignals) {
     return acc;
   }, { total: 0, attempted: 0, reached: 0, good: 0, partial: 0, weak: 0, failed: 0, candidateOnly: 0, observed: 0 });
   coverageSignals.representativeObservationQuality = summary;
+  coverageSignals.representativeExtractionDiagnostics = summarizeRepresentativeExtractionDiagnostics_(coverageSignals.representativePages);
   coverageSignals.representativePagesCount = coverageSignals.representativePages.length;
   coverageSignals.observedSubpageCount = summary.reached;
   coverageSignals.observedCount = summary.reached;
@@ -6143,10 +6426,13 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       usedFallbackExtraction: page.usedFallbackExtraction === true,
       usedShadowDomExtraction: page.usedShadowDomExtraction === true,
       shadowDomTextLength: Number(page.shadowDomTextLength || 0) || 0,
-      shadowDomH1Count: Number(page.shadowDomH1Count || 0) || 0,
-      shadowDomJsonLdCount: Number(page.shadowDomJsonLdCount || 0) || 0,
-      shadowDomLinkCount: Number(page.shadowDomLinkCount || 0) || 0,
-      extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
+        shadowDomH1Count: Number(page.shadowDomH1Count || 0) || 0,
+        shadowDomJsonLdCount: Number(page.shadowDomJsonLdCount || 0) || 0,
+        shadowDomLinkCount: Number(page.shadowDomLinkCount || 0) || 0,
+        primaryExtraction: page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
+        fallbackExtraction: page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
+        shadowExtraction: page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
+        extractionError: page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
         matchedCandidateSources: Array.isArray(candidate.sources)
           ? candidate.sources.slice(0, 8)
           : (candidate.source ? [candidate.source] : [])
@@ -6249,6 +6535,9 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       shadowDomH1Count: Number(page && page.shadowDomH1Count || 0) || 0,
       shadowDomJsonLdCount: Number(page && page.shadowDomJsonLdCount || 0) || 0,
       shadowDomLinkCount: Number(page && page.shadowDomLinkCount || 0) || 0,
+      primaryExtraction: page && page.primaryExtraction && typeof page.primaryExtraction === 'object' ? page.primaryExtraction : null,
+      fallbackExtraction: page && page.fallbackExtraction && typeof page.fallbackExtraction === 'object' ? page.fallbackExtraction : null,
+      shadowExtraction: page && page.shadowExtraction && typeof page.shadowExtraction === 'object' ? page.shadowExtraction : null,
       extractionError: page && page.extractionError ? normalizeSubpageJsonLdText(page.extractionError).slice(0, 160) : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
