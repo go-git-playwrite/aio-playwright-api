@@ -4445,6 +4445,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
   const notes = [];
   if (observedPages.length === 0 && observations.length > 0) notes.push('no_observed_subpages_but_observation_attempted');
+  if (String(payload && payload.subpageObservationMode || '').toLowerCase() === 'htmlfetchonly') {
+    notes.push('subpage_observation_mode_html_fetch_only');
+  }
   return {
     version: 'coverageSignalsV1',
     generatedAt: new Date().toISOString(),
@@ -4631,6 +4634,8 @@ function buildLightweightSubpageSignalsSummary_(subpageSignals) {
 
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
+  const subpageObservationMode = String(opts && opts.subpageObservationMode || '').toLowerCase();
+  const htmlFetchOnlySubpageObservation = subpageObservationMode === 'htmlfetchonly' || subpageObservationMode === 'html-fetch-only';
   const traceCoverageMemory = (phase, extra = {}) => {
     try {
       console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify(Object.assign({
@@ -4692,7 +4697,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const guardHost = (() => {
       try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
     })();
-    if (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com') {
+    if (!htmlFetchOnlySubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
       const skipReason = 'memory_guard_ahamo_representative_observation';
       const coverageSignals = {
         version: 'coverageSignalsV1',
@@ -4813,9 +4818,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       siteMode: 'generic'
     });
     const htmlPages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
-    const playwrightCandidates = selectedCandidates.filter((candidate, index) => {
-      return !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
-    });
+    const playwrightCandidates = htmlFetchOnlySubpageObservation
+      ? []
+      : selectedCandidates.filter((candidate, index) => {
+          return !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
+        });
     const playwrightObserved = playwrightCandidates.length
       ? await observeSubpageJsonLdLightUrls_(playwrightCandidates.map(candidate => candidate.url), {
           siteMode: 'generic',
@@ -4912,7 +4919,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         observedCount: observations.length
       },
       candidates: selectedCandidates,
-      observations
+      observations,
+      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
     };
     const subpageSignals = buildSubpageSignalsV1FromSubpageObservation_(payload);
     if (subpageSignals) {
@@ -8641,6 +8649,7 @@ async function scrapeOnce(req, res) {
   const signalsOnly = String(req.query.signalsOnly || '').toLowerCase() === '1';
   const signalsMode = String(req.query.signalsMode || '').toLowerCase();
   const responseMode = String(req.query.responseMode || '').toLowerCase();
+  const subpageObservationMode = String(req.query.subpageObservationMode || '').toLowerCase();
   const observerMode = String(req.query.observer || '').toLowerCase();
   const signalsFirstLight = signalsMode === 'light' || responseMode === 'signals-first' || responseMode === 'signalsfirst';
   const signalsFirstBalanced = signalsMode === 'balanced' || signalsMode === 'balancedshort' || signalsMode === 'balancedfast' || responseMode === 'signals-balanced' || responseMode === 'signalsbalanced';
@@ -11811,7 +11820,8 @@ async function scrapeOnce(req, res) {
         page,
         context,
         reuseBrowser: true,
-        maxObserve: 2
+        maxObserve: 2,
+        subpageObservationMode
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
