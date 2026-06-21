@@ -11702,6 +11702,22 @@ async function scrapeOnce(req, res) {
         diagnostics,
         memoryHints
       };
+      const logScrapeResponseReadyAudit = payload => {
+        try {
+          const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
+          console.log('[DEBUG][SCRAPE_RESPONSE_READY_AUDIT]', JSON.stringify({
+            route: '/scrape',
+            mode: payload && (payload.responseMode || payload.mode) || (signalsMode || responseMode || null),
+            url: payload && payload.url || urlToFetch,
+            finalUrl: payload && payload.finalUrl || finalUrl,
+            hasGeoSignalsV1: Boolean(payload && payload.geoSignalsV1),
+            hasCoverageSignals: Boolean(coverageSignals),
+            coverageAttached: Boolean(coverageSignals && coverageSignals.checked),
+            observedSubpageCount: coverageSignals ? coverageSignals.observedSubpageCount : null,
+            responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 20) : []
+          }));
+        } catch (_) {}
+      };
       if (balancedShortResponse) {
         const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
         if (balancedShortFastResponse) {
@@ -11731,8 +11747,10 @@ async function scrapeOnce(req, res) {
           navLinkCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.navLinkCount,
           jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
         });
+        logScrapeResponseReadyAudit(shortPayload);
         return res.status(200).json(shortPayload);
       }
+      logScrapeResponseReadyAudit(signalsResponsePayload);
       return res.status(200).json(signalsResponsePayload);
     }
     if (signalsOnly) {
