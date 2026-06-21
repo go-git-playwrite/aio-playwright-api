@@ -6551,6 +6551,131 @@ function logSignalsLightPartialReturnMergeAudit_(payload = {}) {
   } catch (_) {}
 }
 
+function summarizeTopSignalSnapshotPhase16B_(geoSignalsV1) {
+  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const structuredData = geo.structuredData && typeof geo.structuredData === 'object' ? geo.structuredData : {};
+  const headings = geo.headings && typeof geo.headings === 'object' ? geo.headings : {};
+  const coverageSignals = geo.coverageSignals && typeof geo.coverageSignals === 'object' ? geo.coverageSignals : {};
+  const representativePages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
+  return {
+    structuredData: {
+      hasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
+      hasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
+      hasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
+      rawCount: typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null,
+      renderedDomRawCount: typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null,
+      source: structuredData.source || null,
+      observationLimited: Object.prototype.hasOwnProperty.call(structuredData, 'observationLimited') ? structuredData.observationLimited : null
+    },
+    headings: {
+      h1Count: typeof headings.h1Count === 'number' ? headings.h1Count : null,
+      hasH1: Object.prototype.hasOwnProperty.call(headings, 'hasH1') ? headings.hasH1 : null,
+      source: headings.source || null,
+      h1Source: headings.h1Source || null,
+      headingObservationLimited: Object.prototype.hasOwnProperty.call(headings, 'headingObservationLimited') ? headings.headingObservationLimited : null,
+      primaryHeadingCandidate: headings.primaryHeadingCandidate || null
+    },
+    coverageSignals: {
+      observedCount: typeof coverageSignals.observedCount === 'number'
+        ? coverageSignals.observedCount
+        : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+      representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
+        ? coverageSignals.representativePagesCount
+        : representativePages.length,
+      reason: coverageSignals.reason || coverageSignals.error || null
+    }
+  };
+}
+
+function logSignalsLightTopSignalSnapshotPhase16B_(payload = {}) {
+  try {
+    const summary = summarizeTopSignalSnapshotPhase16B_(payload.geoSignalsV1);
+    console.log('[DEBUG][SIGNALS_LIGHT_TOP_SIGNAL_SNAPSHOT_PHASE16B]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      stage: payload.stage || '',
+      earlyReturnReason: payload.earlyReturnReason || null,
+      structuredData: summary.structuredData,
+      headings: summary.headings,
+      coverageSignals: summary.coverageSignals
+    }));
+  } catch (_) {}
+}
+
+function normalizePartialReturnStructuredDataUnknownSafe_(structuredData) {
+  if (!structuredData || typeof structuredData !== 'object') return structuredData;
+  const rawCount = typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null;
+  const renderedDomRawCount = typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null;
+  const htmlScanSkipped = structuredData.htmlScanSkipped === true;
+  const jsScanSkipped = structuredData.jsScanSkipped === true;
+  const chunkScanSkipped = structuredData.chunkScanSkipped === true;
+  const limitedRenderedOnly = structuredData.observationLimited === true && htmlScanSkipped && jsScanSkipped && chunkScanSkipped;
+  const emptyRenderedOnly = limitedRenderedOnly && Number(rawCount || 0) === 0 && Number(renderedDomRawCount || 0) === 0;
+  if (!emptyRenderedOnly) return structuredData;
+  [
+    'hasJsonLd',
+    'hasSeoJsonLd',
+    'hasWebsite',
+    'hasOrganization',
+    'hasBreadcrumbList',
+    'hasFAQPage',
+    'breadcrumbObserved',
+    'breadcrumbMissing'
+  ].forEach(key => {
+    if (Object.prototype.hasOwnProperty.call(structuredData, key)) structuredData[key] = null;
+  });
+  structuredData.rawCount = null;
+  structuredData.parseableCount = null;
+  structuredData.partialReturnUnknownSafe = true;
+  if (structuredData.organizationSummary && typeof structuredData.organizationSummary === 'object') {
+    structuredData.organizationSummary = Object.assign({}, structuredData.organizationSummary, {
+      observed: null,
+      hasOrganization: null,
+      partialReturnUnknownSafe: true
+    });
+  }
+  if (structuredData.sameAsSummary && typeof structuredData.sameAsSummary === 'object') {
+    structuredData.sameAsSummary = Object.assign({}, structuredData.sameAsSummary, {
+      observed: null,
+      count: null,
+      externalCount: null,
+      hasOrganizationSameAs: null,
+      hasWebSiteSameAs: null,
+      hasPersonSameAs: null,
+      partialReturnUnknownSafe: true
+    });
+  }
+  return structuredData;
+}
+
+function normalizePartialReturnHeadingsUnknownSafe_(headings) {
+  if (!headings || typeof headings !== 'object') return headings;
+  const h1Count = typeof headings.h1Count === 'number' ? headings.h1Count : null;
+  const notObserved = (headings.source === 'not_observed' || headings.h1Source === 'not_observed') && headings.headingObservationLimited === true;
+  if (h1Count === 0 && notObserved) {
+    headings.h1Count = null;
+    headings.hasH1 = null;
+    headings.hasSingleH1 = null;
+    headings.partialReturnUnknownSafe = true;
+  }
+  return headings;
+}
+
+function normalizeGeoSignalsPartialReturnUnknownSafe_(geoSignalsV1) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return geoSignalsV1;
+  normalizePartialReturnStructuredDataUnknownSafe_(geoSignalsV1.structuredData);
+  normalizePartialReturnHeadingsUnknownSafe_(geoSignalsV1.headings);
+  if (geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object') {
+    normalizePartialReturnStructuredDataUnknownSafe_(geoSignalsV1.observed.structuredData);
+    if (geoSignalsV1.observed.h1 && typeof geoSignalsV1.observed.h1 === 'object' && geoSignalsV1.observed.h1.count === 0 && geoSignalsV1.observed.h1.source === 'not_observed') {
+      geoSignalsV1.observed.h1.count = null;
+      geoSignalsV1.observed.h1.hasH1 = null;
+      geoSignalsV1.observed.h1.hasSingleH1 = null;
+      geoSignalsV1.observed.h1.partialReturnUnknownSafe = true;
+    }
+  }
+  return geoSignalsV1;
+}
+
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -15411,6 +15536,12 @@ async function scrapeOnce(req, res) {
       }
       const baseGeoSignalsForPartialReturn = snapshotGeoSignalsTopBranchesForPartialMerge_(geoSignalsV1);
       const baseGeoSignalsPartialReturnSummary = summarizeGeoSignalsTopSignalsForPartialMerge_(geoSignalsV1);
+      logSignalsLightTopSignalSnapshotPhase16B_({
+        origin: watchdogOrigin(),
+        stage: 'after_build_geo',
+        earlyReturnReason: null,
+        geoSignalsV1
+      });
       logWatchdog('top_observation_complete', geoSignalsWatchdogStartedAt);
       const subpageObservationPhase11State = {
         debugRunId,
@@ -15449,6 +15580,12 @@ async function scrapeOnce(req, res) {
         errorMessage: subpageObservationPhase11State.errorMessage || null
       });
       if (subpageObservationPhase11State.fallbackReason === 'partial_subpage_observation_timeout') {
+        logSignalsLightTopSignalSnapshotPhase16B_({
+          origin: watchdogOrigin(),
+          stage: 'before_partial_restore',
+          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
+          geoSignalsV1
+        });
         const coverageSignalsForPartialReturn = geoSignalsV1 && geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'
           ? geoSignalsV1.coverageSignals
           : null;
@@ -15458,6 +15595,13 @@ async function scrapeOnce(req, res) {
         restoreGeoSignalsTopBranchesForPartialReturn_(geoSignalsV1, baseGeoSignalsForPartialReturn);
         if (coverageSignalsForPartialReturn) geoSignalsV1.coverageSignals = coverageSignalsForPartialReturn;
         if (subpageSignalsForPartialReturn) geoSignalsV1.subpageSignals = subpageSignalsForPartialReturn;
+        normalizeGeoSignalsPartialReturnUnknownSafe_(geoSignalsV1);
+        logSignalsLightTopSignalSnapshotPhase16B_({
+          origin: watchdogOrigin(),
+          stage: 'after_partial_restore',
+          earlyReturnReason: subpageObservationPhase11State.fallbackReason,
+          geoSignalsV1
+        });
         logSignalsLightPartialReturnMergeAudit_({
           origin: watchdogOrigin(),
           earlyReturnReason: subpageObservationPhase11State.fallbackReason,
@@ -16042,6 +16186,12 @@ async function scrapeOnce(req, res) {
       if (signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals) {
         attachRepresentativeObservationQuality_(signalsResponsePayload.geoSignalsV1.coverageSignals);
       }
+      logSignalsLightTopSignalSnapshotPhase16B_({
+        origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
+        stage: 'before_final_response',
+        earlyReturnReason: signalsResponsePayload && signalsResponsePayload.earlyReturnReason || null,
+        geoSignalsV1: signalsResponsePayload && signalsResponsePayload.geoSignalsV1
+      });
       logRepresentativeFinalResponsePhase12Audit_({
         route: '/scrape',
         mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
