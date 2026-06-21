@@ -6508,6 +6508,38 @@ function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   }
 }
 
+function logRepresentativeCandidateSourcePhase16BAudit_(payload = {}) {
+  try {
+    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+    const selectedCandidates = Array.isArray(payload.selectedCandidates) ? payload.selectedCandidates : [];
+    const preservedRepresentativePages = Array.isArray(payload.preservedRepresentativePages) ? payload.preservedRepresentativePages : [];
+    const finalRepresentativePages = Array.isArray(payload.finalRepresentativePages) ? payload.finalRepresentativePages : [];
+    const countBySource = (sourceName) => candidates.filter(candidate => {
+      const sources = Array.isArray(candidate && candidate.sources)
+        ? candidate.sources
+        : (candidate && candidate.source ? [candidate.source] : []);
+      return sources.includes(sourceName);
+    }).length;
+    console.log('[DEBUG][REPRESENTATIVE_CANDIDATE_SOURCE_PHASE16B_AUDIT]', JSON.stringify({
+      origin: String(payload.origin || '').slice(0, 180),
+      candidateSourceSummary: payload.candidateSourceSummary || {},
+      rawCandidateCount: candidates.length,
+      sitemapCandidateCount: countBySource('sitemap'),
+      navCandidateCount: countBySource('nav'),
+      footerCandidateCount: countBySource('footer'),
+      otherCandidateCount: Math.max(0, candidates.length - countBySource('sitemap') - countBySource('nav') - countBySource('footer')),
+      afterHardExcludeCount: Number(payload.afterHardExcludeCount || 0),
+      selectionInputCount: Number(payload.selectionInputCount || 0),
+      selectedCandidatesCount: selectedCandidates.length,
+      preservedRepresentativePagesCount: preservedRepresentativePages.length,
+      finalRepresentativePagesCount: finalRepresentativePages.length,
+      reason: String(payload.reason || '').slice(0, 160),
+      selectedPaths: selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean).slice(0, 10),
+      finalPaths: finalRepresentativePages.map(page => String(page && page.path || '').slice(0, 160)).filter(Boolean).slice(0, 10)
+    }));
+  } catch (_) {}
+}
+
 function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
@@ -7389,22 +7421,22 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       debugRunId: phase11DebugRunId
     }), subpageGuardMs, 'subpage_discovery');
     lastDiscoveredForCoverage = discovered;
-    const allPrioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
-    const primaryRepresentativeCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(discovered.candidates)).slice(0, maxObserve);
-    const selectedCandidates = selectCoverageRepresentativeCandidates_(discovered.candidates, maxObserve, {
-      debugRunId: phase11DebugRunId,
-      origin: normalized.origin,
-      reason: 'coverage_observe_selection'
-    });
-    lastSelectedCandidatesForCoverage = selectedCandidates;
-    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
     const auditCandidates = discovered && discovered._audit && Array.isArray(discovered._audit.allCandidates)
       ? discovered._audit.allCandidates
       : discovered.candidates;
     const coverageCandidates = Array.isArray(auditCandidates) && auditCandidates.length
       ? auditCandidates
       : discovered.candidates;
-    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(discovered.candidates, 4, {
+    const allPrioritizedCandidates = sortCoverageObserveCandidates_(coverageCandidates);
+    const primaryRepresentativeCandidates = sortCoverageObserveCandidates_(filterCoverageRepresentativeCandidates_(coverageCandidates)).slice(0, maxObserve);
+    const selectedCandidates = selectCoverageRepresentativeCandidates_(coverageCandidates, maxObserve, {
+      debugRunId: phase11DebugRunId,
+      origin: normalized.origin,
+      reason: 'coverage_observe_selection'
+    });
+    lastSelectedCandidatesForCoverage = selectedCandidates;
+    const primaryRepresentativeKeys = new Set(primaryRepresentativeCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
+    const auditRepresentativePages = buildLightweightRepresentativePagesFromCandidates_(coverageCandidates, 4, {
       debugRunId: phase11DebugRunId,
       origin: normalized.origin,
       reason: 'audit_representative_preview'
@@ -7465,6 +7497,17 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       representativePages: auditRepresentativePages,
       hasSubpageSignals: !!(geoSignalsV1 && geoSignalsV1.subpageSignals)
     });
+    logRepresentativeCandidateSourcePhase16BAudit_({
+      origin: normalized.origin,
+      candidateSourceSummary: discovered.sourceSummary,
+      candidates: coverageCandidates,
+      afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+      selectionInputCount: coverageCandidates.length,
+      selectedCandidates,
+      preservedRepresentativePages: auditRepresentativePages,
+      finalRepresentativePages: auditRepresentativePages,
+      reason: 'after_representative_selection'
+    });
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = allPrioritizedCandidates
       .filter(candidate => !selectedCandidates.some(item => String(item && item.url || '') === String(candidate && candidate.url || '')))
@@ -7489,10 +7532,26 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       observeCount: selectedCandidates.length
     });
     if (!selectedCandidates.length) {
-      const emptyCoverageSignals = attachEmptySignals('no_subpage_candidates', discovered);
+      const noCandidateReason = coverageCandidates.length
+        ? 'no_representative_candidates_after_hard_exclude'
+        : 'no_subpage_candidates';
+      const emptyCoverageSignals = attachEmptySignals(noCandidateReason, discovered, auditRepresentativePages.length ? coverageCandidates : []);
       logPayload.origin = normalized.origin;
-      logPayload.reason = 'no_subpage_candidates';
-      setPhase11State({ fallbackReason: 'no_subpage_candidates' });
+      logPayload.reason = noCandidateReason;
+      setPhase11State({ fallbackReason: noCandidateReason });
+      logRepresentativeCandidateSourcePhase16BAudit_({
+        origin: normalized.origin,
+        candidateSourceSummary: discovered.sourceSummary,
+        candidates: coverageCandidates,
+        afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+        selectionInputCount: coverageCandidates.length,
+        selectedCandidates,
+        preservedRepresentativePages: auditRepresentativePages,
+        finalRepresentativePages: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+          ? geoSignalsV1.coverageSignals.representativePages
+          : [],
+        reason: noCandidateReason
+      });
       traceCoverageMemory('attach_skip_no_candidates', {
         candidateCount: discovered.totalCandidates
       });
@@ -7615,7 +7674,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'coverage_representative_assign_start',
       reason: 'assign coverageSignals representativePages',
       candidateCount: discovered.totalCandidates,
-      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
+      eligibleCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
       selectedCount: selectedCandidates.length,
       backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
       finalCount: Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : 0,
@@ -7636,7 +7695,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       phase: 'coverage_representative_assign_complete',
       reason: 'assigned coverageSignals representativePages',
       candidateCount: discovered.totalCandidates,
-      eligibleCount: filterCoverageRepresentativeCandidates_(discovered.candidates).length,
+      eligibleCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
       selectedCount: selectedCandidates.length,
       backfillCount: Math.max(0, selectedCandidates.length - primaryRepresentativeCandidates.length),
       finalCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
@@ -7646,6 +7705,21 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       afterCount: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
         ? geoSignalsV1.coverageSignals.representativePages.length
         : 0
+    });
+    logRepresentativeCandidateSourcePhase16BAudit_({
+      origin: normalized.origin,
+      candidateSourceSummary: discovered.sourceSummary,
+      candidates: coverageCandidates,
+      afterHardExcludeCount: filterCoverageRepresentativeCandidates_(coverageCandidates).length,
+      selectionInputCount: coverageCandidates.length,
+      selectedCandidates,
+      preservedRepresentativePages: coverageSignalsV1 && Array.isArray(coverageSignalsV1.representativePages)
+        ? coverageSignalsV1.representativePages
+        : [],
+      finalRepresentativePages: geoSignalsV1 && geoSignalsV1.coverageSignals && Array.isArray(geoSignalsV1.coverageSignals.representativePages)
+        ? geoSignalsV1.coverageSignals.representativePages
+        : [],
+      reason: 'final_coverage_assignment'
     });
     logSubpageCoverageSignalsFinalAudit_({
       route: '/scrape',
