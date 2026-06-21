@@ -159,6 +159,7 @@ const PQueue = require('p-queue').default;
 const BUILD_TAG = 'scrape-v5-bundle-cache-07-scoring-fallback';
 const app = express();
 const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: '64kb' }));
 
 function logSfMemory(label) {
   try {
@@ -2900,6 +2901,2134 @@ app.get('/healthz', (_, res) => {
   res.status(200).json({ ok: true, rss: m.rss, heapUsed: m.heapUsed });
 });
 
+// -------------------- Subpage JSON-LD light batch --------------------
+function normalizeSubpageJsonLdText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeSubpageJsonLdType(value) {
+  return normalizeSubpageJsonLdText(value).replace(/^https?:\/\/schema\.org\//i, '');
+}
+
+function isBlockedSubpageJsonLdHost(hostname) {
+  const host = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === 'metadata.google.internal' || host.endsWith('.metadata.google.internal')) return true;
+  if (/metadata/i.test(host) && /(google|cloud|aws|azure|instance|internal)/i.test(host)) return true;
+  if (host === '169.254.169.254') return true;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const parts = host.split('.').map(n => Number(n));
+    if (parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true;
+    const a = parts[0];
+    const b = parts[1];
+    if (a === 0 || a === 10 || a === 127 || a === 169 && b === 254 || a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  if (/^fc|^fd/i.test(host)) return true;
+  if (/^fe[89ab]/i.test(host)) return true;
+  return false;
+}
+
+function collectSubpageJsonLdTypes(node, out, depth = 0) {
+  if (!node || depth > 10) return;
+  if (Array.isArray(node)) {
+    node.forEach(item => collectSubpageJsonLdTypes(item, out, depth + 1));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  const typeValue = node['@type'];
+  const types = Array.isArray(typeValue) ? typeValue : (typeValue ? [typeValue] : []);
+  types.forEach(type => {
+    const normalized = normalizeSubpageJsonLdType(type);
+    if (normalized) out.push(normalized);
+  });
+  if (Array.isArray(node['@graph'])) {
+    node['@graph'].forEach(item => collectSubpageJsonLdTypes(item, out, depth + 1));
+  }
+  Object.keys(node).forEach(key => {
+    if (key === '@graph' || key === '@type') return;
+    const value = node[key];
+    if (value && typeof value === 'object') collectSubpageJsonLdTypes(value, out, depth + 1);
+  });
+}
+
+function countSubpageJsonLdTypes(types) {
+  const counts = {};
+  (Array.isArray(types) ? types : []).forEach(type => {
+    const normalized = normalizeSubpageJsonLdType(type);
+    if (!normalized) return;
+    counts[normalized] = (counts[normalized] || 0) + 1;
+  });
+  return counts;
+}
+
+function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
+  const typeSet = new Set((Array.isArray(jsonldTypes) ? jsonldTypes : []).map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+  const path = (() => {
+    try { return new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { return String(url || '').toLowerCase(); }
+  })();
+  if (typeSet.has('product') || typeSet.has('offer')) return 'product';
+  if (typeSet.has('faqpage')) return 'faq';
+  if (typeSet.has('article') || typeSet.has('newsarticle') || typeSet.has('blogposting')) return 'article';
+  if (typeSet.has('breadcrumblist')) return 'category_or_detail';
+  if (/\/(?:faq|faqs|guide|guides|help|support)(?:\/|$|-|_)/i.test(path)) return 'faq';
+  if (/\/(?:product|products|item|items)(?:\/|$|-|_)/i.test(path)) return 'product';
+  if (/\/(?:category|categories|collections|collection)(?:\/|$|-|_)/i.test(path)) return 'category';
+  return siteMode === 'ec' && /\/collections?\//i.test(path) ? 'category' : 'unknown';
+}
+
+function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
+  const $ = cheerio.load(String(html || ''));
+  const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
+  const canonicalRaw = normalizeSubpageJsonLdText($('link[rel~="canonical" i]').first().attr('href') || '');
+  let canonical = canonicalRaw;
+  if (canonicalRaw) {
+    try { canonical = new URL(canonicalRaw, finalUrl || url).toString(); } catch (_) {}
+  }
+  const h1Texts = [];
+  $('h1').each((_, el) => {
+    const text = normalizeSubpageJsonLdText($(el).text());
+    if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
+  });
+  const jsonldTypes = [];
+  let parseErrors = 0;
+  $('script[type*="ld+json" i]').each((_, el) => {
+    const raw = String($(el).contents().text() || $(el).html() || '').trim();
+    if (!raw) return;
+    try {
+      collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+    } catch (_) {
+      parseErrors += 1;
+    }
+  });
+  const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+  const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
+  const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+  const breadcrumbSelector = [
+    'nav[aria-label*="breadcrumb" i]',
+    '[aria-label*="パンくず"]',
+    '[class*="breadcrumb" i]',
+    '[id*="breadcrumb" i]',
+    '[class*="breadcrumbs" i]',
+    '[id*="breadcrumbs" i]',
+    '[class*="pankuzu" i]',
+    '[id*="pankuzu" i]'
+  ].join(',');
+  let hasBreadcrumbUi = $(breadcrumbSelector).length > 0;
+  if (!hasBreadcrumbUi) {
+    $('nav, ol, ul, div').slice(0, 200).each((_, el) => {
+      if (hasBreadcrumbUi) return;
+      const attrs = [
+        $(el).attr('class'),
+        $(el).attr('id'),
+        $(el).attr('aria-label')
+      ].map(v => normalizeSubpageJsonLdText(v).toLowerCase()).join(' ');
+      const text = normalizeSubpageJsonLdText($(el).text()).slice(0, 120);
+      if (/(breadcrumb|breadcrumbs|pankuzu)/i.test(attrs) || /パンくず/.test(attrs) || /パンくず/.test(text)) {
+        hasBreadcrumbUi = true;
+      }
+    });
+  }
+  return {
+    url,
+    finalUrl: finalUrl || url,
+    status,
+    ok: true,
+    pageType: inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes),
+    title,
+    canonical,
+    h1Count: $('h1').length,
+    h1Texts,
+    jsonldTypes: uniqueTypes,
+    jsonldTypeCounts,
+    breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
+    listItemCount: Number(jsonldTypeCounts.ListItem || 0),
+    hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
+    hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
+    hasFaqJsonLd: lowerTypes.has('faqpage'),
+    hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
+    hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
+    hasBreadcrumbUi,
+    error: null,
+    parseErrors
+  };
+}
+
+function normalizeDiscoverSubpageUrl(rawUrl, origin) {
+  let parsed = null;
+  try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return null; }
+  if (!/^https?:$/.test(parsed.protocol)) return null;
+  if (origin && parsed.origin !== origin) return null;
+  parsed.hash = '';
+  parsed.search = '';
+  const path = parsed.pathname || '/';
+  const lowerPath = path.toLowerCase();
+  if (isBlockedSubpageJsonLdHost(parsed.hostname)) return null;
+  if (lowerPath === '/' || lowerPath === '') return null;
+  if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?|xml)(?:$|\/)/i.test(lowerPath)) return null;
+  if (/\/(?:wp-json|feed)(?:\/|$)/i.test(lowerPath)) return null;
+  if (/\/(?:tag|category|author|page)\//i.test(lowerPath)) return null;
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function discoverSubpageCandidateKey(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return (u.origin + u.pathname).replace(/\/$/, '').toLowerCase();
+  } catch (_) {
+    return String(url || '').replace(/\/$/, '').toLowerCase();
+  }
+}
+
+function isDiscoverImportantPath(path) {
+  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|access|sitemap)(?:\/|$|-|_)/i.test(String(path || ''));
+}
+
+function isDiscoverDetailLikePath(path) {
+  const p = String(path || '').toLowerCase();
+  if (/\/(?:case|cases|works|news|topics|blog|column)\/.+/i.test(p)) return true;
+  if (/\/\d{4}\/\d{1,2}(?:\/|$)/.test(p)) return true;
+  if (/(?:\/|[-_])\d{3,}(?:\.html)?$/i.test(p)) return true;
+  if (/\/[^/]+\.html$/i.test(p) && !/\/index\.html$/i.test(p) && p.split('/').filter(Boolean).length >= 2) return true;
+  return false;
+}
+
+function reasonDiscoverSubpageCandidate(url, source, sources) {
+  let path = '';
+  try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
+  const important = isDiscoverImportantPath(path);
+  const detailLike = isDiscoverDetailLikePath(path);
+  const sourceCount = Array.isArray(sources) ? sources.length : 1;
+  if (sourceCount >= 2 && important) return 'multiple sources with important path';
+  if (source === 'nav' && important) return 'primary navigation link with important path';
+  if (source === 'footer' && important) return 'footer link with important path';
+  if (source === 'htmlSitemap' && important) return 'HTML sitemap link with important path';
+  if (source === 'sitemap' && detailLike) return 'sitemap detail-like url';
+  if (source === 'sitemap' && important) return 'sitemap url with important path';
+  return `${source || 'unknown'} candidate`;
+}
+
+function scoreDiscoverSubpageCandidate(url, source, sources) {
+  let path = '';
+  try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : 0)));
+  const depth = path.split('/').filter(Boolean).length;
+  const sourceCount = Array.isArray(sources) ? sources.length : 1;
+  let score = sourceScore;
+  if (isDiscoverImportantPath(path)) score += 50;
+  if (depth <= 1) score += 15;
+  else if (depth === 2) score += 8;
+  if (sourceCount >= 2) score += Math.min(30, 10 + (sourceCount - 2) * 10);
+  if (depth >= 3) score -= Math.min(30, (depth - 2) * 10);
+  if (isDiscoverDetailLikePath(path)) score -= 30;
+  if (/(?:\/|[-_])\d{3,}(?:\.html)?$/i.test(path) || /\/\d{4}(?:\/|-|_)/.test(path)) score -= 20;
+  if (/\/[^/]+\.html$/i.test(path) && !/\/index\.html$/i.test(path) && depth >= 2) score -= 10;
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary) {
+  const url = normalizeDiscoverSubpageUrl(rawUrl, origin);
+  if (!url) return false;
+  const key = discoverSubpageCandidateKey(url);
+  const sourcePriority = { sitemap: 1, htmlSitemap: 2, footer: 3, nav: 4 };
+  const existing = map.get(key);
+  if (existing) {
+    if (!existing.sources.includes(source)) existing.sources.push(source);
+    if ((sourcePriority[source] || 0) > (sourcePriority[existing.source] || 0)) {
+      existing.source = source;
+    }
+    existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
+    return false;
+  }
+  const item = {
+    url,
+    source,
+    sources: [source],
+    score: scoreDiscoverSubpageCandidate(url, source, [source]),
+    reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason
+  };
+  map.set(key, item);
+  if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
+  return true;
+}
+
+async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller ? controller.signal : undefined,
+      headers: {
+        'Accept': 'application/xml,text/xml,text/html,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+      }
+    });
+    const status = response && typeof response.status === 'number' ? response.status : null;
+    if (!response || !response.ok) return { ok: false, status, text: '', finalUrl: response && response.url || url };
+    const text = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
+    return { ok: true, status, text, finalUrl: response.url || url };
+  } catch (e) {
+    return { ok: false, status: null, text: '', finalUrl: url, error: String(e && (e.message || e) || '').slice(0, 160) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function parseDiscoverSitemapXml(xml) {
+  const $ = cheerio.load(String(xml || ''), { xmlMode: true });
+  const sitemapLocs = [];
+  const urlLocs = [];
+  $('sitemap > loc').each((_, el) => {
+    const loc = normalizeSubpageJsonLdText($(el).text());
+    if (loc) sitemapLocs.push(loc);
+  });
+  $('url > loc').each((_, el) => {
+    const loc = normalizeSubpageJsonLdText($(el).text());
+    if (loc) urlLocs.push(loc);
+  });
+  return { sitemapLocs, urlLocs };
+}
+
+async function collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors) {
+  const roots = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml'].map(path => origin.replace(/\/$/, '') + path);
+  for (const sitemapUrl of roots) {
+    const rootRes = await fetchDiscoverSubpageText(sitemapUrl, 8000);
+    if (!rootRes.ok) {
+      errors.push({ source: 'sitemap', message: `${sitemapUrl}: ${rootRes.status || rootRes.error || 'fetch_failed'}` });
+      continue;
+    }
+    const parsed = parseDiscoverSitemapXml(rootRes.text);
+    if (parsed.urlLocs.length) {
+      parsed.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+      return;
+    }
+    if (parsed.sitemapLocs.length) {
+      const children = parsed.sitemapLocs.slice(0, 10);
+      for (const childUrl of children) {
+        const normalizedChild = normalizeDiscoverSubpageUrl(childUrl, origin) || childUrl;
+        try {
+          const childParsed = new URL(String(normalizedChild || childUrl));
+          if (childParsed.origin !== origin) continue;
+        } catch (_) {
+          continue;
+        }
+        const childRes = await fetchDiscoverSubpageText(childUrl, 8000);
+        if (!childRes.ok) {
+          errors.push({ source: 'sitemap', message: `${childUrl}: ${childRes.status || childRes.error || 'fetch_failed'}` });
+          continue;
+        }
+        const childParsedXml = parseDiscoverSitemapXml(childRes.text);
+        childParsedXml.urlLocs.forEach(loc => addDiscoverSubpageCandidate(candidateMap, loc, 'sitemap', origin, 'important path from sitemap', sourceSummary));
+      }
+      return;
+    }
+  }
+}
+
+async function collectDiscoverLinksFromPage(page) {
+  return page.evaluate(() => {
+    const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+    const absUrl = (href) => {
+      try { return new URL(href, location.href).toString(); } catch (_) { return ''; }
+    };
+    const queryAllDeep = (selector, opts = {}) => {
+      const out = [];
+      const seen = new Set();
+      const maxNodes = Math.max(1, Math.min(600, Number(opts.maxNodes || 300)));
+      const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 5)));
+      const walk = (root, depth = 0) => {
+        if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+        try {
+          Array.from(root.querySelectorAll(selector)).forEach((el) => {
+            if (!el || seen.has(el) || out.length >= maxNodes) return;
+            seen.add(el);
+            out.push(el);
+          });
+          Array.from(root.querySelectorAll('*')).forEach((el) => {
+            if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+          });
+        } catch (_) {}
+      };
+      walk(document, 0);
+      return out;
+    };
+    const linkFrom = (a) => ({
+      href: absUrl(a.getAttribute && a.getAttribute('href') || ''),
+      text: clean(a.innerText || a.textContent || a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title')) || '')
+    });
+    const allLinks = queryAllDeep('a[href]', { maxNodes: 500 }).map(linkFrom).filter(x => x.href);
+    const htmlSitemapLinks = allLinks.filter(x => /sitemap|site-map|サイトマップ/i.test(`${x.href} ${x.text}`)).slice(0, 5);
+    const navLinks = queryAllDeep('nav a[href],[role="navigation"] a[href],header a[href]', { maxNodes: 250 }).map(linkFrom).filter(x => x.href).slice(0, 200);
+    const footerLinks = queryAllDeep('footer a[href],[role="contentinfo"] a[href]', { maxNodes: 200 }).map(linkFrom).filter(x => x.href).slice(0, 160);
+    return { allLinks: allLinks.slice(0, 500), htmlSitemapLinks, navLinks, footerLinks };
+  }).catch(() => ({ htmlSitemapLinks: [], navLinks: [], footerLinks: [] }));
+}
+
+async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts = {}) {
+  if (opts && opts.page) {
+    const page = opts.page;
+    try {
+      const currentUrl = typeof page.url === 'function' ? page.url() : '';
+      if (currentUrl !== topUrl) {
+        await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
+      }
+      const topLinks = await collectDiscoverLinksFromPage(page);
+      if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
+        for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
+          const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
+          if (!sitemapPageUrl) continue;
+          try {
+            await page.goto(sitemapPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
+            const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
+            (htmlSitemapLinks.allLinks || []).forEach(link => {
+              addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+            });
+          } catch (e) {
+            errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
+          }
+        }
+        await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+        await collectBalancedHydrationMetrics(page, 1500, { shortFastMode: false }).catch(() => null);
+      }
+      const navFooterLinks = await collectDiscoverLinksFromPage(page);
+      (navFooterLinks.navLinks || []).forEach(link => {
+        addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+      });
+      (navFooterLinks.footerLinks || []).forEach(link => {
+        addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+      });
+    } catch (e) {
+      errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
+    }
+    return;
+  }
+  let browser = null;
+  let context = null;
+  let page = null;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    page = await context.newPage();
+    page.setDefaultNavigationTimeout(15000);
+    page.setDefaultTimeout(15000);
+    await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await collectBalancedHydrationMetrics(page, 2500, { shortFastMode: false }).catch(() => null);
+    const topLinks = await collectDiscoverLinksFromPage(page);
+    if (Array.isArray(topLinks.htmlSitemapLinks) && topLinks.htmlSitemapLinks.length) {
+      for (const sitemapLink of topLinks.htmlSitemapLinks.slice(0, 3)) {
+        const sitemapPageUrl = normalizeDiscoverSubpageUrl(sitemapLink.href, origin);
+        if (!sitemapPageUrl) continue;
+        try {
+          await page.goto(sitemapPageUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+          await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
+          const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
+          (htmlSitemapLinks.allLinks || []).forEach(link => {
+            addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+          });
+        } catch (e) {
+          errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
+        }
+      }
+      await page.goto(topUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null);
+      await collectBalancedHydrationMetrics(page, 1500, { shortFastMode: false }).catch(() => null);
+    }
+    const navFooterLinks = await collectDiscoverLinksFromPage(page);
+    (navFooterLinks.navLinks || []).forEach(link => {
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+    });
+    (navFooterLinks.footerLinks || []).forEach(link => {
+      addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+    });
+  } catch (e) {
+    errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+    try { if (context) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+  }
+}
+
+function normalizeDiscoverTopUrl(rawTopUrl) {
+  if (!rawTopUrl) return { ok: false, error: 'topUrl or url is required' };
+  try {
+    const parsed = new URL(String(rawTopUrl || ''));
+    if (!/^https?:$/.test(parsed.protocol)) throw new Error('unsupported protocol');
+    if (isBlockedSubpageJsonLdHost(parsed.hostname)) throw new Error('blocked_private_or_metadata_host');
+    parsed.hash = '';
+    return { ok: true, topUrl: parsed.toString(), origin: parsed.origin };
+  } catch (e) {
+    return { ok: false, error: String(e && (e.message || e) || 'invalid topUrl').slice(0, 160) };
+  }
+}
+
+async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts = {}) {
+  const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
+  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0 };
+  const errors = [];
+  const candidateMap = new Map();
+  await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
+  await collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts);
+  const allCandidates = Array.from(candidateMap.values())
+    .map(item => ({
+      url: item.url,
+      source: item.source,
+      sources: item.sources,
+      score: item.score,
+      reason: item.reason
+    }))
+    .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  return {
+    candidates: allCandidates.slice(0, normalizedLimit),
+    totalCandidates: allCandidates.length,
+    sourceSummary,
+    errors
+  };
+}
+
+app.post('/discover-subpage-candidates-light', async (req, res) => {
+  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
+  const normalized = normalizeDiscoverTopUrl(rawTopUrl);
+  if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
+  const limit = Math.max(1, Math.min(50, Number(req.body && req.body.limit || 20) || 20));
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, limit);
+  return res.status(200).json({
+    ok: true,
+    mode: 'discoverSubpageCandidatesLight',
+    topUrl: normalized.topUrl,
+    origin: normalized.origin,
+    limit,
+    candidates: discovered.candidates,
+    sourceSummary: discovered.sourceSummary,
+    errors: discovered.errors
+  });
+});
+
+// Render check:
+// curl -sS -X POST "https://aio-playwright-api-2.onrender.com/discover-subpage-candidates-light" -H "content-type: application/json" --max-time 180 -d '{"topUrl":"https://www.fork.co.jp/","limit":20}' | jq
+
+async function fetchSubpageJsonLdLight(url, opts = {}) {
+  const maxHtmlBytes = 2 * 1024 * 1024;
+  const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const context = opts.context;
+  let page = null;
+  const jsErrors = [];
+  const failedRequests = [];
+  const consoleErrors = [];
+  try {
+    const initialUrl = new URL(String(url || ''));
+    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
+      return {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'blocked_private_or_metadata_host'
+      };
+    }
+    if (!context || typeof context.newPage !== 'function') throw new Error('missing_playwright_context');
+    page = await context.newPage();
+    try {
+      page.setDefaultNavigationTimeout(timeoutMs);
+      page.setDefaultTimeout(timeoutMs);
+    } catch (_) {}
+    page.on('pageerror', (err) => {
+      if (jsErrors.length >= 10) return;
+      jsErrors.push(String(err && (err.message || err) || '').slice(0, 240));
+    });
+    page.on('console', (msg) => {
+      try {
+        if (!msg || !['error', 'warning'].includes(msg.type()) || consoleErrors.length >= 10) return;
+        consoleErrors.push({
+          type: msg.type(),
+          text: String(msg.text() || '').slice(0, 240)
+        });
+      } catch (_) {}
+    });
+    page.on('requestfailed', (request) => {
+      try {
+        if (failedRequests.length >= 10) return;
+        const failure = request.failure && request.failure();
+        failedRequests.push({
+          url: String(request.url() || '').slice(0, 240),
+          resourceType: request.resourceType && request.resourceType(),
+          failureText: String(failure && failure.errorText || '').slice(0, 160)
+        });
+      } catch (_) {}
+    });
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: timeoutMs
+    });
+    const status = response && typeof response.status === 'function' ? response.status() : null;
+    const finalUrl = page && typeof page.url === 'function' ? page.url() : (response && response.url ? response.url : url);
+    let finalParsed = null;
+    try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
+    if (finalParsed && isBlockedSubpageJsonLdHost(finalParsed.hostname)) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'blocked_private_or_metadata_host'
+      };
+    }
+    if (finalParsed && finalParsed.origin !== initialUrl.origin) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'redirect_origin_mismatch'
+      };
+    }
+    if (!response || (typeof response.ok === 'function' && !response.ok())) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: status ? `HTTP ${status}` : 'fetch_failed'
+      };
+    }
+    const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+    const contentType = headers && typeof headers === 'object'
+      ? String(headers['content-type'] || '')
+      : '';
+    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'unsupported_content_type'
+      };
+    }
+    const contentLengthHeader = headers && typeof headers === 'object'
+      ? Number(headers['content-length'] || 0)
+      : 0;
+    if (Number.isFinite(contentLengthHeader) && contentLengthHeader > maxHtmlBytes) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'content_length_too_large'
+      };
+    }
+    const hydrationMetrics = await collectBalancedHydrationMetrics(page, 3500, { shortFastMode: false });
+    let webdriverValue = '__unavailable__';
+    try {
+      const rawWebdriverValue = await page.evaluate(() => navigator.webdriver);
+      webdriverValue = typeof rawWebdriverValue === 'undefined' ? '__undefined__' : rawWebdriverValue;
+    } catch (_) {}
+    const waitStartedAt = Date.now();
+    const waitStrategyParts = [];
+    try {
+      await page.waitForLoadState('networkidle', { timeout: Math.min(1800, Math.max(800, timeoutMs - 1000)) });
+      waitStrategyParts.push('networkidle');
+    } catch (_) {
+      waitStrategyParts.push('networkidle_timeout');
+    }
+    const countJsonLdScripts = async () => page.evaluate(() => {
+      const queryAllDeep = (selector, opts = {}) => {
+        const out = [];
+        const seen = new Set();
+        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
+        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
+        const walk = (root, depth = 0) => {
+          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+          try {
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el) || out.length >= maxNodes) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          } catch (_) {}
+        };
+        walk(document, 0);
+        return out;
+      };
+      return {
+        domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
+        deepJsonLdScriptCount: queryAllDeep('script[type*="ld+json" i]', { maxNodes: 80 }).length
+      };
+    }).catch(() => ({ domJsonLdScriptCount: 0, deepJsonLdScriptCount: 0 }));
+    let jsonLdCountProbe = await countJsonLdScripts();
+    const pollStartedAt = Date.now();
+    while (
+      Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) <= 0 &&
+      Date.now() - pollStartedAt < 2500
+    ) {
+      try { await page.waitForTimeout(250); } catch (_) {}
+      jsonLdCountProbe = await countJsonLdScripts();
+    }
+    waitStrategyParts.push(Number(jsonLdCountProbe && jsonLdCountProbe.deepJsonLdScriptCount || 0) > 0 ? 'jsonld_poll_found' : 'jsonld_poll_timeout');
+    try {
+      await page.waitForTimeout(1000);
+      waitStrategyParts.push('post_poll_wait_1000ms');
+    } catch (_) {}
+    const observed = await page.evaluate(() => {
+      const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+      const queryAllDeep = (selector, opts = {}) => {
+        const out = [];
+        const seen = new Set();
+        const maxNodes = Math.max(1, Math.min(500, Number(opts.maxNodes || 300)));
+        const maxDepth = Math.max(1, Math.min(8, Number(opts.maxDepth || 6)));
+        const walk = (root, depth = 0) => {
+          if (!root || depth > maxDepth || !root.querySelectorAll || out.length >= maxNodes) return;
+          try {
+            Array.from(root.querySelectorAll(selector)).forEach((el) => {
+              if (!el || seen.has(el) || out.length >= maxNodes) return;
+              seen.add(el);
+              out.push(el);
+            });
+            Array.from(root.querySelectorAll('*')).forEach((el) => {
+              if (el && el.shadowRoot) walk(el.shadowRoot, depth + 1);
+            });
+          } catch (_) {}
+        };
+        walk(document, 0);
+        return out;
+      };
+      const h1Texts = [];
+      queryAllDeep('h1', { maxNodes: 50 }).forEach((el) => {
+        const text = clean(el.innerText || el.textContent);
+        if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
+      });
+      const h2Sample = [];
+      queryAllDeep('h2', { maxNodes: 80 }).forEach((el) => {
+        const text = clean(el.innerText || el.textContent);
+        if (text && !h2Sample.includes(text) && h2Sample.length < 5) h2Sample.push(text.slice(0, 160));
+      });
+      const jsonldTexts = queryAllDeep('script[type*="ld+json" i]', { maxNodes: 50 })
+        .map(el => String(el.textContent || '').trim())
+        .filter(Boolean);
+      const breadcrumbCandidates = queryAllDeep([
+        'nav[aria-label*="breadcrumb" i]',
+        '[aria-label*="パンくず"]',
+        '.breadcrumb',
+        '.breadcrumbs',
+        '[class*="breadcrumb" i]',
+        '[id*="breadcrumb" i]',
+        '[class*="breadcrumbs" i]',
+        '[id*="breadcrumbs" i]',
+        '[class*="pankuzu" i]',
+        '[id*="pankuzu" i]',
+        'ol',
+        'ul'
+      ].join(','), { maxNodes: 200 });
+      let hasBreadcrumbUi = false;
+      for (const el of breadcrumbCandidates) {
+        const attrs = [
+          el.getAttribute && el.getAttribute('class'),
+          el.getAttribute && el.getAttribute('id'),
+          el.getAttribute && el.getAttribute('aria-label')
+        ].map(v => clean(v).toLowerCase()).join(' ');
+        const text = clean(el.innerText || el.textContent).slice(0, 160);
+        const liCount = el.querySelectorAll ? el.querySelectorAll('li').length : 0;
+        if (/(breadcrumb|breadcrumbs|pankuzu)/i.test(attrs) || /パンくず/.test(attrs) || /パンくず/.test(text) || (liCount >= 2 && /[>›»]/.test(text))) {
+          hasBreadcrumbUi = true;
+          break;
+        }
+      }
+      const canonicalEl = document.querySelector('link[rel~="canonical" i]');
+      const title = clean(document.title || '').slice(0, 180);
+      const canonical = canonicalEl && canonicalEl.href ? String(canonicalEl.href || '').trim() : '';
+      const metaDescription = clean((document.querySelector('meta[name="description" i]') || {}).content || '').slice(0, 240);
+      const ogTitle = clean((document.querySelector('meta[property="og:title" i]') || {}).content || '').slice(0, 180);
+      const ogDescription = clean((document.querySelector('meta[property="og:description" i]') || {}).content || '').slice(0, 240);
+      const ogImageExists = !!clean((document.querySelector('meta[property="og:image" i]') || {}).content || '');
+      const mainCandidates = queryAllDeep('main,[role="main"]', { maxNodes: 20 });
+      const anchorEls = queryAllDeep('a[href]', { maxNodes: 1200 });
+      let internalLinkCount = 0;
+      let externalLinkCount = 0;
+      anchorEls.forEach((a) => {
+        try {
+          const href = a.href || a.getAttribute('href') || '';
+          if (!href || /^(?:mailto:|tel:|javascript:|#)/i.test(href)) return;
+          const u = new URL(href, location.href);
+          if (u.origin === location.origin) internalLinkCount += 1;
+          else externalLinkCount += 1;
+        } catch (_) {}
+      });
+      let sampledText = '';
+      try {
+        const clone = document.body ? document.body.cloneNode(true) : null;
+        if (clone && clone.querySelectorAll) {
+          clone.querySelectorAll('script,style,noscript,svg,nav,footer').forEach(el => el.remove());
+          sampledText = clean(clone.innerText || clone.textContent || '').slice(0, 500);
+        }
+      } catch (_) {}
+      if (!sampledText) {
+        const textParts = [];
+        queryAllDeep('main,[role="main"],article,section,p,li', { maxNodes: 160 }).forEach((el) => {
+          if (textParts.join(' ').length >= 600) return;
+          const text = clean(el.innerText || el.textContent);
+          if (text && text.length >= 12 && !textParts.includes(text)) textParts.push(text);
+        });
+        sampledText = clean(textParts.join(' ')).slice(0, 500);
+      }
+      if (!sampledText) sampledText = clean((document.body && document.body.innerText) || '').slice(0, 500);
+      const allNodes = Array.from(document.querySelectorAll('*')).slice(0, 3000);
+      const shadowHostCount = allNodes.filter(el => !!el.shadowRoot).length;
+      return {
+        finalUrl: location.href,
+        readyState: document.readyState || '',
+        locationHref: location.href,
+        title,
+        canonical,
+        metaDescription,
+        ogTitle,
+        ogDescription,
+        ogImageExists,
+        domJsonLdScriptCount: document.querySelectorAll('script[type*="ld+json" i]').length,
+        deepJsonLdScriptCount: jsonldTexts.length,
+        scriptCount: document.querySelectorAll('script').length,
+        moduleScriptCount: document.querySelectorAll('script[type="module"],script[type="module"][src]').length,
+        nextDataExists: !!document.querySelector('#__NEXT_DATA__'),
+        nuxtDataExists: !!(window.__NUXT__ || document.querySelector('#__NUXT_DATA__')),
+        shadowHostCount,
+        bodyTextLength: String((document.body && document.body.innerText) || '').length,
+        h1Count: queryAllDeep('h1', { maxNodes: 100 }).length,
+        h1Texts,
+        h2Sample,
+        jsonldTexts,
+        hasMain: mainCandidates.length > 0,
+        hasMainLandmark: mainCandidates.length > 0,
+        hasBreadcrumbUi,
+        internalLinkCount,
+        externalLinkCount,
+        sampledText,
+        htmlLength: String((document.documentElement && document.documentElement.outerHTML) || '').length
+      };
+    });
+    if (Number(observed && observed.htmlLength || 0) > maxHtmlBytes) {
+      return {
+        url,
+        finalUrl,
+        status,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: 'html_too_large'
+      };
+    }
+    const jsonldTypes = [];
+    let parseErrors = 0;
+    (Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts : []).forEach(raw => {
+      try {
+        collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+      } catch (_) {
+        parseErrors += 1;
+      }
+    });
+    const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
+    const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
+    const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+    const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
+    return {
+      url,
+      finalUrl: observedFinalUrl || finalUrl || url,
+      status,
+      ok: true,
+      pageType: inferSubpageJsonLdPageType(observedFinalUrl || finalUrl || url, opts.siteMode, uniqueTypes),
+      title: normalizeSubpageJsonLdText(observed && observed.title).slice(0, 180),
+      canonical: normalizeSubpageJsonLdText(observed && observed.canonical),
+      metaDescription: normalizeSubpageJsonLdText(observed && observed.metaDescription).slice(0, 240),
+      ogTitle: normalizeSubpageJsonLdText(observed && observed.ogTitle).slice(0, 180),
+      ogDescription: normalizeSubpageJsonLdText(observed && observed.ogDescription).slice(0, 240),
+      ogImageExists: !!(observed && observed.ogImageExists),
+      h1Count: Number(observed && observed.h1Count || 0),
+      h1Texts: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
+      h2Sample: Array.isArray(observed && observed.h2Sample) ? observed.h2Sample.slice(0, 5) : [],
+      jsonldTypes: uniqueTypes,
+      jsonLdCount: Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts.length : uniqueTypes.length,
+      jsonldTypeCounts,
+      breadcrumbListCount: Number(jsonldTypeCounts.BreadcrumbList || 0),
+      listItemCount: Number(jsonldTypeCounts.ListItem || 0),
+      domJsonLdScriptCount: Number(observed && observed.domJsonLdScriptCount || 0),
+      deepJsonLdScriptCount: Number(observed && observed.deepJsonLdScriptCount || 0),
+      readyState: String(observed && observed.readyState || ''),
+      locationHref: String(observed && observed.locationHref || ''),
+      bodyTextLength: Number(observed && observed.bodyTextLength || 0),
+      htmlLength: Number(observed && observed.htmlLength || 0),
+      scriptCount: Number(observed && observed.scriptCount || 0),
+      moduleScriptCount: Number(observed && observed.moduleScriptCount || 0),
+      nextDataExists: !!(observed && observed.nextDataExists),
+      nuxtDataExists: !!(observed && observed.nuxtDataExists),
+      shadowHostCount: Number(observed && observed.shadowHostCount || 0),
+      hydrationMetrics,
+      webdriverValue,
+      launchProfile: 'signalsFirstLightAligned',
+      jsErrors,
+      failedRequests,
+      consoleErrors,
+      waitedMs: Math.max(0, Date.now() - waitStartedAt),
+      waitStrategy: waitStrategyParts.join('+'),
+      hasJsonLd: uniqueTypes.length > 0,
+      hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
+      hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
+      hasFaqJsonLd: lowerTypes.has('faqpage'),
+      hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
+      hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
+      hasOrganization: lowerTypes.has('organization') || lowerTypes.has('corporation') || lowerTypes.has('localbusiness'),
+      hasWebPage: lowerTypes.has('webpage') || lowerTypes.has('aboutpage') || lowerTypes.has('contactpage') || lowerTypes.has('collectionpage'),
+      hasService: lowerTypes.has('service'),
+      hasBreadcrumbUi: !!(observed && observed.hasBreadcrumbUi),
+      hasMain: !!(observed && observed.hasMain),
+      hasMainLandmark: !!(observed && observed.hasMainLandmark),
+      internalLinkCount: Number(observed && observed.internalLinkCount || 0),
+      externalLinkCount: Number(observed && observed.externalLinkCount || 0),
+      sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
+      error: null,
+      parseErrors
+    };
+  } catch (e) {
+    return {
+      url,
+      finalUrl: url,
+      status: null,
+      ok: false,
+      pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+      title: '',
+      canonical: '',
+      h1Count: 0,
+      h1Texts: [],
+      jsonldTypes: [],
+      hasBreadcrumbJsonLd: false,
+      hasProductJsonLd: false,
+      hasFaqJsonLd: false,
+      hasArticleJsonLd: false,
+      hasBlogPostingJsonLd: false,
+      hasBreadcrumbUi: false,
+      error: e && e.name === 'AbortError' ? 'timeout' : String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
+    };
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
+function compactSubpageJsonLdObservation_(page) {
+  const rawCounts = page && page.jsonldTypeCounts && typeof page.jsonldTypeCounts === 'object'
+    ? page.jsonldTypeCounts
+    : {};
+  const breadcrumbListCount = Number(
+    page && typeof page.breadcrumbListCount === 'number'
+      ? page.breadcrumbListCount
+      : rawCounts.BreadcrumbList || 0
+  );
+  const listItemCount = Number(
+    page && typeof page.listItemCount === 'number'
+      ? page.listItemCount
+      : rawCounts.ListItem || 0
+  );
+  return Object.assign({}, page || {}, {
+    url: page && page.url || '',
+    ok: !!(page && page.ok),
+    finalUrl: page && page.finalUrl || page && page.url || '',
+    status: page && typeof page.status !== 'undefined' ? page.status : null,
+    h1Count: Number(page && page.h1Count || 0),
+    h1Texts: Array.isArray(page && page.h1Texts) ? page.h1Texts.slice(0, 5) : [],
+    jsonldTypes: Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [],
+    breadcrumbListCount,
+    listItemCount
+  });
+}
+
+function isCoverageSignalsAboutPath_(value) {
+  const path = (() => {
+    try { return new URL(String(value || '')).pathname.toLowerCase(); } catch (_) { return String(value || '').toLowerCase(); }
+  })();
+  return /\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path);
+}
+
+function getCoverageRepresentativePriority_(page) {
+  const raw = String(page && (page.finalUrl || page.url || page.path) || '').toLowerCase();
+  const path = (() => {
+    try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
+  })();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 0;
+  if (/\/(?:business|service|services|solution|solutions|case|works|products|product|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
+  return 2;
+}
+
+function getCoverageCandidatePath_(candidate) {
+  try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
+}
+
+function sortCoverageObserveCandidates_(candidates) {
+  return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
+    const aPriority = getCoverageRepresentativePriority_(a);
+    const bPriority = getCoverageRepresentativePriority_(b);
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    const aSources = Array.isArray(a && a.sources) ? a.sources.length : (a && a.source ? 1 : 0);
+    const bSources = Array.isArray(b && b.sources) ? b.sources.length : (b && b.source ? 1 : 0);
+    if (aSources !== bSources) return bSources - aSources;
+    const aScore = Number(a && a.score || 0);
+    const bScore = Number(b && b.score || 0);
+    if (aScore !== bScore) return bScore - aScore;
+    return String(a && a.url || '').localeCompare(String(b && b.url || ''));
+  });
+}
+
+function buildCoverageCandidatePageTypes_(candidates) {
+  const out = {
+    about: false,
+    business: false,
+    service: false,
+    case: false,
+    recruit: false,
+    contact: false,
+    legal: false,
+    sitemap: false
+  };
+  (Array.isArray(candidates) ? candidates : []).forEach(candidate => {
+    const path = getCoverageCandidatePath_(candidate).toLowerCase();
+    if (!path) return;
+    if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) out.about = true;
+    if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) out.business = true;
+    if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) out.service = true;
+    if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) out.case = true;
+    if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) out.recruit = true;
+    if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) out.contact = true;
+    if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) out.legal = true;
+    if (/\/(?:sitemap)(?:\/|$|-|_)/i.test(path)) out.sitemap = true;
+  });
+  return out;
+}
+
+function buildCoverageSignalsV1FromSubpageObservation_(payload) {
+  const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
+  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const candidateByUrl = new Map();
+  candidates.forEach(candidate => {
+    if (!candidate || !candidate.url) return;
+    candidateByUrl.set(String(candidate.url), candidate);
+  });
+  const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
+    ? payload.candidateSummary.sourceSummary
+    : null;
+  const candidateSourceSummary = rawSourceSummary
+    ? {
+        sitemap: Number(rawSourceSummary.sitemap || 0),
+        nav: Number(rawSourceSummary.nav || 0),
+        footer: Number(rawSourceSummary.footer || 0),
+        other: Number(rawSourceSummary.other || rawSourceSummary.htmlSitemap || 0)
+      }
+    : candidates.reduce((acc, candidate) => {
+        const sources = Array.isArray(candidate && candidate.sources)
+          ? candidate.sources
+          : (candidate && candidate.source ? [candidate.source] : []);
+        sources.forEach(source => {
+          if (source === 'sitemap' || source === 'nav' || source === 'footer') acc[source] += 1;
+          else acc.other += 1;
+        });
+        return acc;
+      }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
+  const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
+  const observedPages = observations.filter(page => page && page.ok === true);
+  const hasBreadcrumb = page => {
+    const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
+    return page && (
+      page.hasBreadcrumbJsonLd === true ||
+      Number(page.breadcrumbListCount || 0) > 0 ||
+      types.some(type => normalizeSubpageJsonLdType(type).toLowerCase() === 'breadcrumblist')
+    );
+  };
+  const representativePages = observedPages
+    .map(page => {
+      const candidate = candidateByUrl.get(String(page.url || '')) || {};
+      const finalUrl = page.finalUrl || page.url || '';
+      const path = (() => {
+        try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
+      })();
+      const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
+      const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      return {
+        url: page.url || '',
+        finalUrl,
+        path,
+        title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
+        h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
+        hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
+        hasBreadcrumbList: hasBreadcrumb(page),
+        jsonLdTypes,
+        matchedCandidateSources: Array.isArray(candidate.sources)
+          ? candidate.sources.slice(0, 8)
+          : (candidate.source ? [candidate.source] : [])
+      };
+    })
+    .sort((a, b) => {
+      const aPriority = getCoverageRepresentativePriority_(a);
+      const bPriority = getCoverageRepresentativePriority_(b);
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      if (a.hasBreadcrumbList !== b.hasBreadcrumbList) return a.hasBreadcrumbList ? -1 : 1;
+      if (a.hasH1 !== b.hasH1) return a.hasH1 ? -1 : 1;
+      if (a.matchedCandidateSources.length !== b.matchedCandidateSources.length) {
+        return b.matchedCandidateSources.length - a.matchedCandidateSources.length;
+      }
+      return String(a.url || '').localeCompare(String(b.url || ''));
+    })
+    .slice(0, 10);
+  const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
+  const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
+  return {
+    version: 'coverageSignalsV1',
+    generatedAt: new Date().toISOString(),
+    source: 'discover-and-observe-subpages-light',
+    topUrl: payload && payload.topUrl || '',
+    origin: payload && payload.origin || '',
+    candidateSourceSummary,
+    candidatePageTypes,
+    observedSubpageCount: observedPages.length,
+    observedH1PageCount,
+    observedBreadcrumbPageCount,
+    hasObservedSubpageH1: observedH1PageCount > 0,
+    hasObservedBreadcrumbList: observedBreadcrumbPageCount > 0,
+    hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
+    representativePages,
+    notes: []
+  };
+}
+
+function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
+  if (!coverageSignalsV1 || typeof coverageSignalsV1 !== 'object') return null;
+  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0) return null;
+  return {
+    version: 'coverageSignalsV1',
+    source: 'discover-and-observe-subpages-light',
+    checked: true,
+    observedSubpageCount: Number(coverageSignalsV1.observedSubpageCount || 0),
+    observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
+    observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
+    hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
+    hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
+    hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
+    candidateSourceSummary: coverageSignalsV1.candidateSourceSummary || {
+      sitemap: 0,
+      nav: 0,
+      footer: 0,
+      other: 0
+    },
+    candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
+    representativePages: (Array.isArray(coverageSignalsV1.representativePages)
+      ? coverageSignalsV1.representativePages
+      : []
+    ).slice(0, 5).map(page => ({
+      url: page && page.url || '',
+      path: page && page.path || '',
+      title: page && page.title || '',
+      h1: page && page.h1 || '',
+      hasH1: !!(page && page.hasH1),
+      hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
+      jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
+      matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
+        ? page.matchedCandidateSources.slice(0, 8)
+        : []
+    }))
+  };
+}
+
+function inferSubpageSignalsPageType_(page) {
+  const existing = normalizeSubpageJsonLdText(page && page.pageType);
+  if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
+  const path = (() => {
+    try { return new URL(String(page && (page.finalUrl || page.url) || '')).pathname.toLowerCase(); } catch (_) { return ''; }
+  })();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 'about';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
+  if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) return 'legal';
+  return existing || 'unknown';
+}
+
+function buildSubpageSignalsSummary_(pages) {
+  const okPages = (Array.isArray(pages) ? pages : []).filter(page => page && page.ok !== false);
+  const pageTypes = Array.from(new Set(okPages.map(page => normalizeSubpageJsonLdText(page.pageType)).filter(Boolean))).slice(0, 20);
+  const jsonLdTypesAll = Array.from(new Set([].concat(...okPages.map(page => (
+    Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes : (Array.isArray(page.jsonldTypes) ? page.jsonldTypes : [])
+  ))).map(normalizeSubpageJsonLdType).filter(Boolean))).slice(0, 50);
+  return {
+    observedPageTypes: pageTypes,
+    hasAnyJsonLd: okPages.some(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0),
+    hasAnyBreadcrumbList: okPages.some(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0),
+    hasAnyMain: okPages.some(page => page.hasMain === true || page.hasMainLandmark === true),
+    jsonLdTypesAll,
+    pagesWithH1Count: okPages.filter(page => Number(page.h1Count || 0) > 0 || !!normalizeSubpageJsonLdText(page.h1)).length,
+    pagesWithJsonLdCount: okPages.filter(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0).length,
+    pagesWithBreadcrumbListCount: okPages.filter(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0).length
+  };
+}
+
+function buildSubpageSignalsV1FromSubpageObservation_(payload) {
+  const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const pages = observations
+    .filter(page => page && page.ok === true)
+    .slice(0, 5)
+    .map(page => {
+      const finalUrl = page.finalUrl || page.url || '';
+      const path = (() => {
+        try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
+      })();
+      const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
+      const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      const pageType = inferSubpageSignalsPageType_(page);
+      return {
+        url: page.url || '',
+        finalUrl,
+        path,
+        pageType,
+        title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
+        h1: normalizeSubpageJsonLdText(h1Texts[0] || '').slice(0, 180),
+        h1Count: Number(page.h1Count || 0),
+        h2Sample: Array.isArray(page.h2Sample) ? page.h2Sample.slice(0, 5).map(v => normalizeSubpageJsonLdText(v).slice(0, 160)).filter(Boolean) : [],
+        canonical: normalizeSubpageJsonLdText(page.canonical).slice(0, 240),
+        jsonLdTypes,
+        jsonLdCount: Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || jsonLdTypes.length || 0),
+        hasJsonLd: page.hasJsonLd === true || jsonLdTypes.length > 0,
+        hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
+        hasBreadcrumbUi: page.hasBreadcrumbUi === true,
+        hasOrganization: page.hasOrganization === true,
+        hasWebPage: page.hasWebPage === true,
+        hasService: page.hasService === true,
+        hasFAQPage: page.hasFaqJsonLd === true,
+        hasArticle: page.hasArticleJsonLd === true || page.hasBlogPostingJsonLd === true,
+        hasMain: page.hasMain === true || page.hasMainLandmark === true,
+        hasMainLandmark: page.hasMainLandmark === true,
+        metaDescription: normalizeSubpageJsonLdText(page.metaDescription).slice(0, 240),
+        ogTitle: normalizeSubpageJsonLdText(page.ogTitle).slice(0, 180),
+        ogDescription: normalizeSubpageJsonLdText(page.ogDescription).slice(0, 240),
+        ogImageExists: page.ogImageExists === true,
+        internalLinkCount: Number(page.internalLinkCount || 0),
+        externalLinkCount: Number(page.externalLinkCount || 0),
+        sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500)
+      };
+    });
+  if (!pages.length) return null;
+  const summary = buildSubpageSignalsSummary_(pages);
+  return {
+    version: 'subpageSignalsV1',
+    observedCount: pages.length,
+    pages,
+    summary
+  };
+}
+
+function buildLightweightSubpageSignalsSummary_(subpageSignals) {
+  if (!subpageSignals || typeof subpageSignals !== 'object') return null;
+  const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
+  return {
+    observedCount: Number(subpageSignals.observedCount || 0),
+    observedPageTypes: Array.isArray(summary.observedPageTypes) ? summary.observedPageTypes.slice(0, 20) : [],
+    hasAnyJsonLd: summary.hasAnyJsonLd === true,
+    hasAnyBreadcrumbList: summary.hasAnyBreadcrumbList === true,
+    jsonLdTypesAll: Array.isArray(summary.jsonLdTypesAll) ? summary.jsonLdTypesAll.slice(0, 50) : [],
+    pagesWithH1Count: Number(summary.pagesWithH1Count || 0),
+    pagesWithJsonLdCount: Number(summary.pagesWithJsonLdCount || 0),
+    pagesWithBreadcrumbListCount: Number(summary.pagesWithBreadcrumbListCount || 0)
+  };
+}
+
+async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
+  const normalized = normalizeDiscoverTopUrl(topUrl);
+  const traceCoverageMemory = (phase, extra = {}) => {
+    try {
+      console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify(Object.assign({
+        phase,
+        browserCreated: false,
+        contextCreated: false,
+        pageCreated: false,
+        candidateCount: 0,
+        observeCount: 0
+      }, extra)));
+    } catch (_) {}
+  };
+  const logPayload = {
+    url: String(topUrl || ''),
+    origin: normalized && normalized.origin || '',
+    attached: false,
+    observedSubpageCount: 0,
+    observedH1PageCount: 0,
+    observedBreadcrumbPageCount: 0,
+    hasObservedAboutPage: false,
+    hasObservedBreadcrumbList: false,
+    reason: ''
+  };
+  const reusePageForDiscover = !!(opts && opts.page);
+  const reuseContextForObserve = !!(opts && opts.context);
+  const maxObserve = Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
+  const auditPayload = {
+    url: String(topUrl || ''),
+    reusePageForDiscover,
+    reuseContextForObserve,
+    maxObserve,
+    newBrowserCreatedForCoverage: !(reusePageForDiscover && reuseContextForObserve),
+    observedSubpageCount: 0,
+    attached: false
+  };
+  try {
+    traceCoverageMemory('attach_start', {
+      candidateCount: 0,
+      observeCount: 0
+    });
+    if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') {
+      logPayload.reason = 'missing_geo_signals';
+      traceCoverageMemory('attach_skip_missing_geo_signals');
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        reason: logPayload.reason
+      })));
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    if (!normalized.ok) {
+      logPayload.reason = normalized.error || 'invalid_top_url';
+      traceCoverageMemory('attach_skip_invalid_top_url');
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        reason: logPayload.reason
+      })));
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    traceCoverageMemory('discover_before', {
+      browserCreated: !reusePageForDiscover,
+      contextCreated: true,
+      pageCreated: true
+    });
+    const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
+      page: opts && opts.page,
+      context: opts && opts.context,
+      reuseBrowser: reusePageForDiscover || reuseContextForObserve
+    });
+    const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
+    const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    const skippedUtilityPaths = prioritizedCandidates
+      .slice(maxObserve)
+      .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
+      .map(getCoverageCandidatePath_)
+      .filter(Boolean)
+      .slice(0, 10);
+    try {
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_OBSERVE_SELECTION]', JSON.stringify({
+        url: normalized.topUrl,
+        maxObserve,
+        selectedPaths,
+        skippedUtilityPaths,
+        candidateCount: discovered.totalCandidates
+      }));
+    } catch (_) {}
+    traceCoverageMemory('discover_after', {
+      browserCreated: !reusePageForDiscover,
+      contextCreated: true,
+      pageCreated: true,
+      candidateCount: discovered.totalCandidates,
+      observeCount: selectedCandidates.length
+    });
+    if (!selectedCandidates.length) {
+      logPayload.origin = normalized.origin;
+      logPayload.reason = 'no_subpage_candidates';
+      traceCoverageMemory('attach_skip_no_candidates', {
+        candidateCount: discovered.totalCandidates
+      });
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        reason: logPayload.reason
+      })));
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    traceCoverageMemory('observe_before', {
+      browserCreated: !reuseContextForObserve,
+      contextCreated: true,
+      pageCreated: true,
+      candidateCount: discovered.totalCandidates,
+      observeCount: selectedCandidates.length
+    });
+    const observed = await observeSubpageJsonLdLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+      siteMode: 'generic',
+      timeout: 8000,
+      concurrency: reuseContextForObserve ? 1 : 3,
+      context: opts && opts.context,
+      reuseBrowser: reuseContextForObserve,
+      sequential: reuseContextForObserve
+    });
+    traceCoverageMemory('observe_after', {
+      browserCreated: !reuseContextForObserve,
+      contextCreated: true,
+      pageCreated: true,
+      candidateCount: discovered.totalCandidates,
+      observeCount: selectedCandidates.length
+    });
+    const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+    const payload = {
+      topUrl: normalized.topUrl,
+      origin: normalized.origin,
+      candidateSummary: {
+        sourceSummary: discovered.sourceSummary,
+        totalCandidates: discovered.totalCandidates,
+        observedCount: observations.length
+      },
+      candidates: selectedCandidates,
+      observations
+    };
+    const subpageSignals = buildSubpageSignalsV1FromSubpageObservation_(payload);
+    if (subpageSignals) {
+      geoSignalsV1.subpageSignals = subpageSignals;
+      try {
+        console.log('[DEBUG][SUBPAGE_SIGNALS_LIGHT]', JSON.stringify({
+          observedCount: subpageSignals.observedCount,
+          observedPageTypes: subpageSignals.summary && subpageSignals.summary.observedPageTypes,
+          pages: subpageSignals.pages.map(page => ({
+            path: page.path,
+            pageType: page.pageType,
+            title: page.title,
+            h1: page.h1,
+            jsonLdTypes: page.jsonLdTypes,
+            hasBreadcrumbList: page.hasBreadcrumbList,
+            hasBreadcrumbUi: page.hasBreadcrumbUi,
+            hasMain: page.hasMain
+          })),
+          summary: subpageSignals.summary
+        }));
+      } catch (_) {}
+    }
+    const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
+      candidates: discovered.candidates
+    }));
+    try {
+      console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
+        url: normalized.topUrl,
+        candidateCount: discovered.totalCandidates,
+        candidatePageTypes: coverageSignalsV1.candidatePageTypes
+      }));
+    } catch (_) {}
+    const coverageSignals = buildGeoSignalsCoverageSignals_(coverageSignalsV1);
+    if (!coverageSignals) {
+      logPayload.origin = normalized.origin;
+      logPayload.reason = 'no_observed_subpages';
+      traceCoverageMemory('attach_skip_no_observed_subpages', {
+        candidateCount: discovered.totalCandidates,
+        observeCount: selectedCandidates.length
+      });
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+        observedSubpageCount: 0,
+        reason: logPayload.reason
+      })));
+      console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+      return null;
+    }
+    geoSignalsV1.coverageSignals = coverageSignals;
+    traceCoverageMemory('attach_done', {
+      browserCreated: !(reusePageForDiscover && reuseContextForObserve),
+      contextCreated: true,
+      pageCreated: true,
+      candidateCount: discovered.totalCandidates,
+      observeCount: selectedCandidates.length
+    });
+    logPayload.origin = normalized.origin;
+    logPayload.attached = true;
+    logPayload.observedSubpageCount = coverageSignals.observedSubpageCount;
+    logPayload.observedH1PageCount = coverageSignals.observedH1PageCount;
+    logPayload.observedBreadcrumbPageCount = coverageSignals.observedBreadcrumbPageCount;
+    logPayload.hasObservedAboutPage = coverageSignals.hasObservedAboutPage;
+    logPayload.hasObservedBreadcrumbList = coverageSignals.hasObservedBreadcrumbList;
+    logPayload.reason = 'attached';
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+      newBrowserCreatedForCoverage: !(reusePageForDiscover && reuseContextForObserve),
+      observedSubpageCount: coverageSignals.observedSubpageCount,
+      attached: true,
+      reason: 'attached'
+    })));
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+    return coverageSignals;
+  } catch (e) {
+    logPayload.reason = String(e && (e.message || e) || 'coverage_integration_failed').slice(0, 160);
+    traceCoverageMemory('attach_error', {
+      reason: logPayload.reason
+    });
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_REUSE_AUDIT]', JSON.stringify(Object.assign({}, auditPayload, {
+      reason: logPayload.reason
+    })));
+    console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
+    return null;
+  }
+}
+
+async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
+  const started = Date.now();
+  const normalizedUrls = Array.isArray(urls) ? urls.slice(0, 20) : [];
+  const siteMode = normalizeSubpageJsonLdText(opts.siteMode || 'generic').toLowerCase() || 'generic';
+  const timeout = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
+  const reuseContext = !!(opts && opts.context);
+  const concurrency = reuseContext
+    ? 1
+    : Math.max(1, Math.min(5, Number(opts.concurrency || 4) || 4));
+  const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
+  let browser = null;
+  let context = opts && opts.context || null;
+  const pages = new Array(normalizedUrls.length);
+  try {
+    try {
+      console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+        phase: 'observe_launch_before',
+        browserCreated: false,
+        contextCreated: reuseContext,
+        pageCreated: false,
+        candidateCount: normalizedUrls.length,
+        observeCount: normalizedUrls.length
+      }));
+    } catch (_) {}
+    if (!reuseContext) {
+      browser = await chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-software-rasterizer',
+          '--no-zygote',
+          '--no-first-run',
+          '--no-default-browser-check'
+        ]
+      });
+      try {
+        console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+          phase: 'observe_browser_created',
+          browserCreated: true,
+          contextCreated: false,
+          pageCreated: false,
+          candidateCount: normalizedUrls.length,
+          observeCount: normalizedUrls.length
+        }));
+      } catch (_) {}
+      context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                   'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                   'Chrome/122.0.0.0 Safari/537.36',
+        serviceWorkers: 'allow',
+        viewport: { width: 1366, height: 900 },
+        javaScriptEnabled: true,
+        locale: 'ja-JP',
+        timezoneId: 'Asia/Tokyo',
+        ignoreHTTPSErrors: true
+      });
+      try {
+        console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+          phase: 'observe_context_created',
+          browserCreated: true,
+          contextCreated: true,
+          pageCreated: false,
+          candidateCount: normalizedUrls.length,
+          observeCount: normalizedUrls.length
+        }));
+      } catch (_) {}
+      await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+    } else {
+      try {
+        console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+          phase: 'observe_reuse_context',
+          browserCreated: false,
+          contextCreated: true,
+          pageCreated: false,
+          candidateCount: normalizedUrls.length,
+          observeCount: normalizedUrls.length
+        }));
+      } catch (_) {}
+    }
+    let nextIndex = 0;
+    const workerCount = Math.min(concurrency, normalizedUrls.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < normalizedUrls.length) {
+        const index = nextIndex++;
+        const url = normalizedUrls[index];
+        try {
+          let origin = '';
+          try { origin = new URL(url).origin; } catch (_) {}
+          if (baseOrigin && origin !== baseOrigin) {
+            pages[index] = {
+              url,
+              finalUrl: url,
+              status: null,
+              ok: false,
+              pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+              title: '',
+              canonical: '',
+              h1Count: 0,
+              h1Texts: [],
+              jsonldTypes: [],
+              breadcrumbListCount: 0,
+              listItemCount: 0,
+              hasBreadcrumbJsonLd: false,
+              hasProductJsonLd: false,
+              hasFaqJsonLd: false,
+              hasArticleJsonLd: false,
+              hasBlogPostingJsonLd: false,
+              hasBreadcrumbUi: false,
+              error: 'origin_mismatch'
+            };
+            continue;
+          }
+          try {
+            console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+              phase: 'observe_page_before',
+              browserCreated: true,
+              contextCreated: true,
+              pageCreated: false,
+              candidateCount: normalizedUrls.length,
+              observeCount: normalizedUrls.length
+            }));
+          } catch (_) {}
+          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+          try {
+            console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+              phase: 'observe_page_after',
+              browserCreated: true,
+              contextCreated: true,
+              pageCreated: true,
+              candidateCount: normalizedUrls.length,
+              observeCount: normalizedUrls.length
+            }));
+          } catch (_) {}
+        } catch (e) {
+          pages[index] = {
+            url,
+            finalUrl: url,
+            status: null,
+            ok: false,
+            pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+            title: '',
+            canonical: '',
+            h1Count: 0,
+            h1Texts: [],
+            jsonldTypes: [],
+            breadcrumbListCount: 0,
+            listItemCount: 0,
+            hasBreadcrumbJsonLd: false,
+            hasProductJsonLd: false,
+            hasFaqJsonLd: false,
+            hasArticleJsonLd: false,
+            hasBlogPostingJsonLd: false,
+            hasBreadcrumbUi: false,
+            error: String(e && (e.message || e) || 'fetch_failed').slice(0, 160)
+          };
+        }
+      }
+    });
+    await Promise.allSettled(workers);
+  } catch (e) {
+    normalizedUrls.forEach((url, index) => {
+      pages[index] = pages[index] || {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        breadcrumbListCount: 0,
+        listItemCount: 0,
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: String(e && (e.message || e) || 'playwright_failed').slice(0, 160)
+      };
+    });
+  } finally {
+    try { if (context && !reuseContext) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+    try {
+      console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
+        phase: 'observe_closed',
+        browserCreated: false,
+        contextCreated: false,
+        pageCreated: false,
+        candidateCount: normalizedUrls.length,
+        observeCount: normalizedUrls.length
+      }));
+    } catch (_) {}
+  }
+  const compactPages = pages.map(page => compactSubpageJsonLdObservation_(page));
+  return {
+    requestedCount: normalizedUrls.length,
+    fetchedCount: compactPages.filter(page => page.ok === true).length,
+    elapsedMs: Math.max(0, Date.now() - started),
+    pages: compactPages,
+    summary: {
+      hasBreadcrumbJsonLdOnSubpage: compactPages.some(page => page.hasBreadcrumbJsonLd === true),
+      hasProductJsonLdOnSubpage: compactPages.some(page => page.hasProductJsonLd === true),
+      hasFaqJsonLdOnSubpage: compactPages.some(page => page.hasFaqJsonLd === true),
+      hasArticleJsonLdOnSubpage: compactPages.some(page => page.hasArticleJsonLd === true),
+      hasBlogPostingJsonLdOnSubpage: compactPages.some(page => page.hasBlogPostingJsonLd === true),
+      hasBreadcrumbUiOnSubpage: compactPages.some(page => page.hasBreadcrumbUi === true)
+    }
+  };
+}
+
+app.post('/subpage-jsonld-light', async (req, res) => {
+  const started = Date.now();
+  const urls = req && req.body && Array.isArray(req.body.urls) ? req.body.urls : null;
+  if (!urls) return res.status(400).json({ ok: false, error: 'urls must be an array' });
+  if (urls.length > 5) return res.status(400).json({ ok: false, error: 'urls max is 5' });
+  const normalizedUrls = [];
+  for (const raw of urls) {
+    try {
+      const u = new URL(String(raw || ''));
+      if (!/^https?:$/.test(u.protocol)) throw new Error('unsupported protocol');
+      normalizedUrls.push(u.toString());
+    } catch (_) {
+      return res.status(400).json({ ok: false, error: 'urls must contain only valid http/https URLs' });
+    }
+  }
+  const siteMode = normalizeSubpageJsonLdText(req.body.siteMode || 'generic').toLowerCase() || 'generic';
+  const timeout = Math.max(1000, Math.min(15000, Number(req.body.timeout || 8000) || 8000));
+  const baseOrigin = normalizedUrls.length ? new URL(normalizedUrls[0]).origin : '';
+  console.log('[SUBPAGE_JSONLD_LIGHT][START]', JSON.stringify({
+    requestedCount: normalizedUrls.length,
+    siteMode,
+    timeout
+  }));
+  let browser = null;
+  let context = null;
+  let settled = [];
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-zygote',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ]
+    });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+                 'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+                 'Chrome/122.0.0.0 Safari/537.36',
+      serviceWorkers: 'allow',
+      viewport: { width: 1366, height: 900 },
+      javaScriptEnabled: true,
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      ignoreHTTPSErrors: true
+    });
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+    const tasks = normalizedUrls.map(url => {
+      let origin = '';
+      try { origin = new URL(url).origin; } catch (_) {}
+      if (baseOrigin && origin !== baseOrigin) {
+        return Promise.resolve({
+          url,
+          finalUrl: url,
+          status: null,
+          ok: false,
+          pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+          title: '',
+          canonical: '',
+          h1Count: 0,
+          h1Texts: [],
+          jsonldTypes: [],
+          hasBreadcrumbJsonLd: false,
+          hasProductJsonLd: false,
+          hasFaqJsonLd: false,
+          hasArticleJsonLd: false,
+          hasBlogPostingJsonLd: false,
+          hasBreadcrumbUi: false,
+          error: 'origin_mismatch'
+        });
+      }
+      return fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+    });
+    settled = await Promise.allSettled(tasks);
+  } catch (e) {
+    settled = normalizedUrls.map(url => ({
+      status: 'fulfilled',
+      value: {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        jsonldTypes: [],
+        hasBreadcrumbJsonLd: false,
+        hasProductJsonLd: false,
+        hasFaqJsonLd: false,
+        hasArticleJsonLd: false,
+        hasBlogPostingJsonLd: false,
+        hasBreadcrumbUi: false,
+        error: String(e && (e.message || e) || 'playwright_failed').slice(0, 160)
+      }
+    }));
+  } finally {
+    try { if (context) await context.close(); } catch (_) {}
+    try { if (browser) await browser.close(); } catch (_) {}
+  }
+  const pages = settled.map((result, index) => {
+    if (result.status === 'fulfilled') return result.value;
+    const url = normalizedUrls[index] || '';
+    return {
+      url,
+      finalUrl: url,
+      status: null,
+      ok: false,
+      pageType: inferSubpageJsonLdPageType(url, siteMode, []),
+      title: '',
+      canonical: '',
+      h1Count: 0,
+      h1Texts: [],
+      jsonldTypes: [],
+      hasBreadcrumbJsonLd: false,
+      hasProductJsonLd: false,
+      hasFaqJsonLd: false,
+      hasArticleJsonLd: false,
+      hasBlogPostingJsonLd: false,
+      hasBreadcrumbUi: false,
+      error: String(result.reason && (result.reason.message || result.reason) || 'fetch_failed').slice(0, 160)
+    };
+  });
+  pages.forEach(page => {
+    console.log('[SUBPAGE_JSONLD_LIGHT][PAGE]', JSON.stringify({
+      url: page.url,
+      status: page.status,
+      ok: page.ok,
+      pageType: page.pageType,
+      title: page.title,
+      domJsonLdScriptCount: page.domJsonLdScriptCount,
+      deepJsonLdScriptCount: page.deepJsonLdScriptCount,
+      h1Count: page.h1Count,
+      jsonldTypes: page.jsonldTypes,
+      waitedMs: page.waitedMs,
+      waitStrategy: page.waitStrategy,
+      hasBreadcrumbJsonLd: page.hasBreadcrumbJsonLd,
+      hasProductJsonLd: page.hasProductJsonLd,
+      hasFaqJsonLd: page.hasFaqJsonLd,
+      hasArticleJsonLd: page.hasArticleJsonLd,
+      hasBlogPostingJsonLd: page.hasBlogPostingJsonLd,
+      hasBreadcrumbUi: page.hasBreadcrumbUi,
+      error: page.error
+    }));
+  });
+  const summary = {
+    hasBreadcrumbJsonLdOnSubpage: pages.some(page => page.hasBreadcrumbJsonLd === true),
+    hasProductJsonLdOnSubpage: pages.some(page => page.hasProductJsonLd === true),
+    hasFaqJsonLdOnSubpage: pages.some(page => page.hasFaqJsonLd === true),
+    hasArticleJsonLdOnSubpage: pages.some(page => page.hasArticleJsonLd === true),
+    hasBlogPostingJsonLdOnSubpage: pages.some(page => page.hasBlogPostingJsonLd === true),
+    hasBreadcrumbUiOnSubpage: pages.some(page => page.hasBreadcrumbUi === true)
+  };
+  const payload = {
+    ok: true,
+    mode: 'subpageJsonLdLight',
+    siteMode,
+    requestedCount: normalizedUrls.length,
+    fetchedCount: pages.filter(page => page.ok === true).length,
+    elapsedMs: Math.max(0, Date.now() - started),
+    pages: pages.map(page => {
+      const out = Object.assign({}, page);
+      delete out.parseErrors;
+      delete out.domJsonLdScriptCount;
+      delete out.deepJsonLdScriptCount;
+      delete out.readyState;
+      delete out.locationHref;
+      delete out.bodyTextLength;
+      delete out.htmlLength;
+      delete out.scriptCount;
+      delete out.moduleScriptCount;
+      delete out.nextDataExists;
+      delete out.nuxtDataExists;
+      delete out.shadowHostCount;
+      delete out.hydrationMetrics;
+      delete out.webdriverValue;
+      delete out.launchProfile;
+      delete out.jsErrors;
+      delete out.failedRequests;
+      delete out.consoleErrors;
+      delete out.waitedMs;
+      delete out.waitStrategy;
+      return out;
+    }),
+    summary
+  };
+  console.log('[SUBPAGE_JSONLD_LIGHT][DONE]', JSON.stringify({
+    requestedCount: payload.requestedCount,
+    fetchedCount: payload.fetchedCount,
+    elapsedMs: payload.elapsedMs,
+    summary
+  }));
+  console.log('[DEBUG][SUBPAGE_JSONLD_LIGHT_PLAYWRIGHT_OBSERVED]', JSON.stringify({
+    requestedCount: payload.requestedCount,
+    fetchedCount: payload.fetchedCount,
+    elapsedMs: payload.elapsedMs,
+    pages: pages.map(p => ({
+      url: p.url,
+      finalUrl: p.finalUrl,
+      status: p.status,
+      ok: p.ok,
+      title: p.title,
+      domJsonLdScriptCount: p.domJsonLdScriptCount,
+      deepJsonLdScriptCount: p.deepJsonLdScriptCount,
+      h1Count: p.h1Count,
+      jsonldTypes: p.jsonldTypes,
+      waitedMs: p.waitedMs,
+      waitStrategy: p.waitStrategy,
+      hasBreadcrumbJsonLd: p.hasBreadcrumbJsonLd,
+      hasBreadcrumbUi: p.hasBreadcrumbUi,
+      error: p.error
+    }))
+  }));
+  pages.forEach(p => {
+    console.log('[DEBUG][SUBPAGE_JSONLD_LIGHT_PAGE_DIAG]', JSON.stringify({
+      url: p.url,
+      finalUrl: p.finalUrl,
+      status: p.status,
+      ok: p.ok,
+      readyState: p.readyState,
+      locationHref: p.locationHref,
+      title: p.title,
+      domJsonLdScriptCount: p.domJsonLdScriptCount,
+      deepJsonLdScriptCount: p.deepJsonLdScriptCount,
+      h1Count: p.h1Count,
+      bodyTextLength: p.bodyTextLength,
+      htmlLength: p.htmlLength,
+      scriptCount: p.scriptCount,
+      moduleScriptCount: p.moduleScriptCount,
+      nextDataExists: p.nextDataExists,
+      nuxtDataExists: p.nuxtDataExists,
+      shadowHostCount: p.shadowHostCount,
+      hydrationMetrics: p.hydrationMetrics ? {
+        waitMs: p.hydrationMetrics.waitMs,
+        bodyTextBeforeWait: p.hydrationMetrics.bodyTextBeforeWait,
+        bodyTextAfterWait: p.hydrationMetrics.bodyTextAfterWait,
+        anchorCountBeforeWait: p.hydrationMetrics.anchorCountBeforeWait,
+        anchorCountAfterWait: p.hydrationMetrics.anchorCountAfterWait,
+        navLinkCountBeforeWait: p.hydrationMetrics.navLinkCountBeforeWait,
+        navLinkCountAfterWait: p.hydrationMetrics.navLinkCountAfterWait,
+        shadowHostCountBeforeWait: p.hydrationMetrics.shadowHostCountBeforeWait,
+        shadowHostCountAfterWait: p.hydrationMetrics.shadowHostCountAfterWait,
+        shadowJsonLdCountBeforeWait: p.hydrationMetrics.shadowJsonLdCountBeforeWait,
+        shadowJsonLdCountAfterWait: p.hydrationMetrics.shadowJsonLdCountAfterWait,
+        shadowH1CountBeforeWait: p.hydrationMetrics.shadowH1CountBeforeWait,
+        shadowH1CountAfterWait: p.hydrationMetrics.shadowH1CountAfterWait,
+        improvedBodyText: p.hydrationMetrics.improvedBodyText,
+        improvedLinks: p.hydrationMetrics.improvedLinks,
+        warningTextBeforeWait: p.hydrationMetrics.warningTextBeforeWait,
+        warningTextAfterWait: p.hydrationMetrics.warningTextAfterWait,
+        error: p.hydrationMetrics.error || null
+      } : null,
+      webdriverValue: p.webdriverValue,
+      launchProfile: p.launchProfile,
+      jsonldTypes: p.jsonldTypes,
+      waitedMs: p.waitedMs,
+      waitStrategy: p.waitStrategy,
+      jsErrors: Array.isArray(p.jsErrors) ? p.jsErrors.slice(0, 10) : [],
+      consoleErrors: Array.isArray(p.consoleErrors) ? p.consoleErrors.slice(0, 10) : [],
+      failedRequests: Array.isArray(p.failedRequests) ? p.failedRequests.slice(0, 10) : [],
+      error: p.error
+    }));
+  });
+  return res.status(200).json(payload);
+});
+
+app.post('/discover-and-observe-subpages-light', async (req, res) => {
+  const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
+  const normalized = normalizeDiscoverTopUrl(rawTopUrl);
+  if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
+  const limit = Math.max(1, Math.min(20, Number(req.body && (req.body.maxObserve || req.body.limit) || 10) || 10));
+  const candidateLimit = Math.max(
+    limit,
+    Math.min(50, Number(req.body && req.body.maxCandidates || 0) || Math.max(limit * 3, 20))
+  );
+  const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
+  const selectedCandidates = discovered.candidates.slice(0, limit);
+  const urls = selectedCandidates.map(candidate => candidate.url);
+  const observed = await observeSubpageJsonLdLightUrls_(urls, {
+    siteMode,
+    timeout: req.body && req.body.timeout,
+    concurrency: 3
+  });
+  const observations = observed.pages.map(page => compactSubpageJsonLdObservation_(page));
+  const observationErrors = observations
+    .map((page, index) => {
+      if (page && page.ok === true) return null;
+      const candidate = selectedCandidates[index] || {};
+      return {
+        url: page && page.url || candidate.url || '',
+        source: candidate.source || '',
+        message: String(page && page.error || 'observation_failed').slice(0, 160)
+      };
+    })
+    .filter(Boolean);
+  const payload = {
+    ok: true,
+    mode: 'discoverAndObserveSubpagesLight',
+    topUrl: normalized.topUrl,
+    origin: normalized.origin,
+    limit,
+    candidateSummary: {
+      sourceSummary: discovered.sourceSummary,
+      totalCandidates: discovered.totalCandidates,
+      observedCount: observations.length
+    },
+    candidates: selectedCandidates,
+    observations,
+    errors: [].concat(discovered.errors || [], observationErrors)
+  };
+  payload.coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
+    candidates: discovered.candidates
+  }));
+  console.log('[DEBUG][COVERAGE_SIGNALS_V1_SUMMARY]', JSON.stringify({
+    topUrl: payload.topUrl,
+    origin: payload.origin,
+    observedSubpageCount: payload.coverageSignalsV1.observedSubpageCount,
+    observedH1PageCount: payload.coverageSignalsV1.observedH1PageCount,
+    observedBreadcrumbPageCount: payload.coverageSignalsV1.observedBreadcrumbPageCount,
+    hasObservedAboutPage: payload.coverageSignalsV1.hasObservedAboutPage,
+    hasObservedBreadcrumbList: payload.coverageSignalsV1.hasObservedBreadcrumbList,
+    representativePageCount: Array.isArray(payload.coverageSignalsV1.representativePages)
+      ? payload.coverageSignalsV1.representativePages.length
+      : 0
+  }));
+  return res.status(200).json(payload);
+});
+
 // -------------------- Simple in-memory cache --------------------
 const CACHE_TTL_MS      = Number(process.env.SCRAPE_CACHE_TTL_MS || 6 * 60 * 60 * 1000); // 既定6h
 const CACHE_MAX_ENTRIES = Number(process.env.SCRAPE_CACHE_MAX   || 300);                 // 既定300件
@@ -4110,11 +6239,88 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       };
       const profileHostRe = /(?:^|\/\/|\.)(facebook\.com|instagram\.com|note\.com|twitter\.com|x\.com|linkedin\.com|youtube\.com|tiktok\.com|wantedly\.com|github\.com)\b/i;
       const navTexts = anchors.filter((a) => a.navLike && a.text).map((a) => a.text);
+      const ctaIgnoreRe = /^(home|top|menu|close|prev|previous|next|share|facebook|instagram|x|twitter|youtube|line|linkedin|tiktok|ホーム|トップ|メニュー|閉じる|前へ|次へ|共有)$/i;
+      const ctaCandidateRe = /(?:お問い合わせ|お問合せ|問い合わせ|相談|資料請求|見積|申し込|申込|購入|詳しく見る|詳細を見る|採用情報|エントリー|contact|inquiry|consult|request|quote|apply|entry|buy|purchase|learn more|read more|details)/i;
+      const ctaTextFrom = (el) => {
+        if (!el) return '';
+        const tag = String(el.tagName || '').toLowerCase();
+        const raw = tag === 'input'
+          ? (el.getAttribute('value') || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+          : (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+        return clean(raw).slice(0, 80);
+      };
+      const ctaElements = queryAllDeep('a[href],button,[role="button"],input[type="submit"],input[type="button"]');
+      const ctaTexts = limit(Array.from(new Set(ctaElements
+        .map(ctaTextFrom)
+        .filter((text) => text && text.length <= 80 && !ctaIgnoreRe.test(text) && ctaCandidateRe.test(text)))), 10);
       const internal = anchors.filter((a) => {
         try { return new URL(a.href).origin === location.origin; } catch (_) { return false; }
       }).map((a) => ({ text: a.text, href: a.href }));
       const externalProfileItems = limit(anchors.filter((a) => profileHostRe.test(a.href)).map((a) => a.href), 10);
       const footerExternalProfileItems = limit(anchors.filter((a) => a.footerLike && profileHostRe.test(a.href)).map((a) => a.href), 10);
+      const semanticHeaderCount = queryAllDeep('header,[role="banner"]').length;
+      const semanticNavCount = queryAllDeep('nav,[role="navigation"]').length;
+      const semanticFooterCount = queryAllDeep('footer,[role="contentinfo"]').length;
+      const semanticElements = {
+        hasHeaderElement: semanticHeaderCount > 0,
+        hasNavElement: semanticNavCount > 0,
+        hasFooterElement: semanticFooterCount > 0,
+        headerCount: semanticHeaderCount,
+        navCount: semanticNavCount,
+        footerCount: semanticFooterCount,
+        semanticElementsObserved: true,
+        source: 'rendered_dom_light'
+      };
+      const breadcrumbEl = queryAllDeep([
+        '[aria-label*="breadcrumb" i]',
+        '[class*="breadcrumb" i]',
+        '[id*="breadcrumb" i]',
+        'nav[aria-label*="パンくず" i]',
+        '[class*="パンくず" i]'
+      ].join(','))[0] || null;
+      const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
+      const footerAnchors = anchors.filter((a) => a.footerLike);
+      const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
+      const legalRe = /legal|law|特定商取引|特商法|法務/;
+      const termsRe = /terms|利用規約|規約/;
+      const privacyPolicyRe = /privacy|privacy\s*policy|プライバシーポリシー|個人情報保護方針|個人情報/;
+      const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
+      const legalLike = hasLike(legalRe);
+      const termsLike = hasLike(termsRe);
+      const faqLink = hasLike(faqRe);
+      const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
+      const faqSectionEl = queryAllDeep([
+        'section[aria-label*="faq" i]',
+        'section[aria-label*="よくある質問" i]',
+        'section[id*="faq" i]',
+        'section[class*="faq" i]',
+        '[id*="faq" i]',
+        '[class*="faq" i]'
+      ].join(',')).find((el) => {
+        const text = clean(el && (el.innerText || el.textContent)).slice(0, 200);
+        return faqRe.test(text || '');
+      }) || null;
+      const faqHeadingEl = queryAllDeep('h1,h2,h3,h4,[role="heading"]').find((el) => {
+        const text = clean(el && (el.innerText || el.textContent));
+        return faqRe.test(text || '');
+      }) || null;
+      const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
+      const footerObserved = footerAnchors.length > 0 || semanticFooterCount > 0;
+      const footerSignals = {
+        observed: footerObserved,
+        linkCount: footerObserved ? footerAnchors.length : null,
+        hasPrivacyLink: footerObserved ? privacyPolicyRe.test(footerHay) : null,
+        hasCompanyLink: footerObserved ? /company|about|corporate|会社|企業|運営|概要/.test(footerHay) : null,
+        hasCompanyProfileLink: footerObserved ? /company|about|corporate|profile|会社概要|企業情報|会社情報|企業|運営|概要/.test(footerHay) : null,
+        hasContactLink: footerObserved ? /contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/.test(footerHay) : null,
+        hasLegalLink: footerObserved ? legalRe.test(footerHay) : null,
+        hasTermsLink: footerObserved ? termsRe.test(footerHay) : null,
+        sampleTexts: footerAnchors.map((a) => a.text).filter(Boolean).slice(0, 8),
+        externalProfileLinksSample: footerExternalProfileItems.slice(0, 10),
+        socialLinksSample: footerExternalProfileItems.slice(0, 10),
+        footerExternalLinksSample: footerExternalProfileItems.slice(0, 10),
+        source: 'rendered_dom_footer_scan'
+      };
       browserPhaseTimings.linksMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - linksPhaseStart));
       const multimodalPhaseStart = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
       const firstMetaContent = (selectors) => {
@@ -4158,7 +6364,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const contactRe = /contact|inquiry|support|help|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/;
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
       const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
-      const privacyRe = /privacy|policy|プライバシー|個人情報/;
+      const privacyRe = /privacy|policy|プライバシー|個人情報|プライバシーポリシー|個人情報保護方針/;
       const trustSignals = {
         hasContactLink: hasLike(contactRe),
         contactPathFound: hasLike(contactRe),
@@ -4177,6 +6383,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasPrivacyPolicyLink: hasLike(privacyRe),
         privacyLinkSource: hasLike(privacyRe) ? 'dom' : 'not_observed',
         privacyLinkSample: firstLikeLink(privacyRe),
+        hasLegalLink: legalLike,
+        legalLinkSource: legalLike === true ? 'dom' : (legalLike === false ? 'not_observed' : 'not_observed'),
+        legalLinkSample: firstLikeLink(legalRe),
+        hasTermsLink: termsLike,
+        termsLinkSource: termsLike === true ? 'dom' : (termsLike === false ? 'not_observed' : 'not_observed'),
+        termsLinkSample: firstLikeLink(termsRe),
         source: 'balanced_light'
       };
       const multimodalSignals = {
@@ -4193,6 +6405,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         imgCount: imgNodes.length,
         primaryImageOfPage: primaryImageCandidate || '',
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
+        source: 'balanced_light'
+      };
+      const claritySignals = {
+        ctaTexts,
+        ctaCandidatesCount: ctaTexts.length,
+        ctaObserved: true,
         source: 'balanced_light'
       };
       browserPhaseTimings.multimodalMs = Math.max(0, Math.round((typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()) - multimodalPhaseStart));
@@ -4225,13 +6443,34 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasServiceLikeLink: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           hasContactLikeLink: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/),
           hasPrivacyLikeLink: hasLike(/privacy|プライバシー|個人情報/),
+          hasLegalLikeLink: legalLike,
+          hasTermsLikeLink: termsLike,
           contactLinkSource: hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/) ? 'dom' : 'not_observed',
           companyLinkSource: hasLike(/company|about|corporate|会社|企業|運営|概要/) ? 'dom' : 'not_observed',
           serviceLinkSource: hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/) ? 'dom' : 'not_observed',
-          privacyLinkSource: hasLike(/privacy|プライバシー|個人情報/) ? 'dom' : 'not_observed'
+          privacyLinkSource: hasLike(/privacy|プライバシー|個人情報/) ? 'dom' : 'not_observed',
+          legalLinkSource: legalLike === true ? 'dom' : 'not_observed',
+          termsLinkSource: termsLike === true ? 'dom' : 'not_observed'
         },
         multimodalSignals,
+        clarity: claritySignals,
         trustSignals,
+        coverage: {
+          semanticElements,
+          hasFaqLink: faqLink,
+          hasFaqNav: faqNav,
+          hasFaqSection: !!(faqSectionEl || faqHeadingEl),
+          faqLinkSource: faqLink === true ? 'dom_link_text' : 'not_observed',
+          faqLinkSample: firstLikeLink(faqRe),
+          faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
+          faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
+          breadcrumbUiObserved: true,
+          hasBreadcrumbUi: !!breadcrumbEl,
+          breadcrumbUiSource: 'dom_scan',
+          breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
+          footerSignals,
+          source: 'rendered_dom_light'
+        },
         structuredData: {
           types: typeList,
           rawCount: rawJsonLd.length,
@@ -4570,6 +6809,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const observedTrustSignals = observed.trustSignals && typeof observed.trustSignals === 'object'
       ? observed.trustSignals
       : null;
+    const observedCoverageSignals = observed.coverage && typeof observed.coverage === 'object'
+      ? observed.coverage
+      : null;
     const scriptTrustObserved = scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.observed;
     const domContactObserved = observedTrustSignals && typeof observedTrustSignals.contactPathFound === 'boolean'
       ? observedTrustSignals.contactPathFound
@@ -4580,6 +6822,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       : null;
     const domPrivacyObserved = observedTrustSignals && typeof observedTrustSignals.hasPrivacyPolicyLink === 'boolean'
       ? observedTrustSignals.hasPrivacyPolicyLink
+      : null;
+    const domLegalObserved = observedTrustSignals && typeof observedTrustSignals.hasLegalLink === 'boolean'
+      ? observedTrustSignals.hasLegalLink
+      : null;
+    const domTermsObserved = observedTrustSignals && typeof observedTrustSignals.hasTermsLink === 'boolean'
+      ? observedTrustSignals.hasTermsLink
       : null;
     const scriptCompanyHint = scriptTrustObserved && scriptSrcJsonLdSummary.companyPathFound === true;
     const scriptServiceHint = scriptTrustObserved && scriptSrcJsonLdSummary.servicePathFound === true;
@@ -4615,6 +6863,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       privacyLinkSample: observedTrustSignals && observedTrustSignals.privacyLinkSample
         ? observedTrustSignals.privacyLinkSample
         : (scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.privacyPathSample ? { text: 'same-origin script path', href: scriptSrcJsonLdSummary.privacyPathSample } : null),
+      hasLegalLink: domLegalObserved,
+      legalLinkSource: domLegalObserved === true ? 'dom' : 'not_observed',
+      legalLinkSample: observedTrustSignals && observedTrustSignals.legalLinkSample
+        ? observedTrustSignals.legalLinkSample
+        : null,
+      hasTermsLink: domTermsObserved,
+      termsLinkSource: domTermsObserved === true ? 'dom' : 'not_observed',
+      termsLinkSample: observedTrustSignals && observedTrustSignals.termsLinkSample
+        ? observedTrustSignals.termsLinkSample
+        : null,
       scriptSrcTrustObserved: !!scriptTrustObserved,
       source: scriptTrustObserved ? 'balanced_light_dom_plus_script_src' : 'balanced_light'
     };
@@ -4793,7 +7051,52 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasStructured: null,
         source: 'balanced_light'
       },
+      clarity: observed.clarity || {
+        ctaTexts: [],
+        ctaCandidatesCount: null,
+        ctaObserved: null,
+        source: 'not_observed'
+      },
       trustSignals: trustSignalsLight,
+      coverage: observedCoverageSignals || {
+        semanticElements: {
+          hasHeaderElement: null,
+          hasNavElement: null,
+          hasFooterElement: null,
+          headerCount: null,
+          navCount: null,
+          footerCount: null,
+          semanticElementsObserved: null,
+          source: 'not_observed'
+        },
+        hasFaqLink: null,
+        hasFaqNav: null,
+        hasFaqSection: null,
+        faqLinkSource: 'not_observed',
+        faqLinkSample: null,
+        faqSectionSource: 'not_observed',
+        faqSectionTextSample: '',
+        breadcrumbUiObserved: null,
+        hasBreadcrumbUi: null,
+        breadcrumbUiSource: 'not_observed',
+        breadcrumbUiTextSample: '',
+        footerSignals: {
+          observed: null,
+          linkCount: null,
+          hasPrivacyLink: null,
+          hasCompanyLink: null,
+          hasCompanyProfileLink: null,
+          hasContactLink: null,
+          hasLegalLink: null,
+          hasTermsLink: null,
+          sampleTexts: [],
+          externalProfileLinksSample: [],
+          socialLinksSample: [],
+          footerExternalLinksSample: [],
+          source: 'not_observed'
+        },
+        source: 'not_observed'
+      },
       observed: {
         title: {
           value: observed.title || null,
@@ -4940,7 +7243,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           confidence: mainLandmarkConfidence
         },
         multimodalSignals: observedMultimodalSignals || null,
+        clarity: observed.clarity || null,
         trustSignals: trustSignalsLight,
+        coverage: observedCoverageSignals || null,
         body: {
           textLength: observed.body && typeof observed.body.textLength === 'number' ? observed.body.textLength : 0,
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
@@ -5106,8 +7411,8 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
     }));
   };
   try {
-    const before = await measure();
-    const sparseBefore = !!(
+      const before = await measure();
+      const sparseBefore = !!(
       before.warningText ||
       before.bodyTextLength < 800 ||
       before.anchorCount === 0 ||
@@ -5168,6 +7473,12 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
         anchorCountAfterWait: after.anchorCount,
         navLinkCountBeforeWait: before.navLinkCount,
         navLinkCountAfterWait: after.navLinkCount,
+        shadowHostCountBeforeWait: before.shadowHostCount,
+        shadowHostCountAfterWait: after.shadowHostCount,
+        shadowJsonLdCountBeforeWait: before.shadowJsonLdCount,
+        shadowJsonLdCountAfterWait: after.shadowJsonLdCount,
+        shadowH1CountBeforeWait: before.shadowH1Count,
+        shadowH1CountAfterWait: after.shadowH1Count,
         improvedBodyText: after.bodyTextLength > before.bodyTextLength,
         improvedLinks: after.anchorCount > before.anchorCount || after.navLinkCount > before.navLinkCount,
         warningTextBeforeWait: !!before.warningText,
@@ -5182,6 +7493,12 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       anchorCountAfterWait: before.anchorCount,
       navLinkCountBeforeWait: before.navLinkCount,
       navLinkCountAfterWait: before.navLinkCount,
+      shadowHostCountBeforeWait: before.shadowHostCount,
+      shadowHostCountAfterWait: before.shadowHostCount,
+      shadowJsonLdCountBeforeWait: before.shadowJsonLdCount,
+      shadowJsonLdCountAfterWait: before.shadowJsonLdCount,
+      shadowH1CountBeforeWait: before.shadowH1Count,
+      shadowH1CountAfterWait: before.shadowH1Count,
       warningTextBeforeWait: !!before.warningText,
       warningTextAfterWait: !!before.warningText
     });
@@ -6827,10 +9144,30 @@ async function scrapeOnce(req, res) {
         const serviceLike = hasLike(/service|business|solution|plan|サービス|事業|料金|プラン/);
         const contactLike = hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/);
         const privacyLike = hasLike(/privacy|プライバシー|個人情報/);
+        const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
+        const faqLink = hasLike(faqRe);
+        const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
         const navTextItems = uniqueBy(
           anchors.filter((a) => a.navLike && a.text),
           (a) => a.text,
           50
+        );
+        const ctaIgnoreRe = /^(home|top|menu|close|prev|previous|next|share|facebook|instagram|x|twitter|youtube|line|linkedin|tiktok|ホーム|トップ|メニュー|閉じる|前へ|次へ|共有)$/i;
+        const ctaCandidateRe = /(?:お問い合わせ|お問合せ|問い合わせ|相談|資料請求|見積|申し込|申込|購入|詳しく見る|詳細を見る|採用情報|エントリー|contact|inquiry|consult|request|quote|apply|entry|buy|purchase|learn more|read more|details)/i;
+        const ctaTextFrom = (el) => {
+          if (!el) return '';
+          const tag = String(el.tagName || '').toLowerCase();
+          const raw = tag === 'input'
+            ? (el.getAttribute('value') || el.getAttribute('aria-label') || el.getAttribute('title') || '')
+            : (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+          return clean(raw).slice(0, 80);
+        };
+        const ctaElements = queryAllDeep('a[href],button,[role="button"],input[type="submit"],input[type="button"]');
+        const ctaItems = uniqueBy(
+          ctaElements.map((el) => ({ text: ctaTextFrom(el), source: 'dom_or_open_shadow_dom' }))
+            .filter((item) => item.text && item.text.length <= 80 && !ctaIgnoreRe.test(item.text) && ctaCandidateRe.test(item.text)),
+          (item) => item.text,
+          10
         );
         const internalItems = uniqueBy(
           anchors.filter((a) => {
@@ -6859,6 +9196,22 @@ async function scrapeOnce(req, res) {
           '[class*="パンくず" i]'
         ].join(','))[0] || null;
         const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
+        const faqSectionEl = queryAllDeep([
+          'section[aria-label*="faq" i]',
+          'section[aria-label*="よくある質問" i]',
+          'section[id*="faq" i]',
+          'section[class*="faq" i]',
+          '[id*="faq" i]',
+          '[class*="faq" i]'
+        ].join(',')).find((el) => {
+          const text = clean(el && (el.innerText || el.textContent)).slice(0, 200);
+          return faqRe.test(text || '');
+        }) || null;
+        const faqHeadingEl = queryAllDeep('h1,h2,h3,h4,[role="heading"]').find((el) => {
+          const text = clean(el && (el.innerText || el.textContent));
+          return faqRe.test(text || '');
+        }) || null;
+        const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
         const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0;
         return {
           anchorCount: anchors.length,
@@ -6866,6 +9219,9 @@ async function scrapeOnce(req, res) {
           navLinkCount: navTextItems.length,
           internalLinkCount: internalItems.length,
           navTextsSample: navTextItems.map((a) => a.text),
+          ctaTexts: ctaItems.map((item) => item.text),
+          ctaCandidatesCount: ctaItems.length,
+          ctaObserved: true,
           internalLinksSample: internalItems.map((a) => ({ text: a.text, href: a.href })),
           externalProfileLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
           socialLinksSample: externalProfileItems.map((a) => a.href).slice(0, 10),
@@ -6883,6 +9239,13 @@ async function scrapeOnce(req, res) {
           companyLinkSample: firstLike(/company|about|corporate|会社|企業|運営|概要/),
           serviceLinkSample: firstLike(/service|business|solution|plan|サービス|事業|料金|プラン/),
           privacyLinkSample: firstLike(/privacy|プライバシー|個人情報/),
+          hasFaqLink: faqLink,
+          hasFaqNav: faqNav,
+          faqLinkSource: sourceFor(faqLink),
+          faqLinkSample: firstLike(faqRe),
+          hasFaqSection: !!(faqSectionEl || faqHeadingEl),
+          faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
+          faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
@@ -7325,8 +9688,24 @@ async function scrapeOnce(req, res) {
       const multimodalObserved = !!(phaseByName('multimodal') && phaseByName('multimodal').ok) || typeof multimodal.imgCount === 'number';
       const linkNumber = (key) => linksObserved && typeof linksTrust[key] === 'number' ? Number(linksTrust[key]) : null;
       const linkBoolean = (key) => linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, key) ? linksTrust[key] : null;
-      const multimodalBoolean = (key) => multimodalObserved && Object.prototype.hasOwnProperty.call(multimodal, key) ? !!multimodal[key] : null;
-      const multimodalNumber = (key) => multimodalObserved && typeof multimodal[key] === 'number' ? Number(multimodal[key]) : null;
+      const multimodalImage = multimodal && multimodal.image && typeof multimodal.image === 'object' ? multimodal.image : {};
+      const multimodalBoolean = (key) => {
+        if (!multimodalObserved) return null;
+        if (Object.prototype.hasOwnProperty.call(multimodal, key)) return !!multimodal[key];
+        if (Object.prototype.hasOwnProperty.call(multimodalImage, key)) return !!multimodalImage[key];
+        return null;
+      };
+      const multimodalNumber = (key) => {
+        if (!multimodalObserved) return null;
+        if (typeof multimodal[key] === 'number') return Number(multimodal[key]);
+        if (typeof multimodalImage[key] === 'number') return Number(multimodalImage[key]);
+        return null;
+      };
+      const multimodalString = (key) => multimodalObserved ? String(multimodal[key] || multimodalImage[key] || '').trim() : '';
+      const ogImageUrl = multimodalString('ogImageUrl');
+      const twitterImageUrl = multimodalString('twitterImageUrl');
+      const faviconUrl = multimodalString('faviconUrl');
+      const appleTouchIconUrl = multimodalString('appleTouchIconUrl');
       const geoThemeSignals = collectGeoThemeSignalsLight_({
         bodyTextSample: unifiedBodyTextSample,
         headings: []
@@ -7417,18 +9796,22 @@ async function scrapeOnce(req, res) {
         },
         multimodalSignals: {
           checked: multimodalObserved,
-          hasImage: multimodalObserved ? !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || Number(multimodal.imgCount || 0) > 0) : null,
+          hasImage: multimodalObserved ? !!(multimodal.hasOgImage || multimodal.hasTwitterImage || multimodal.hasFavicon || multimodal.hasAppleTouchIcon || ogImageUrl || twitterImageUrl || faviconUrl || appleTouchIconUrl || Number(multimodal.imgCount || multimodalImage.imageCount || 0) > 0) : null,
           hasStructured: null,
-          hasOgImage: multimodalBoolean('hasOgImage'),
-          hasTwitterImage: multimodalBoolean('hasTwitterImage'),
-          hasFavicon: multimodalBoolean('hasFavicon'),
-          hasAppleTouchIcon: multimodalBoolean('hasAppleTouchIcon'),
+          hasOgImage: multimodalBoolean('hasOgImage') === true || !!ogImageUrl,
+          ogImageUrl,
+          hasTwitterImage: multimodalBoolean('hasTwitterImage') === true || !!twitterImageUrl,
+          twitterImageUrl,
+          hasFavicon: multimodalBoolean('hasFavicon') === true || !!faviconUrl,
+          faviconUrl,
+          hasAppleTouchIcon: multimodalBoolean('hasAppleTouchIcon') === true || !!appleTouchIconUrl,
+          appleTouchIconUrl,
           hasStructuredLogo: null,
           imageObjectCount: null,
           structuredImageCount: null,
           imgCount: multimodalNumber('imgCount'),
-          primaryImageOfPage: '',
-          sampleImageUrls: [],
+          primaryImageOfPage: ogImageUrl || twitterImageUrl || '',
+          sampleImageUrls: [ogImageUrl, twitterImageUrl].filter(Boolean).slice(0, 5),
           source: 'shortfast_phase_builder'
         },
         trustSignals: {
@@ -7458,7 +9841,20 @@ async function scrapeOnce(req, res) {
           contactPointSource: structuredTrustSummary.contactPointSource,
           source: 'shortfast_phase_builder'
         },
+        clarity: {
+          ctaTexts: Array.isArray(linksTrust.ctaTexts) ? linksTrust.ctaTexts.slice(0, 10) : [],
+          ctaCandidatesCount: linksObserved && typeof linksTrust.ctaCandidatesCount === 'number' ? Number(linksTrust.ctaCandidatesCount) : null,
+          ctaObserved: linksObserved ? linksTrust.ctaObserved === true : null,
+          source: 'shortfast_phase_builder'
+        },
         coverage: {
+          hasFaqLink: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqLink') ? linksTrust.hasFaqLink : null,
+          hasFaqNav: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqNav') ? linksTrust.hasFaqNav : null,
+          hasFaqSection: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasFaqSection') ? linksTrust.hasFaqSection : null,
+          faqLinkSource: linksTrust.faqLinkSource || (linksObserved ? 'not_observed' : 'phase_failed'),
+          faqLinkSample: linksTrust.faqLinkSample || null,
+          faqSectionSource: linksTrust.faqSectionSource || (linksObserved ? 'not_observed' : 'phase_failed'),
+          faqSectionTextSample: linksTrust.faqSectionTextSample || '',
           breadcrumbUiObserved: linksObserved ? (linksTrust.breadcrumbUiObserved === true) : null,
           hasBreadcrumbUi: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasBreadcrumbUi') ? !!linksTrust.hasBreadcrumbUi : null,
           breadcrumbUiSource: linksTrust.breadcrumbUiSource || (linksObserved ? 'dom_scan' : 'not_observed'),
@@ -7656,6 +10052,9 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: linkBoolean('hasServiceLikeLink'),
         hasContactLikeLink: linkBoolean('hasContactLikeLink'),
         hasPrivacyLikeLink: linkBoolean('hasPrivacyLikeLink'),
+        ctaTexts: Array.isArray(geoSignalsV1.clarity.ctaTexts) ? geoSignalsV1.clarity.ctaTexts.slice(0, 10) : [],
+        ctaCandidatesCount: geoSignalsV1.clarity.ctaCandidatesCount,
+        ctaObserved: geoSignalsV1.clarity.ctaObserved,
         bodyTextLength: unifiedBodyTextLength,
         bodyTextSample: unifiedBodyTextSample || null,
         mainTextHead: unifiedBodyTextSample || null,
@@ -7690,6 +10089,9 @@ async function scrapeOnce(req, res) {
         sameAsValuesSample: structuredDataLight.sameAsSummary && Array.isArray(structuredDataLight.sameAsSummary.valuesSample)
           ? structuredDataLight.sameAsSummary.valuesSample.slice(0, 8)
           : [],
+        hasFaqLink: geoSignalsV1.coverage.hasFaqLink,
+        hasFaqNav: geoSignalsV1.coverage.hasFaqNav,
+        hasFaqSection: geoSignalsV1.coverage.hasFaqSection,
         breadcrumbUiObserved: geoSignalsV1.coverage.breadcrumbUiObserved,
         hasBreadcrumbUi: geoSignalsV1.coverage.hasBreadcrumbUi,
         breadcrumbUiSource: geoSignalsV1.coverage.breadcrumbUiSource,
@@ -8837,6 +11239,12 @@ async function scrapeOnce(req, res) {
           ? scrapeTiming.gotoMs
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
       });
+      await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch, {
+        page,
+        context,
+        reuseBrowser: true,
+        maxObserve: 2
+      });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
       const headingsObserved = observed.headings || {};
@@ -8844,7 +11252,12 @@ async function scrapeOnce(req, res) {
       const landmarksObserved = (geoSignalsV1 && geoSignalsV1.landmarks) || observed.landmarks || {};
       const structuredObserved = observed.structuredData || {};
       const multimodalObserved = (geoSignalsV1 && geoSignalsV1.multimodalSignals) || observed.multimodalSignals || {};
+      const clarityObserved = (geoSignalsV1 && geoSignalsV1.clarity) || observed.clarity || {};
       const trustObserved = (geoSignalsV1 && geoSignalsV1.trustSignals) || observed.trustSignals || {};
+      const coverageObserved = (geoSignalsV1 && geoSignalsV1.coverage) || observed.coverage || {};
+      const semanticObserved = coverageObserved && coverageObserved.semanticElements && typeof coverageObserved.semanticElements === 'object'
+        ? coverageObserved.semanticElements
+        : {};
       const bodyObserved = observed.body || {};
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
@@ -8891,6 +11304,18 @@ async function scrapeOnce(req, res) {
         hasServiceLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasServiceLikeLink') ? linksObserved.hasServiceLikeLink : null,
         hasContactLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasContactLikeLink') ? linksObserved.hasContactLikeLink : null,
         hasPrivacyLikeLink: Object.prototype.hasOwnProperty.call(linksObserved, 'hasPrivacyLikeLink') ? linksObserved.hasPrivacyLikeLink : null,
+        ctaTexts: Array.isArray(clarityObserved.ctaTexts) ? clarityObserved.ctaTexts.slice(0, 10) : [],
+        ctaCandidatesCount: typeof clarityObserved.ctaCandidatesCount === 'number' ? clarityObserved.ctaCandidatesCount : null,
+        ctaObserved: Object.prototype.hasOwnProperty.call(clarityObserved, 'ctaObserved') ? clarityObserved.ctaObserved : null,
+        hasHeaderElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasHeaderElement') ? semanticObserved.hasHeaderElement : null,
+        hasNavElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasNavElement') ? semanticObserved.hasNavElement : null,
+        hasFooterElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasFooterElement') ? semanticObserved.hasFooterElement : null,
+        hasFaqLink: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqLink') ? coverageObserved.hasFaqLink : null,
+        hasFaqNav: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqNav') ? coverageObserved.hasFaqNav : null,
+        hasFaqSection: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasFaqSection') ? coverageObserved.hasFaqSection : null,
+        breadcrumbUiObserved: Object.prototype.hasOwnProperty.call(coverageObserved, 'breadcrumbUiObserved') ? coverageObserved.breadcrumbUiObserved : null,
+        hasBreadcrumbUi: Object.prototype.hasOwnProperty.call(coverageObserved, 'hasBreadcrumbUi') ? coverageObserved.hasBreadcrumbUi : null,
+        breadcrumbUiSource: coverageObserved.breadcrumbUiSource || null,
         bodyTextLength: typeof bodyObserved.textLength === 'number' ? bodyObserved.textLength : 0,
         jsonldCount: typeof structuredObserved.rawCount === 'number' ? structuredObserved.rawCount : 0,
         jsonldParseableCount: typeof structuredObserved.parseableCount === 'number' ? structuredObserved.parseableCount : 0,
@@ -8952,8 +11377,16 @@ async function scrapeOnce(req, res) {
         companyLinkSource: trustObserved.companyLinkSource || linksObserved.companyLinkSource || null,
         serviceLinkSource: trustObserved.serviceLinkSource || linksObserved.serviceLinkSource || null,
         privacyLinkSource: trustObserved.privacyLinkSource || linksObserved.privacyLinkSource || null,
+        hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasPrivacyPolicyLink') ? trustObserved.hasPrivacyPolicyLink : null,
+        hasLegalLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasLegalLink') ? trustObserved.hasLegalLink : null,
+        hasTermsLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasTermsLink') ? trustObserved.hasTermsLink : null,
+        legalLinkSource: trustObserved.legalLinkSource || linksObserved.legalLinkSource || null,
+        termsLinkSource: trustObserved.termsLinkSource || linksObserved.termsLinkSource || null,
         contactConfidence: trustObserved.contactConfidence || null
       };
+      if (geoSignalsV1 && geoSignalsV1.subpageSignals) {
+        lightweightSummary.subpageSignals = buildLightweightSubpageSignalsSummary_(geoSignalsV1.subpageSignals);
+      }
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
           ? geoSignalsV1.diagnostics.evaluateCount
