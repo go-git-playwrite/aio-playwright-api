@@ -6399,6 +6399,73 @@ function logRepresentativeFinalResponsePhase12Audit_(payload = {}) {
   } catch (_) {}
 }
 
+function logSignalsLightFinalResponsePathAudit_(payload = {}) {
+  try {
+    const responsePayload = payload.responsePayload && typeof payload.responsePayload === 'object'
+      ? payload.responsePayload
+      : {};
+    const geoSignalsV1 = responsePayload.geoSignalsV1 && typeof responsePayload.geoSignalsV1 === 'object'
+      ? responsePayload.geoSignalsV1
+      : {};
+    const observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object'
+      ? geoSignalsV1.observed
+      : {};
+    const structuredData = geoSignalsV1.structuredData && typeof geoSignalsV1.structuredData === 'object'
+      ? geoSignalsV1.structuredData
+      : (observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {});
+    const headings = geoSignalsV1.headings && typeof geoSignalsV1.headings === 'object'
+      ? geoSignalsV1.headings
+      : (observed.headings && typeof observed.headings === 'object' ? observed.headings : {});
+    const observedH1 = observed.h1 && typeof observed.h1 === 'object' ? observed.h1 : {};
+    const coverageSignals = geoSignalsV1.coverageSignals && typeof geoSignalsV1.coverageSignals === 'object'
+      ? geoSignalsV1.coverageSignals
+      : {};
+    let origin = payload.origin || '';
+    if (!origin) {
+      try { origin = new URL(String(responsePayload.finalUrl || responsePayload.url || '')).origin; } catch (_) {}
+    }
+    console.log('[DEBUG][SIGNALS_LIGHT_FINAL_RESPONSE_PATH_AUDIT]', JSON.stringify({
+      origin: String(origin || '').slice(0, 180),
+      route: payload.route || '/scrape',
+      mode: responsePayload.mode || payload.mode || null,
+      responseMode: responsePayload.responseMode || payload.responseMode || null,
+      earlyReturnReason: responsePayload.earlyReturnReason || payload.earlyReturnReason || null,
+      guardReason: responsePayload.guardReason || payload.guardReason || null,
+      elapsedMs: typeof payload.elapsedMs === 'number' ? payload.elapsedMs : null,
+      hasGeoSignalsV1: !!responsePayload.geoSignalsV1,
+      structuredData: {
+        hasJsonLd: Object.prototype.hasOwnProperty.call(structuredData, 'hasJsonLd') ? structuredData.hasJsonLd : null,
+        hasWebsite: Object.prototype.hasOwnProperty.call(structuredData, 'hasWebsite') ? structuredData.hasWebsite : null,
+        hasOrganization: Object.prototype.hasOwnProperty.call(structuredData, 'hasOrganization') ? structuredData.hasOrganization : null,
+        rawCount: typeof structuredData.rawCount === 'number' ? structuredData.rawCount : null,
+        renderedDomRawCount: typeof structuredData.renderedDomRawCount === 'number' ? structuredData.renderedDomRawCount : null,
+        htmlScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'htmlScanSkipped') ? structuredData.htmlScanSkipped : null,
+        jsScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'jsScanSkipped') ? structuredData.jsScanSkipped : null,
+        chunkScanSkipped: Object.prototype.hasOwnProperty.call(structuredData, 'chunkScanSkipped') ? structuredData.chunkScanSkipped : null
+      },
+      headings: {
+        h1Count: typeof headings.h1Count === 'number'
+          ? headings.h1Count
+          : (typeof observedH1.count === 'number' ? observedH1.count : null),
+        source: headings.source || headings.h1Source || observedH1.source || null,
+        headingObservationLimited: Object.prototype.hasOwnProperty.call(headings, 'headingObservationLimited')
+          ? headings.headingObservationLimited
+          : (Object.prototype.hasOwnProperty.call(observedH1, 'headingObservationLimited') ? observedH1.headingObservationLimited : null)
+      },
+      coverageSignals: {
+        observedCount: typeof coverageSignals.observedCount === 'number'
+          ? coverageSignals.observedCount
+          : (typeof coverageSignals.observedSubpageCount === 'number' ? coverageSignals.observedSubpageCount : null),
+        representativePagesCount: typeof coverageSignals.representativePagesCount === 'number'
+          ? coverageSignals.representativePagesCount
+          : (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages.length : null),
+        reason: coverageSignals.reason || coverageSignals.error || null,
+        candidateSourceSummary: coverageSignals.candidateSourceSummary || null
+      }
+    }));
+  } catch (_) {}
+}
+
 function logSubpageCandidateDiscoveryAudit_(payload = {}) {
   try {
     const origin = String(payload.origin || '');
@@ -11855,6 +11922,8 @@ function buildBalancedShortResponsePayload(fullPayload) {
     ok: true,
     mode: fullPayload.mode,
     responseMode: 'short',
+    earlyReturnReason: fullPayload.earlyReturnReason || null,
+    guardReason: fullPayload.guardReason || null,
     shortMode: true,
     url: fullPayload.url,
     finalUrl: fullPayload.finalUrl,
@@ -15696,6 +15765,11 @@ async function scrapeOnce(req, res) {
       const signalsResponsePayload = {
         ok: true,
         mode: signalsFirstBalanced ? 'signalsFirstBalanced' : 'signalsFirstLight',
+        responseMode: watchdogResponseMode,
+        earlyReturnReason: subpageObservationPhase11State.fallbackReason || null,
+        guardReason: subpageObservationPhase11State.memoryGuardTriggered === true
+          ? (subpageObservationPhase11State.fallbackReason || 'pre_response_memory_guard')
+          : null,
         url: urlToFetch,
         finalUrl,
         status: resp && typeof resp.status === 'function' ? resp.status() : null,
@@ -15818,6 +15892,15 @@ async function scrapeOnce(req, res) {
           coverageSignals: shortPayload && shortPayload.geoSignalsV1 && shortPayload.geoSignalsV1.coverageSignals,
           earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
         });
+        logSignalsLightFinalResponsePathAudit_({
+          route: '/scrape',
+          mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+          responseMode: shortPayload && shortPayload.responseMode,
+          earlyReturnReason: shortPayload && shortPayload.earlyReturnReason || subpageObservationPhase11State.fallbackReason || null,
+          guardReason: shortPayload && shortPayload.guardReason || null,
+          elapsedMs: Math.max(0, Date.now() - scrapeWatchdogStartedAt),
+          responsePayload: shortPayload
+        });
         const responseSendStartedAt = Date.now();
         logWatchdog('response_send_start', responseSendStartedAt, {
           completedAt: null,
@@ -15861,6 +15944,15 @@ async function scrapeOnce(req, res) {
         origin: (() => { try { return new URL(String(signalsResponsePayload && (signalsResponsePayload.finalUrl || signalsResponsePayload.url) || '')).origin; } catch (_) { return ''; } })(),
         coverageSignals: signalsResponsePayload && signalsResponsePayload.geoSignalsV1 && signalsResponsePayload.geoSignalsV1.coverageSignals,
         earlyReturnReason: subpageObservationPhase11State.fallbackReason || null
+      });
+      logSignalsLightFinalResponsePathAudit_({
+        route: '/scrape',
+        mode: signalsFirstBalanced ? 'signalsMode=balanced' : 'signalsMode=light',
+        responseMode: signalsResponsePayload && signalsResponsePayload.responseMode || 'default',
+        earlyReturnReason: signalsResponsePayload && signalsResponsePayload.earlyReturnReason || null,
+        guardReason: signalsResponsePayload && signalsResponsePayload.guardReason || null,
+        elapsedMs: Math.max(0, Date.now() - scrapeWatchdogStartedAt),
+        responsePayload: signalsResponsePayload
       });
       const responseSendStartedAt = Date.now();
       logWatchdog('response_send_start', responseSendStartedAt, {
