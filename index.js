@@ -6966,6 +6966,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
   const startedAt = Date.now();
   const balancedMode = !!(opts && opts.balancedMode);
   const shortFastMode = !!(opts && opts.shortFastMode);
+  const debugHeavySite = opts && opts.debugHeavySite === true;
+  const debugHeavySiteStartedAt = Number(opts && opts.debugHeavySiteStartedAt || startedAt) || startedAt;
   const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
   const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
     ? opts.hydrationMetrics
@@ -6978,8 +6980,43 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     multimodalMs: null,
     totalMs: null
   };
+  const buildGeoMemorySnapshot = () => {
+    try {
+      const memory = process.memoryUsage();
+      return {
+        rss: memory.rss,
+        heapUsed: memory.heapUsed,
+        heapTotal: memory.heapTotal,
+        external: memory.external,
+        arrayBuffers: memory.arrayBuffers
+      };
+    } catch (_) {
+      return null;
+    }
+  };
+  const logHeavySiteBuildGeoAudit = (phase, details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      console.log('[DEBUG][HEAVY_SITE_BUILD_GEOSIGNALS_AUDIT]', JSON.stringify({
+        phase,
+        url: String(url || ''),
+        finalUrl: page && typeof page.url === 'function' ? page.url() : '',
+        elapsedMs: Date.now() - debugHeavySiteStartedAt,
+        memory: buildGeoMemorySnapshot(),
+        details
+      }));
+    } catch (_) {}
+  };
   try {
+    logHeavySiteBuildGeoAudit('build_start', {
+      balancedMode,
+      shortFastMode,
+      boundedHydrationWaitMs
+    });
     const basicDomStart = Date.now();
+    logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_start', {
+      source: 'initial_rendered_dom_evaluate'
+    });
     const observed = await page.evaluate(({ inputUrl, balancedMode, shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).filter(Boolean)));
@@ -7584,6 +7621,56 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       };
     }, { inputUrl: String(url || ''), balancedMode, shortFastMode });
     phaseTimings.basicDomMs = Math.max(0, Date.now() - basicDomStart);
+    logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_end', {
+      basicDomMs: phaseTimings.basicDomMs,
+      finalUrl: observed && observed.finalUrl,
+      titleLength: String(observed && observed.title || '').length,
+      bodyTextLength: observed && observed.body && observed.body.textLength,
+      rawJsonLdCount: observed && observed.structuredData && observed.structuredData.rawCount,
+      h1Count: Array.isArray(observed && observed.h1) ? observed.h1.length : null,
+      h2Count: Array.isArray(observed && observed.h2) ? observed.h2.length : null,
+      linksMs: observed && observed.phaseTimings && observed.phaseTimings.linksMs,
+      multimodalMs: observed && observed.phaseTimings && observed.phaseTimings.multimodalMs
+    });
+    logHeavySiteBuildGeoAudit('structured_data_end', {
+      source: 'initial_rendered_dom_evaluate',
+      rawCount: observed && observed.structuredData && observed.structuredData.rawCount,
+      parseableCount: observed && observed.structuredData && observed.structuredData.parseableCount,
+      hasJsonLd: observed && observed.structuredData && observed.structuredData.hasJsonLd,
+      hasWebsite: observed && observed.structuredData && observed.structuredData.hasWebsite,
+      hasOrganization: observed && observed.structuredData && observed.structuredData.hasOrganization
+    });
+    logHeavySiteBuildGeoAudit('headings_end', {
+      source: 'initial_rendered_dom_evaluate',
+      h1Count: Array.isArray(observed && observed.h1) ? observed.h1.length : null,
+      h2Count: Array.isArray(observed && observed.h2) ? observed.h2.length : null,
+      h3Count: Array.isArray(observed && observed.h3) ? observed.h3.length : null,
+      shadowObserved: observed && observed.shadowHeadings && observed.shadowHeadings.observed,
+      shadowHostCount: observed && observed.shadowHeadings && observed.shadowHeadings.hostCount
+    });
+    logHeavySiteBuildGeoAudit('links_end', {
+      source: 'initial_rendered_dom_evaluate',
+      linksMs: observed && observed.phaseTimings && observed.phaseTimings.linksMs,
+      navTextsCount: observed && observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.length : null,
+      internalLinksSampleCount: observed && observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.length : null,
+      externalProfileLinksSampleCount: observed && observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.length : null
+    });
+    logHeavySiteBuildGeoAudit('social_external_links_end', {
+      source: 'initial_rendered_dom_evaluate',
+      externalProfileLinksSampleCount: observed && observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.length : null,
+      socialLinksSampleCount: observed && observed.links && Array.isArray(observed.links.socialLinksSample) ? observed.links.socialLinksSample.length : null
+    });
+    logHeavySiteBuildGeoAudit('footer_links_end', {
+      source: 'initial_rendered_dom_evaluate',
+      footerObserved: observed && observed.coverage && observed.coverage.footerSignals && observed.coverage.footerSignals.observed,
+      footerLinkCount: observed && observed.coverage && observed.coverage.footerSignals && observed.coverage.footerSignals.linkCount
+    });
+    logHeavySiteBuildGeoAudit('trust_signals_end', {
+      source: 'initial_rendered_dom_evaluate',
+      hasContactLink: observed && observed.trustSignals && observed.trustSignals.hasContactLink,
+      hasCompanyLink: observed && observed.trustSignals && observed.trustSignals.hasCompanyLink,
+      hasPrivacyPolicyLink: observed && observed.trustSignals && observed.trustSignals.hasPrivacyPolicyLink
+    });
     if (observed && observed.phaseTimings) {
       phaseTimings.linksMs = typeof observed.phaseTimings.linksMs === 'number' ? observed.phaseTimings.linksMs : null;
       phaseTimings.multimodalMs = typeof observed.phaseTimings.multimodalMs === 'number' ? observed.phaseTimings.multimodalMs : null;
@@ -7672,6 +7759,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       a11yHeadings.error = 'skipped_short_fast';
     } else {
       try {
+        logHeavySiteBuildGeoAudit('headings_start', {
+          source: 'a11y_get_by_role_heading'
+        });
         const allText = await page.getByRole('heading').allTextContents().catch(() => []);
         const h1Text = await page.getByRole('heading', { level: 1 }).allTextContents().catch(() => []);
         const h2Text = await page.getByRole('heading', { level: 2 }).allTextContents().catch(() => []);
@@ -7681,8 +7771,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         a11yHeadings.h2 = uniqueHeadingTexts(h2Text, 20);
         a11yHeadings.h3 = uniqueHeadingTexts(h3Text, 20);
         a11yHeadings.observed = true;
+        logHeavySiteBuildGeoAudit('headings_end', {
+          source: 'a11y_get_by_role_heading',
+          allCount: a11yHeadings.all.length,
+          h1Count: a11yHeadings.h1.length,
+          h2Count: a11yHeadings.h2.length,
+          h3Count: a11yHeadings.h3.length
+        });
       } catch (e) {
         a11yHeadings.error = String(e && (e.message || e) || '').slice(0, 160);
+        logHeavySiteBuildGeoAudit('headings_end', {
+          source: 'a11y_get_by_role_heading',
+          error: a11yHeadings.error
+        });
       }
     }
     const filteredDomH1 = filterHeadingTexts(domH1);
@@ -7814,13 +7915,25 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       a11yMain.error = 'skipped_short_fast';
     } else {
       try {
+        logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_start', {
+          source: 'a11y_get_by_role_main'
+        });
         const mainLocator = page.getByRole('main');
         const mainTexts = await mainLocator.allTextContents().catch(() => []);
         a11yMain.texts = uniqueHeadingTexts(mainTexts.map((v) => String(v || '').slice(0, 220)), 3);
         a11yMain.count = a11yMain.texts.length;
         a11yMain.observed = true;
+        logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_end', {
+          source: 'a11y_get_by_role_main',
+          count: a11yMain.count,
+          observed: a11yMain.observed
+        });
       } catch (e) {
         a11yMain.error = String(e && (e.message || e) || '').slice(0, 160);
+        logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_end', {
+          source: 'a11y_get_by_role_main',
+          error: a11yMain.error
+        });
       }
     }
     const hasDomMain = domLandmarks.hasMainLandmark === true;
@@ -7845,6 +7958,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       : null;
     const mainLandmarkObservationLimited = !(hasDomMain || hasA11yMain);
     const structuredDataStart = Date.now();
+    logHeavySiteBuildGeoAudit('jsonld_parse_start', {
+      source: 'html_content_and_same_origin_script_src'
+    });
+    logHeavySiteBuildGeoAudit('structured_data_start', {
+      source: 'html_content_and_same_origin_script_src',
+      balancedMode
+    });
     const htmlContentJsonLdSummary = balancedMode
       ? await collectHtmlContentJsonLdSummaryLight(page)
       : null;
@@ -7854,6 +7974,22 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         : {})
       : null;
     phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
+    logHeavySiteBuildGeoAudit('jsonld_parse_end', {
+      source: 'html_content_and_same_origin_script_src',
+      structuredDataMs: phaseTimings.structuredDataMs,
+      htmlRawCount: htmlContentJsonLdSummary && htmlContentJsonLdSummary.rawCount,
+      htmlParseableCount: htmlContentJsonLdSummary && htmlContentJsonLdSummary.parseableCount,
+      scriptSrcCandidateCount: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.candidateCount,
+      scriptSrcFetchedCount: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.fetchedCount,
+      scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
+      htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
+    });
+    logHeavySiteBuildGeoAudit('structured_data_end', {
+      source: 'html_content_and_same_origin_script_src',
+      structuredDataMs: phaseTimings.structuredDataMs,
+      htmlRawCount: htmlContentJsonLdSummary && htmlContentJsonLdSummary.rawCount,
+      scriptSrcCandidateCount: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.candidateCount
+    });
     const renderedStructured = observed.structuredData && typeof observed.structuredData === 'object' ? observed.structuredData : {};
     const renderedTypes = Array.isArray(renderedStructured.types) ? renderedStructured.types : [];
     const htmlTypes = htmlContentJsonLdSummary && Array.isArray(htmlContentJsonLdSummary.types) ? htmlContentJsonLdSummary.types : [];
@@ -8385,8 +8521,19 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         renderedTextLength: geoSignalsV1.observed.body.textLength
       }));
     } catch (_) {}
+    logHeavySiteBuildGeoAudit('build_end', {
+      totalMs: geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.phaseTimings && geoSignalsV1.diagnostics.phaseTimings.totalMs,
+      basicDomMs: phaseTimings.basicDomMs,
+      structuredDataMs: phaseTimings.structuredDataMs,
+      linksMs: phaseTimings.linksMs,
+      multimodalMs: phaseTimings.multimodalMs,
+      hasGeoSignalsV1: true
+    });
     return geoSignalsV1;
   } catch (e) {
+    logHeavySiteBuildGeoAudit('build_error', {
+      error: String(e && (e.message || e) || '').slice(0, 240)
+    });
     return {
       version: 'geoSignalsV1',
       generatedAt,
@@ -12416,7 +12563,9 @@ async function scrapeOnce(req, res) {
         hydrationMetrics,
         gotoMs: typeof scrapeTiming.gotoMs === 'number'
           ? scrapeTiming.gotoMs
-          : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
+          : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null),
+        debugHeavySite,
+        debugHeavySiteStartedAt
       });
       logHeavySiteTopPageAudit('buildGeoSignalsV1_end', {
         hasGeoSignalsV1: !!geoSignalsV1,
