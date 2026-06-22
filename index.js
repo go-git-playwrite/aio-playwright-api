@@ -9319,9 +9319,49 @@ async function scrapeOnce(req, res) {
   const safeArrayLength = (v) => {
     try { return Array.isArray(v) ? v.length : 0; } catch (_) { return 0; }
   };
+  const topPageMemorySnapshot = () => {
+    try {
+      const memory = process.memoryUsage();
+      return {
+        rss: memory.rss,
+        heapUsed: memory.heapUsed,
+        heapTotal: memory.heapTotal,
+        external: memory.external,
+        arrayBuffers: memory.arrayBuffers
+      };
+    } catch (_) {
+      return null;
+    }
+  };
+  const logHeavySiteTopPageAudit = (phase, details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      const currentFinalUrl = page && typeof page.url === 'function' ? page.url() : '';
+      console.log('[DEBUG][HEAVY_SITE_TOPPAGE_AUDIT]', JSON.stringify({
+        phase,
+        url: urlToFetch,
+        finalUrl: currentFinalUrl || '',
+        elapsedMs: Date.now() - debugHeavySiteStartedAt,
+        memory: topPageMemorySnapshot(),
+        details
+      }));
+    } catch (_) {}
+  };
 
   try {
+    logHeavySiteTopPageAudit('request_start', {
+      signalsMode,
+      responseMode,
+      subpageObservationMode,
+      noCache,
+      signalsOnly,
+      signalsFirstLight,
+      signalsFirstBalanced
+    });
     const __timingBrowserStart = Date.now();
+    logHeavySiteTopPageAudit('browser_page_setup_start', {
+      step: 'chromium_launch'
+    });
     browser = await chromium.launch({
       headless: true,
       // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
@@ -9337,6 +9377,9 @@ async function scrapeOnce(req, res) {
       ]
     });
     scrapeTiming.browserReadyMs = Math.max(0, Date.now() - __timingBrowserStart);
+    logHeavySiteTopPageAudit('browser_page_setup_progress', {
+      browserReadyMs: scrapeTiming.browserReadyMs
+    });
 
     const __timingPageReadyStart = Date.now();
     context = await browser.newContext({
@@ -9361,6 +9404,11 @@ async function scrapeOnce(req, res) {
     });
     scrapeTiming.pageReadyMs = Math.max(0, Date.now() - __timingPageReadyStart);
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
+    logHeavySiteTopPageAudit('browser_page_setup_end', {
+      browserReadyMs: scrapeTiming.browserReadyMs,
+      pageReadyMs: scrapeTiming.pageReadyMs,
+      navTimeoutMs: NAV_TIMEOUT_MS
+    });
 
     if (probeMode === 'gototiming') {
       const probeStartedAt = Date.now();
@@ -11587,8 +11635,17 @@ async function scrapeOnce(req, res) {
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
+    logHeavySiteTopPageAudit('page_goto_start', {
+      waitUntil: 'domcontentloaded',
+      timeoutMs: 60000
+    });
     const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
+    logHeavySiteTopPageAudit('page_goto_end', {
+      status: resp && typeof resp.status === 'function' ? resp.status() : null,
+      finalUrl: page && typeof page.url === 'function' ? page.url() : null,
+      gotoMs: scrapeTiming.gotoMs
+    });
     logSf('AFTER_GOTO', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
       finalUrl: page && typeof page.url === 'function' ? page.url() : null
@@ -12322,7 +12379,18 @@ async function scrapeOnce(req, res) {
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
       const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_start', {
+        boundedHydrationWaitMs,
+        shortFastMode: balancedShortFastResponse
+      });
       const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+      logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_end', {
+        waitMs: hydrationMetrics && hydrationMetrics.waitMs,
+        bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
+        bodyTextAfterWait: hydrationMetrics && hydrationMetrics.bodyTextAfterWait,
+        anchorCountBeforeWait: hydrationMetrics && hydrationMetrics.anchorCountBeforeWait,
+        anchorCountAfterWait: hydrationMetrics && hydrationMetrics.anchorCountAfterWait
+      });
       if (signalsFirstBalanced || signalsFirstLight) {
         logSf(signalsFirstBalanced ? 'SIGNALS_FIRST_BALANCED_HYDRATION_WAIT' : 'SIGNALS_FIRST_LIGHT_HYDRATION_WAIT', {
           waitMs: hydrationMetrics && hydrationMetrics.waitMs,
@@ -12337,6 +12405,10 @@ async function scrapeOnce(req, res) {
           warningTextAfterWait: hydrationMetrics && hydrationMetrics.warningTextAfterWait
         });
       }
+      logHeavySiteTopPageAudit('buildGeoSignalsV1_start', {
+        balancedMode: signalsFirstBalanced,
+        shortFastMode: balancedShortFastResponse
+      });
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
         shortFastMode: balancedShortFastResponse,
@@ -12345,6 +12417,38 @@ async function scrapeOnce(req, res) {
         gotoMs: typeof scrapeTiming.gotoMs === 'number'
           ? scrapeTiming.gotoMs
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null)
+      });
+      logHeavySiteTopPageAudit('buildGeoSignalsV1_end', {
+        hasGeoSignalsV1: !!geoSignalsV1,
+        geoKeys: geoSignalsV1 && typeof geoSignalsV1 === 'object' ? Object.keys(geoSignalsV1).slice(0, 40) : []
+      });
+      logHeavySiteTopPageAudit('structuredData_extraction_end', {
+        hasStructuredData: !!(geoSignalsV1 && geoSignalsV1.structuredData),
+        hasJsonLd: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasJsonLd,
+        hasWebsite: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasWebsite,
+        hasOrganization: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasOrganization,
+        rawCount: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.rawCount
+      });
+      logHeavySiteTopPageAudit('headings_extraction_end', {
+        hasHeadings: !!(geoSignalsV1 && geoSignalsV1.headings),
+        h1Count: geoSignalsV1 && geoSignalsV1.headings && geoSignalsV1.headings.h1Count,
+        hasH1: geoSignalsV1 && geoSignalsV1.headings && geoSignalsV1.headings.hasH1,
+        source: geoSignalsV1 && geoSignalsV1.headings && geoSignalsV1.headings.source
+      });
+      logHeavySiteTopPageAudit('link_extraction_end', {
+        navLinkCount: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.links && geoSignalsV1.observed.links.navLinkCount,
+        internalLinkCount: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.links && geoSignalsV1.observed.links.internalLinkCount,
+        externalLinkCount: geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.links && geoSignalsV1.observed.links.externalLinkCount
+      });
+      logHeavySiteTopPageAudit('trust_social_footer_extraction_end', {
+        hasTrustSignals: !!(geoSignalsV1 && geoSignalsV1.trustSignals),
+        hasFooterSignals: !!(geoSignalsV1 && geoSignalsV1.footerSignals),
+        sameAsObserved: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.sameAsSummary && geoSignalsV1.structuredData.sameAsSummary.observed,
+        sameAsCount: geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.sameAsSummary && geoSignalsV1.structuredData.sameAsSummary.count
+      });
+      logHeavySiteTopPageAudit('attachCoverageSignalsToGeoSignalsLight_call_start', {
+        subpageObservationMode,
+        maxObserve: 2
       });
       await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch, {
         page,
@@ -12355,6 +12459,10 @@ async function scrapeOnce(req, res) {
         signalsMode,
         debugHeavySite,
         debugHeavySiteStartedAt
+      });
+      logHeavySiteTopPageAudit('attachCoverageSignalsToGeoSignalsLight_call_end', {
+        hasCoverageSignals: !!(geoSignalsV1 && geoSignalsV1.coverageSignals),
+        observedSubpageCount: geoSignalsV1 && geoSignalsV1.coverageSignals && geoSignalsV1.coverageSignals.observedSubpageCount
       });
       const observed = geoSignalsV1 && geoSignalsV1.observed ? geoSignalsV1.observed : {};
       const linksObserved = observed.links || {};
