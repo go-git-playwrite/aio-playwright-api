@@ -5956,6 +5956,42 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           : []
       }));
     } catch (_) {}
+    try {
+      console.log('[DEBUG][SUBPAGE_COVERAGE_SIGNALS_FINAL_AUDIT]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        hasCoverageSignals: !!coverageSignals,
+        observedCount: coverageSignals && coverageSignals.observedCount,
+        observedSubpageCount: coverageSignals && coverageSignals.observedSubpageCount,
+        representativePagesCount: Array.isArray(coverageSignals && coverageSignals.representativePages)
+          ? coverageSignals.representativePages.length
+          : 0,
+        representativePages: Array.isArray(coverageSignals && coverageSignals.representativePages)
+          ? coverageSignals.representativePages.slice(0, 10).map(page => ({
+              path: page && page.path || '',
+              pageType: page && page.pageType || '',
+              candidateOnly: page && page.candidateOnly === true,
+              reached: page && page.reached === true
+            }))
+          : [],
+        candidatePageTypes: coverageSignals && coverageSignals.candidatePageTypes || {}
+      }));
+    } catch (_) {}
+    try {
+      const matrixAudit = buildSubpageCardConnectionMatrixAudit_(coverageSignals);
+      console.log('[DEBUG][SUBPAGE_CARD_CONNECTION_MATRIX_AUDIT]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        hasCoverageSignals: !!coverageSignals,
+        sourceKeys: matrixAudit.sourceKeys || [],
+        representativePagesCount: matrixAudit.representativePagesCount || 0,
+        representativeObservationQualityCount: matrixAudit.representativeObservationQualityCount || 0,
+        observedPages: matrixAudit.observedPages || [],
+        matrix: matrixAudit.matrix || []
+      }));
+    } catch (_) {}
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -13421,7 +13457,6 @@ async function scrapeOnce(req, res) {
         memoryHints
       };
       const logScrapeResponseReadyAudit = payload => {
-        console.log('[DEBUG][SCRAPE_RESPONSE_READY_AUDIT_ENTERED]');
         try {
           const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
           const stringifyProbe = value => {
@@ -13463,21 +13498,6 @@ async function scrapeOnce(req, res) {
             coverageSignalsStringifyError: coverageSignalsProbe.error,
             responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 20) : []
           }));
-          try {
-            const matrixAudit = buildSubpageCardConnectionMatrixAudit_(coverageSignals);
-            console.log('[DEBUG][SUBPAGE_CARD_CONNECTION_MATRIX_AUDIT]', JSON.stringify({
-              route: '/scrape',
-              mode: 'signalsMode=light',
-              origin: coverageSignals && coverageSignals.origin || payload && payload.geoSignalsV1 && payload.geoSignalsV1.url || payload && payload.finalUrl || finalUrl || null,
-              hasCoverageSignals: matrixAudit.hasCoverageSignals === true,
-              observedPages: matrixAudit.observedPages || [],
-              matrix: matrixAudit.matrix || [],
-              blockedReason: matrixAudit.blockedReason || null,
-              sourceKeys: matrixAudit.sourceKeys || [],
-              representativePagesCount: matrixAudit.representativePagesCount || 0,
-              representativeObservationQualityCount: matrixAudit.representativeObservationQualityCount || 0
-            }));
-          } catch (_) {}
           logHeavySiteInvestigationAudit('response_ready', {
             mode: payload && (payload.responseMode || payload.mode) || (signalsMode || responseMode || null),
             hasGeoSignalsV1: Boolean(payload && payload.geoSignalsV1),
