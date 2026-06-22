@@ -3562,6 +3562,50 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   };
 }
 
+function inferHtmlFetchOnlyStaticCandidatePageType_(path) {
+  const value = String(path || '').toLowerCase();
+  if (/\/about(?:\/|$|-|_)/i.test(value)) return 'about';
+  if (/\/contact(?:\/|$|-|_)/i.test(value)) return 'contact';
+  if (/\/(?:faq|guide|support)(?:\/|$|-|_)/i.test(value)) return 'faq';
+  if (/\/(?:terms|privacy)(?:\/|$|-|_)/i.test(value)) return 'legal';
+  return 'unknown';
+}
+
+function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin) {
+  const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy'];
+  const source = 'html-fetch-only-static-candidate';
+  const candidates = staticPaths
+    .map(path => {
+      const url = normalizeDiscoverSubpageUrl(path, origin);
+      if (!url) return null;
+      const pageType = inferHtmlFetchOnlyStaticCandidatePageType_(path);
+      return {
+        url,
+        path,
+        pageType,
+        source,
+        sources: [source],
+        score: scoreDiscoverSubpageCandidate(url, 'nav', [source]),
+        reason: 'html fetch only static candidate',
+        candidateOnly: true
+      };
+    })
+    .filter(Boolean);
+  return {
+    candidates,
+    totalCandidates: candidates.length,
+    sourceSummary: {
+      sitemap: 0,
+      htmlSitemap: 0,
+      nav: 0,
+      footer: 0,
+      other: candidates.length
+    },
+    errors: [],
+    notes: ['subpage_observation_mode_html_fetch_only_static_candidates']
+  };
+}
+
 app.post('/discover-subpage-candidates-light', async (req, res) => {
   const rawTopUrl = req && req.body && (req.body.topUrl || req.body.url);
   const normalized = normalizeDiscoverTopUrl(rawTopUrl);
@@ -4429,6 +4473,12 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
   const notes = [];
+  if (Array.isArray(payload && payload.notes)) {
+    payload.notes.slice(0, 10).forEach(note => {
+      const normalizedNote = String(note || '').trim();
+      if (normalizedNote && !notes.includes(normalizedNote)) notes.push(normalizedNote);
+    });
+  }
   if (observedPages.length === 0 && observations.length > 0) notes.push('no_observed_subpages_but_observation_attempted');
   if (String(payload && payload.subpageObservationMode || '').toLowerCase() === 'htmlfetchonly') {
     notes.push('subpage_observation_mode_html_fetch_only');
@@ -4647,7 +4697,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   };
   const reusePageForDiscover = !!(opts && opts.page);
   const reuseContextForObserve = !!(opts && opts.context);
-  const maxObserve = Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
+  const maxObserve = htmlFetchOnlySubpageObservation
+    ? 2
+    : Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
   const auditPayload = {
     url: String(topUrl || ''),
     reusePageForDiscover,
@@ -4758,15 +4810,18 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return coverageSignals;
     }
     traceCoverageMemory('discover_before', {
-      browserCreated: !reusePageForDiscover,
-      contextCreated: true,
-      pageCreated: true
+      browserCreated: htmlFetchOnlySubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !htmlFetchOnlySubpageObservation,
+      pageCreated: !htmlFetchOnlySubpageObservation,
+      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
     });
-    const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
-      page: opts && opts.page,
-      context: opts && opts.context,
-      reuseBrowser: reusePageForDiscover || reuseContextForObserve
-    });
+    const discovered = htmlFetchOnlySubpageObservation
+      ? buildHtmlFetchOnlyStaticSubpageCandidates_(normalized.topUrl, normalized.origin)
+      : await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
+          page: opts && opts.page,
+          context: opts && opts.context,
+          reuseBrowser: reusePageForDiscover || reuseContextForObserve
+        });
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
@@ -4786,11 +4841,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       }));
     } catch (_) {}
     traceCoverageMemory('discover_after', {
-      browserCreated: !reusePageForDiscover,
-      contextCreated: true,
-      pageCreated: true,
+      browserCreated: htmlFetchOnlySubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !htmlFetchOnlySubpageObservation,
+      pageCreated: !htmlFetchOnlySubpageObservation,
       candidateCount: discovered.totalCandidates,
-      observeCount: selectedCandidates.length
+      observeCount: selectedCandidates.length,
+      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
     });
     if (!selectedCandidates.length) {
       logPayload.origin = normalized.origin;
@@ -4952,7 +5008,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       },
       candidates: selectedCandidates,
       observations,
-      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
+      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '',
+      notes: Array.isArray(discovered.notes) ? discovered.notes.slice(0, 10) : []
     };
     const subpageSignals = buildSubpageSignalsV1FromSubpageObservation_(payload);
     if (subpageSignals) {
