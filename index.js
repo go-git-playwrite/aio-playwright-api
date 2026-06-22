@@ -3189,6 +3189,221 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   return { pages };
 }
 
+async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
+  const context = opts && opts.context;
+  let page = null;
+  try {
+    if (!context || typeof context.newPage !== 'function') {
+      return {
+        url,
+        finalUrl: url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        h2Sample: [],
+        jsonldTypes: [],
+        jsonLdCount: 0,
+        hasBreadcrumbJsonLd: false,
+        hasBreadcrumbUi: false,
+        hasMain: false,
+        hasMainLandmark: false,
+        internalLinkCount: 0,
+        externalLinkCount: 0,
+        bodyTextLength: 0,
+        sampledText: '',
+        error: 'playwright_scoped_light_context_unavailable',
+        observationSource: 'playwright-scoped-light',
+        observationMethod: 'playwright_scoped_light'
+      };
+    }
+    page = await context.newPage();
+    let response = null;
+    try {
+      response = await page.goto(url, {
+        waitUntil: 'commit',
+        timeout: Math.max(1000, Math.min(8000, Number(opts.timeout || 8000) || 8000))
+      });
+    } catch (e) {
+      return {
+        url,
+        finalUrl: typeof page.url === 'function' ? page.url() || url : url,
+        status: null,
+        ok: false,
+        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+        title: '',
+        canonical: '',
+        h1Count: 0,
+        h1Texts: [],
+        h2Sample: [],
+        jsonldTypes: [],
+        jsonLdCount: 0,
+        hasBreadcrumbJsonLd: false,
+        hasBreadcrumbUi: false,
+        hasMain: false,
+        hasMainLandmark: false,
+        internalLinkCount: 0,
+        externalLinkCount: 0,
+        bodyTextLength: 0,
+        sampledText: '',
+        error: String(e && (e.message || e) || 'playwright_scoped_light_goto_failed').slice(0, 240),
+        observationSource: 'playwright-scoped-light',
+        observationMethod: 'playwright_scoped_light'
+      };
+    }
+    const status = response && typeof response.status === 'function' ? response.status() : null;
+    const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
+    const observed = await page.evaluate(() => {
+      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const isVisible = el => {
+        try {
+          if (!el || !el.getBoundingClientRect) return false;
+          const style = window.getComputedStyle(el);
+          if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        } catch (_) {
+          return true;
+        }
+      };
+      const pickText = selector => Array.from(document.querySelectorAll(selector))
+        .filter(isVisible)
+        .map(el => clean(el.textContent).slice(0, 180))
+        .filter(Boolean);
+      const jsonldTypes = [];
+      const collectTypes = (node, depth = 0) => {
+        if (!node || depth > 4) return;
+        if (Array.isArray(node)) {
+          node.slice(0, 50).forEach(item => collectTypes(item, depth + 1));
+          return;
+        }
+        if (typeof node !== 'object') return;
+        const type = node['@type'];
+        if (Array.isArray(type)) type.slice(0, 10).forEach(item => jsonldTypes.push(String(item || '').trim()));
+        else if (type) jsonldTypes.push(String(type || '').trim());
+        if (Array.isArray(node['@graph'])) node['@graph'].slice(0, 50).forEach(item => collectTypes(item, depth + 1));
+      };
+      Array.from(document.querySelectorAll('script[type*="ld+json" i]')).slice(0, 20).forEach(script => {
+        try { collectTypes(JSON.parse(script.textContent || ''), 0); } catch (_) {}
+      });
+      const canonicalRaw = document.querySelector('link[rel~="canonical" i]')?.getAttribute('href') || '';
+      let canonical = canonicalRaw;
+      try { if (canonicalRaw) canonical = new URL(canonicalRaw, location.href).toString(); } catch (_) {}
+      const metaDescription = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content') || '').slice(0, 240);
+      const textNodes = Array.from(document.querySelectorAll('main,article,[role="main"]'))
+        .filter(isVisible)
+        .slice(0, 8)
+        .map(el => {
+          try {
+            el.querySelectorAll('script,style,iframe,noscript,svg,canvas,[hidden],[aria-hidden="true"]').forEach(node => node.remove());
+          } catch (_) {}
+          return clean(el.textContent).slice(0, 1500);
+        })
+        .filter(Boolean);
+      const scopedText = textNodes.join(' ').slice(0, 5000);
+      let internalLinkCount = 0;
+      let externalLinkCount = 0;
+      Array.from(document.querySelectorAll('nav a[href],footer a[href]')).slice(0, 250).forEach(a => {
+        try {
+          if (!isVisible(a)) return;
+          const link = new URL(a.getAttribute('href') || '', location.href);
+          if (link.origin === location.origin) internalLinkCount += 1;
+          else externalLinkCount += 1;
+        } catch (_) {}
+      });
+      return {
+        title: clean(document.title).slice(0, 180),
+        canonical,
+        metaDescription,
+        h1Texts: pickText('h1').slice(0, 5),
+        h2Sample: pickText('h2').slice(0, 5),
+        jsonldTypes: Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50),
+        hasBreadcrumbUi: !!document.querySelector('[aria-label*="breadcrumb" i], nav[class*="breadcrumb" i], .breadcrumb, [class*="breadcrumb" i]'),
+        hasMain: !!document.querySelector('main,article,[role="main"]'),
+        internalLinkCount,
+        externalLinkCount,
+        bodyTextLength: scopedText.length,
+        sampledText: scopedText.slice(0, 500)
+      };
+    }).catch(e => ({
+      title: '',
+      canonical: '',
+      metaDescription: '',
+      h1Texts: [],
+      h2Sample: [],
+      jsonldTypes: [],
+      hasBreadcrumbUi: false,
+      hasMain: false,
+      internalLinkCount: 0,
+      externalLinkCount: 0,
+      bodyTextLength: 0,
+      sampledText: '',
+      error: String(e && (e.message || e) || 'playwright_scoped_light_extract_failed').slice(0, 240)
+    }));
+    const uniqueTypes = Array.from(new Set((observed.jsonldTypes || []).map(type => normalizeSubpageJsonLdType(type)).filter(Boolean))).slice(0, 50);
+    const lowerTypes = new Set(uniqueTypes.map(type => type.toLowerCase()));
+    const jsonldTypeCounts = countSubpageJsonLdTypes(uniqueTypes);
+    return {
+      url,
+      finalUrl,
+      status,
+      ok: !observed.error,
+      pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, uniqueTypes),
+      title: normalizeSubpageJsonLdText(observed.title).slice(0, 180),
+      canonical: observed.canonical || '',
+      metaDescription: normalizeSubpageJsonLdText(observed.metaDescription).slice(0, 240),
+      h1Count: Array.isArray(observed.h1Texts) ? observed.h1Texts.length : 0,
+      h1Texts: Array.isArray(observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
+      h2Sample: Array.isArray(observed.h2Sample) ? observed.h2Sample.slice(0, 5) : [],
+      jsonldTypes: uniqueTypes,
+      jsonLdCount: uniqueTypes.length,
+      jsonldTypeCounts,
+      hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
+      hasBreadcrumbUi: observed.hasBreadcrumbUi === true,
+      hasMain: observed.hasMain === true,
+      hasMainLandmark: observed.hasMain === true,
+      internalLinkCount: Number(observed.internalLinkCount || 0),
+      externalLinkCount: Number(observed.externalLinkCount || 0),
+      bodyTextLength: Number(observed.bodyTextLength || 0),
+      sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
+      error: observed.error || null,
+      observationSource: 'playwright-scoped-light',
+      observationMethod: 'playwright_scoped_light'
+    };
+  } catch (e) {
+    return {
+      url,
+      finalUrl: url,
+      status: null,
+      ok: false,
+      pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
+      title: '',
+      canonical: '',
+      h1Count: 0,
+      h1Texts: [],
+      h2Sample: [],
+      jsonldTypes: [],
+      jsonLdCount: 0,
+      hasBreadcrumbJsonLd: false,
+      hasBreadcrumbUi: false,
+      hasMain: false,
+      hasMainLandmark: false,
+      internalLinkCount: 0,
+      externalLinkCount: 0,
+      bodyTextLength: 0,
+      sampledText: '',
+      error: String(e && (e.message || e) || 'playwright_scoped_light_failed').slice(0, 240),
+      observationSource: 'playwright-scoped-light',
+      observationMethod: 'playwright_scoped_light'
+    };
+  } finally {
+    try { if (page) await page.close(); } catch (_) {}
+  }
+}
+
 function isSubpageHtmlLightObservationSufficient_(page) {
   if (!page || page.ok !== true) return false;
   const hasTitle = !!normalizeSubpageJsonLdText(page.title);
@@ -3571,9 +3786,11 @@ function inferHtmlFetchOnlyStaticCandidatePageType_(path) {
   return 'unknown';
 }
 
-function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin) {
+function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin, mode) {
   const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy'];
-  const source = 'html-fetch-only-static-candidate';
+  const source = mode === 'scopedPlaywright'
+    ? 'scoped-playwright-static-candidate'
+    : 'html-fetch-only-static-candidate';
   const candidates = staticPaths
     .map(path => {
       const url = normalizeDiscoverSubpageUrl(path, origin);
@@ -3602,7 +3819,9 @@ function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin) {
       other: candidates.length
     },
     errors: [],
-    notes: ['subpage_observation_mode_html_fetch_only_static_candidates']
+    notes: [mode === 'scopedPlaywright'
+      ? 'subpage_observation_mode_scoped_playwright_static_candidates'
+      : 'subpage_observation_mode_html_fetch_only_static_candidates']
   };
 }
 
@@ -4347,6 +4566,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       if (observedSignals.jsonLd) reasons.push('has_jsonld');
       if (observedSignals.links) reasons.push('has_links');
       if (method === 'html_fetch_light') reasons.push('method_html_fetch_light');
+      if (method === 'playwright_scoped_light') reasons.push('method_playwright_scoped_light');
       if (fallbackUsed) reasons.push('fallback_used');
       if (shadowTimedOut) reasons.push('shadow_timeout');
       if (timedOut) reasons.push('timeout');
@@ -4482,6 +4702,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   if (observedPages.length === 0 && observations.length > 0) notes.push('no_observed_subpages_but_observation_attempted');
   if (String(payload && payload.subpageObservationMode || '').toLowerCase() === 'htmlfetchonly') {
     notes.push('subpage_observation_mode_html_fetch_only');
+  }
+  if (String(payload && payload.subpageObservationMode || '').toLowerCase() === 'scopedplaywright') {
+    notes.push('subpage_observation_mode_scoped_playwright');
   }
   return {
     version: 'coverageSignalsV1',
@@ -4672,6 +4895,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   const subpageObservationMode = String(opts && opts.subpageObservationMode || '').toLowerCase();
   const normalizedSubpageObservationMode = subpageObservationMode.replace(/[^a-z]/g, '');
   const htmlFetchOnlySubpageObservation = normalizedSubpageObservationMode === 'htmlfetchonly';
+  const scopedPlaywrightSubpageObservation = normalizedSubpageObservationMode === 'scopedplaywright';
+  const staticCandidateSubpageObservation = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation;
   const traceCoverageMemory = (phase, extra = {}) => {
     try {
       console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify(Object.assign({
@@ -4697,7 +4922,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   };
   const reusePageForDiscover = !!(opts && opts.page);
   const reuseContextForObserve = !!(opts && opts.context);
-  const maxObserve = htmlFetchOnlySubpageObservation
+  const maxObserve = staticCandidateSubpageObservation
     ? 2
     : Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
   const auditPayload = {
@@ -4735,18 +4960,18 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const guardHost = (() => {
       try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
     })();
-    if (htmlFetchOnlySubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
+    if (staticCandidateSubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
       try {
         console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_MEMORY_GUARD_BYPASS]', JSON.stringify({
           route: '/scrape',
           mode: 'signalsMode=light',
           origin: normalized.origin,
           subpageObservationMode: opts && opts.subpageObservationMode || '',
-          reason: 'html_fetch_only'
+          reason: scopedPlaywrightSubpageObservation ? 'scoped_playwright' : 'html_fetch_only'
         }));
       } catch (_) {}
     }
-    if (!htmlFetchOnlySubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
+    if (!staticCandidateSubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
       const skipReason = 'memory_guard_ahamo_representative_observation';
       const coverageSignals = {
         version: 'coverageSignalsV1',
@@ -4810,13 +5035,17 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return coverageSignals;
     }
     traceCoverageMemory('discover_before', {
-      browserCreated: htmlFetchOnlySubpageObservation ? false : !reusePageForDiscover,
-      contextCreated: !htmlFetchOnlySubpageObservation,
-      pageCreated: !htmlFetchOnlySubpageObservation,
-      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
+      browserCreated: staticCandidateSubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !staticCandidateSubpageObservation,
+      pageCreated: !staticCandidateSubpageObservation,
+      subpageObservationMode: scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '')
     });
-    const discovered = htmlFetchOnlySubpageObservation
-      ? buildHtmlFetchOnlyStaticSubpageCandidates_(normalized.topUrl, normalized.origin)
+    const discovered = staticCandidateSubpageObservation
+      ? buildHtmlFetchOnlyStaticSubpageCandidates_(
+          normalized.topUrl,
+          normalized.origin,
+          scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : 'htmlFetchOnly'
+        )
       : await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
           page: opts && opts.page,
           context: opts && opts.context,
@@ -4841,12 +5070,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       }));
     } catch (_) {}
     traceCoverageMemory('discover_after', {
-      browserCreated: htmlFetchOnlySubpageObservation ? false : !reusePageForDiscover,
-      contextCreated: !htmlFetchOnlySubpageObservation,
-      pageCreated: !htmlFetchOnlySubpageObservation,
+      browserCreated: staticCandidateSubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !staticCandidateSubpageObservation,
+      pageCreated: !staticCandidateSubpageObservation,
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length,
-      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''
+      subpageObservationMode: scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '')
     });
     if (!selectedCandidates.length) {
       logPayload.origin = normalized.origin;
@@ -4867,46 +5096,62 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length
     });
-    try {
-      console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_START]', JSON.stringify({
-        route: '/scrape',
-        mode: 'signalsMode=light',
-        origin: normalized.origin,
-        subpageObservationMode,
-        urlCount: selectedCandidates.length,
-        urls: selectedCandidates.slice(0, 5).map(candidate => candidate && candidate.url || '')
-      }));
-    } catch (_) {}
-    const htmlObserved = await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
-      siteMode: 'generic'
-    });
-    try {
-      const htmlObservedItems = Array.isArray(htmlObserved && htmlObserved.pages)
-        ? htmlObserved.pages
-        : (Array.isArray(htmlObserved && htmlObserved.observations) ? htmlObserved.observations : []);
-      console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_COMPLETE]', JSON.stringify({
-        route: '/scrape',
-        mode: 'signalsMode=light',
-        origin: normalized.origin,
-        subpageObservationMode,
-        observedCount: htmlObservedItems.length,
-        sample: htmlObservedItems.slice(0, 5).map(page => ({
-          url: page && page.url || '',
-          finalUrl: page && page.finalUrl || '',
-          ok: page && page.ok,
-          status: page && page.status,
-          title: page && page.title || '',
-          h1Count: page && page.h1Count,
-          bodyTextLength: page && page.bodyTextLength,
-          internalLinkCount: page && page.internalLinkCount,
-          jsonLdCount: page && (page.jsonLdCount || page.jsonldCount) || 0,
-          errorStage: page && page.errorStage || null,
-          error: page && page.error || null
-        }))
-      }));
-    } catch (_) {}
+    const scopedPages = [];
+    if (scopedPlaywrightSubpageObservation) {
+      for (const candidate of selectedCandidates) {
+        scopedPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
+          siteMode: 'generic',
+          timeout: 8000,
+          context: opts && opts.context
+        }));
+      }
+    }
+    if (!scopedPlaywrightSubpageObservation) {
+      try {
+        console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_START]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          subpageObservationMode,
+          urlCount: selectedCandidates.length,
+          urls: selectedCandidates.slice(0, 5).map(candidate => candidate && candidate.url || '')
+        }));
+      } catch (_) {}
+    }
+    const htmlObserved = scopedPlaywrightSubpageObservation
+      ? { pages: [] }
+      : await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
+          siteMode: 'generic'
+        });
+    if (!scopedPlaywrightSubpageObservation) {
+      try {
+        const htmlObservedItems = Array.isArray(htmlObserved && htmlObserved.pages)
+          ? htmlObserved.pages
+          : (Array.isArray(htmlObserved && htmlObserved.observations) ? htmlObserved.observations : []);
+        console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_COMPLETE]', JSON.stringify({
+          route: '/scrape',
+          mode: 'signalsMode=light',
+          origin: normalized.origin,
+          subpageObservationMode,
+          observedCount: htmlObservedItems.length,
+          sample: htmlObservedItems.slice(0, 5).map(page => ({
+            url: page && page.url || '',
+            finalUrl: page && page.finalUrl || '',
+            ok: page && page.ok,
+            status: page && page.status,
+            title: page && page.title || '',
+            h1Count: page && page.h1Count,
+            bodyTextLength: page && page.bodyTextLength,
+            internalLinkCount: page && page.internalLinkCount,
+            jsonLdCount: page && (page.jsonLdCount || page.jsonldCount) || 0,
+            errorStage: page && page.errorStage || null,
+            error: page && page.error || null
+          }))
+        }));
+      } catch (_) {}
+    }
     const htmlPages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
-    const playwrightCandidates = htmlFetchOnlySubpageObservation
+    const playwrightCandidates = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation
       ? []
       : selectedCandidates.filter((candidate, index) => {
           return !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
@@ -4932,6 +5177,24 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     });
     const observed = {
       pages: selectedCandidates.map((candidate, index) => {
+        if (scopedPlaywrightSubpageObservation) {
+          return scopedPages[index] || {
+            url: candidate && candidate.url || '',
+            finalUrl: candidate && candidate.url || '',
+            status: null,
+            ok: false,
+            pageType: inferSubpageJsonLdPageType(candidate && candidate.url || '', 'generic', []),
+            title: '',
+            canonical: '',
+            h1Count: 0,
+            h1Texts: [],
+            jsonldTypes: [],
+            hasBreadcrumbJsonLd: false,
+            hasBreadcrumbUi: false,
+            observationMethod: 'playwright_scoped_light',
+            error: 'subpage_scoped_observation_not_available'
+          };
+        }
         const htmlPage = htmlPages[index];
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
         if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
@@ -5008,7 +5271,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       },
       candidates: selectedCandidates,
       observations,
-      subpageObservationMode: htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '',
+      subpageObservationMode: scopedPlaywrightSubpageObservation
+        ? 'scopedPlaywright'
+        : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''),
       notes: Array.isArray(discovered.notes) ? discovered.notes.slice(0, 10) : []
     };
     const subpageSignals = buildSubpageSignalsV1FromSubpageObservation_(payload);
