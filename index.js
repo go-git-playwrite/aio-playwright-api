@@ -3216,6 +3216,15 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       }, details || {})));
     } catch (_) {}
   };
+  const emitScopedBodyEmptyAudit = (details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      console.log('[DEBUG][SCOPED_PLAYWRIGHT_BODY_EMPTY_AUDIT]', JSON.stringify(Object.assign({
+        url,
+        finalUrl: details && details.finalUrl || null
+      }, details || {})));
+    } catch (_) {}
+  };
   let page = null;
   const pageStartedAt = Date.now();
   try {
@@ -3432,6 +3441,31 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       let canonical = canonicalRaw;
       try { if (canonicalRaw) canonical = new URL(canonicalRaw, location.href).toString(); } catch (_) {}
       const metaDescription = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content') || '').slice(0, 240);
+      const head = document.head;
+      const docEl = document.documentElement;
+      const htmlOuter = String(docEl && docEl.outerHTML || '');
+      const htmlHeadSample = clean(htmlOuter.slice(0, 300));
+      const scripts = Array.from(document.querySelectorAll('script'));
+      const scriptSrcs = scripts.map(script => script.getAttribute('src') || '').filter(Boolean);
+      const sameOriginScriptCount = scriptSrcs.filter(src => {
+        try { return new URL(src, location.href).origin === location.origin; } catch (_) { return false; }
+      }).length;
+      const moduleScriptCount = scripts.filter(script => String(script.getAttribute('type') || '').toLowerCase() === 'module').length;
+      const metaRefresh = document.querySelector('meta[http-equiv="refresh" i]');
+      const robotsMeta = document.querySelector('meta[name="robots" i]')?.getAttribute('content') || '';
+      const cspMeta = document.querySelector('meta[http-equiv="content-security-policy" i]');
+      const bodyDirectTagSample = Array.from(body && body.children || [])
+        .slice(0, 10)
+        .map(el => String(el && el.tagName || '').toLowerCase())
+        .filter(Boolean);
+      const appRoots = {
+        next: !!document.querySelector('#__next'),
+        app: !!document.querySelector('#app'),
+        root: !!document.querySelector('#root'),
+        nuxt: !!document.querySelector('[data-nuxt]'),
+        reactroot: !!document.querySelector('[data-reactroot]')
+      };
+      const noscriptTextLength = clean(Array.from(document.querySelectorAll('noscript')).map(el => el.textContent || '').join(' ')).length;
       const textNodes = Array.from(document.querySelectorAll('main,article,[role="main"]'))
         .filter(isVisible)
         .slice(0, 8)
@@ -3518,6 +3552,30 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
             shadowH1Count,
             shadowLinkCount,
             shadowJsonLdCount
+          },
+          bodyEmptyAudit: {
+            documentReadyState: document.readyState || '',
+            documentContentType: document.contentType || '',
+            documentElementOuterHTMLLengthCapped: Math.min(htmlOuter.length, 200000),
+            documentElementOuterHTMLLengthOverCap: htmlOuter.length > 200000,
+            headChildCount: head ? head.children.length : 0,
+            bodyExists: !!body,
+            bodyChildCount: bodyChildren,
+            bodyInnerHTMLLength: String(body && body.innerHTML || '').length,
+            bodyTextContentLength: bodyText.length,
+            appRoots,
+            scriptCount: scripts.length,
+            scriptSrcCount: scriptSrcs.length,
+            sameOriginScriptCount,
+            moduleScriptCount,
+            noscriptTextLength,
+            metaRefresh: !!metaRefresh,
+            metaRefreshContent: metaRefresh ? String(metaRefresh.getAttribute('content') || '').slice(0, 160) : '',
+            canonical,
+            robotsMeta: String(robotsMeta || '').slice(0, 160),
+            hasCspMeta: !!cspMeta,
+            bodyDirectTagSample,
+            htmlHeadSample
           }
         }
       };
@@ -3543,6 +3601,10 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
     emitScopedExtractionAudit('link_probe', Object.assign({ finalUrl }, scopedAudit.linkProbe || {}));
     emitScopedExtractionAudit('heading_probe', Object.assign({ finalUrl }, scopedAudit.headingProbe || {}));
     emitScopedExtractionAudit('shadow_probe', Object.assign({ finalUrl }, scopedAudit.shadowProbe || {}));
+    emitScopedBodyEmptyAudit(Object.assign({
+      finalUrl,
+      status
+    }, scopedAudit.bodyEmptyAudit || {}));
     const qualityInputs = {
       hasTitle: !!normalizeSubpageJsonLdText(observed && observed.title),
       hasH1: Array.isArray(observed && observed.h1Texts) && observed.h1Texts.length > 0,
