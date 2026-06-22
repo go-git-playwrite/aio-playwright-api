@@ -4961,8 +4961,25 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
 }
 
 function buildSubpageCardConnectionMatrixAudit_(coverageSignals) {
+  const sourceKeys = coverageSignals && typeof coverageSignals === 'object' ? Object.keys(coverageSignals) : [];
+  if (!coverageSignals || typeof coverageSignals !== 'object') {
+    return {
+      hasCoverageSignals: false,
+      sourceKeys,
+      representativePagesCount: 0,
+      representativeObservationQualityCount: 0,
+      observedPages: [],
+      matrix: [],
+      blockedReason: 'coverage_signals_missing'
+    };
+  }
   const quality = coverageSignals && coverageSignals.representativeObservationQuality || {};
   const pages = Array.isArray(quality.pages) ? quality.pages : [];
+  const representativePages = Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [];
+  const representativeByPath = new Map();
+  representativePages.forEach(page => {
+    if (page && page.path) representativeByPath.set(String(page.path), page);
+  });
   const usableStrength = strength => strength === 'strong' || strength === 'partial';
   const typeMatches = (pageType, values) => {
     const type = normalizeSubpageJsonLdText(pageType).toLowerCase();
@@ -4971,34 +4988,42 @@ function buildSubpageCardConnectionMatrixAudit_(coverageSignals) {
   const buildBlockedReason = (page) => {
     const strength = normalizeSubpageJsonLdText(page && page.quality).toLowerCase();
     const observed = page && page.observed || {};
-    if (observed.bodyText !== true) return 'empty_dom_reference_only';
     if (strength === 'weak') return 'weak_reference_only';
-    if (strength === 'timeout') return 'timeout_reference_only';
-    if (strength === 'failed') return 'failed_reference_only';
+    if (strength === 'timeout' || strength === 'failed' || strength === 'error') return 'observation_failed_reference_only';
+    if (observed.bodyText !== true) return 'empty_dom_reference_only';
     if (!usableStrength(strength)) return 'not_enough_observation_strength';
     return '';
   };
   const matrixPages = pages.slice(0, 20).map(page => {
+    const path = page && page.path || '';
+    const representative = representativeByPath.get(String(path)) || {};
     const strength = normalizeSubpageJsonLdText(page && page.quality).toLowerCase() || 'unknown';
     const pageType = page && page.pageType || '';
     const observed = page && page.observed || {};
     const diagnostics = page && page.diagnostics || {};
-    const usable = usableStrength(strength) && observed.bodyText === true;
+    const bodyTextLength = Number(
+      page && page.bodyTextLength ||
+      representative && (representative.bodyTextLength || representative.textLength) ||
+      0
+    );
+    const hasBodyText = observed.bodyText === true || bodyTextLength > 0;
+    const usable = usableStrength(strength) && hasBodyText;
     const blockedReason = usable ? '' : buildBlockedReason(page);
     const usableForCards = {
-      DOC_PRIMARY_MESSAGE: usable && (observed.h1 === true || observed.title === true || observed.bodyText === true),
-      DATA_ORG_PROFILE: usable && typeMatches(pageType, ['about', 'business', 'company', 'corporate', 'profile']),
-      FAQ: usable && (typeMatches(pageType, ['faq']) || observed.jsonLd === true),
-      FRESHNESS: usable && typeMatches(pageType, ['news', 'article', 'blog', 'column']),
-      ENTITY: usable && (observed.jsonLd === true || typeMatches(pageType, ['about', 'business', 'service', 'company'])),
-      SERVICE_CASE_STORE: usable && typeMatches(pageType, ['service', 'case', 'store', 'product', 'category', 'business'])
+      DOC_PRIMARY_MESSAGE: usable && typeMatches(pageType, ['about', 'business', 'service', 'guide', 'faq', 'case']),
+      DATA_ORG_PROFILE: usable && typeMatches(pageType, ['about', 'company', 'corporate', 'contact', 'legal']),
+      FAQ: usable && typeMatches(pageType, ['faq', 'guide', 'help', 'support']),
+      FRESHNESS: usable && typeMatches(pageType, ['news', 'blog', 'notice', 'press']),
+      ENTITY: usable && typeMatches(pageType, ['about', 'company', 'corporate', 'business', 'service']),
+      SERVICE_CASE_STORE: usable && typeMatches(pageType, ['business', 'service', 'case', 'store', 'category', 'guide'])
     };
     const usableKeys = Object.keys(usableForCards).filter(key => usableForCards[key]);
     return {
-      path: page && page.path || '',
+      path,
       pageType,
       method: diagnostics.method || 'unknown',
       strength,
+      hasBodyText,
       usableForCards,
       reason: usableKeys.length
         ? `usable_for_${usableKeys.join(',').toLowerCase()}`
@@ -5007,8 +5032,12 @@ function buildSubpageCardConnectionMatrixAudit_(coverageSignals) {
     };
   });
   return {
-    observedPages: pages.length,
-    pages: matrixPages
+    hasCoverageSignals: true,
+    sourceKeys,
+    representativePagesCount: representativePages.length,
+    representativeObservationQualityCount: pages.length,
+    observedPages: pages.map(page => page && page.path || '').filter(Boolean),
+    matrix: matrixPages
   };
 }
 
@@ -5925,16 +5954,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
               diagnostics: page && page.diagnostics || {}
             }))
           : []
-      }));
-    } catch (_) {}
-    try {
-      const matrixAudit = buildSubpageCardConnectionMatrixAudit_(coverageSignals);
-      console.log('[DEBUG][SUBPAGE_CARD_CONNECTION_MATRIX_AUDIT]', JSON.stringify({
-        route: '/scrape',
-        mode: 'signalsMode=light',
-        origin: normalized.origin,
-        observedPages: matrixAudit.observedPages,
-        pages: matrixAudit.pages
       }));
     } catch (_) {}
     geoSignalsV1.coverageSignals = coverageSignals;
@@ -13443,6 +13462,21 @@ async function scrapeOnce(req, res) {
             coverageSignalsStringifyError: coverageSignalsProbe.error,
             responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 20) : []
           }));
+          try {
+            const matrixAudit = buildSubpageCardConnectionMatrixAudit_(coverageSignals);
+            console.log('[DEBUG][SUBPAGE_CARD_CONNECTION_MATRIX_AUDIT]', JSON.stringify({
+              route: '/scrape',
+              mode: 'signalsMode=light',
+              origin: coverageSignals && coverageSignals.origin || payload && payload.geoSignalsV1 && payload.geoSignalsV1.url || payload && payload.finalUrl || finalUrl || null,
+              hasCoverageSignals: matrixAudit.hasCoverageSignals === true,
+              observedPages: matrixAudit.observedPages || [],
+              matrix: matrixAudit.matrix || [],
+              blockedReason: matrixAudit.blockedReason || null,
+              sourceKeys: matrixAudit.sourceKeys || [],
+              representativePagesCount: matrixAudit.representativePagesCount || 0,
+              representativeObservationQualityCount: matrixAudit.representativeObservationQualityCount || 0
+            }));
+          } catch (_) {}
           logHeavySiteInvestigationAudit('response_ready', {
             mode: payload && (payload.responseMode || payload.mode) || (signalsMode || responseMode || null),
             hasGeoSignalsV1: Boolean(payload && payload.geoSignalsV1),
