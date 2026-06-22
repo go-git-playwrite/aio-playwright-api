@@ -3189,187 +3189,6 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   return { pages };
 }
 
-function isTlsSslSubpageHtmlFetchFailure_(page) {
-  const error = String(page && page.error || '');
-  return /ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED|SSL|TLS/i.test(error);
-}
-
-async function fetchSubpagePlaywrightUltraLight(url, opts = {}) {
-  const context = opts && opts.context;
-  let page = null;
-  try {
-    if (!context || typeof context.newPage !== 'function') {
-      return {
-        url,
-        finalUrl: url,
-        status: null,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        internalLinkCount: 0,
-        bodyTextLength: 0,
-        sampledText: '',
-        error: 'playwright_ultra_light_context_unavailable',
-        observationSource: 'playwright-ultra-light',
-        observationMethod: 'playwright_ultra_light'
-      };
-    }
-    page = await context.newPage();
-    await page.route('**/*', route => {
-      try {
-        const type = route.request().resourceType();
-        if (['image', 'stylesheet', 'font', 'media', 'websocket', 'eventsource', 'manifest'].includes(type)) {
-          return route.abort();
-        }
-      } catch (_) {}
-      return route.continue();
-    });
-    let response = null;
-    try {
-      response = await page.goto(url, { waitUntil: 'commit', timeout: Math.max(1000, Math.min(8000, Number(opts.timeout || 8000) || 8000)) });
-    } catch (e) {
-      return {
-        url,
-        finalUrl: typeof page.url === 'function' ? page.url() || url : url,
-        status: null,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        internalLinkCount: 0,
-        bodyTextLength: 0,
-        sampledText: '',
-        error: String(e && (e.message || e) || 'playwright_ultra_light_goto_failed').slice(0, 240),
-        observationSource: 'playwright-ultra-light',
-        observationMethod: 'playwright_ultra_light'
-      };
-    }
-    const status = response && typeof response.status === 'function' ? response.status() : null;
-    const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
-    const observed = await page.evaluate(() => {
-      const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-      const jsonldTypes = [];
-      const collectTypes = (node, depth = 0) => {
-        if (!node || depth > 4) return;
-        if (Array.isArray(node)) {
-          node.slice(0, 50).forEach(item => collectTypes(item, depth + 1));
-          return;
-        }
-        if (typeof node !== 'object') return;
-        const type = node['@type'];
-        if (Array.isArray(type)) type.slice(0, 10).forEach(item => jsonldTypes.push(String(item || '').trim()));
-        else if (type) jsonldTypes.push(String(type || '').trim());
-        if (Array.isArray(node['@graph'])) node['@graph'].slice(0, 50).forEach(item => collectTypes(item, depth + 1));
-      };
-      Array.from(document.querySelectorAll('script[type*="ld+json" i]')).slice(0, 20).forEach(script => {
-        try { collectTypes(JSON.parse(script.textContent || ''), 0); } catch (_) {}
-      });
-      const h1Texts = Array.from(document.querySelectorAll('h1')).slice(0, 5).map(el => clean(el.textContent).slice(0, 180)).filter(Boolean);
-      const canonicalRaw = document.querySelector('link[rel~="canonical" i]')?.getAttribute('href') || '';
-      let canonical = canonicalRaw;
-      try { if (canonicalRaw) canonical = new URL(canonicalRaw, location.href).toString(); } catch (_) {}
-      const bodyText = clean(document.body && document.body.innerText || '').slice(0, 5000);
-      let internalLinkCount = 0;
-      let externalLinkCount = 0;
-      Array.from(document.querySelectorAll('a[href]')).slice(0, 300).forEach(a => {
-        try {
-          const link = new URL(a.getAttribute('href') || '', location.href);
-          if (link.origin === location.origin) internalLinkCount += 1;
-          else externalLinkCount += 1;
-        } catch (_) {}
-      });
-      return {
-        title: clean(document.title).slice(0, 180),
-        canonical,
-        h1Count: document.querySelectorAll('h1').length,
-        h1Texts,
-        jsonldTypes: Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50),
-        hasBreadcrumbUi: !!document.querySelector('[aria-label*="breadcrumb" i], nav[class*="breadcrumb" i], .breadcrumb, [class*="breadcrumb" i]'),
-        hasMain: !!document.querySelector('main,[role="main"]'),
-        internalLinkCount,
-        externalLinkCount,
-        bodyTextLength: bodyText.length,
-        sampledText: bodyText.slice(0, 500)
-      };
-    }).catch(e => ({
-      title: '',
-      canonical: '',
-      h1Count: 0,
-      h1Texts: [],
-      jsonldTypes: [],
-      hasBreadcrumbUi: false,
-      hasMain: false,
-      internalLinkCount: 0,
-      externalLinkCount: 0,
-      bodyTextLength: 0,
-      sampledText: '',
-      error: String(e && (e.message || e) || 'playwright_ultra_light_extract_failed').slice(0, 240)
-    }));
-    const uniqueTypes = Array.from(new Set((observed.jsonldTypes || []).map(type => normalizeSubpageJsonLdType(type)).filter(Boolean))).slice(0, 50);
-    const lowerTypes = new Set(uniqueTypes.map(type => type.toLowerCase()));
-    const jsonldTypeCounts = countSubpageJsonLdTypes(uniqueTypes);
-    return {
-      url,
-      finalUrl,
-      status,
-      ok: !observed.error,
-      pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, uniqueTypes),
-      title: normalizeSubpageJsonLdText(observed.title).slice(0, 180),
-      canonical: observed.canonical || '',
-      h1Count: Number(observed.h1Count || 0),
-      h1Texts: Array.isArray(observed.h1Texts) ? observed.h1Texts.slice(0, 5) : [],
-      jsonldTypes: uniqueTypes,
-      jsonLdCount: uniqueTypes.length,
-      jsonldTypeCounts,
-      hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
-      hasBreadcrumbUi: observed.hasBreadcrumbUi === true,
-      hasMain: observed.hasMain === true,
-      hasMainLandmark: observed.hasMain === true,
-      internalLinkCount: Number(observed.internalLinkCount || 0),
-      externalLinkCount: Number(observed.externalLinkCount || 0),
-      bodyTextLength: Number(observed.bodyTextLength || 0),
-      sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
-      error: observed.error || null,
-      observationSource: 'playwright-ultra-light',
-      observationMethod: 'playwright_ultra_light'
-    };
-  } catch (e) {
-    return {
-      url,
-      finalUrl: url,
-      status: null,
-      ok: false,
-      pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
-      title: '',
-      canonical: '',
-      h1Count: 0,
-      h1Texts: [],
-      jsonldTypes: [],
-      hasBreadcrumbJsonLd: false,
-      hasBreadcrumbUi: false,
-      internalLinkCount: 0,
-      bodyTextLength: 0,
-      sampledText: '',
-      error: String(e && (e.message || e) || 'playwright_ultra_light_failed').slice(0, 240),
-      observationSource: 'playwright-ultra-light',
-      observationMethod: 'playwright_ultra_light'
-    };
-  } finally {
-    try { if (page) await page.close(); } catch (_) {}
-  }
-}
-
 function isSubpageHtmlLightObservationSufficient_(page) {
   if (!page || page.ok !== true) return false;
   const hasTitle = !!normalizeSubpageJsonLdText(page.title);
@@ -4528,7 +4347,6 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       if (observedSignals.jsonLd) reasons.push('has_jsonld');
       if (observedSignals.links) reasons.push('has_links');
       if (method === 'html_fetch_light') reasons.push('method_html_fetch_light');
-      if (method === 'playwright_ultra_light') reasons.push('method_playwright_ultra_light');
       if (fallbackUsed) reasons.push('fallback_used');
       if (shadowTimedOut) reasons.push('shadow_timeout');
       if (timedOut) reasons.push('timeout');
@@ -5088,27 +4906,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       }));
     } catch (_) {}
     const htmlPages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
-    const ultraLightCandidates = selectedCandidates.filter((candidate, index) => {
-      return isTlsSslSubpageHtmlFetchFailure_(htmlPages[index]);
-    });
-    const ultraLightPages = [];
-    for (const candidate of ultraLightCandidates) {
-      ultraLightPages.push(await fetchSubpagePlaywrightUltraLight(candidate && candidate.url || '', {
-        siteMode: 'generic',
-        timeout: 8000,
-        context: opts && opts.context
-      }));
-    }
-    const ultraLightCandidateUrls = new Set(ultraLightCandidates.map(candidate => String(candidate && candidate.url || '')));
-    const ultraLightByUrl = new Map();
-    ultraLightPages.forEach(page => {
-      if (page && page.url) ultraLightByUrl.set(String(page.url), page);
-    });
     const playwrightCandidates = htmlFetchOnlySubpageObservation
       ? []
       : selectedCandidates.filter((candidate, index) => {
-          const candidateUrl = String(candidate && candidate.url || '');
-          return !ultraLightCandidateUrls.has(candidateUrl) && !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
+          return !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
         });
     const playwrightObserved = playwrightCandidates.length
       ? await observeSubpageJsonLdLightUrls_(playwrightCandidates.map(candidate => candidate.url), {
@@ -5132,22 +4933,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const observed = {
       pages: selectedCandidates.map((candidate, index) => {
         const htmlPage = htmlPages[index];
-        const ultraLightPage = ultraLightByUrl.get(String(candidate && candidate.url || ''));
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
-        if (isSubpageHtmlLightObservationSufficient_(htmlPage)) return Object.assign({}, htmlPage, {
-          observationMethod: 'html_fetch_light',
-          observationSource: 'html-fetch-light'
-        });
         if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
-        if (isTlsSslSubpageHtmlFetchFailure_(htmlPage)) {
-          if (ultraLightPage && ultraLightPage.ok === true) return ultraLightPage;
-          return Object.assign({}, htmlPage || {}, {
-            ultraLightFallbackError: ultraLightPage && ultraLightPage.error || null,
-            ultraLightFallbackAttempted: !!ultraLightPage,
-            observationMethod: htmlPage && htmlPage.observationMethod || 'html_fetch_light',
-            observationSource: 'html-fetch-light'
-          });
-        }
         if (htmlPage && htmlPage.ok === true) return Object.assign({}, htmlPage, {
           observationMethod: 'html_fetch_light',
           observationSource: playwrightPage ? 'html-fetch-light-after-playwright-fallback' : 'html-fetch-light'
@@ -5199,7 +4986,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           jsonldTypes: page && (page.jsonldTypes || page.jsonLdTypes) || [],
           internalLinkCount: page && page.internalLinkCount,
           bodyTextLength: page && page.bodyTextLength,
-          observationMethod: page && page.observationMethod || '',
           error: page && page.error || null
         }))
       }));
