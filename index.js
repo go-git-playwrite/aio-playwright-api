@@ -12446,6 +12446,25 @@ async function scrapeOnce(req, res) {
           }));
         } catch (_) {}
       };
+      const logScrapeResponseSentAudit = payload => {
+        try {
+          const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
+          let payloadBytes = null;
+          try {
+            payloadBytes = Buffer.byteLength(JSON.stringify(payload) || '', 'utf8');
+          } catch (_) {}
+          console.log('[DEBUG][SCRAPE_RESPONSE_SENT_AUDIT]', JSON.stringify({
+            route: '/scrape',
+            mode: payload && (payload.responseMode || payload.mode) || (signalsMode || responseMode || null),
+            url: payload && payload.url || urlToFetch,
+            finalUrl: payload && payload.finalUrl || finalUrl,
+            hasGeoSignalsV1: Boolean(payload && payload.geoSignalsV1),
+            hasCoverageSignals: Boolean(coverageSignals),
+            observedSubpageCount: coverageSignals ? coverageSignals.observedSubpageCount : null,
+            payloadBytes
+          }));
+        } catch (_) {}
+      };
       if (balancedShortResponse) {
         const shortPayload = buildBalancedShortResponsePayload(signalsResponsePayload);
         if (balancedShortFastResponse) {
@@ -12476,10 +12495,14 @@ async function scrapeOnce(req, res) {
           jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
         });
         logScrapeResponseReadyAudit(shortPayload);
-        return res.status(200).json(shortPayload);
+        res.status(200).json(shortPayload);
+        logScrapeResponseSentAudit(shortPayload);
+        return;
       }
       logScrapeResponseReadyAudit(signalsResponsePayload);
-      return res.status(200).json(signalsResponsePayload);
+      res.status(200).json(signalsResponsePayload);
+      logScrapeResponseSentAudit(signalsResponsePayload);
+      return;
     }
     if (signalsOnly) {
       const finalUrl = page && typeof page.url === 'function' ? page.url() : urlToFetch;
