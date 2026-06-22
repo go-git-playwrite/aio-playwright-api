@@ -13421,6 +13421,7 @@ async function scrapeOnce(req, res) {
         memoryHints
       };
       const logScrapeResponseReadyAudit = payload => {
+        console.log('[DEBUG][SCRAPE_RESPONSE_READY_AUDIT_ENTERED]');
         try {
           const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
           const stringifyProbe = value => {
