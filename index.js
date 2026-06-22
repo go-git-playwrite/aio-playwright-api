@@ -3206,6 +3206,16 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       }));
     } catch (_) {}
   };
+  const emitScopedExtractionAudit = (phase, details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      console.log('[DEBUG][SCOPED_PLAYWRIGHT_EXTRACTION_AUDIT]', JSON.stringify(Object.assign({
+        phase,
+        url,
+        finalUrl: details && details.finalUrl || null
+      }, details || {})));
+    } catch (_) {}
+  };
   let page = null;
   const pageStartedAt = Date.now();
   try {
@@ -3301,6 +3311,7 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
     const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
     const extractStartedAt = Date.now();
     emitScopedAudit('scoped_extract_start', { targetUrl: url, finalUrl, status });
+    emitScopedExtractionAudit('extract_start', { finalUrl, status });
     const observed = await page.evaluate(() => {
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
       const isVisible = el => {
@@ -3318,6 +3329,89 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
         .filter(isVisible)
         .map(el => clean(el.textContent).slice(0, 180))
         .filter(Boolean);
+      const safeText = el => clean(el && (el.innerText || el.textContent));
+      const visibleText = el => (isVisible(el) ? safeText(el) : '');
+      const body = document.body;
+      const bodyText = clean(body && (body.textContent || ''));
+      const bodyInnerText = clean(body && (body.innerText || ''));
+      const bodyChildren = body ? body.children.length : 0;
+      const mainEls = Array.from(document.querySelectorAll('main')).filter(isVisible);
+      const articleEls = Array.from(document.querySelectorAll('article')).filter(isVisible);
+      const roleMainEls = Array.from(document.querySelectorAll('[role="main"]')).filter(isVisible);
+      const navEls = Array.from(document.querySelectorAll('nav,[role="navigation"]')).filter(isVisible);
+      const footerEls = Array.from(document.querySelectorAll('footer,[role="contentinfo"]')).filter(isVisible);
+      const h1Els = Array.from(document.querySelectorAll('h1')).filter(isVisible);
+      const h2Els = Array.from(document.querySelectorAll('h2')).filter(isVisible);
+      const linkEls = Array.from(document.querySelectorAll('a[href]')).filter(isVisible);
+      const visibleTextParts = [];
+      [mainEls, articleEls, roleMainEls, navEls, footerEls, h1Els, h2Els].forEach(list => {
+        list.slice(0, 10).forEach(el => {
+          const text = visibleText(el);
+          if (text) visibleTextParts.push(text.slice(0, 500));
+        });
+      });
+      const visibleTextLength = clean(visibleTextParts.join(' ')).length;
+      const mainText = clean(mainEls.map(visibleText).join(' '));
+      const articleText = clean(articleEls.map(visibleText).join(' '));
+      const roleMainText = clean(roleMainEls.map(visibleText).join(' '));
+      let selectedTextSource = 'none';
+      let selectedTextRejectedReason = '';
+      if (mainText.length >= 80) selectedTextSource = 'main';
+      else if (articleText.length >= 80) selectedTextSource = 'article';
+      else if (roleMainText.length >= 80) selectedTextSource = 'role_main';
+      else if (visibleTextLength >= 80) {
+        selectedTextSource = 'visible_scoped';
+        selectedTextRejectedReason = 'main_article_role_main_text_too_short';
+      } else {
+        selectedTextRejectedReason = 'no_scoped_visible_text';
+      }
+      let sameOriginLinks = 0;
+      let navLinks = 0;
+      let footerLinks = 0;
+      const linkSamples = [];
+      linkEls.slice(0, 250).forEach(a => {
+        try {
+          const link = new URL(a.getAttribute('href') || '', location.href);
+          if (link.origin === location.origin) {
+            sameOriginLinks += 1;
+            if (linkSamples.length < 5) linkSamples.push({ text: clean(a.textContent).slice(0, 80), href: link.pathname });
+          }
+          if (a.closest('nav,[role="navigation"],header')) navLinks += 1;
+          if (a.closest('footer,[role="contentinfo"]')) footerLinks += 1;
+        } catch (_) {}
+      });
+      const selectedInternalLinkCount = navLinks || footerLinks || sameOriginLinks;
+      const rejectedLinkReason = selectedInternalLinkCount ? '' : 'no_visible_same_origin_links';
+      const h1TextsForAudit = h1Els.map(el => clean(el.textContent).slice(0, 120)).filter(Boolean).slice(0, 5);
+      const h2TextsForAudit = h2Els.map(el => clean(el.textContent).slice(0, 120)).filter(Boolean).slice(0, 5);
+      const selectedH1 = h1TextsForAudit[0] || '';
+      const selectedHeadingSource = selectedH1 ? 'dom_h1' : (h2TextsForAudit[0] ? 'dom_h2' : 'none');
+      const rejectedHeadingReason = selectedHeadingSource === 'none' ? 'no_visible_h1_h2' : '';
+      let shadowHostCount = 0;
+      let shadowTextLength = 0;
+      let shadowH1Count = 0;
+      let shadowLinkCount = 0;
+      let shadowJsonLdCount = 0;
+      try {
+        const walkShadow = (root, depth = 0) => {
+          if (!root || depth > 3 || shadowHostCount > 40) return;
+          const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll('*') : []);
+          nodes.slice(0, 300).forEach(el => {
+            if (!el) return;
+            if (el.shadowRoot) {
+              shadowHostCount += 1;
+              const text = clean(el.shadowRoot.textContent || '');
+              shadowTextLength += Math.min(1000, text.length);
+              walkShadow(el.shadowRoot, depth + 1);
+            }
+            const tag = String(el.tagName || '').toLowerCase();
+            if (tag === 'h1') shadowH1Count += 1;
+            if (tag === 'a' && el.getAttribute && el.getAttribute('href')) shadowLinkCount += 1;
+            if (tag === 'script' && /ld\+json/i.test(String(el.getAttribute && el.getAttribute('type') || ''))) shadowJsonLdCount += 1;
+          });
+        };
+        walkShadow(document, 0);
+      } catch (_) {}
       const jsonldTypes = [];
       const collectTypes = (node, depth = 0) => {
         if (!node || depth > 4) return;
@@ -3371,7 +3465,61 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
         internalLinkCount,
         externalLinkCount,
         bodyTextLength: scopedText.length,
-        sampledText: scopedText.slice(0, 500)
+        sampledText: scopedText.slice(0, 500),
+        scopedAudit: {
+          domProbe: {
+            titleLength: clean(document.title).length,
+            bodyChildCount: bodyChildren,
+            bodyTextLength: bodyText.length,
+            bodyInnerTextLength: bodyInnerText.length,
+            visibleTextLength,
+            mainCount: mainEls.length,
+            articleCount: articleEls.length,
+            roleMainCount: roleMainEls.length,
+            navCount: navEls.length,
+            footerCount: footerEls.length,
+            h1Count: h1Els.length,
+            h2Count: h2Els.length,
+            linkCount: linkEls.length,
+            shadowHostCount
+          },
+          textProbe: {
+            mainTextLength: mainText.length,
+            articleTextLength: articleText.length,
+            roleMainTextLength: roleMainText.length,
+            bodyTextLength: bodyText.length,
+            visibleTextSampleLength: Math.min(200, clean(visibleTextParts.join(' ')).length),
+            sampledTextLength: scopedText.slice(0, 500).length,
+            selectedTextSource,
+            selectedTextRejectedReason
+          },
+          linkProbe: {
+            totalLinks: linkEls.length,
+            sameOriginLinks,
+            navLinks,
+            footerLinks,
+            selectedInternalLinkCount,
+            rejectedLinkReason,
+            linkSamples
+          },
+          headingProbe: {
+            h1Texts: h1TextsForAudit,
+            h2TextsSample: h2TextsForAudit,
+            domH1Count: h1Els.length,
+            domH2Count: h2Els.length,
+            roleHeadingCountIfAlreadyAvailable: 0,
+            selectedH1,
+            selectedHeadingSource,
+            rejectedHeadingReason
+          },
+          shadowProbe: {
+            shadowHostCount,
+            shadowTextLength,
+            shadowH1Count,
+            shadowLinkCount,
+            shadowJsonLdCount
+          }
+        }
       };
     }).catch(e => ({
       title: '',
@@ -3386,8 +3534,35 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       externalLinkCount: 0,
       bodyTextLength: 0,
       sampledText: '',
-      error: String(e && (e.message || e) || 'playwright_scoped_light_extract_failed').slice(0, 240)
+      error: String(e && (e.message || e) || 'playwright_scoped_light_extract_failed').slice(0, 240),
+      scopedAudit: null
     }));
+    const scopedAudit = observed && observed.scopedAudit || {};
+    emitScopedExtractionAudit('dom_probe', Object.assign({ finalUrl }, scopedAudit.domProbe || {}));
+    emitScopedExtractionAudit('text_probe', Object.assign({ finalUrl }, scopedAudit.textProbe || {}));
+    emitScopedExtractionAudit('link_probe', Object.assign({ finalUrl }, scopedAudit.linkProbe || {}));
+    emitScopedExtractionAudit('heading_probe', Object.assign({ finalUrl }, scopedAudit.headingProbe || {}));
+    emitScopedExtractionAudit('shadow_probe', Object.assign({ finalUrl }, scopedAudit.shadowProbe || {}));
+    const qualityInputs = {
+      hasTitle: !!normalizeSubpageJsonLdText(observed && observed.title),
+      hasH1: Array.isArray(observed && observed.h1Texts) && observed.h1Texts.length > 0,
+      hasBodyText: Number(observed && observed.bodyTextLength || 0) >= 100,
+      hasJsonLd: Array.isArray(observed && observed.jsonldTypes) && observed.jsonldTypes.length > 0,
+      hasLinks: Number(observed && observed.internalLinkCount || 0) > 0
+    };
+    const reasonIfWeak = qualityInputs.hasTitle && !qualityInputs.hasH1 && !qualityInputs.hasBodyText && !qualityInputs.hasJsonLd && !qualityInputs.hasLinks
+      ? 'title_only'
+      : (!qualityInputs.hasBodyText ? 'body_text_missing_or_short' : '');
+    emitScopedExtractionAudit('extraction_decision', {
+      finalUrl,
+      observationMethod: 'playwright_scoped_light',
+      ok: !observed.error,
+      qualityInputs,
+      selectedTextSource: scopedAudit.textProbe && scopedAudit.textProbe.selectedTextSource || 'unknown',
+      selectedHeadingSource: scopedAudit.headingProbe && scopedAudit.headingProbe.selectedHeadingSource || 'unknown',
+      selectedLinkSource: scopedAudit.linkProbe && scopedAudit.linkProbe.selectedInternalLinkCount ? 'visible_same_origin_links' : 'none',
+      reasonIfWeak
+    });
     emitScopedAudit('scoped_extract_end', {
       targetUrl: url,
       finalUrl,
@@ -3396,6 +3571,16 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       h1Count: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.length : 0,
       bodyTextLength: Number(observed && observed.bodyTextLength || 0),
       elapsedMs: Math.max(0, Date.now() - extractStartedAt),
+      error: observed && observed.error || null
+    });
+    emitScopedExtractionAudit('extract_end', {
+      finalUrl,
+      status,
+      elapsedMs: Math.max(0, Date.now() - extractStartedAt),
+      titleLength: String(observed && observed.title || '').length,
+      h1Count: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.length : 0,
+      bodyTextLength: Number(observed && observed.bodyTextLength || 0),
+      internalLinkCount: Number(observed && observed.internalLinkCount || 0),
       error: observed && observed.error || null
     });
     const uniqueTypes = Array.from(new Set((observed.jsonldTypes || []).map(type => normalizeSubpageJsonLdType(type)).filter(Boolean))).slice(0, 50);
@@ -3424,6 +3609,11 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       externalLinkCount: Number(observed.externalLinkCount || 0),
       bodyTextLength: Number(observed.bodyTextLength || 0),
       sampledText: normalizeSubpageJsonLdText(observed.sampledText).slice(0, 500),
+      scopedExtractionSource: 'playwright_scoped_light',
+      scopedTextSource: scopedAudit.textProbe && scopedAudit.textProbe.selectedTextSource || '',
+      scopedHeadingSource: scopedAudit.headingProbe && scopedAudit.headingProbe.selectedHeadingSource || '',
+      scopedLinkSource: scopedAudit.linkProbe && scopedAudit.linkProbe.selectedInternalLinkCount ? 'visible_same_origin_links' : '',
+      scopedWeakReason: reasonIfWeak || '',
       error: observed.error || null,
       observationSource: 'playwright-scoped-light',
       observationMethod: 'playwright_scoped_light'
