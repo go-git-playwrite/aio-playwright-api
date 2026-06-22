@@ -3191,9 +3191,31 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
 
 async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
   const context = opts && opts.context;
+  const debugHeavySite = opts && opts.debugHeavySite === true;
+  const emitScopedAudit = (phase, details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      console.log('[DEBUG][HEAVY_SITE_INVESTIGATION_AUDIT]', JSON.stringify({
+        phase,
+        route: '/scrape',
+        url,
+        finalUrl: details.finalUrl || null,
+        elapsedMs: Number(details.elapsedMs || 0),
+        memory: typeof process !== 'undefined' && process.memoryUsage ? process.memoryUsage() : null,
+        details
+      }));
+    } catch (_) {}
+  };
   let page = null;
+  const pageStartedAt = Date.now();
   try {
+    emitScopedAudit('scoped_page_start', { targetUrl: url });
     if (!context || typeof context.newPage !== 'function') {
+      emitScopedAudit('scoped_page_done', {
+        targetUrl: url,
+        elapsedMs: Math.max(0, Date.now() - pageStartedAt),
+        error: 'playwright_scoped_light_context_unavailable'
+      });
       return {
         url,
         finalUrl: url,
@@ -3223,11 +3245,32 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
     page = await context.newPage();
     let response = null;
     try {
+      const gotoStartedAt = Date.now();
+      emitScopedAudit('scoped_goto_start', { targetUrl: url });
       response = await page.goto(url, {
         waitUntil: 'commit',
         timeout: Math.max(1000, Math.min(8000, Number(opts.timeout || 8000) || 8000))
       });
+      emitScopedAudit('scoped_goto_end', {
+        targetUrl: url,
+        finalUrl: typeof page.url === 'function' ? page.url() || url : url,
+        status: response && typeof response.status === 'function' ? response.status() : null,
+        elapsedMs: Math.max(0, Date.now() - gotoStartedAt)
+      });
     } catch (e) {
+      const gotoError = String(e && (e.message || e) || 'playwright_scoped_light_goto_failed').slice(0, 240);
+      emitScopedAudit('scoped_goto_end', {
+        targetUrl: url,
+        finalUrl: typeof page.url === 'function' ? page.url() || url : url,
+        elapsedMs: Math.max(0, Date.now() - pageStartedAt),
+        error: gotoError
+      });
+      emitScopedAudit('scoped_page_done', {
+        targetUrl: url,
+        finalUrl: typeof page.url === 'function' ? page.url() || url : url,
+        elapsedMs: Math.max(0, Date.now() - pageStartedAt),
+        error: gotoError
+      });
       return {
         url,
         finalUrl: typeof page.url === 'function' ? page.url() || url : url,
@@ -3256,6 +3299,8 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
     }
     const status = response && typeof response.status === 'function' ? response.status() : null;
     const finalUrl = typeof page.url === 'function' ? page.url() || url : url;
+    const extractStartedAt = Date.now();
+    emitScopedAudit('scoped_extract_start', { targetUrl: url, finalUrl, status });
     const observed = await page.evaluate(() => {
       const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
       const isVisible = el => {
@@ -3343,10 +3388,20 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       sampledText: '',
       error: String(e && (e.message || e) || 'playwright_scoped_light_extract_failed').slice(0, 240)
     }));
+    emitScopedAudit('scoped_extract_end', {
+      targetUrl: url,
+      finalUrl,
+      status,
+      titleLength: String(observed && observed.title || '').length,
+      h1Count: Array.isArray(observed && observed.h1Texts) ? observed.h1Texts.length : 0,
+      bodyTextLength: Number(observed && observed.bodyTextLength || 0),
+      elapsedMs: Math.max(0, Date.now() - extractStartedAt),
+      error: observed && observed.error || null
+    });
     const uniqueTypes = Array.from(new Set((observed.jsonldTypes || []).map(type => normalizeSubpageJsonLdType(type)).filter(Boolean))).slice(0, 50);
     const lowerTypes = new Set(uniqueTypes.map(type => type.toLowerCase()));
     const jsonldTypeCounts = countSubpageJsonLdTypes(uniqueTypes);
-    return {
+    const result = {
       url,
       finalUrl,
       status,
@@ -3373,7 +3428,24 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       observationSource: 'playwright-scoped-light',
       observationMethod: 'playwright_scoped_light'
     };
+    emitScopedAudit('scoped_page_done', {
+      targetUrl: url,
+      finalUrl,
+      status,
+      ok: result.ok,
+      titleLength: String(result.title || '').length,
+      h1Count: result.h1Count,
+      bodyTextLength: result.bodyTextLength,
+      elapsedMs: Math.max(0, Date.now() - pageStartedAt),
+      error: result.error || null
+    });
+    return result;
   } catch (e) {
+    emitScopedAudit('scoped_page_done', {
+      targetUrl: url,
+      elapsedMs: Math.max(0, Date.now() - pageStartedAt),
+      error: String(e && (e.message || e) || 'playwright_scoped_light_failed').slice(0, 240)
+    });
     return {
       url,
       finalUrl: url,
@@ -5173,7 +5245,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         scopedPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
           siteMode: 'generic',
           timeout: 8000,
-          context: opts && opts.context
+          context: opts && opts.context,
+          debugHeavySite: opts && opts.debugHeavySite === true
         }));
       }
       emitHeavySiteAudit('scoped_playwright_end', {
@@ -7920,8 +7993,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       observed: false,
       error: null
     };
+    const bodyTextLengthForMain = Number(observed && observed.body && observed.body.textLength || 0);
+    const domHasMainLikeElement = !!(
+      domLandmarks.hasMainLandmark === true ||
+      domLandmarks.mainLandmarkCandidateFound === true ||
+      bodyTextLengthForMain >= 800
+    );
     if (shortFastMode) {
       a11yMain.error = 'skipped_short_fast';
+    } else if (domHasMainLikeElement) {
+      a11yMain.error = 'skipped_dom_main_or_body_text_already_observed';
+      logHeavySiteBuildGeoAudit('main_a11y_skip', {
+        reason: 'dom_main_or_body_text_already_observed',
+        bodyTextLength: bodyTextLengthForMain,
+        hasMainLikeElement: domHasMainLikeElement,
+        hasMain: domLandmarks.hasMainLandmark === true,
+        hasArticle: domLandmarks.mainLandmarkSource === 'dom_article',
+        hasRoleMain: domLandmarks.mainLandmarkSource === 'dom_role_main',
+        mainLandmarkSource: domLandmarks.mainLandmarkSource || null,
+        mainLandmarkCandidateFound: domLandmarks.mainLandmarkCandidateFound === true,
+        mainLandmarkCandidateSource: domLandmarks.mainLandmarkCandidateSource || null
+      });
     } else {
       try {
         logHeavySiteBuildGeoAudit('shadow_dom_or_deep_query_start', {
@@ -8561,6 +8653,23 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
 async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
   const maxWaitMs = Math.max(0, Math.min(5000, Number(waitMs || 0)));
   const shortFastMode = !!(opts && opts.shortFastMode);
+  const debugHeavySite = opts && opts.debugHeavySite === true;
+  const debugStartedAt = Number(opts && opts.debugHeavySiteStartedAt || Date.now()) || Date.now();
+  const debugUrl = String(opts && opts.url || '');
+  const debugFinalUrl = String(opts && opts.finalUrl || '');
+  const logHydrationAudit = (phase, details = {}) => {
+    if (!debugHeavySite) return;
+    try {
+      console.log('[DEBUG][HEAVY_SITE_TOPPAGE_AUDIT]', JSON.stringify({
+        phase,
+        url: debugUrl,
+        finalUrl: debugFinalUrl,
+        elapsedMs: Math.max(0, Date.now() - debugStartedAt),
+        memory: typeof process !== 'undefined' && process.memoryUsage ? process.memoryUsage() : null,
+        details
+      }));
+    } catch (_) {}
+  };
   const empty = {
     waitMs: 0,
     bodyTextBeforeWait: 0,
@@ -8576,6 +8685,8 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
     error: null
   };
   const measure = async () => {
+    const measureStartedAt = Date.now();
+    logHydrationAudit('hydration_body_count_start', { shortFastMode });
     return page.evaluate(({ shortFastMode }) => {
       const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
       const shadowTextParts = [];
@@ -8623,12 +8734,34 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
         shadowHostCount,
         warningText: /JavaScriptを有効にしてください|window\.fetch|ブラウザではご利用いただけません/i.test(bodyText)
       };
-    }, { shortFastMode }).catch(() => ({
+    }, { shortFastMode }).then((result) => {
+      logHydrationAudit('hydration_body_count_end', {
+        durationMs: Math.max(0, Date.now() - measureStartedAt),
+        bodyTextLength: result && result.bodyTextLength,
+        anchorCount: result && result.anchorCount,
+        navLinkCount: result && result.navLinkCount,
+        shadowHostCount: result && result.shadowHostCount,
+        shadowJsonLdCount: result && result.shadowJsonLdCount,
+        shadowH1Count: result && result.shadowH1Count
+      });
+      logHydrationAudit('hydration_anchor_count_end', {
+        durationMs: Math.max(0, Date.now() - measureStartedAt),
+        anchorCount: result && result.anchorCount,
+        navLinkCount: result && result.navLinkCount
+      });
+      return result;
+    }).catch((e) => {
+      logHydrationAudit('hydration_body_count_end', {
+        durationMs: Math.max(0, Date.now() - measureStartedAt),
+        error: String(e && (e.message || e) || '').slice(0, 160)
+      });
+      return {
       bodyTextLength: 0,
       anchorCount: 0,
       navLinkCount: 0,
       warningText: false
-    }));
+    };
+    });
   };
   try {
       const before = await measure();
@@ -8642,6 +8775,13 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
     if (maxWaitMs > 0 && sparseBefore) {
       const startedAt = Date.now();
       try {
+        logHydrationAudit('hydration_wait_start', {
+          maxWaitMs,
+          sparseBefore,
+          bodyTextBeforeWait: before.bodyTextLength,
+          anchorCountBeforeWait: before.anchorCount,
+          navLinkCountBeforeWait: before.navLinkCount
+        });
         await page.waitForFunction(({ shortFastMode }) => {
           const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
             const shadowTextParts = [];
@@ -8684,7 +8824,20 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       } catch (_) {
         try { await page.waitForTimeout(Math.min(750, maxWaitMs)); } catch (_) {}
       }
+      logHydrationAudit('hydration_wait_end', {
+        waitMs: Math.min(maxWaitMs, Date.now() - startedAt)
+      });
+      logHydrationAudit('hydration_recount_start', {
+        bodyTextBeforeWait: before.bodyTextLength,
+        anchorCountBeforeWait: before.anchorCount,
+        navLinkCountBeforeWait: before.navLinkCount
+      });
       const after = await measure();
+      logHydrationAudit('hydration_recount_end', {
+        bodyTextAfterWait: after.bodyTextLength,
+        anchorCountAfterWait: after.anchorCount,
+        navLinkCountAfterWait: after.navLinkCount
+      });
       return {
         waitMs: Math.min(maxWaitMs, Date.now() - startedAt),
         bodyTextBeforeWait: before.bodyTextLength,
@@ -12539,7 +12692,13 @@ async function scrapeOnce(req, res) {
         boundedHydrationWaitMs,
         shortFastMode: balancedShortFastResponse
       });
-      const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, { shortFastMode: balancedShortFastResponse });
+      const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, {
+        shortFastMode: balancedShortFastResponse,
+        debugHeavySite,
+        debugHeavySiteStartedAt,
+        url: String(urlToFetch || ''),
+        finalUrl: String(finalUrl || '')
+      });
       logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_end', {
         waitMs: hydrationMetrics && hydrationMetrics.waitMs,
         bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
