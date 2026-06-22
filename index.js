@@ -12083,6 +12083,25 @@ async function scrapeOnce(req, res) {
       const logScrapeResponseReadyAudit = payload => {
         try {
           const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
+          const stringifyProbe = value => {
+            try {
+              const json = JSON.stringify(value);
+              return {
+                ok: true,
+                bytes: Buffer.byteLength(json || '', 'utf8'),
+                error: null
+              };
+            } catch (e) {
+              return {
+                ok: false,
+                bytes: null,
+                error: String(e && (e.message || e) || 'stringify_failed').slice(0, 240)
+              };
+            }
+          };
+          const payloadProbe = stringifyProbe(payload);
+          const geoSignalsProbe = stringifyProbe(payload && payload.geoSignalsV1);
+          const coverageSignalsProbe = stringifyProbe(coverageSignals);
           console.log('[DEBUG][SCRAPE_RESPONSE_READY_AUDIT]', JSON.stringify({
             route: '/scrape',
             mode: payload && (payload.responseMode || payload.mode) || (signalsMode || responseMode || null),
@@ -12092,6 +12111,15 @@ async function scrapeOnce(req, res) {
             hasCoverageSignals: Boolean(coverageSignals),
             coverageAttached: Boolean(coverageSignals && coverageSignals.checked),
             observedSubpageCount: coverageSignals ? coverageSignals.observedSubpageCount : null,
+            payloadStringifyOk: payloadProbe.ok,
+            payloadBytes: payloadProbe.bytes,
+            payloadStringifyError: payloadProbe.error,
+            geoSignalsBytes: geoSignalsProbe.bytes,
+            geoSignalsStringifyOk: geoSignalsProbe.ok,
+            geoSignalsStringifyError: geoSignalsProbe.error,
+            coverageSignalsBytes: coverageSignalsProbe.bytes,
+            coverageSignalsStringifyOk: coverageSignalsProbe.ok,
+            coverageSignalsStringifyError: coverageSignalsProbe.error,
             responseKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 20) : []
           }));
         } catch (_) {}
