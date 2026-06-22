@@ -4826,9 +4826,43 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length
     });
+    try {
+      console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_START]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        subpageObservationMode,
+        urlCount: selectedCandidates.length,
+        urls: selectedCandidates.slice(0, 5).map(candidate => candidate && candidate.url || '')
+      }));
+    } catch (_) {}
     const htmlObserved = await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
       siteMode: 'generic'
     });
+    try {
+      const htmlObservedItems = Array.isArray(htmlObserved && htmlObserved.pages)
+        ? htmlObserved.pages
+        : (Array.isArray(htmlObserved && htmlObserved.observations) ? htmlObserved.observations : []);
+      console.log('[DEBUG][SUBPAGE_HTML_FETCH_LIGHT_COMPLETE]', JSON.stringify({
+        route: '/scrape',
+        mode: 'signalsMode=light',
+        origin: normalized.origin,
+        subpageObservationMode,
+        observedCount: htmlObservedItems.length,
+        sample: htmlObservedItems.slice(0, 5).map(page => ({
+          url: page && page.url || '',
+          finalUrl: page && page.finalUrl || '',
+          ok: page && page.ok,
+          status: page && page.status,
+          title: page && page.title || '',
+          h1Count: page && page.h1Count,
+          bodyTextLength: page && page.bodyTextLength,
+          internalLinkCount: page && page.internalLinkCount,
+          jsonLdCount: page && (page.jsonLdCount || page.jsonldCount) || 0,
+          error: page && page.error || null
+        }))
+      }));
+    } catch (_) {}
     const htmlPages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
     const playwrightCandidates = htmlFetchOnlySubpageObservation
       ? []
