@@ -3079,120 +3079,105 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
 }
 
 async function fetchSubpageHtmlLight(url, opts = {}) {
+  const buildFetchError = (stage, error, meta) => {
+    const cause = error && error.cause ? error.cause : null;
+    const parts = [];
+    const add = (key, value, limit) => {
+      if (value === null || value === undefined || value === '') return;
+      parts.push(`${key}=${String(value).slice(0, limit || 160)}`);
+    };
+    add('stage', stage, 40);
+    add('url', url, 180);
+    add('name', error && error.name, 80);
+    add('message', error && error.message, 180);
+    add('code', error && error.code, 80);
+    add('causeName', cause && cause.name, 80);
+    add('causeCode', cause && cause.code, 80);
+    add('causeMessage', cause && cause.message, 180);
+    add('reason', meta && meta.reason, 120);
+    add('status', meta && meta.status, 40);
+    if (meta && typeof meta.redirected === 'boolean') add('redirected', meta.redirected, 20);
+    add('finalUrl', meta && meta.finalUrl, 180);
+    return (parts.join(' | ') || 'html_fetch_failed').slice(0, 700);
+  };
+  const emptyHtmlFetchResult = (finalUrl, status, error, errorStage) => ({
+    url,
+    finalUrl: finalUrl || url,
+    status: typeof status === 'number' ? status : null,
+    ok: false,
+    pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
+    title: '',
+    canonical: '',
+    h1Count: 0,
+    h1Texts: [],
+    jsonldTypes: [],
+    hasBreadcrumbJsonLd: false,
+    hasBreadcrumbUi: false,
+    error,
+    errorStage,
+    observationSource: 'html-fetch-light',
+    observationMethod: 'html_fetch_light'
+  });
   try {
     const initialUrl = new URL(String(url || ''));
     if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
-      return {
-        url,
-        finalUrl: url,
-        status: null,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        error: 'blocked_private_or_metadata_host',
-        observationSource: 'html-fetch-light',
-        observationMethod: 'html_fetch_light'
-      };
+      return emptyHtmlFetchResult(url, null, 'blocked_private_or_metadata_host', 'precheck');
     }
-    const response = await fetch(url, {
-      method: 'GET',
-      redirect: 'follow',
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
-    });
+    let response = null;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
+      });
+    } catch (e) {
+      return emptyHtmlFetchResult(url, null, buildFetchError('fetch', e), 'fetch');
+    }
     const status = response && typeof response.status === 'number' ? response.status : null;
     const finalUrl = response && response.url ? response.url : url;
+    const responseMeta = {
+      status,
+      redirected: !!(response && response.redirected),
+      finalUrl
+    };
     let finalParsed = null;
     try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
     if (finalParsed && finalParsed.origin !== initialUrl.origin) {
-      return {
-        url,
-        finalUrl,
-        status,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        error: 'redirect_origin_mismatch',
-        observationSource: 'html-fetch-light',
-        observationMethod: 'html_fetch_light'
-      };
+      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
+        reason: 'redirect_origin_mismatch'
+      })), 'fetch');
     }
     if (!response || !response.ok) {
-      return {
-        url,
-        finalUrl,
-        status,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        error: status ? `HTTP ${status}` : 'fetch_failed',
-        observationSource: 'html-fetch-light',
-        observationMethod: 'html_fetch_light'
-      };
+      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
+        reason: status ? `HTTP ${status}` : 'fetch_failed'
+      })), 'fetch');
     }
     const contentType = String(response.headers && response.headers.get && response.headers.get('content-type') || '');
     if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
-      return {
-        url,
-        finalUrl,
-        status,
-        ok: false,
-        pageType: inferSubpageJsonLdPageType(finalUrl || url, opts.siteMode, []),
-        title: '',
-        canonical: '',
-        h1Count: 0,
-        h1Texts: [],
-        jsonldTypes: [],
-        hasBreadcrumbJsonLd: false,
-        hasBreadcrumbUi: false,
-        error: 'unsupported_content_type',
-        observationSource: 'html-fetch-light',
-        observationMethod: 'html_fetch_light'
-      };
+      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('fetch', null, Object.assign({}, responseMeta, {
+        reason: `unsupported_content_type:${contentType.slice(0, 80)}`
+      })), 'fetch');
     }
-    const html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
-    return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode), {
-      observationSource: 'html-fetch-light',
-      observationMethod: 'html_fetch_light'
-    });
+    let html = '';
+    try {
+      html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
+    } catch (e) {
+      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('response_text', e, responseMeta), 'response_text');
+    }
+    try {
+      return Object.assign(parseSubpageJsonLdLightHtml(url, finalUrl, status, html, opts.siteMode), {
+        observationSource: 'html-fetch-light',
+        observationMethod: 'html_fetch_light',
+        errorStage: null
+      });
+    } catch (e) {
+      return emptyHtmlFetchResult(finalUrl, status, buildFetchError('parse', e, responseMeta), 'parse');
+    }
   } catch (e) {
-    return {
-      url,
-      finalUrl: url,
-      status: null,
-      ok: false,
-      pageType: inferSubpageJsonLdPageType(url, opts.siteMode, []),
-      title: '',
-      canonical: '',
-      h1Count: 0,
-      h1Texts: [],
-      jsonldTypes: [],
-      hasBreadcrumbJsonLd: false,
-      hasBreadcrumbUi: false,
-      error: String(e && (e.message || e) || 'html_fetch_failed').slice(0, 160),
-      observationSource: 'html-fetch-light',
-      observationMethod: 'html_fetch_light'
-    };
+    return emptyHtmlFetchResult(url, null, buildFetchError('fetch', e), 'fetch');
   }
 }
 
@@ -4859,6 +4844,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           bodyTextLength: page && page.bodyTextLength,
           internalLinkCount: page && page.internalLinkCount,
           jsonLdCount: page && (page.jsonLdCount || page.jsonldCount) || 0,
+          errorStage: page && page.errorStage || null,
           error: page && page.error || null
         }))
       }));
