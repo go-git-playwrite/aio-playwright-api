@@ -7755,8 +7755,17 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       observed: false,
       error: null
     };
+    const domHeadingObservedCount = domH1.length + domH2.length + domH3.length;
     if (shortFastMode) {
       a11yHeadings.error = 'skipped_short_fast';
+    } else if (domHeadingObservedCount > 0) {
+      a11yHeadings.error = 'skipped_dom_headings_already_observed';
+      logHeavySiteBuildGeoAudit('headings_a11y_skip', {
+        reason: 'dom_headings_already_observed',
+        domH1Count: domH1.length,
+        domH2Count: domH2.length,
+        domH3Count: domH3.length
+      });
     } else {
       try {
         logHeavySiteBuildGeoAudit('headings_start', {
