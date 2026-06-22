@@ -3489,6 +3489,19 @@ function isSubpageHtmlLightObservationSufficient_(page) {
   return hasTitle && hasEnoughText && (hasH1 || hasJsonLd || hasStrongLinks);
 }
 
+function isSubpageHtmlLightTlsSslFailure_(page) {
+  if (!page || page.ok === true) return false;
+  const text = [
+    page.error,
+    page.errorMessage,
+    page.errorCode,
+    page.causeCode,
+    page.causeMessage,
+    page.errorStage
+  ].map(value => String(value || '')).join(' ');
+  return /ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED|(?:^|\b)(?:SSL|TLS)(?:\b|_)/i.test(text);
+}
+
 function normalizeDiscoverSubpageUrl(rawUrl, origin) {
   let parsed = null;
   try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return null; }
@@ -4456,6 +4469,10 @@ function compactSubpageJsonLdObservation_(page) {
       ? String(page.observationMethod).slice(0, 80)
       : (page && page.observationSource === 'html-fetch-light' ? 'html_fetch_light' : ''),
     observationSource: page && page.observationSource ? String(page.observationSource).slice(0, 80) : '',
+    scopedFallbackAttempted: page && page.scopedFallbackAttempted === true,
+    scopedFallbackError: page && page.scopedFallbackError ? String(page.scopedFallbackError).slice(0, 160) : null,
+    scopedFallbackStatus: page && typeof page.scopedFallbackStatus !== 'undefined' ? page.scopedFallbackStatus : null,
+    scopedFallbackObservationMethod: page && page.scopedFallbackObservationMethod ? String(page.scopedFallbackObservationMethod).slice(0, 80) : '',
     error: page && page.error ? String(page.error).slice(0, 160) : null
   };
 }
@@ -4639,6 +4656,7 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
       if (observedSignals.links) reasons.push('has_links');
       if (method === 'html_fetch_light') reasons.push('method_html_fetch_light');
       if (method === 'playwright_scoped_light') reasons.push('method_playwright_scoped_light');
+      if (observed && observed.scopedFallbackAttempted === true) reasons.push('scoped_playwright_fallback_attempted');
       if (fallbackUsed) reasons.push('fallback_used');
       if (shadowTimedOut) reasons.push('shadow_timeout');
       if (timedOut) reasons.push('timeout');
@@ -4669,6 +4687,8 @@ function buildRepresentativeObservationQualityAudit_(representativePages, observ
           fallbackUsed: !!fallbackUsed,
           shadowAttempted: !!shadowAttempted,
           shadowTimedOut: !!shadowTimedOut,
+          scopedFallbackAttempted: observed && observed.scopedFallbackAttempted === true,
+          scopedFallbackError: observed && observed.scopedFallbackError || null,
           error: errorText || null
         }
       };
@@ -4969,6 +4989,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   const htmlFetchOnlySubpageObservation = normalizedSubpageObservationMode === 'htmlfetchonly';
   const scopedPlaywrightSubpageObservation = normalizedSubpageObservationMode === 'scopedplaywright';
   const staticCandidateSubpageObservation = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation;
+  const guardHost = (() => {
+    try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
+  })();
+  const hostMemoryGuardMatched = guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com';
+  const memoryGuardScopedProbeSubpageObservation = !staticCandidateSubpageObservation && hostMemoryGuardMatched;
+  const effectiveStaticCandidateSubpageObservation = staticCandidateSubpageObservation || memoryGuardScopedProbeSubpageObservation;
   const debugHeavySite = opts && opts.debugHeavySite === true;
   const debugHeavySiteStartedAt = Number(opts && opts.debugHeavySiteStartedAt || Date.now()) || Date.now();
   const heavySiteMemorySnapshot = () => {
@@ -5029,7 +5055,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
   };
   const reusePageForDiscover = !!(opts && opts.page);
   const reuseContextForObserve = !!(opts && opts.context);
-  const maxObserve = staticCandidateSubpageObservation
+  const maxObserve = effectiveStaticCandidateSubpageObservation
     ? 2
     : Math.max(1, Math.min(5, Number(opts && opts.maxObserve || 5) || 5));
   const auditPayload = {
@@ -5070,13 +5096,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
     }
-    const guardHost = (() => {
-      try { return new URL(normalized.topUrl || normalized.url || topUrl || '').hostname; } catch (_) { return ''; }
-    })();
-    if (staticCandidateSubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
+    if ((staticCandidateSubpageObservation || memoryGuardScopedProbeSubpageObservation) && hostMemoryGuardMatched) {
       emitHeavySiteAudit('guard_bypass', {
         guardHost,
-        reason: scopedPlaywrightSubpageObservation ? 'scoped_playwright' : 'html_fetch_only'
+        reason: memoryGuardScopedProbeSubpageObservation
+          ? 'tls_ssl_scoped_fallback_probe'
+          : (scopedPlaywrightSubpageObservation ? 'scoped_playwright' : 'html_fetch_only')
       });
       try {
         console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_MEMORY_GUARD_BYPASS]', JSON.stringify({
@@ -5084,11 +5109,13 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           mode: 'signalsMode=light',
           origin: normalized.origin,
           subpageObservationMode: opts && opts.subpageObservationMode || '',
-          reason: scopedPlaywrightSubpageObservation ? 'scoped_playwright' : 'html_fetch_only'
+          reason: memoryGuardScopedProbeSubpageObservation
+            ? 'tls_ssl_scoped_fallback_probe'
+            : (scopedPlaywrightSubpageObservation ? 'scoped_playwright' : 'html_fetch_only')
         }));
       } catch (_) {}
     }
-    if (!staticCandidateSubpageObservation && (guardHost === 'ahamo.com' || guardHost === 'www.ahamo.com')) {
+    if (!effectiveStaticCandidateSubpageObservation && hostMemoryGuardMatched) {
       const skipReason = 'memory_guard_ahamo_representative_observation';
       emitHeavySiteAudit('guard_memory', {
         guardHost,
@@ -5156,17 +5183,18 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       return coverageSignals;
     }
     emitHeavySiteAudit('discover_start', {
-      staticCandidateSubpageObservation,
+      staticCandidateSubpageObservation: effectiveStaticCandidateSubpageObservation,
+      memoryGuardScopedProbeSubpageObservation,
       reusePageForDiscover,
       reuseContextForObserve
     });
     traceCoverageMemory('discover_before', {
-      browserCreated: staticCandidateSubpageObservation ? false : !reusePageForDiscover,
-      contextCreated: !staticCandidateSubpageObservation,
-      pageCreated: !staticCandidateSubpageObservation,
+      browserCreated: effectiveStaticCandidateSubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !effectiveStaticCandidateSubpageObservation,
+      pageCreated: !effectiveStaticCandidateSubpageObservation,
       subpageObservationMode: scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '')
     });
-    const discovered = staticCandidateSubpageObservation
+    const discovered = effectiveStaticCandidateSubpageObservation
       ? buildHtmlFetchOnlyStaticSubpageCandidates_(
           normalized.topUrl,
           normalized.origin,
@@ -5180,7 +5208,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     emitHeavySiteAudit('discover_end', {
       candidateCount: discovered.totalCandidates,
       sourceSummary: discovered.sourceSummary,
-      staticCandidateSubpageObservation
+      staticCandidateSubpageObservation: effectiveStaticCandidateSubpageObservation,
+      memoryGuardScopedProbeSubpageObservation
     });
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
@@ -5207,9 +5236,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       skippedUtilityPaths
     });
     traceCoverageMemory('discover_after', {
-      browserCreated: staticCandidateSubpageObservation ? false : !reusePageForDiscover,
-      contextCreated: !staticCandidateSubpageObservation,
-      pageCreated: !staticCandidateSubpageObservation,
+      browserCreated: effectiveStaticCandidateSubpageObservation ? false : !reusePageForDiscover,
+      contextCreated: !effectiveStaticCandidateSubpageObservation,
+      pageCreated: !effectiveStaticCandidateSubpageObservation,
       candidateCount: discovered.totalCandidates,
       observeCount: selectedCandidates.length,
       subpageObservationMode: scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : '')
@@ -5328,11 +5357,47 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       } catch (_) {}
     }
     const htmlPages = Array.isArray(htmlObserved && htmlObserved.pages) ? htmlObserved.pages : [];
-    const playwrightCandidates = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation
+    const scopedFallbackCandidates = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation
       ? []
       : selectedCandidates.filter((candidate, index) => {
-          return !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
+          return isSubpageHtmlLightTlsSslFailure_(htmlPages[index]);
         });
+    const scopedFallbackCandidateUrls = new Set(scopedFallbackCandidates.map(candidate => String(candidate && candidate.url || '')));
+    const playwrightCandidates = htmlFetchOnlySubpageObservation || scopedPlaywrightSubpageObservation || memoryGuardScopedProbeSubpageObservation
+      ? []
+      : selectedCandidates.filter((candidate, index) => {
+          const candidateUrl = String(candidate && candidate.url || '');
+          return !scopedFallbackCandidateUrls.has(candidateUrl) && !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
+        });
+    const scopedFallbackPages = [];
+    if (scopedFallbackCandidates.length) {
+      emitHeavySiteAudit('scoped_playwright_start', {
+        reason: 'html_fetch_tls_ssl_failure',
+        selectedCandidateUrls: scopedFallbackCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
+      });
+      for (const candidate of scopedFallbackCandidates) {
+        scopedFallbackPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
+          siteMode: 'generic',
+          timeout: 8000,
+          context: opts && opts.context,
+          debugHeavySite: opts && opts.debugHeavySite === true
+        }));
+      }
+      emitHeavySiteAudit('scoped_playwright_end', {
+        reason: 'html_fetch_tls_ssl_failure',
+        observedCount: scopedFallbackPages.length,
+        sample: scopedFallbackPages.slice(0, 5).map(page => ({
+          url: page && page.url || '',
+          finalUrl: page && page.finalUrl || '',
+          ok: page && page.ok,
+          status: page && page.status,
+          title: page && page.title || '',
+          h1Count: page && page.h1Count,
+          bodyTextLength: page && page.bodyTextLength,
+          error: page && page.error || null
+        }))
+      });
+    }
     emitHeavySiteAudit('playwright_fallback_start', {
       candidateCount: playwrightCandidates.length,
       candidateUrls: playwrightCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
@@ -5369,6 +5434,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     playwrightPages.forEach(page => {
       if (page && page.url) playwrightByUrl.set(String(page.url), page);
     });
+    const scopedFallbackByUrl = new Map();
+    scopedFallbackPages.forEach(page => {
+      if (page && page.url) scopedFallbackByUrl.set(String(page.url), page);
+    });
     const observed = {
       pages: selectedCandidates.map((candidate, index) => {
         if (scopedPlaywrightSubpageObservation) {
@@ -5391,10 +5460,22 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         }
         const htmlPage = htmlPages[index];
         const playwrightPage = playwrightByUrl.get(String(candidate && candidate.url || ''));
+        const scopedFallbackPage = scopedFallbackByUrl.get(String(candidate && candidate.url || ''));
         if (playwrightPage && playwrightPage.ok === true) return playwrightPage;
+        if (scopedFallbackPage && scopedFallbackPage.ok === true) return Object.assign({}, scopedFallbackPage, {
+          observationMethod: 'playwright_scoped_light',
+          observationSource: 'playwright-scoped-light-after-html-fetch-tls-ssl-failure',
+          scopedFallbackAttempted: true
+        });
         if (htmlPage && htmlPage.ok === true) return Object.assign({}, htmlPage, {
           observationMethod: 'html_fetch_light',
           observationSource: playwrightPage ? 'html-fetch-light-after-playwright-fallback' : 'html-fetch-light'
+        });
+        if (htmlPage && scopedFallbackPage) return Object.assign({}, htmlPage, {
+          scopedFallbackAttempted: true,
+          scopedFallbackError: scopedFallbackPage && scopedFallbackPage.error || null,
+          scopedFallbackStatus: scopedFallbackPage && typeof scopedFallbackPage.status !== 'undefined' ? scopedFallbackPage.status : null,
+          scopedFallbackObservationMethod: 'playwright_scoped_light'
         });
         return playwrightPage || htmlPage || {
           url: candidate && candidate.url || '',
