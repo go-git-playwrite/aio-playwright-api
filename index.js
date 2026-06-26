@@ -2964,11 +2964,117 @@ function countSubpageJsonLdTypes(types) {
   return counts;
 }
 
+function isLegalOperatorCandidateText_(value) {
+  return /特定商取引法に基づく(?:表示|表記)|特定商取引に関する表記|特定商取引|特商法|商取引|販売者情報|販売業者|legal\s*notice|act\s+on\s+specified\s+commercial\s+transactions/i.test(String(value || ''));
+}
+
+function isLegalOperatorCandidatePath_(value) {
+  const path = (() => {
+    try { return new URL(String(value || '')).pathname.toLowerCase(); } catch (_) { return String(value || '').toLowerCase(); }
+  })();
+  return /\/(?:policies\/legal-notice|legal-notice|legal|law|commercial-transactions|specified-commercial-transactions|tokushoho)(?:\/|$|-|_)/i.test(path);
+}
+
+function inferLegalOperatorPageType_(url, title, h1Texts) {
+  const hay = [
+    url,
+    title,
+    ...(Array.isArray(h1Texts) ? h1Texts : [])
+  ].map(v => String(v || '')).join(' ');
+  return isLegalOperatorCandidatePath_(url) || isLegalOperatorCandidateText_(hay) ? 'legal' : '';
+}
+
+function inferSiteModeForRepresentativeObservation_(topUrl, explicitMode) {
+  const mode = normalizeSubpageJsonLdText(explicitMode).toLowerCase();
+  if (mode && mode !== 'generic' && mode !== 'unknown') return mode;
+  try {
+    const parsed = new URL(String(topUrl || ''));
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    if (/^(store|shop)\./.test(host) || /\.(store|shop)\./.test(host)) return 'ec';
+    if (/\/(?:products?|collections?|cart|checkout|item|items)(?:\/|$|-|_)/i.test(path)) return 'ec';
+  } catch (_) {}
+  return mode || 'generic';
+}
+
+function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
+  const empty = {
+    observed: false,
+    pageType: 'legal',
+    sourceUrl: String(sourceUrl || ''),
+    operatorName: '',
+    address: '',
+    telephone: '',
+    hasOperatorName: false,
+    hasAddress: false,
+    hasTelephone: false,
+    hasOperatorInfo: false,
+    extractionMethod: 'html_text',
+    evidenceLabels: []
+  };
+  try {
+    const $ = cheerio.load(String(html || ''));
+    const title = normalizeSubpageJsonLdText((meta && meta.title) || $('title').first().text());
+    const h1Texts = Array.isArray(meta && meta.h1Texts) ? meta.h1Texts : $('h1').map((_, el) => normalizeSubpageJsonLdText($(el).text())).get();
+    const pageHay = [sourceUrl, title].concat(h1Texts).join(' ');
+    if (!isLegalOperatorCandidatePath_(sourceUrl) && !isLegalOperatorCandidateText_(pageHay)) return empty;
+
+    const rows = [];
+    $('tr').each((_, el) => {
+      const cells = $(el).find('th,td').map((__, cell) => normalizeSubpageJsonLdText($(cell).text())).get().filter(Boolean);
+      if (cells.length >= 2) rows.push({ label: cells[0], value: cells.slice(1).join(' ') });
+    });
+    $('dt').each((_, el) => {
+      const label = normalizeSubpageJsonLdText($(el).text());
+      const value = normalizeSubpageJsonLdText($(el).next('dd').text());
+      if (label && value) rows.push({ label, value });
+    });
+
+    const bodyText = normalizeSubpageJsonLdText($('body').text());
+    const labelValueFromText = (labelRe, valueRe) => {
+      for (const row of rows) {
+        if (labelRe.test(row.label) && row.value) return { value: row.value, label: row.label };
+      }
+      const match = bodyText.match(new RegExp(`(${labelRe.source})\\s*[：:\\s]*([^\\n。]{1,120})`, 'i'));
+      if (match && match[2]) {
+        const raw = normalizeSubpageJsonLdText(match[2]);
+        const valueMatch = valueRe ? raw.match(valueRe) : null;
+        return { value: normalizeSubpageJsonLdText(valueMatch && valueMatch[0] || raw), label: match[1] };
+      }
+      return { value: '', label: '' };
+    };
+
+    const operator = labelValueFromText(/販売業者|事業者名|事業者|運営会社|販売者|会社名/i);
+    const address = labelValueFromText(/所在地|住所|本社所在地/i, /〒?\s?\d{3}[-‐‑‒–—]?\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県).{2,90}/);
+    const telephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先/i, /(?:\+?\d[\d\s()（）+\-‐‑‒–—ー]{6,}\d)/);
+
+    const normalizePhone = v => normalizeSubpageJsonLdText(v).replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/\s+/g, '');
+    const out = Object.assign({}, empty, {
+      operatorName: operator.value ? operator.value.slice(0, 120) : '',
+      address: address.value ? address.value.slice(0, 160) : '',
+      telephone: telephone.value ? normalizePhone(telephone.value).slice(0, 60) : ''
+    });
+    if (out.operatorName) out.evidenceLabels.push(operator.label || 'operatorName');
+    if (out.address) out.evidenceLabels.push(address.label || 'address');
+    if (out.telephone) out.evidenceLabels.push(telephone.label || 'telephone');
+    out.hasOperatorName = !!out.operatorName;
+    out.hasAddress = !!out.address;
+    out.hasTelephone = !!out.telephone;
+    out.hasOperatorInfo = out.hasAddress && out.hasTelephone;
+    out.observed = out.hasOperatorName || out.hasOperatorInfo;
+    out.evidenceLabels = Array.from(new Set(out.evidenceLabels.filter(Boolean))).slice(0, 10);
+    return out;
+  } catch (_) {
+    return empty;
+  }
+}
+
 function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
   const typeSet = new Set((Array.isArray(jsonldTypes) ? jsonldTypes : []).map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
   const path = (() => {
     try { return new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { return String(url || '').toLowerCase(); }
   })();
+  if (isLegalOperatorCandidatePath_(url)) return 'legal';
   if (typeSet.has('product') || typeSet.has('offer')) return 'product';
   if (typeSet.has('faqpage')) return 'faq';
   if (typeSet.has('article') || typeSet.has('newsarticle') || typeSet.has('blogposting')) return 'article';
@@ -3006,6 +3112,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const uniqueTypes = Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50);
   const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
   const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
+  const legalPageType = inferLegalOperatorPageType_(finalUrl || url, title, h1Texts);
   const breadcrumbSelector = [
     'nav[aria-label*="breadcrumb" i]',
     '[aria-label*="パンくず"]',
@@ -3035,6 +3142,9 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   bodyClone.find('script,style,noscript,svg,nav,footer').remove();
   const sampledText = normalizeSubpageJsonLdText(bodyClone.text()).slice(0, 500);
   const bodyTextLength = normalizeSubpageJsonLdText($('body').first().text()).length;
+  const legalOperatorInfo = legalPageType === 'legal'
+    ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
+    : null;
   let internalLinkCount = 0;
   let externalLinkCount = 0;
   $('a[href]').slice(0, 1200).each((_, el) => {
@@ -3052,7 +3162,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     finalUrl: finalUrl || url,
     status,
     ok: true,
-    pageType: inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes),
+    pageType: legalPageType || inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes),
     title,
     canonical,
     h1Count: $('h1').length,
@@ -3073,6 +3183,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     externalLinkCount,
     bodyTextLength,
     sampledText,
+    legalOperatorInfo,
     error: null,
     parseErrors
   };
@@ -3781,7 +3892,7 @@ function discoverSubpageCandidateKey(url) {
 }
 
 function isDiscoverImportantPath(path) {
-  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|access|sitemap)(?:\/|$|-|_)/i.test(String(path || ''));
+  return /\/(?:about|company|corporate|profile|business|service|services|solution|solutions|works|case|cases|news|topics|blog|column|contact|inquiry|recruit|career|privacy|policy|ai_policy|faq|access|sitemap|legal-notice|legal|law|commercial-transactions|specified-commercial-transactions|tokushoho)(?:\/|$|-|_)/i.test(String(path || ''));
 }
 
 function isDiscoverDetailLikePath(path) {
@@ -3808,7 +3919,7 @@ function reasonDiscoverSubpageCandidate(url, source, sources) {
   return `${source || 'unknown'} candidate`;
 }
 
-function scoreDiscoverSubpageCandidate(url, source, sources) {
+function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
   const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : 0)));
@@ -3816,6 +3927,7 @@ function scoreDiscoverSubpageCandidate(url, source, sources) {
   const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
   if (isDiscoverImportantPath(path)) score += 50;
+  if (isLegalOperatorCandidatePath_(url) || isLegalOperatorCandidateText_(label)) score += 15;
   if (depth <= 1) score += 15;
   else if (depth === 2) score += 8;
   if (sourceCount >= 2) score += Math.min(30, 10 + (sourceCount - 2) * 10);
@@ -3827,26 +3939,30 @@ function scoreDiscoverSubpageCandidate(url, source, sources) {
 }
 
 function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary) {
-  const url = normalizeDiscoverSubpageUrl(rawUrl, origin);
+  const rawHref = rawUrl && typeof rawUrl === 'object' ? (rawUrl.href || rawUrl.url || '') : rawUrl;
+  const label = rawUrl && typeof rawUrl === 'object' ? normalizeSubpageJsonLdText(rawUrl.text || rawUrl.label || rawUrl.title || '') : '';
+  const url = normalizeDiscoverSubpageUrl(rawHref, origin);
   if (!url) return false;
   const key = discoverSubpageCandidateKey(url);
   const sourcePriority = { sitemap: 1, htmlSitemap: 2, footer: 3, nav: 4 };
   const existing = map.get(key);
   if (existing) {
     if (!existing.sources.includes(source)) existing.sources.push(source);
+    if (label && !existing.label) existing.label = label.slice(0, 120);
     if ((sourcePriority[source] || 0) > (sourcePriority[existing.source] || 0)) {
       existing.source = source;
     }
-    existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources);
+    existing.score = scoreDiscoverSubpageCandidate(url, existing.source, existing.sources, existing.label || label);
     existing.reason = reasonDiscoverSubpageCandidate(url, existing.source, existing.sources);
     if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
     return false;
   }
   const item = {
     url,
+    label: label.slice(0, 120),
     source,
     sources: [source],
-    score: scoreDiscoverSubpageCandidate(url, source, [source]),
+    score: scoreDiscoverSubpageCandidate(url, source, [source], label),
     reason: reasonDiscoverSubpageCandidate(url, source, [source]) || reason
   };
   map.set(key, item);
@@ -3987,7 +4103,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
             await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
             const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
             (htmlSitemapLinks.allLinks || []).forEach(link => {
-              addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+              addDiscoverSubpageCandidate(candidateMap, link, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
             });
           } catch (e) {
             errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
@@ -3998,10 +4114,10 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       }
       const navFooterLinks = await collectDiscoverLinksFromPage(page);
       (navFooterLinks.navLinks || []).forEach(link => {
-        addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+        addDiscoverSubpageCandidate(candidateMap, link, 'nav', origin, 'important path from navigation', sourceSummary);
       });
       (navFooterLinks.footerLinks || []).forEach(link => {
-        addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+        addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
       });
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
@@ -4052,7 +4168,7 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
           await collectBalancedHydrationMetrics(page, 2000, { shortFastMode: false }).catch(() => null);
           const htmlSitemapLinks = await collectDiscoverLinksFromPage(page);
           (htmlSitemapLinks.allLinks || []).forEach(link => {
-            addDiscoverSubpageCandidate(candidateMap, link.href, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
+            addDiscoverSubpageCandidate(candidateMap, link, 'htmlSitemap', origin, 'linked from HTML sitemap', sourceSummary);
           });
         } catch (e) {
           errors.push({ source: 'htmlSitemap', message: `${sitemapPageUrl}: ${String(e && (e.message || e) || '').slice(0, 120)}` });
@@ -4063,10 +4179,10 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     }
     const navFooterLinks = await collectDiscoverLinksFromPage(page);
     (navFooterLinks.navLinks || []).forEach(link => {
-      addDiscoverSubpageCandidate(candidateMap, link.href, 'nav', origin, 'important path from navigation', sourceSummary);
+      addDiscoverSubpageCandidate(candidateMap, link, 'nav', origin, 'important path from navigation', sourceSummary);
     });
     (navFooterLinks.footerLinks || []).forEach(link => {
-      addDiscoverSubpageCandidate(candidateMap, link.href, 'footer', origin, 'important path from footer', sourceSummary);
+      addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
     });
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
@@ -4100,6 +4216,7 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
   const allCandidates = Array.from(candidateMap.values())
     .map(item => ({
       url: item.url,
+      label: item.label || '',
       source: item.source,
       sources: item.sources,
       score: item.score,
@@ -4119,12 +4236,13 @@ function inferHtmlFetchOnlyStaticCandidatePageType_(path) {
   if (/\/about(?:\/|$|-|_)/i.test(value)) return 'about';
   if (/\/contact(?:\/|$|-|_)/i.test(value)) return 'contact';
   if (/\/(?:faq|guide|support)(?:\/|$|-|_)/i.test(value)) return 'faq';
+  if (isLegalOperatorCandidatePath_(value)) return 'legal';
   if (/\/(?:terms|privacy)(?:\/|$|-|_)/i.test(value)) return 'legal';
   return 'unknown';
 }
 
 function buildHtmlFetchOnlyStaticSubpageCandidates_(topUrl, origin, mode) {
-  const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy'];
+  const staticPaths = ['/about', '/contact', '/faq', '/guide', '/support', '/terms', '/privacy', '/legal', '/law', '/policies/legal-notice', '/tokushoho'];
   const source = mode === 'scopedPlaywright'
     ? 'scoped-playwright-static-candidate'
     : 'html-fetch-only-static-candidate';
@@ -4717,6 +4835,20 @@ function compactSubpageJsonLdObservation_(page) {
     externalLinkCount: Number(page && page.externalLinkCount || 0),
     bodyTextLength: Number(page && page.bodyTextLength || 0),
     sampledText: normalizeSubpageJsonLdText(String(page && page.sampledText || '').slice(0, 500)),
+    legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? {
+      observed: true,
+      pageType: 'legal',
+      sourceUrl: String(page.legalOperatorInfo.sourceUrl || page.finalUrl || page.url || ''),
+      operatorName: normalizeSubpageJsonLdText(page.legalOperatorInfo.operatorName).slice(0, 120),
+      address: normalizeSubpageJsonLdText(page.legalOperatorInfo.address).slice(0, 160),
+      telephone: normalizeSubpageJsonLdText(page.legalOperatorInfo.telephone).slice(0, 60),
+      hasOperatorName: page.legalOperatorInfo.hasOperatorName === true,
+      hasAddress: page.legalOperatorInfo.hasAddress === true,
+      hasTelephone: page.legalOperatorInfo.hasTelephone === true,
+      hasOperatorInfo: page.legalOperatorInfo.hasOperatorInfo === true,
+      extractionMethod: String(page.legalOperatorInfo.extractionMethod || 'html_text').slice(0, 80),
+      evidenceLabels: Array.isArray(page.legalOperatorInfo.evidenceLabels) ? page.legalOperatorInfo.evidenceLabels.slice(0, 10) : []
+    } : null,
     observationMethod: page && page.observationMethod
       ? String(page.observationMethod).slice(0, 80)
       : (page && page.observationSource === 'html-fetch-light' ? 'html_fetch_light' : ''),
@@ -4736,12 +4868,14 @@ function isCoverageSignalsAboutPath_(value) {
   return /\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path);
 }
 
-function getCoverageRepresentativePriority_(page) {
+function getCoverageRepresentativePriority_(page, siteMode = 'generic') {
   const raw = String(page && (page.finalUrl || page.url || page.path) || '').toLowerCase();
   const path = (() => {
     try { return new URL(raw).pathname.toLowerCase(); } catch (_) { return raw; }
   })();
+  const mode = normalizeSubpageJsonLdText(siteMode).toLowerCase();
   if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 0;
+  if (mode === 'ec' && isLegalOperatorCandidatePath_(raw)) return 1;
   if (/\/(?:business|service|services|solution|solutions|case|works|products|product|recruit|career|careers|contact|inquiry)(?:\/|$|-|_)/i.test(path)) return 1;
   if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 3;
   return 2;
@@ -4751,10 +4885,10 @@ function getCoverageCandidatePath_(candidate) {
   try { return new URL(String(candidate && candidate.url || '')).pathname || '/'; } catch (_) { return ''; }
 }
 
-function sortCoverageObserveCandidates_(candidates) {
+function sortCoverageObserveCandidates_(candidates, siteMode = 'generic') {
   return (Array.isArray(candidates) ? candidates.slice() : []).sort((a, b) => {
-    const aPriority = getCoverageRepresentativePriority_(a);
-    const bPriority = getCoverageRepresentativePriority_(b);
+    const aPriority = getCoverageRepresentativePriority_(a, siteMode);
+    const bPriority = getCoverageRepresentativePriority_(b, siteMode);
     if (aPriority !== bPriority) return aPriority - bPriority;
     const aSources = Array.isArray(a && a.sources) ? a.sources.length : (a && a.source ? 1 : 0);
     const bSources = Array.isArray(b && b.sources) ? b.sources.length : (b && b.source ? 1 : 0);
@@ -5088,23 +5222,27 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       })();
       const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
       const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
+      const pageType = page.pageType || inferSubpageSignalsPageType_(page);
+      const legalOperatorInfo = page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null;
       return {
         url: page.url || '',
         finalUrl,
         path,
+        pageType,
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
         hasBreadcrumbList: hasBreadcrumb(page),
         jsonLdTypes,
+        legalOperatorInfo,
         matchedCandidateSources: Array.isArray(candidate.sources)
           ? candidate.sources.slice(0, 8)
           : (candidate.source ? [candidate.source] : [])
       };
     })
     .sort((a, b) => {
-      const aPriority = getCoverageRepresentativePriority_(a);
-      const bPriority = getCoverageRepresentativePriority_(b);
+      const aPriority = getCoverageRepresentativePriority_(a, payload && payload.siteMode);
+      const bPriority = getCoverageRepresentativePriority_(b, payload && payload.siteMode);
       if (aPriority !== bPriority) return aPriority - bPriority;
       if (a.hasBreadcrumbList !== b.hasBreadcrumbList) return a.hasBreadcrumbList ? -1 : 1;
       if (a.hasH1 !== b.hasH1) return a.hasH1 ? -1 : 1;
@@ -5182,11 +5320,13 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     representativePages: representativePages.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
+      pageType: page && page.pageType || '',
       title: page && page.title || '',
       h1: page && page.h1 || '',
       hasH1: !!(page && page.hasH1),
       hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
+      legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
         ? page.matchedCandidateSources.slice(0, 8)
         : []
@@ -5287,7 +5427,8 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         ogImageExists: page.ogImageExists === true,
         internalLinkCount: Number(page.internalLinkCount || 0),
         externalLinkCount: Number(page.externalLinkCount || 0),
-        sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500)
+        sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500),
+        legalOperatorInfo: page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null
       };
     });
   if (!pages.length) return null;
@@ -5315,8 +5456,43 @@ function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   };
 }
 
+function pickBestLegalOperatorInfo_(pages) {
+  const candidates = (Array.isArray(pages) ? pages : [])
+    .map(page => page && page.legalOperatorInfo)
+    .filter(info => info && info.observed === true);
+  if (!candidates.length) return null;
+  const scoreInfo = info => {
+    let score = 0;
+    if (info.hasOperatorInfo === true) score += 50;
+    if (info.hasAddress === true) score += 20;
+    if (info.hasTelephone === true) score += 20;
+    if (info.hasOperatorName === true) score += 10;
+    return score;
+  };
+  const best = candidates.slice().sort((a, b) => scoreInfo(b) - scoreInfo(a))[0];
+  return {
+    observed: true,
+    pageType: 'legal',
+    sourceUrl: String(best.sourceUrl || ''),
+    operatorName: normalizeSubpageJsonLdText(best.operatorName).slice(0, 120),
+    address: normalizeSubpageJsonLdText(best.address).slice(0, 160),
+    telephone: normalizeSubpageJsonLdText(best.telephone).slice(0, 60),
+    hasOperatorName: best.hasOperatorName === true,
+    hasAddress: best.hasAddress === true,
+    hasTelephone: best.hasTelephone === true,
+    hasOperatorInfo: best.hasOperatorInfo === true,
+    extractionMethod: String(best.extractionMethod || 'html_text').slice(0, 80),
+    evidenceLabels: Array.isArray(best.evidenceLabels) ? best.evidenceLabels.slice(0, 10) : []
+  };
+}
+
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
+  const siteMode = inferSiteModeForRepresentativeObservation_(topUrl,
+    opts && opts.siteMode ||
+    geoSignalsV1 && (geoSignalsV1.siteMode || geoSignalsV1.siteType || geoSignalsV1.rawSiteType) ||
+    'generic'
+  );
   const subpageObservationMode = String(opts && opts.subpageObservationMode || '').toLowerCase();
   const normalizedSubpageObservationMode = subpageObservationMode.replace(/[^a-z]/g, '');
   const htmlFetchOnlySubpageObservation = normalizedSubpageObservationMode === 'htmlfetchonly';
@@ -5354,6 +5530,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         finalUrl: normalized && normalized.topUrl || '',
         origin: normalized && normalized.origin || '',
         signalsMode: opts && opts.signalsMode || '',
+        siteMode,
         subpageObservationMode: opts && opts.subpageObservationMode || '',
         normalizedSubpageObservationMode,
         debugHeavySite: true,
@@ -5544,12 +5721,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       staticCandidateSubpageObservation: effectiveStaticCandidateSubpageObservation,
       memoryGuardScopedProbeSubpageObservation
     });
-    const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates);
+    const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates, siteMode);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const skippedUtilityPaths = prioritizedCandidates
       .slice(maxObserve)
-      .filter(candidate => getCoverageRepresentativePriority_(candidate) === 3)
+      .filter(candidate => getCoverageRepresentativePriority_(candidate, siteMode) === 3)
       .map(getCoverageCandidatePath_)
       .filter(Boolean)
       .slice(0, 10);
@@ -5605,7 +5782,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       });
       for (const candidate of selectedCandidates) {
         scopedPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
-          siteMode: 'generic',
+          siteMode,
           timeout: 8000,
           context: opts && opts.context,
           debugHeavySite: opts && opts.debugHeavySite === true
@@ -5643,7 +5820,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const htmlObserved = scopedPlaywrightSubpageObservation
       ? { pages: [] }
       : await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
-          siteMode: 'generic'
+          siteMode
         });
     if (!scopedPlaywrightSubpageObservation) {
       const htmlObservedItemsForAudit = Array.isArray(htmlObserved && htmlObserved.pages)
@@ -5710,7 +5887,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       });
       for (const candidate of scopedFallbackCandidates) {
         scopedFallbackPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
-          siteMode: 'generic',
+          siteMode,
           timeout: 8000,
           context: opts && opts.context,
           debugHeavySite: opts && opts.debugHeavySite === true
@@ -5737,7 +5914,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     });
     const playwrightObserved = playwrightCandidates.length
       ? await observeSubpageJsonLdLightUrls_(playwrightCandidates.map(candidate => candidate.url), {
-          siteMode: 'generic',
+          siteMode,
           timeout: 8000,
           concurrency: reuseContextForObserve ? 1 : 3,
           context: opts && opts.context,
@@ -5872,6 +6049,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
+      siteMode,
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
         totalCandidates: discovered.totalCandidates,
@@ -5908,6 +6086,13 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const coverageSignalsV1 = buildCoverageSignalsV1FromSubpageObservation_(Object.assign({}, payload, {
       candidates: discovered.candidates
     }));
+    const legalOperatorInfo = pickBestLegalOperatorInfo_(observations);
+    if (legalOperatorInfo) {
+      geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
+        ? geoSignalsV1.trustSignals
+        : {};
+      geoSignalsV1.trustSignals.legalOperatorInfo = legalOperatorInfo;
+    }
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
         url: normalized.topUrl,
@@ -9897,6 +10082,7 @@ async function scrapeOnce(req, res) {
   const signalsMode = String(req.query.signalsMode || '').toLowerCase();
   const responseMode = String(req.query.responseMode || '').toLowerCase();
   const subpageObservationMode = String(req.query.subpageObservationMode || '').toLowerCase();
+  const siteMode = normalizeSubpageJsonLdText(req.query.siteMode || 'generic').toLowerCase() || 'generic';
   const debugHeavySite = String(req.query.debugHeavySite || '').toLowerCase() === '1';
   const debugHeavySiteStartedAt = Date.now();
   const observerMode = String(req.query.observer || '').toLowerCase();
@@ -13223,6 +13409,7 @@ async function scrapeOnce(req, res) {
         reuseBrowser: true,
         maxObserve: 2,
         subpageObservationMode,
+        siteMode,
         signalsMode,
         debugHeavySite,
         debugHeavySiteStartedAt
