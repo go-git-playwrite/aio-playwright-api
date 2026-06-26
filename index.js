@@ -7766,11 +7766,94 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
   }
 }
 
+function normalizeFreshnessDateYmd_(value) {
+  const m = String(value || '').match(/\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/);
+  if (!m) return '';
+  const y = m[1];
+  const mm = String(m[2]).padStart(2, '0');
+  const dd = String(m[3]).padStart(2, '0');
+  return `${y}-${mm}-${dd}`;
+}
+
+function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
+  const siteMode = normalizeSubpageJsonLdText(opts.siteMode || '').toLowerCase();
+  if (siteMode !== 'media') return null;
+  const g = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const existing = g.freshnessOperationSignals && typeof g.freshnessOperationSignals === 'object'
+    ? g.freshnessOperationSignals
+    : null;
+  if (existing && (existing.hasNewsDateEvidence === true || existing.latestDate || existing.hasUpdatedDateEvidence === true)) return existing;
+  const observed = g.observed && typeof g.observed === 'object' ? g.observed : {};
+  const links = observed.links && Array.isArray(observed.links.internalLinksSample)
+    ? observed.links.internalLinksSample
+    : [];
+  const dateRe = /\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b/g;
+  const articleUrlRe = /\/(?:post|posts|article|articles|news|story|stories|entry|entries|contents?)\/|\/20\d{2}\/\d{1,2}\//i;
+  const picked = [];
+  const seen = new Set();
+  const addDate_ = (date, source, text, href) => {
+    const normalized = normalizeFreshnessDateYmd_(date);
+    if (!normalized || seen.has(`${source}:${normalized}:${href || ''}`)) return;
+    seen.add(`${source}:${normalized}:${href || ''}`);
+    picked.push({
+      date: normalized,
+      source,
+      text: String(text || '').replace(/\s+/g, ' ').trim().slice(0, 180),
+      href: String(href || '').slice(0, 220)
+    });
+  };
+  links.forEach((link) => {
+    const text = String(link && (link.text || link.label) || '');
+    const href = String(link && (link.href || link.url) || '');
+    if (!articleUrlRe.test(href)) return;
+    const matches = text.match(dateRe) || [];
+    matches.forEach((date) => addDate_(date, 'internal_link_date', text, href));
+  });
+  if (!picked.length) {
+    const bodySample = String(observed.body && observed.body.sample || '');
+    const matches = bodySample.match(dateRe) || [];
+    matches.slice(0, 10).forEach((date) => addDate_(date, 'body_sample_date', bodySample, ''));
+  }
+  if (!picked.length) return null;
+  const sampleDates = Array.from(new Set(picked.map((item) => item.date))).sort();
+  const latestDate = sampleDates[sampleDates.length - 1] || null;
+  const primarySource = picked.some((item) => item.source === 'internal_link_date')
+    ? 'media_article_links'
+    : 'media_body_sample';
+  return {
+    observed: true,
+    hasNewsDateEvidence: true,
+    newsDateEvidenceCount: sampleDates.length,
+    latestDate,
+    freshnessEvidenceSources: [primarySource === 'media_article_links' ? 'internal_link_date' : 'body_sample_date'],
+    sampleDates: sampleDates.slice(-10),
+    evidenceSamples: picked.slice(0, 10),
+    source: primarySource,
+    extractionMethod: primarySource === 'media_article_links' ? 'internal_links_sample' : 'body_sample'
+  };
+}
+
+function attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, opts = {}) {
+  const signals = buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts);
+  if (!signals) return null;
+  geoSignalsV1.freshnessOperationSignals = geoSignalsV1.freshnessOperationSignals || signals;
+  geoSignalsV1.observed = geoSignalsV1.observed || {};
+  geoSignalsV1.observed.freshnessOperationSignals = geoSignalsV1.observed.freshnessOperationSignals || signals;
+  if (lightweightSummary && typeof lightweightSummary === 'object') {
+    lightweightSummary.freshnessOperationSignals = lightweightSummary.freshnessOperationSignals || signals;
+    lightweightSummary.hasNewsDateEvidence = lightweightSummary.hasNewsDateEvidence == null ? signals.hasNewsDateEvidence : lightweightSummary.hasNewsDateEvidence;
+    lightweightSummary.newsDateEvidenceCount = lightweightSummary.newsDateEvidenceCount == null ? signals.newsDateEvidenceCount : lightweightSummary.newsDateEvidenceCount;
+    lightweightSummary.latestDate = lightweightSummary.latestDate || signals.latestDate;
+  }
+  return signals;
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
   const balancedMode = !!(opts && opts.balancedMode);
   const shortFastMode = !!(opts && opts.shortFastMode);
+  const siteMode = normalizeSubpageJsonLdText(opts && opts.siteMode || '').toLowerCase();
   const debugHeavySite = opts && opts.debugHeavySite === true;
   const debugHeavySiteStartedAt = Number(opts && opts.debugHeavySiteStartedAt || startedAt) || startedAt;
   const boundedHydrationWaitMs = Number(opts && opts.boundedHydrationWaitMs || 0);
@@ -9317,6 +9400,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         })
       }
     };
+    attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, null, { siteMode, url });
     try {
       console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
         h1Count: geoSignalsV1.observed.h1.count,
@@ -10344,6 +10428,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const structuredData = g.structuredData || observed.structuredData || {};
   const links = observed.links || {};
   const body = observed.body || {};
+  const freshnessOperationSignals = g.freshnessOperationSignals || observed.freshnessOperationSignals || fullPayload && fullPayload.lightweightSummary && fullPayload.lightweightSummary.freshnessOperationSignals || null;
   const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
   const geoDiagnostics = g.diagnostics || {};
   const balanced = g.balanced || {};
@@ -10476,6 +10561,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     landmarks: shortLandmarks,
     multimodalSignals: g.multimodalSignals || null,
     trustSignals: g.trustSignals || null,
+    freshnessOperationSignals,
     observed: {
       title: observed.title || null,
       metaDescription: observed.metaDescription || null,
@@ -10490,6 +10576,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
       landmarks: shortLandmarks,
       multimodalSignals: observed.multimodalSignals || g.multimodalSignals || null,
       trustSignals: observed.trustSignals || g.trustSignals || null,
+      freshnessOperationSignals,
       body: {
         textLength: body.textLength,
         sample: str(body.sample, 280, 'geoSignalsV1.observed.body.sample'),
@@ -12887,6 +12974,7 @@ async function scrapeOnce(req, res) {
           memoryHints
         };
         mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+        attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
         unifiedPayload.geoSignalsV1 = geoSignalsV1;
         unifiedPayload.lightweightSummary = lightweightSummary;
         unifiedPayload.diagnostics.topPageStaticFetch = geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.topPageStaticFetch || {
@@ -12932,6 +13020,7 @@ async function scrapeOnce(req, res) {
         memoryHints
       };
       mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+      attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
       dedicatedPayload.geoSignalsV1 = geoSignalsV1;
       dedicatedPayload.lightweightSummary = lightweightSummary;
       dedicatedPayload.diagnostics.topPageStaticFetch = geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.topPageStaticFetch || {
@@ -13887,6 +13976,7 @@ async function scrapeOnce(req, res) {
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
         shortFastMode: balancedShortFastResponse,
+        siteMode,
         boundedHydrationWaitMs,
         hydrationMetrics,
         gotoMs: typeof scrapeTiming.gotoMs === 'number'
@@ -14137,6 +14227,7 @@ async function scrapeOnce(req, res) {
         memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
       } catch (_) {}
       mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
+      attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
       if (geoSignalsV1 && geoSignalsV1.diagnostics) {
         geoSignalsV1.diagnostics.playwrightTimedOut = false;
         geoSignalsV1.diagnostics.playwrightFailed = false;
@@ -16592,7 +16683,7 @@ async function scrapeOnce(req, res) {
 
   logSf('BEFORE_GEO_SIGNALS');
   logSfMemory('before_geo_signals');
-  const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch);
+  const geoSignalsV1 = await buildGeoSignalsV1(page, urlToFetch, { siteMode });
   logSf('AFTER_GEO_SIGNALS', {
     hasGeoSignals: !!geoSignalsV1,
     error: geoSignalsV1 && geoSignalsV1.error ? true : false
