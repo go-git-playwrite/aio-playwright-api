@@ -268,6 +268,27 @@ async function discoverSitemapFromOrigin_(origin, fetchText, options = {}) {
   return result;
 }
 
+function attachSitemapDiscoveryToGeoSignals_(geoSignalsV1, sitemapDiscovery) {
+  if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object' || !sitemapDiscovery || typeof sitemapDiscovery !== 'object') return;
+  const exists = Object.prototype.hasOwnProperty.call(sitemapDiscovery, 'exists') ? sitemapDiscovery.exists : null;
+  const checked = sitemapDiscovery.checked === true;
+  const checkedUrls = Array.isArray(sitemapDiscovery.checkedUrls) ? sitemapDiscovery.checkedUrls.slice(0, 10) : [];
+  const patch = {
+    hasSitemapXml: exists,
+    sitemapChecked: checked,
+    sitemapExists: exists,
+    sitemapXmlUrl: sitemapDiscovery.url || null,
+    sitemapDiscoveryMethod: sitemapDiscovery.discoveryMethod || 'not_checked',
+    sitemapCheckedUrls: checkedUrls,
+    sitemapHttpStatus: Object.prototype.hasOwnProperty.call(sitemapDiscovery, 'httpStatus') ? sitemapDiscovery.httpStatus : null
+  };
+
+  geoSignalsV1.structuredData = Object.assign({}, geoSignalsV1.structuredData || {}, patch);
+  geoSignalsV1.coverageSignals = Object.assign({}, geoSignalsV1.coverageSignals || {}, patch);
+  geoSignalsV1.observed = geoSignalsV1.observed || {};
+  geoSignalsV1.observed.structuredData = Object.assign({}, geoSignalsV1.observed.structuredData || {}, patch);
+}
+
 console.log('[BOOT][START]', JSON.stringify({
   build: BUILD_TAG,
   pid: process.pid,
@@ -10546,6 +10567,11 @@ function buildBalancedShortResponsePayload(fullPayload) {
     hasOrganization: structuredData.hasOrganization,
     hasBreadcrumbList: structuredData.hasBreadcrumbList,
     hasFAQPage: structuredData.hasFAQPage,
+    hasSitemapXml: Object.prototype.hasOwnProperty.call(structuredData, 'hasSitemapXml') ? structuredData.hasSitemapXml : null,
+    sitemapXmlUrl: structuredData.sitemapXmlUrl || null,
+    sitemapDiscoveryMethod: structuredData.sitemapDiscoveryMethod || 'not_checked',
+    sitemapHttpStatus: Object.prototype.hasOwnProperty.call(structuredData, 'sitemapHttpStatus') ? structuredData.sitemapHttpStatus : null,
+    sitemapCheckedUrls: arr(structuredData.sitemapCheckedUrls, 10, 'geoSignalsV1.structuredData.sitemapCheckedUrls', (v) => str(v, 220)),
     source: structuredData.source,
     typeClassificationSource: structuredData.typeClassificationSource,
     confidence: structuredData.confidence,
@@ -14229,6 +14255,7 @@ async function scrapeOnce(req, res) {
         aiPolicyEvidenceSource: 'not_observed'
       };
       if (geoSignalsV1 && typeof geoSignalsV1 === 'object') {
+        attachSitemapDiscoveryToGeoSignals_(geoSignalsV1, sitemapDiscoveryLight);
         geoSignalsV1.aioCheck = Object.assign({}, geoSignalsV1.aioCheck || {}, aioCheckLight);
         geoSignalsV1.observed = geoSignalsV1.observed || {};
         geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
@@ -16564,6 +16591,7 @@ async function scrapeOnce(req, res) {
       sitemapDiscovery = await discoverSitemapFromOrigin_(origin, fetchTextWithPageRequest, { timeoutMs: 2500 });
       hasSitemapXml = sitemapDiscovery.exists === true;
     }
+    attachSitemapDiscoveryToGeoSignals_(geoSignalsV1, sitemapDiscovery);
 
     // auditSig があれば、ついでにそこにも載せておく（GAS 側互換用）
     if (auditSig && typeof auditSig === 'object') {
