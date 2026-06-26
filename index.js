@@ -182,6 +182,92 @@ function logSf(label, extra) {
   }
 }
 
+const SITEMAP_DISCOVERY_PATHS = [
+  '/sitemap.xml',
+  '/sitemap_index.xml',
+  '/sitemap-index.xml',
+  '/sitemaps.xml',
+  '/sitemap/index.xml'
+];
+
+function extractSitemapUrlsFromRobotsTxt_(robotsText, origin) {
+  const out = [];
+  const seen = new Set();
+  String(robotsText || '').split(/\r?\n/).forEach((line) => {
+    const m = String(line || '').match(/^\s*Sitemap\s*:\s*(\S+)\s*$/i);
+    if (!m || !m[1]) return;
+    try {
+      const u = new URL(m[1].trim(), origin).toString();
+      if (!seen.has(u)) {
+        seen.add(u);
+        out.push(u);
+      }
+    } catch (_) {}
+  });
+  return out;
+}
+
+function looksLikeSitemapXml_(text, contentType) {
+  const ctype = String(contentType || '').toLowerCase();
+  if (ctype.includes('xml')) return true;
+  const head = String(text || '').slice(0, 2048);
+  return /<\s*(urlset|sitemapindex)\b/i.test(head);
+}
+
+async function discoverSitemapFromOrigin_(origin, fetchText, options = {}) {
+  const normalizedOrigin = String(origin || '').replace(/\/+$/, '');
+  const result = {
+    checked: false,
+    exists: null,
+    url: null,
+    httpStatus: null,
+    discoveryMethod: 'not_checked',
+    checkedUrls: [],
+    robotsTxtUrl: normalizedOrigin ? `${normalizedOrigin}/robots.txt` : null,
+    robotsHttpStatus: null,
+    robotsSitemapUrls: []
+  };
+  if (!normalizedOrigin || typeof fetchText !== 'function') return result;
+
+  const timeoutMs = Number(options.timeoutMs || 1500);
+  const robotsUrl = `${normalizedOrigin}/robots.txt`;
+  const robots = await fetchText(robotsUrl, timeoutMs, 'GET');
+  result.robotsHttpStatus = robots && typeof robots.status === 'number' ? robots.status : null;
+
+  const candidates = [];
+  if (robots && robots.ok) {
+    result.robotsSitemapUrls = extractSitemapUrlsFromRobotsTxt_(robots.text || '', normalizedOrigin);
+    result.robotsSitemapUrls.forEach((u) => candidates.push({ url: u, method: 'robots_txt' }));
+  }
+
+  SITEMAP_DISCOVERY_PATHS.forEach((path) => {
+    candidates.push({ url: normalizedOrigin + path, method: 'common_path' });
+  });
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const targetUrl = candidate && candidate.url;
+    if (!targetUrl || seen.has(targetUrl)) continue;
+    seen.add(targetUrl);
+    result.checked = true;
+    result.checkedUrls.push(targetUrl);
+    const res = await fetchText(targetUrl, timeoutMs, 'GET');
+    const status = res && typeof res.status === 'number' ? res.status : null;
+    if (result.httpStatus === null) result.httpStatus = status;
+    if (res && res.ok && looksLikeSitemapXml_(res.text || '', res.contentType || '')) {
+      result.exists = true;
+      result.url = targetUrl;
+      result.httpStatus = status;
+      result.discoveryMethod = candidate.method;
+      return result;
+    }
+  }
+
+  result.exists = false;
+  result.discoveryMethod = result.checked ? 'not_found' : 'not_checked';
+  return result;
+}
+
 console.log('[BOOT][START]', JSON.stringify({
   build: BUILD_TAG,
   pid: process.pid,
@@ -219,17 +305,30 @@ async function collectEnrichedObservations(page, url) {
   // =========================
   try {
     const base = new URL(url).origin;
-    const sitemapUrl = base.replace(/\/$/, '') + '/sitemap.xml';
-
-    const res = await page.request.get(sitemapUrl, { timeout: 5000 });
-    if (res.ok()) {
-      result.sitemap = {
-        found: true,
-        url: sitemapUrl
-      };
-    } else {
-      result.sitemap = { found: false };
-    }
+    const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
+      try {
+        const response = await page.request.get(targetUrl, {
+          timeout: timeoutMs,
+          headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
+        });
+        const status = response && typeof response.status === 'function' ? response.status() : null;
+        const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+        const contentType = String((headers && (headers['content-type'] || headers['Content-Type'])) || '');
+        if (!response || !response.ok()) return { ok: false, status, text: '', contentType };
+        const text = String(await response.text() || '').slice(0, 120000);
+        return { ok: true, status, text, contentType };
+      } catch (e) {
+        return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
+      }
+    };
+    const sitemapDiscovery = await discoverSitemapFromOrigin_(base, fetchTextWithPageRequest, { timeoutMs: 2500 });
+    result.sitemap = {
+      found: sitemapDiscovery.exists === true,
+      url: sitemapDiscovery.url,
+      checkedUrls: sitemapDiscovery.checkedUrls,
+      discoveryMethod: sitemapDiscovery.discoveryMethod,
+      httpStatus: sitemapDiscovery.httpStatus
+    };
   } catch (e) {
     result.sitemap = { found: false };
   }
@@ -10429,6 +10528,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const links = observed.links || {};
   const body = observed.body || {};
   const freshnessOperationSignals = g.freshnessOperationSignals || observed.freshnessOperationSignals || fullPayload && fullPayload.lightweightSummary && fullPayload.lightweightSummary.freshnessOperationSignals || null;
+  const aioCheck = g.aioCheck || observed.aioCheck || fullPayload.aioCheck || {};
   const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
   const geoDiagnostics = g.diagnostics || {};
   const balanced = g.balanced || {};
@@ -10561,6 +10661,25 @@ function buildBalancedShortResponsePayload(fullPayload) {
     landmarks: shortLandmarks,
     multimodalSignals: g.multimodalSignals || null,
     trustSignals: g.trustSignals || null,
+    aioCheck: {
+      checked: aioCheck.checked === true,
+      hasRobotsTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasRobotsTxt') ? aioCheck.hasRobotsTxt : null,
+      robotsTxtUrl: aioCheck.robotsTxtUrl || null,
+      robotsAiBotHints: Object.prototype.hasOwnProperty.call(aioCheck, 'robotsAiBotHints') ? aioCheck.robotsAiBotHints : null,
+      robotsAiBotHintTokens: arr(aioCheck.robotsAiBotHintTokens, 20, 'geoSignalsV1.aioCheck.robotsAiBotHintTokens', (v) => str(v, 80)),
+      hasLlmsTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasLlmsTxt') ? aioCheck.hasLlmsTxt : null,
+      hasLlmsFullTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasLlmsFullTxt') ? aioCheck.hasLlmsFullTxt : null,
+      llmsTxtUrl: aioCheck.llmsTxtUrl || null,
+      llmsFullTxtUrl: aioCheck.llmsFullTxtUrl || null,
+      hasSitemapXml: Object.prototype.hasOwnProperty.call(aioCheck, 'hasSitemapXml') ? aioCheck.hasSitemapXml : null,
+      sitemapXmlUrl: aioCheck.sitemapXmlUrl || null,
+      sitemapDiscoveryMethod: aioCheck.sitemapDiscoveryMethod || 'not_checked',
+      sitemapCheckedUrls: arr(aioCheck.sitemapCheckedUrls, 10, 'geoSignalsV1.aioCheck.sitemapCheckedUrls', (v) => str(v, 220)),
+      sitemapHttpStatus: Object.prototype.hasOwnProperty.call(aioCheck, 'sitemapHttpStatus') ? aioCheck.sitemapHttpStatus : null,
+      sitemapRobotsTxtUrl: aioCheck.sitemapRobotsTxtUrl || null,
+      sitemapRobotsHttpStatus: Object.prototype.hasOwnProperty.call(aioCheck, 'sitemapRobotsHttpStatus') ? aioCheck.sitemapRobotsHttpStatus : null,
+      aiPolicyEvidenceSource: aioCheck.aiPolicyEvidenceSource || 'not_observed'
+    },
     freshnessOperationSignals,
     observed: {
       title: observed.title || null,
@@ -10630,6 +10749,11 @@ function buildBalancedShortResponsePayload(fullPayload) {
     url: fullPayload.url,
     finalUrl: fullPayload.finalUrl,
     status: fullPayload.status,
+    hasSitemapXml: fullPayload.hasSitemapXml,
+    sitemapXmlUrl: fullPayload.sitemapXmlUrl || null,
+    sitemapDiscoveryMethod: fullPayload.sitemapDiscoveryMethod || 'not_checked',
+    sitemapHttpStatus: Object.prototype.hasOwnProperty.call(fullPayload, 'sitemapHttpStatus') ? fullPayload.sitemapHttpStatus : null,
+    sitemapCheckedUrls: arr(fullPayload.sitemapCheckedUrls, 10, 'sitemapCheckedUrls', (v) => str(v, 220)),
     geoSignalsV1: shortGeoSignalsV1,
     lightweightSummary: shortLightweightSummary,
     diagnostics: shortDiagnostics,
@@ -11177,6 +11301,11 @@ async function scrapeOnce(req, res) {
           hasLlmsFullTxt: null,
           llmsTxtUrl: origin ? `${origin}/llms.txt` : null,
           llmsFullTxtUrl: origin ? `${origin}/llms-full.txt` : null,
+          hasSitemapXml: null,
+          sitemapXmlUrl: null,
+          sitemapDiscoveryMethod: 'not_checked',
+          sitemapCheckedUrls: [],
+          sitemapHttpStatus: null,
           checkedLlmsTxtUrls: origin ? [`${origin}/llms.txt`] : [],
           checkedLlmsFullTxtUrls: origin ? [`${origin}/llms-full.txt`] : [],
           aiPolicyEvidenceSource: 'not_observed'
@@ -11196,11 +11325,12 @@ async function scrapeOnce(req, res) {
               headers: { 'Accept': 'text/plain,*/*;q=0.8', 'User-Agent': 'geo-unified-observer-aio-check/1.0' }
             });
             const status = response && typeof response.status === 'number' ? response.status : null;
-            if (!response || !response.ok) return { ok: false, status, text: '' };
+            const contentType = response && response.headers && response.headers.get ? String(response.headers.get('content-type') || '') : '';
+            if (!response || !response.ok) return { ok: false, status, text: '', contentType };
             const text = String(await response.text() || '').slice(0, 120000);
-            return { ok: true, status, text };
+            return { ok: true, status, text, contentType };
           } catch (e) {
-            return { ok: false, status: null, text: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
+            return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
           } finally {
             if (timer) clearTimeout(timer);
           }
@@ -11221,6 +11351,7 @@ async function scrapeOnce(req, res) {
         const hasLlmsTxt = llms && llms.ok ? true : (llms && llms.status === 404 ? false : null);
         const hasLlmsFullTxt = llmsFull && llmsFull.ok ? true : (llmsFull && llmsFull.status === 404 ? false : null);
         const robotsAiBotHints = robotsEvaluated ? hintTokens.length > 0 : null;
+        const sitemapDiscovery = await discoverSitemapFromOrigin_(origin, fetchText, { timeoutMs: 1500 });
         const evidence = [];
         if (robotsEvaluated) evidence.push('robots_txt');
         if (hasLlmsTxt === true) evidence.push('llms_txt');
@@ -11231,6 +11362,13 @@ async function scrapeOnce(req, res) {
           robotsTxtUrl,
           robotsAiBotHints,
           robotsAiBotHintTokens: hintTokens,
+          hasSitemapXml: sitemapDiscovery.exists,
+          sitemapXmlUrl: sitemapDiscovery.url,
+          sitemapDiscoveryMethod: sitemapDiscovery.discoveryMethod,
+          sitemapCheckedUrls: Array.isArray(sitemapDiscovery.checkedUrls) ? sitemapDiscovery.checkedUrls.slice(0, 10) : [],
+          sitemapHttpStatus: sitemapDiscovery.httpStatus,
+          sitemapRobotsTxtUrl: sitemapDiscovery.robotsTxtUrl,
+          sitemapRobotsHttpStatus: sitemapDiscovery.robotsHttpStatus,
           hasLlmsTxt,
           hasLlmsFullTxt,
           llmsTxtUrl,
@@ -12532,6 +12670,13 @@ async function scrapeOnce(req, res) {
           hasLlmsFullTxt: Object.prototype.hasOwnProperty.call(aioCheck, 'hasLlmsFullTxt') ? aioCheck.hasLlmsFullTxt : null,
           llmsTxtUrl: aioCheck.llmsTxtUrl || null,
           llmsFullTxtUrl: aioCheck.llmsFullTxtUrl || null,
+          hasSitemapXml: Object.prototype.hasOwnProperty.call(aioCheck, 'hasSitemapXml') ? aioCheck.hasSitemapXml : null,
+          sitemapXmlUrl: aioCheck.sitemapXmlUrl || null,
+          sitemapDiscoveryMethod: aioCheck.sitemapDiscoveryMethod || 'not_checked',
+          sitemapCheckedUrls: Array.isArray(aioCheck.sitemapCheckedUrls) ? aioCheck.sitemapCheckedUrls.slice(0, 10) : [],
+          sitemapHttpStatus: Object.prototype.hasOwnProperty.call(aioCheck, 'sitemapHttpStatus') ? aioCheck.sitemapHttpStatus : null,
+          sitemapRobotsTxtUrl: aioCheck.sitemapRobotsTxtUrl || null,
+          sitemapRobotsHttpStatus: Object.prototype.hasOwnProperty.call(aioCheck, 'sitemapRobotsHttpStatus') ? aioCheck.sitemapRobotsHttpStatus : null,
           checkedLlmsTxtUrls: Array.isArray(aioCheck.checkedLlmsTxtUrls) ? aioCheck.checkedLlmsTxtUrls.slice(0, 10) : [],
           checkedLlmsFullTxtUrls: Array.isArray(aioCheck.checkedLlmsFullTxtUrls) ? aioCheck.checkedLlmsFullTxtUrls.slice(0, 10) : [],
           aiPolicyEvidenceSource: aioCheck.aiPolicyEvidenceSource || 'not_observed',
@@ -14046,6 +14191,48 @@ async function scrapeOnce(req, res) {
         ? coverageObserved.semanticElements
         : {};
       const bodyObserved = observed.body || {};
+      const sitemapDiscoveryLight = await (async () => {
+        let origin = '';
+        try { origin = new URL(String(finalUrl || urlToFetch || '')).origin; } catch (_) {}
+        if (!origin) return { checked: false, exists: null, url: null, httpStatus: null, discoveryMethod: 'not_checked', checkedUrls: [], robotsHttpStatus: null, robotsTxtUrl: null };
+        const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
+          try {
+            const response = await page.request.get(targetUrl, {
+              timeout: timeoutMs,
+              headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
+            });
+            const status = response && typeof response.status === 'function' ? response.status() : null;
+            const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+            const contentType = String((headers && (headers['content-type'] || headers['Content-Type'])) || '');
+            if (!response || !response.ok()) return { ok: false, status, text: '', contentType };
+            const text = String(await response.text() || '').slice(0, 120000);
+            return { ok: true, status, text, contentType };
+          } catch (e) {
+            return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
+          }
+        };
+        return discoverSitemapFromOrigin_(origin, fetchTextWithPageRequest, { timeoutMs: 2500 });
+      })();
+      const aioCheckLight = {
+        checked: sitemapDiscoveryLight.checked === true,
+        hasRobotsTxt: sitemapDiscoveryLight.robotsHttpStatus === 200 ? true : (sitemapDiscoveryLight.robotsHttpStatus === 404 ? false : null),
+        robotsTxtUrl: sitemapDiscoveryLight.robotsTxtUrl || null,
+        robotsAiBotHints: null,
+        robotsAiBotHintTokens: [],
+        hasSitemapXml: sitemapDiscoveryLight.exists,
+        sitemapXmlUrl: sitemapDiscoveryLight.url,
+        sitemapDiscoveryMethod: sitemapDiscoveryLight.discoveryMethod,
+        sitemapCheckedUrls: Array.isArray(sitemapDiscoveryLight.checkedUrls) ? sitemapDiscoveryLight.checkedUrls.slice(0, 10) : [],
+        sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
+        sitemapRobotsTxtUrl: sitemapDiscoveryLight.robotsTxtUrl || null,
+        sitemapRobotsHttpStatus: sitemapDiscoveryLight.robotsHttpStatus,
+        aiPolicyEvidenceSource: 'not_observed'
+      };
+      if (geoSignalsV1 && typeof geoSignalsV1 === 'object') {
+        geoSignalsV1.aioCheck = Object.assign({}, geoSignalsV1.aioCheck || {}, aioCheckLight);
+        geoSignalsV1.observed = geoSignalsV1.observed || {};
+        geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
+      }
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
         metaDescription: observed.metaDescription && typeof observed.metaDescription.value === 'string' ? observed.metaDescription.value : null,
@@ -14164,6 +14351,12 @@ async function scrapeOnce(req, res) {
         companyLinkSource: trustObserved.companyLinkSource || linksObserved.companyLinkSource || null,
         serviceLinkSource: trustObserved.serviceLinkSource || linksObserved.serviceLinkSource || null,
         privacyLinkSource: trustObserved.privacyLinkSource || linksObserved.privacyLinkSource || null,
+        hasSitemapXml: sitemapDiscoveryLight.exists,
+        sitemapXmlUrl: sitemapDiscoveryLight.url,
+        sitemapDiscoveryMethod: sitemapDiscoveryLight.discoveryMethod,
+        sitemapCheckedUrls: Array.isArray(sitemapDiscoveryLight.checkedUrls) ? sitemapDiscoveryLight.checkedUrls.slice(0, 10) : [],
+        sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
+        sitemapRobotsHttpStatus: sitemapDiscoveryLight.robotsHttpStatus,
         hasPrivacyPolicyLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasPrivacyPolicyLink') ? trustObserved.hasPrivacyPolicyLink : null,
         hasLegalLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasLegalLink') ? trustObserved.hasLegalLink : null,
         hasTermsLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasTermsLink') ? trustObserved.hasTermsLink : null,
@@ -14205,6 +14398,10 @@ async function scrapeOnce(req, res) {
           ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan', 'large_samples']
           : [],
         phaseTimings: geoSignalsV1 && geoSignalsV1.diagnostics && geoSignalsV1.diagnostics.phaseTimings || null,
+        sitemapDiscoveryMethod: sitemapDiscoveryLight.discoveryMethod,
+        sitemapCheckedUrls: Array.isArray(sitemapDiscoveryLight.checkedUrls) ? sitemapDiscoveryLight.checkedUrls.slice(0, 10) : [],
+        sitemapResolvedUrl: sitemapDiscoveryLight.url,
+        sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
         timeoutGuardMs: balancedShortFastResponse ? 60000 : null
       };
       const memoryHints = {
@@ -14265,6 +14462,11 @@ async function scrapeOnce(req, res) {
         url: urlToFetch,
         finalUrl,
         status: resp && typeof resp.status === 'function' ? resp.status() : null,
+        hasSitemapXml: sitemapDiscoveryLight.exists,
+        sitemapXmlUrl: sitemapDiscoveryLight.url,
+        sitemapDiscoveryMethod: sitemapDiscoveryLight.discoveryMethod,
+        sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
+        sitemapCheckedUrls: Array.isArray(sitemapDiscoveryLight.checkedUrls) ? sitemapDiscoveryLight.checkedUrls.slice(0, 10) : [],
         externalProfileLinksSample: Array.isArray(lightweightSummary.externalProfileLinksSample) ? lightweightSummary.externalProfileLinksSample.slice(0, 10) : [],
         socialLinksSample: Array.isArray(lightweightSummary.socialLinksSample) ? lightweightSummary.socialLinksSample.slice(0, 10) : [],
         footerExternalLinksSample: Array.isArray(lightweightSummary.footerExternalLinksSample) ? lightweightSummary.footerExternalLinksSample.slice(0, 10) : [],
@@ -16324,6 +16526,14 @@ async function scrapeOnce(req, res) {
 
   // === XML サイトマップ有無チェック（/sitemap.xml 簡易判定） ===
   let hasSitemapXml = false;
+  let sitemapDiscovery = {
+    checked: false,
+    exists: null,
+    url: null,
+    httpStatus: null,
+    discoveryMethod: 'not_checked',
+    checkedUrls: []
+  };
   try {
     logSf('BEFORE_SITEMAP_CHECK');
     logSfMemory('before_sitemap_check');
@@ -16335,30 +16545,45 @@ async function scrapeOnce(req, res) {
     }
 
     if (origin) {
-      const sitemapUrl = origin.replace(/\/+$/, '') + '/sitemap.xml';
-
-      const sitemapResp = await page.request.get(sitemapUrl, { timeout: 8000 });
-      if (sitemapResp.ok()) {
-        const ctype = (sitemapResp.headers()['content-type'] || '').toLowerCase();
-
-        // content-type に xml が含まれていればほぼ sitemap とみなす
-        if (ctype.includes('xml')) {
-          hasSitemapXml = true;
-        } else {
-          // content-type が微妙な場合は先頭だけテキストを見て XML っぽいか確認
-          const head = (await sitemapResp.text()).slice(0, 512);
-          if (/^\s*</.test(head)) {
-            hasSitemapXml = true;
-          }
+      const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
+        try {
+          const response = await page.request.get(targetUrl, {
+            timeout: timeoutMs,
+            headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
+          });
+          const status = response && typeof response.status === 'function' ? response.status() : null;
+          const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+          const contentType = String((headers && (headers['content-type'] || headers['Content-Type'])) || '');
+          if (!response || !response.ok()) return { ok: false, status, text: '', contentType };
+          const text = String(await response.text() || '').slice(0, 120000);
+          return { ok: true, status, text, contentType };
+        } catch (e) {
+          return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
         }
-      }
+      };
+      sitemapDiscovery = await discoverSitemapFromOrigin_(origin, fetchTextWithPageRequest, { timeoutMs: 2500 });
+      hasSitemapXml = sitemapDiscovery.exists === true;
     }
 
     // auditSig があれば、ついでにそこにも載せておく（GAS 側互換用）
     if (auditSig && typeof auditSig === 'object') {
       auditSig.hasSitemapXml = hasSitemapXml;
+      auditSig.sitemapChecked = sitemapDiscovery.checked === true;
+      auditSig.sitemapExists = sitemapDiscovery.exists;
+      auditSig.sitemapXmlUrl = sitemapDiscovery.url;
+      auditSig.sitemapDiscoveryMethod = sitemapDiscovery.discoveryMethod;
+      auditSig.sitemapCheckedUrls = Array.isArray(sitemapDiscovery.checkedUrls) ? sitemapDiscovery.checkedUrls.slice(0, 10) : [];
+      auditSig.sitemapHttpStatus = sitemapDiscovery.httpStatus;
+      auditSig.sitemapRobotsTxtUrl = sitemapDiscovery.robotsTxtUrl || null;
+      auditSig.sitemapRobotsHttpStatus = sitemapDiscovery.robotsHttpStatus;
     }
-    logSf('AFTER_SITEMAP_CHECK', { hasSitemapXml });
+    logSf('AFTER_SITEMAP_CHECK', {
+      hasSitemapXml,
+      sitemapDiscoveryMethod: sitemapDiscovery.discoveryMethod,
+      sitemapResolvedUrl: sitemapDiscovery.url,
+      sitemapHttpStatus: sitemapDiscovery.httpStatus,
+      sitemapCheckedUrls: sitemapDiscovery.checkedUrls
+    });
     logSfMemory('after_sitemap_check');
   } catch (_) {
     // 失敗しても診断全体は止めない（hasSitemapXml は false のまま）
@@ -16737,6 +16962,12 @@ async function scrapeOnce(req, res) {
 
     // ★ ADD: XML サイトマップ有無（GAS facts 用）
     hasSitemapXml,
+    sitemapChecked: sitemapDiscovery.checked === true,
+    sitemapExists: sitemapDiscovery.exists,
+    sitemapXmlUrl: sitemapDiscovery.url,
+    sitemapDiscoveryMethod: sitemapDiscovery.discoveryMethod,
+    sitemapCheckedUrls: Array.isArray(sitemapDiscovery.checkedUrls) ? sitemapDiscovery.checkedUrls.slice(0, 10) : [],
+    sitemapHttpStatus: sitemapDiscovery.httpStatus,
 
     // ★ Org / WebSite JSON-LD フラグ（GAS v2 facts 用）
     hasJsonLd: hasJsonLdFlag,
@@ -16823,6 +17054,13 @@ async function scrapeOnce(req, res) {
       primaryHeadingText: primaryHeadingText,
       primaryMessageText: primaryMessageText,
       bodyTextCandidates: bodyTextCandidates,
+      hasSitemapXml,
+      sitemapChecked: sitemapDiscovery.checked === true,
+      sitemapExists: sitemapDiscovery.exists,
+      sitemapXmlUrl: sitemapDiscovery.url,
+      sitemapDiscoveryMethod: sitemapDiscovery.discoveryMethod,
+      sitemapCheckedUrls: Array.isArray(sitemapDiscovery.checkedUrls) ? sitemapDiscovery.checkedUrls.slice(0, 10) : [],
+      sitemapHttpStatus: sitemapDiscovery.httpStatus,
       ...(productSpecComparisonSignals ? { productSpecComparisonSignals } : {}),
       ...(multimodalSignals ? { multimodalSignals } : {})
     },
