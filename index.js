@@ -3019,6 +3019,55 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     const pageHay = [sourceUrl, title].concat(h1Texts).join(' ');
     if (!isLegalOperatorCandidatePath_(sourceUrl) && !isLegalOperatorCandidateText_(pageHay)) return empty;
 
+    const canonicalLabel = (value, kind = '') => {
+      const text = normalizeSubpageJsonLdText(value);
+      if (!text) return '';
+      if (/事業者名/.test(text)) return '事業者名';
+      if (/販売業者/.test(text)) return '販売業者';
+      if (/運営会社/.test(text)) return '運営会社';
+      if (/本社所在地/.test(text)) return '本社所在地';
+      if (/所在地/.test(text)) return '所在地';
+      if (/住所/.test(text)) return '住所';
+      if (/お客様相談室/.test(text)) return 'お客様相談室';
+      if (/電話番号/.test(text)) return '電話番号';
+      if (/連絡先/.test(text)) return '連絡先';
+      if (kind === 'operator' && /会社名/.test(text)) return '会社名';
+      return '';
+    };
+    const operatorStopRe = /運営統括責任者|責任者|本社所在地|所在地|住所|連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法/;
+    const addressStopRe = /連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法|返品|交換|キャンセル|引渡|配送/;
+    const genericStopRe = /事業者名|販売業者|運営会社|会社名|本社所在地|所在地|住所|連絡先|電話番号|お客様相談室|販売価格|商品代金|送料|支払方法/;
+    const cutAt = (value, stopRe) => normalizeSubpageJsonLdText(value).split(stopRe)[0] || '';
+    const stripLeadingLabel = (value, kind) => {
+      const text = normalizeSubpageJsonLdText(value);
+      const labelRe = kind === 'operator'
+        ? /^(?:事業者名|販売業者|運営会社|販売者|会社名)\s*[：:：]?\s*/
+        : (kind === 'address'
+            ? /^(?:本社所在地|所在地|住所)\s*[：:：]?\s*/
+            : /^(?:連絡先|電話番号|電話|TEL|Tel|お客様相談室)\s*[：:：]?\s*/);
+      return normalizeSubpageJsonLdText(text.replace(labelRe, ''));
+    };
+    const normalizePhone = v => normalizeSubpageJsonLdText(v)
+      .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+      .replace(/[ー‐‑‒–—−]/g, '-')
+      .replace(/[（）]/g, m => (m === '（' ? '(' : ')'))
+      .replace(/\s+/g, '');
+    const extractJapanesePhone = value => {
+      const text = normalizePhone(value);
+      if (/[A-Za-z]/.test(text)) return '';
+      const match = text.match(/(?:0120-\d{2,4}-\d{3,4}|0\d{1,4}-\d{1,4}-\d{3,4}|0\d{9,10})/);
+      return match ? match[0] : '';
+    };
+    const extractJapaneseAddress = value => {
+      const text = cutAt(stripLeadingLabel(value, 'address'), addressStopRe);
+      const match = text.match(/〒?\s?\d{3}[-‐‑‒–—]?\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県).{0,80}/);
+      return normalizeSubpageJsonLdText(match ? match[0] : text).slice(0, 160);
+    };
+    const cleanOperatorName = value => {
+      const text = cutAt(stripLeadingLabel(value, 'operator'), operatorStopRe);
+      return normalizeSubpageJsonLdText(text).slice(0, 80);
+    };
+
     const rows = [];
     $('tr').each((_, el) => {
       const cells = $(el).find('th,td').map((__, cell) => normalizeSubpageJsonLdText($(cell).text())).get().filter(Boolean);
@@ -3029,34 +3078,48 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
       const value = normalizeSubpageJsonLdText($(el).next('dd').text());
       if (label && value) rows.push({ label, value });
     });
+    const bodyClone = $('body').clone();
+    bodyClone.find('script,style,noscript,svg').remove();
+    bodyClone.find('br,p,div,li,tr,dt,dd,th,td,section,article').append('\n');
+    const visibleLines = bodyClone.text()
+      .split(/\n+/)
+      .map(line => normalizeSubpageJsonLdText(line))
+      .filter(Boolean);
 
-    const bodyText = normalizeSubpageJsonLdText($('body').text());
-    const labelValueFromText = (labelRe, valueRe) => {
+    const labelValueFromText = (labelRe, kind) => {
       for (const row of rows) {
-        if (labelRe.test(row.label) && row.value) return { value: row.value, label: row.label };
+        const label = canonicalLabel(row.label, kind);
+        if (label && labelRe.test(row.label) && row.value) {
+          if (kind === 'telephone' && !extractJapanesePhone(row.value)) continue;
+          return { value: row.value, label };
+        }
       }
-      const match = bodyText.match(new RegExp(`(${labelRe.source})\\s*[：:\\s]*([^\\n。]{1,120})`, 'i'));
-      if (match && match[2]) {
-        const raw = normalizeSubpageJsonLdText(match[2]);
-        const valueMatch = valueRe ? raw.match(valueRe) : null;
-        return { value: normalizeSubpageJsonLdText(valueMatch && valueMatch[0] || raw), label: match[1] };
+      for (let i = 0; i < visibleLines.length; i++) {
+        const line = visibleLines[i];
+        const label = canonicalLabel(line, kind);
+        if (!label || !labelRe.test(line)) continue;
+        const afterLabel = normalizeSubpageJsonLdText(line.replace(new RegExp(`^.*?${label}\\s*[：:：]?\\s*`), ''));
+        const value = afterLabel && !genericStopRe.test(afterLabel)
+          ? afterLabel
+          : normalizeSubpageJsonLdText(visibleLines[i + 1] || '');
+        if (kind === 'telephone' && !extractJapanesePhone(value)) continue;
+        if (value) return { value, label };
       }
       return { value: '', label: '' };
     };
 
-    const operator = labelValueFromText(/販売業者|事業者名|事業者|運営会社|販売者|会社名/i);
-    const address = labelValueFromText(/所在地|住所|本社所在地/i, /〒?\s?\d{3}[-‐‑‒–—]?\d{4}\s*(?:北海道|東京都|(?:京都|大阪)府|..県).{2,90}/);
-    const telephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先/i, /(?:\+?\d[\d\s()（）+\-‐‑‒–—ー]{6,}\d)/);
+    const operator = labelValueFromText(/販売業者|事業者名|運営会社|会社名/i, 'operator');
+    const address = labelValueFromText(/所在地|住所|本社所在地/i, 'address');
+    const telephone = labelValueFromText(/電話番号|電話|TEL|Tel|連絡先|お客様相談室/i, 'telephone');
 
-    const normalizePhone = v => normalizeSubpageJsonLdText(v).replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/\s+/g, '');
     const out = Object.assign({}, empty, {
-      operatorName: operator.value ? operator.value.slice(0, 120) : '',
-      address: address.value ? address.value.slice(0, 160) : '',
-      telephone: telephone.value ? normalizePhone(telephone.value).slice(0, 60) : ''
+      operatorName: operator.value ? cleanOperatorName(operator.value) : '',
+      address: address.value ? extractJapaneseAddress(address.value) : '',
+      telephone: telephone.value ? extractJapanesePhone(telephone.value) : ''
     });
-    if (out.operatorName) out.evidenceLabels.push(operator.label || 'operatorName');
-    if (out.address) out.evidenceLabels.push(address.label || 'address');
-    if (out.telephone) out.evidenceLabels.push(telephone.label || 'telephone');
+    if (out.operatorName && operator.label) out.evidenceLabels.push(operator.label);
+    if (out.address && address.label) out.evidenceLabels.push(address.label);
+    if (out.telephone && telephone.label) out.evidenceLabels.push(telephone.label);
     out.hasOperatorName = !!out.operatorName;
     out.hasAddress = !!out.address;
     out.hasTelephone = !!out.telephone;
@@ -5724,6 +5787,40 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates, siteMode);
     const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    try {
+      const selectedUrlSet = new Set(selectedCandidates.map(candidate => String(candidate && candidate.url || '')));
+      const legalAuditCandidates = prioritizedCandidates
+        .map((candidate, index) => {
+          const url = String(candidate && candidate.url || '');
+          const path = getCoverageCandidatePath_(candidate);
+          const pageType = isLegalOperatorCandidatePath_(url) || isLegalOperatorCandidateText_(candidate && candidate.label || '')
+            ? 'legal'
+            : inferSubpageJsonLdPageType(url, siteMode, []);
+          const selected = selectedUrlSet.has(url);
+          return {
+            index,
+            url,
+            path,
+            pageType,
+            score: Number(candidate && candidate.score || 0),
+            sources: Array.isArray(candidate && candidate.sources) ? candidate.sources : (candidate && candidate.source ? [candidate.source] : []),
+            representativePriority: getCoverageRepresentativePriority_(candidate, siteMode),
+            selected,
+            rejectReason: selected ? '' : (index >= maxObserve ? 'outside_max_observe' : 'not_selected')
+          };
+        })
+        .filter(item => item.pageType === 'legal' || /\/(?:pages\/guide|pages\/faq|policies\/legal-notice)(?:\/|$)/i.test(item.path))
+        .slice(0, 20);
+      console.log('[DEBUG][LEGAL_REPRESENTATIVE_SELECTION_AUDIT]', JSON.stringify({
+        url: normalized.topUrl,
+        siteMode,
+        maxObserve,
+        candidateCount: discovered.totalCandidates,
+        candidateLegal: prioritizedCandidates.some(candidate => isLegalOperatorCandidatePath_(candidate && candidate.url || '') || isLegalOperatorCandidateText_(candidate && candidate.label || '')),
+        selectedPaths,
+        candidates: legalAuditCandidates
+      }));
+    } catch (_) {}
     const skippedUtilityPaths = prioritizedCandidates
       .slice(maxObserve)
       .filter(candidate => getCoverageRepresentativePriority_(candidate, siteMode) === 3)
