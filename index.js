@@ -7044,23 +7044,217 @@ function emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBr
   } catch (_) {}
 }
 
-function buildRepresentativeArticleFacts_(representativeEvidence) {
-  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
-  const articleItem = items.find(item => item && item.role === 'article' && item.facts && typeof item.facts === 'object') || null;
-  const facts = articleItem && articleItem.facts || {};
+function inferRepresentativeArticleDatePrecision_(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}(?:[T\s]|$)/.test(text)) return 'day';
+  if (/^\d{4}-\d{2}$/.test(text)) return 'month';
+  if (/^\d{4}$/.test(text)) return 'year';
+  return null;
+}
+
+function resolveRepresentativeArticleUrl_(value, baseUrl) {
+  const text = normalizeSubpageJsonLdText(value).slice(0, 320);
+  if (!text) return null;
+  try {
+    return new URL(text, baseUrl || undefined).href;
+  } catch (_) {
+    return text;
+  }
+}
+
+function extractRepresentativeArticleDateFromPath_(path) {
+  const match = String(path || '').match(/\/(20\d{2})\/(0?[1-9]|1[0-2])(?:\/(0?[1-9]|[12]\d|3[01]))?(?:\/|\.|$)/);
+  if (!match) return { value: null, precision: null };
+  const year = match[1];
+  const month = String(match[2]).padStart(2, '0');
+  const day = match[3] ? String(match[3]).padStart(2, '0') : '';
+  return {
+    value: day ? `${year}-${month}-${day}` : `${year}-${month}`,
+    precision: day ? 'day' : 'month'
+  };
+}
+
+function extractRepresentativeArticleDateFromText_(text) {
+  const value = normalizeSubpageJsonLdText(text);
+  const match = value.match(/\b(20\d{2})[./-](0?[1-9]|1[0-2])(?:[./-](0?[1-9]|[12]\d|3[01]))?\b/);
+  if (!match) return { value: null, precision: null };
+  const year = match[1];
+  const month = String(match[2]).padStart(2, '0');
+  const day = match[3] ? String(match[3]).padStart(2, '0') : '';
+  return {
+    value: day ? `${year}-${month}-${day}` : `${year}-${month}`,
+    precision: day ? 'day' : 'month'
+  };
+}
+
+function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opts = {}) {
+  const baseUrl = opts && opts.topUrl || opts && opts.url || '';
+  const candidates = [];
+  const addCandidate = (source, item) => {
+    if (!item || typeof item !== 'object') return;
+    const facts = item.facts && typeof item.facts === 'object' ? item.facts : item;
+    const pageType = normalizeSubpageJsonLdText(item.pageType || facts.pageType || '');
+    const role = normalizeSubpageJsonLdText(item.role || facts.role || '');
+    const rawPath = normalizeSubpageJsonLdText(item.path || facts.path || '');
+    const labelText = normalizeSubpageJsonLdText(item.label || item.text || item.title || facts.label || facts.text || facts.title || '');
+    const rawUrl = item.url || item.finalUrl || item.href || facts.url || facts.sourceUrl || facts.canonicalUrl || rawPath;
+    const sourceUrl = resolveRepresentativeArticleUrl_(facts.sourceUrl || item.sourceUrl || rawUrl, baseUrl);
+    const canonicalUrl = resolveRepresentativeArticleUrl_(facts.canonicalUrl || item.canonicalUrl || sourceUrl || rawUrl, baseUrl);
+    const path = (() => {
+      if (rawPath) return rawPath;
+      try { return sourceUrl ? new URL(sourceUrl).pathname || '' : ''; } catch (_) { return ''; }
+    })();
+    const isArticleLike = role === 'article' ||
+      pageType === 'article' ||
+      /\/(?:post|posts|article|articles|news|topics|column|blog|entry|story|stories|information)(?:\/|$)/i.test(path || sourceUrl || '');
+    if (!isArticleLike) return;
+    const pathDate = extractRepresentativeArticleDateFromPath_(path);
+    const labelDate = extractRepresentativeArticleDateFromText_(labelText);
+    const headline = normalizeSubpageJsonLdText(
+      facts.headline ||
+      facts.title ||
+      item.headline ||
+      item.title ||
+      item.h1 ||
+      labelText
+    ).slice(0, 180) || null;
+    const datePublished = normalizeSubpageJsonLdText(
+      facts.datePublished ||
+      facts.publishedAt ||
+      facts.date ||
+      facts.time ||
+      item.datePublished ||
+      item.publishedAt ||
+      item.date ||
+      item.time ||
+      labelDate.value ||
+      pathDate.value
+    ).slice(0, 80) || null;
+    const datePublishedPrecision = facts.datePublishedPrecision ||
+      item.datePublishedPrecision ||
+      labelDate.precision ||
+      pathDate.precision ||
+      inferRepresentativeArticleDatePrecision_(datePublished);
+    const dateModified = normalizeSubpageJsonLdText(
+      facts.dateModified ||
+      facts.modifiedAt ||
+      item.dateModified ||
+      item.modifiedAt
+    ).slice(0, 80) || null;
+    const authorName = normalizeSubpageJsonLdText(facts.authorName || facts.author || item.authorName || item.author).slice(0, 160) || null;
+    const publisherName = normalizeSubpageJsonLdText(facts.publisherName || facts.publisher || item.publisherName || item.publisher).slice(0, 160) || null;
+    const hasIdentity = !!(headline || sourceUrl || canonicalUrl);
+    if (!hasIdentity) return;
+    candidates.push({
+      source,
+      role: 'article',
+      pageType: 'article',
+      path,
+      url: sourceUrl || canonicalUrl || '',
+      headline,
+      datePublished,
+      datePublishedPrecision: datePublishedPrecision || null,
+      dateModified,
+      authorName,
+      publisherName,
+      canonicalUrl: canonicalUrl || null,
+      sourceUrl: sourceUrl || canonicalUrl || null
+    });
+  };
+  (Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [])
+    .forEach(item => addCandidate('representativeEvidence.items', item));
+  const articleSignals = opts && opts.representativeSignals && opts.representativeSignals.roles && opts.representativeSignals.roles.article;
+  (Array.isArray(articleSignals && articleSignals.evidencePages) ? articleSignals.evidencePages : [])
+    .forEach(item => addCandidate('representativeSignals.roles.article.evidencePages', item));
+  const coverageSignals = opts && opts.coverageSignals && typeof opts.coverageSignals === 'object' ? opts.coverageSignals : {};
+  (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [])
+    .forEach(item => addCandidate('coverageSignals.representativePages', item));
+  const roleCandidates = coverageSignals.roleRepresentativeCandidates && typeof coverageSignals.roleRepresentativeCandidates === 'object'
+    ? coverageSignals.roleRepresentativeCandidates
+    : {};
+  (Array.isArray(roleCandidates.article) ? roleCandidates.article : [])
+    .forEach(item => addCandidate('coverageSignals.roleRepresentativeCandidates.article', item));
+  const roleBasedPages = coverageSignals.representativePagesAudit && Array.isArray(coverageSignals.representativePagesAudit.roleBasedRepresentativePages)
+    ? coverageSignals.representativePagesAudit.roleBasedRepresentativePages
+    : [];
+  roleBasedPages.forEach(item => addCandidate('coverageSignals.representativePagesAudit.roleBasedRepresentativePages', item));
+  const roleBasedPlan = coverageSignals.observationPlanAudit && Array.isArray(coverageSignals.observationPlanAudit.roleBasedObservationPlan)
+    ? coverageSignals.observationPlanAudit.roleBasedObservationPlan
+    : [];
+  roleBasedPlan.forEach(item => addCandidate('coverageSignals.observationPlanAudit.roleBasedObservationPlan', item));
+  const seen = new Set();
+  const uniqueCandidates = candidates.filter(candidate => {
+    const key = candidate.sourceUrl || candidate.canonicalUrl || candidate.path || candidate.headline || '';
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const scored = uniqueCandidates.map(candidate => {
+    let score = 0;
+    if (candidate.headline) score += 20;
+    if (candidate.datePublished || candidate.dateModified) score += 20;
+    if (candidate.sourceUrl || candidate.canonicalUrl) score += 10;
+    if (candidate.authorName || candidate.publisherName) score += 5;
+    if (candidate.source === 'representativeEvidence.items') score += 4;
+    if (candidate.source === 'representativeSignals.roles.article.evidencePages') score += 3;
+    return Object.assign({ score }, candidate);
+  });
+  scored.sort((a, b) => b.score - a.score);
+  const selected = scored[0] || null;
+  const values = selected ? {
+    headline: selected.headline,
+    datePublished: selected.datePublished,
+    datePublishedPrecision: selected.datePublishedPrecision,
+    dateModified: selected.dateModified,
+    authorName: selected.authorName,
+    publisherName: selected.publisherName,
+    canonicalUrl: selected.canonicalUrl,
+    sourceUrl: selected.sourceUrl
+  } : {};
+  const factKeys = ['headline', 'datePublished', 'datePublishedPrecision', 'dateModified', 'authorName', 'publisherName', 'canonicalUrl', 'sourceUrl'];
+  const filledKeys = factKeys.filter(key => values[key] != null && values[key] !== '');
+  const missingKeys = factKeys.filter(key => values[key] == null || values[key] === '');
+  return {
+    version: 1,
+    target: 'representativeArticleFacts',
+    selectedSource: selected && selected.source || null,
+    candidateCount: uniqueCandidates.length,
+    articleCandidateCount: uniqueCandidates.length,
+    selectedCandidatePath: selected && selected.path || null,
+    selectedCandidateUrl: selected && selected.sourceUrl || selected && selected.url || null,
+    selectedCandidateHeadline: selected && selected.headline || null,
+    selectedCandidateDatePublished: selected && selected.datePublished || null,
+    selectedCandidateDatePublishedPrecision: selected && selected.datePublishedPrecision || null,
+    filledKeys,
+    missingKeys,
+    blockedReason: selected ? null : 'no_article_candidate',
+    connectedToFactsBridge: false,
+    connectedToDiagnosis: false,
+    selectedCandidate: selected
+  };
+}
+
+function buildRepresentativeArticleFacts_(representativeEvidence, opts = {}) {
+  const sourceAudit = opts && opts.sourceAudit && typeof opts.sourceAudit === 'object'
+    ? opts.sourceAudit
+    : buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opts);
+  const selected = sourceAudit.selectedCandidate && typeof sourceAudit.selectedCandidate === 'object'
+    ? sourceAudit.selectedCandidate
+    : null;
   const out = {
     version: 1,
     generatedFrom: 'representativeEvidence',
-    evidenceSource: 'representativeEvidence.article.facts',
-    headline: articleItem ? (facts.headline || null) : null,
-    datePublished: articleItem ? (facts.datePublished || null) : null,
-    datePublishedPrecision: articleItem ? (facts.datePublishedPrecision || null) : null,
-    dateModified: articleItem ? (facts.dateModified || null) : null,
-    authorName: articleItem ? (facts.author || null) : null,
-    publisherName: articleItem ? (facts.publisher || null) : null,
-    canonicalUrl: articleItem ? (facts.canonicalUrl || null) : null,
-    sourceUrl: articleItem ? (facts.sourceUrl || articleItem.url || null) : null,
-    evidencePath: articleItem ? (articleItem.path || '') : '',
+    evidenceSource: sourceAudit.selectedSource || 'representativeEvidence.article.facts',
+    headline: selected ? (selected.headline || null) : null,
+    datePublished: selected ? (selected.datePublished || null) : null,
+    datePublishedPrecision: selected ? (selected.datePublishedPrecision || null) : null,
+    dateModified: selected ? (selected.dateModified || null) : null,
+    authorName: selected ? (selected.authorName || null) : null,
+    publisherName: selected ? (selected.publisherName || null) : null,
+    canonicalUrl: selected ? (selected.canonicalUrl || null) : null,
+    sourceUrl: selected ? (selected.sourceUrl || selected.url || null) : null,
+    evidencePath: selected ? (selected.path || '') : '',
     connectedToFactsBridge: false,
     connectedToDiagnosis: false
   };
@@ -7074,6 +7268,34 @@ function buildRepresentativeArticleFacts_(representativeEvidence) {
     'canonicalUrl',
     'sourceUrl'
   ].filter(key => out[key] == null || out[key] === '');
+  return out;
+}
+
+function emitRepresentativeArticleFactsSourceAudit_(audit) {
+  try {
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_SOURCE_AUDIT]', JSON.stringify({
+      target: 'representativeArticleFacts',
+      selectedSource: audit && audit.selectedSource || null,
+      candidateCount: Number(audit && audit.candidateCount || 0),
+      articleCandidateCount: Number(audit && audit.articleCandidateCount || 0),
+      selectedCandidatePath: audit && audit.selectedCandidatePath || null,
+      selectedCandidateUrl: audit && audit.selectedCandidateUrl || null,
+      selectedCandidateHeadline: audit && audit.selectedCandidateHeadline || null,
+      selectedCandidateDatePublished: audit && audit.selectedCandidateDatePublished || null,
+      selectedCandidateDatePublishedPrecision: audit && audit.selectedCandidateDatePublishedPrecision || null,
+      filledKeys: Array.isArray(audit && audit.filledKeys) ? audit.filledKeys : [],
+      missingKeys: Array.isArray(audit && audit.missingKeys) ? audit.missingKeys : [],
+      blockedReason: audit && audit.blockedReason || null,
+      connectedToFactsBridge: false,
+      connectedToDiagnosis: false
+    }));
+  } catch (_) {}
+}
+
+function compactRepresentativeArticleFactsSourceAudit_(audit) {
+  if (!audit || typeof audit !== 'object') return null;
+  const out = Object.assign({}, audit);
+  delete out.selectedCandidate;
   return out;
 }
 
@@ -8559,7 +8781,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsBridgeAudit = buildRepresentativeArticleFactsBridgeAudit_(representativeEvidence, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
     geoSignalsV1.representativeArticleFactsBridgeAudit = representativeArticleFactsBridgeAudit;
     emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
-    const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence);
+    const representativeArticleFactsSourceAudit = buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, {
+      representativeSignals,
+      coverageSignals,
+      topUrl: normalized.topUrl
+    });
+    geoSignalsV1.representativeArticleFactsSourceAudit = compactRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
+    emitRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
+    const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence, {
+      sourceAudit: representativeArticleFactsSourceAudit
+    });
     geoSignalsV1.representativeArticleFacts = representativeArticleFacts;
     emitRepresentativeArticleFactsPhase2Audit_(representativeEvidence, representativeArticleFacts);
     const representativeArticleFactsAdoptionAudit = buildRepresentativeArticleFactsAdoptionAudit_(representativeArticleFacts, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
@@ -9236,7 +9467,20 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeArticleFactsBridgeAudit
   };
   emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
-  const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence);
+  const representativeArticleFactsSourceAudit = buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, {
+    representativeSignals,
+    coverageSignals: payload.coverageSignalsV1,
+    topUrl: normalized.topUrl
+  });
+  payload.coverageSignalsV1.representativeArticleFactsSourceAudit = compactRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeArticleFactsSourceAudit: compactRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit)
+  };
+  emitRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
+  const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence, {
+    sourceAudit: representativeArticleFactsSourceAudit
+  });
   payload.coverageSignalsV1.representativeArticleFacts = representativeArticleFacts;
   payload.geoSignalsV1 = {
     ...(payload.geoSignalsV1 || {}),
@@ -13284,6 +13528,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.representativeArticleFactsExtractionAudit && typeof g.representativeArticleFactsExtractionAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsExtractionAudit = g.representativeArticleFactsExtractionAudit;
+  }
+  if (g.representativeArticleFactsSourceAudit && typeof g.representativeArticleFactsSourceAudit === 'object') {
+    shortGeoSignalsV1.representativeArticleFactsSourceAudit = g.representativeArticleFactsSourceAudit;
   }
   if (g.representativeArticleFactsBridgeAudit && typeof g.representativeArticleFactsBridgeAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsBridgeAudit = g.representativeArticleFactsBridgeAudit;
