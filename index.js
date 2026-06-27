@@ -6429,6 +6429,16 @@ function buildRepresentativeSignalsV1_(payload, opts = {}) {
 
 function buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, url) {
   const clean = (value, maxLen = 240) => normalizeSubpageJsonLdText(value).slice(0, maxLen) || null;
+  const inferDatePrecision = (value, source) => {
+    const text = String(value || '').trim();
+    if (!text) return null;
+    if (source === 'url_path_year_month_day') return 'day';
+    if (source === 'url_path_year_month') return 'month';
+    if (/^\d{4}-\d{2}-\d{2}(?:[T\s]|$)/.test(text)) return 'day';
+    if (/^\d{4}-\d{2}$/.test(text)) return 'month';
+    if (/^\d{4}$/.test(text)) return 'year';
+    return null;
+  };
   const articleSignals = geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object'
     ? geoSignalsV1.articleSignals
     : (geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.articleSignals && typeof geoSignalsV1.observed.articleSignals === 'object'
@@ -6471,6 +6481,7 @@ function buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, url) {
     { value: meta.publishedTime, source: 'meta.article:published_time', maxLen: 80 },
     { value: pathDate.value, source: pathDate.source, maxLen: 80 }
   ]);
+  const datePublishedPrecision = inferDatePrecision(datePublished.value, datePublished.source);
   const dateModified = pick([
     { value: jsonLd.dateModified, source: 'jsonld.dateModified', maxLen: 80 },
     { value: meta.modifiedTime, source: 'meta.article:modified_time', maxLen: 80 }
@@ -6515,6 +6526,7 @@ function buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, url) {
     strength: headline.value && datePublished.value && (authorName.value || publisherName.value) ? 'strong' : (headline.value ? 'partial' : 'weak'),
     headline: headline.value,
     datePublished: datePublished.value,
+    datePublishedPrecision,
     dateModified: dateModified.value,
     author: authorName.value,
     publisher: publisherName.value,
@@ -6530,7 +6542,9 @@ function buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, url) {
     filledKeys,
     missingKeys,
     headlineSource: headline.source,
+    datePublished: datePublished.value,
     datePublishedSource: datePublished.source,
+    datePublishedPrecision,
     dateModifiedSource: dateModified.source,
     canonicalUrlSource: canonical.source,
     sourceUrlSource: sourceUrl.source,
@@ -6578,6 +6592,8 @@ function emitRepresentativeArticleFactsExtractionAudit_(audit) {
       missingKeys: Array.isArray(audit && audit.missingKeys) ? audit.missingKeys : [],
       headlineSource: audit && audit.headlineSource || null,
       datePublishedSource: audit && audit.datePublishedSource || null,
+      datePublished: audit && audit.datePublished || null,
+      datePublishedPrecision: audit && audit.datePublishedPrecision || null,
       canonicalUrlSource: audit && audit.canonicalUrlSource || null,
       sourceUrlSource: audit && audit.sourceUrlSource || null,
       connectedToFactsBridge: false,
@@ -6617,6 +6633,7 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
     const observedSignals = [];
     if (page && page.headline) observedSignals.push('headline');
     if (page && page.datePublished) observedSignals.push('datePublished');
+    if (page && page.datePublishedPrecision) observedSignals.push('datePublishedPrecision');
     if (page && page.dateModified) observedSignals.push('dateModified');
     if (page && page.author) observedSignals.push('author');
     if (page && page.publisher) observedSignals.push('publisher');
@@ -6628,6 +6645,7 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
     if (page && page.headline) usableFor.push('contentUnderstanding');
     const headline = page && page.headline || null;
     const datePublished = page && page.datePublished || null;
+    const datePublishedPrecision = page && page.datePublishedPrecision || null;
     const dateModified = page && page.dateModified || null;
     const author = page && page.author || null;
     const publisher = page && page.publisher || null;
@@ -6654,6 +6672,7 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
       facts: {
         headline,
         datePublished,
+        datePublishedPrecision,
         dateModified,
         author,
         publisher,
@@ -7035,6 +7054,7 @@ function buildRepresentativeArticleFacts_(representativeEvidence) {
     evidenceSource: 'representativeEvidence.article.facts',
     headline: articleItem ? (facts.headline || null) : null,
     datePublished: articleItem ? (facts.datePublished || null) : null,
+    datePublishedPrecision: articleItem ? (facts.datePublishedPrecision || null) : null,
     dateModified: articleItem ? (facts.dateModified || null) : null,
     authorName: articleItem ? (facts.author || null) : null,
     publisherName: articleItem ? (facts.publisher || null) : null,
@@ -7047,6 +7067,7 @@ function buildRepresentativeArticleFacts_(representativeEvidence) {
   out.missingKeys = [
     'headline',
     'datePublished',
+    'datePublishedPrecision',
     'dateModified',
     'authorName',
     'publisherName',
@@ -7064,6 +7085,7 @@ function emitRepresentativeArticleFactsPhase2Audit_(representativeEvidence, repr
       generated: !!representativeArticleFacts,
       headline: facts.headline || null,
       datePublished: facts.datePublished || null,
+      datePublishedPrecision: facts.datePublishedPrecision || null,
       dateModified: facts.dateModified || null,
       canonicalUrl: facts.canonicalUrl || null,
       sourceUrl: facts.sourceUrl || null,
@@ -7119,6 +7141,10 @@ function buildRepresentativeArticleFactsAdoptionAudit_(representativeArticleFact
   });
   const representativeOnlyKeys = comparableKeys.filter(key => valueFor_(representativeFacts, key) != null && valueFor_(currentFacts, key) == null);
   const currentOnlyKeys = comparableKeys.filter(key => valueFor_(currentFacts, key) != null && valueFor_(representativeFacts, key) == null);
+  const representativeDatePublishedPrecision = valueFor_(representativeFacts, 'datePublishedPrecision');
+  const currentDatePublishedPrecision = null;
+  const representativeDatePublished = valueFor_(representativeFacts, 'datePublished');
+  const currentDatePublished = valueFor_(currentFacts, 'datePublished');
   const hasRepresentativeArticleFacts = !!representativeFacts;
   const hasCurrentArticleSignals = !!(articleSignals && typeof articleSignals === 'object');
   const hasIdentityField = !!(valueFor_(representativeFacts, 'headline') || valueFor_(representativeFacts, 'canonicalUrl') || valueFor_(representativeFacts, 'sourceUrl'));
@@ -7149,6 +7175,10 @@ function buildRepresentativeArticleFactsAdoptionAudit_(representativeArticleFact
     currentFilledKeys,
     representativeMissingKeys,
     currentMissingKeys,
+    representativeDatePublishedPrecision,
+    currentDatePublishedPrecision,
+    representativeDatePublished,
+    currentDatePublished,
     adoptionCandidate,
     adoptionBlockedReason
   };
@@ -7162,6 +7192,10 @@ function emitRepresentativeArticleFactsAdoptionAudit_(representativeArticleFacts
       hasCurrentArticleSignals: audit.hasCurrentArticleSignals === true,
       adoptionCandidate: audit.adoptionCandidate === true,
       adoptionBlockedReason: audit.adoptionBlockedReason || null,
+      representativeDatePublished: audit.representativeDatePublished || null,
+      representativeDatePublishedPrecision: audit.representativeDatePublishedPrecision || null,
+      currentDatePublished: audit.currentDatePublished || null,
+      currentDatePublishedPrecision: audit.currentDatePublishedPrecision || null,
       representativeFilledKeys: Array.isArray(audit.representativeFilledKeys) ? audit.representativeFilledKeys : [],
       currentFilledKeys: Array.isArray(audit.currentFilledKeys) ? audit.currentFilledKeys : [],
       differingKeys: Array.isArray(audit.differingKeys) ? audit.differingKeys : [],
@@ -7190,6 +7224,8 @@ function buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFa
     valueFor_(facts, 'datePublished') ||
     valueFor_(facts, 'dateModified')
   );
+  const datePublishedPrecision = valueFor_(facts, 'datePublishedPrecision');
+  const requiredDatePrecisionPassed = datePublishedPrecision === 'day' || datePublishedPrecision === 'month';
   const adoptionCandidate = adoption.adoptionCandidate === true;
   const gatePassed = adoptionCandidate && !!facts && requiredIdentityPassed && requiredDatePassed;
   const gateBlockedReason = gatePassed
@@ -7212,6 +7248,9 @@ function buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFa
     gateBlockedReason,
     requiredIdentityPassed,
     requiredDatePassed,
+    datePublished: valueFor_(facts, 'datePublished'),
+    datePublishedPrecision,
+    requiredDatePrecisionPassed,
     representativeFilledKeys: Array.isArray(adoption.representativeFilledKeys) ? adoption.representativeFilledKeys : [],
     representativeMissingKeys: Array.isArray(adoption.representativeMissingKeys) ? adoption.representativeMissingKeys : [],
     currentArticleSignalsChecked: articleSignals && articleSignals.checked === true,
@@ -7229,6 +7268,9 @@ function emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFac
       gateBlockedReason: audit.gateBlockedReason || null,
       requiredIdentityPassed: audit.requiredIdentityPassed === true,
       requiredDatePassed: audit.requiredDatePassed === true,
+      datePublished: audit && audit.datePublished || null,
+      datePublishedPrecision: audit.datePublishedPrecision || null,
+      requiredDatePrecisionPassed: audit.requiredDatePrecisionPassed === true,
       adoptionCandidate: audit.adoptionCandidate === true,
       adoptionBlockedReason: audit.adoptionBlockedReason || null,
       connectedToFactsBridge: false,
