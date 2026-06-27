@@ -6762,6 +6762,97 @@ function emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2Decision
   } catch (_) {}
 }
 
+function buildRepresentativeArticleFactsBridgeAudit_(representativeEvidence, articleSignals) {
+  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+  const representativeItem = items.find(item => item && item.role === 'article' && item.facts && typeof item.facts === 'object') || null;
+  const representativeFacts = representativeItem && representativeItem.facts || {};
+  const jsonLd = articleSignals && articleSignals.jsonLd && typeof articleSignals.jsonLd === 'object' ? articleSignals.jsonLd : {};
+  const meta = articleSignals && articleSignals.meta && typeof articleSignals.meta === 'object' ? articleSignals.meta : {};
+  const currentArticleFacts = {
+    headline: jsonLd.headline || null,
+    datePublished: jsonLd.datePublished || meta.publishedTime || null,
+    dateModified: jsonLd.dateModified || meta.modifiedTime || null,
+    authorName: jsonLd.authorName || meta.author || null,
+    publisherName: jsonLd.publisherName || null
+  };
+  const representativeArticleFacts = {
+    headline: representativeItem ? (representativeFacts.headline || null) : null,
+    datePublished: representativeItem ? (representativeFacts.datePublished || null) : null,
+    dateModified: representativeItem ? (representativeFacts.dateModified || null) : null,
+    author: representativeItem ? (representativeFacts.author || null) : null,
+    publisher: representativeItem ? (representativeFacts.publisher || null) : null,
+    evidencePath: representativeItem && representativeItem.path || '',
+    evidenceRole: representativeItem && representativeItem.role || ''
+  };
+  const pairs = [
+    ['headline', currentArticleFacts.headline, representativeArticleFacts.headline],
+    ['datePublished', currentArticleFacts.datePublished, representativeArticleFacts.datePublished],
+    ['dateModified', currentArticleFacts.dateModified, representativeArticleFacts.dateModified],
+    ['author', currentArticleFacts.authorName, representativeArticleFacts.author],
+    ['publisher', currentArticleFacts.publisherName, representativeArticleFacts.publisher]
+  ];
+  const fieldMatch_ = (currentValue, representativeValue) => !!(currentValue && representativeValue && currentValue === representativeValue);
+  const representativeHasMoreInformation = pairs.some(([, currentValue, representativeValue]) => !currentValue && !!representativeValue);
+  const representativeMissingInformation = pairs.some(([, currentValue, representativeValue]) => !!currentValue && !representativeValue);
+  const allObservedFieldsMatch = pairs.every(([, currentValue, representativeValue]) => {
+    if (!currentValue && !representativeValue) return true;
+    return fieldMatch_(currentValue, representativeValue);
+  });
+  const comparison = {
+    headlineMatches: fieldMatch_(currentArticleFacts.headline, representativeArticleFacts.headline),
+    datePublishedMatches: fieldMatch_(currentArticleFacts.datePublished, representativeArticleFacts.datePublished),
+    dateModifiedMatches: fieldMatch_(currentArticleFacts.dateModified, representativeArticleFacts.dateModified),
+    authorMatches: fieldMatch_(currentArticleFacts.authorName, representativeArticleFacts.author),
+    publisherMatches: fieldMatch_(currentArticleFacts.publisherName, representativeArticleFacts.publisher),
+    representativeHasMoreInformation,
+    representativeMissingInformation,
+    safeToSwitch: false
+  };
+  const decisionReason = !representativeItem
+    ? 'no_representative_article'
+    : (representativeMissingInformation
+      ? 'representative_missing_information'
+      : (representativeHasMoreInformation
+        ? 'representative_has_more_information'
+        : (allObservedFieldsMatch
+          ? 'representative_matches_articlesignals'
+          : 'compare_only_phase1')));
+  return {
+    version: 1,
+    target: 'article',
+    generatedFrom: 'representativeEvidence',
+    selectedSource: 'articleSignals',
+    switched: false,
+    currentArticleSignals: currentArticleFacts,
+    representativeArticleFacts,
+    comparison,
+    decisionReason
+  };
+}
+
+function emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit) {
+  try {
+    const audit = representativeArticleFactsBridgeAudit || {};
+    const comparison = audit.comparison || {};
+    const representative = audit.representativeArticleFacts || {};
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_BRIDGE_AUDIT]', JSON.stringify({
+      hasRepresentativeArticle: !!(representative.headline || representative.datePublished || representative.dateModified || representative.author || representative.publisher),
+      selectedSource: audit.selectedSource || 'articleSignals',
+      switched: audit.switched === true,
+      decisionReason: audit.decisionReason || '',
+      headlineMatches: comparison.headlineMatches === true,
+      datePublishedMatches: comparison.datePublishedMatches === true,
+      dateModifiedMatches: comparison.dateModifiedMatches === true,
+      authorMatches: comparison.authorMatches === true,
+      publisherMatches: comparison.publisherMatches === true,
+      representativeHasMoreInformation: comparison.representativeHasMoreInformation === true,
+      representativeMissingInformation: comparison.representativeMissingInformation === true,
+      safeToSwitch: comparison.safeToSwitch === true,
+      evidencePath: representative.evidencePath || ''
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7567,6 +7658,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
     geoSignalsV1.representativeEvidence = representativeEvidence;
     emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
+    const representativeArticleFactsBridgeAudit = buildRepresentativeArticleFactsBridgeAudit_(representativeEvidence, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
+    geoSignalsV1.representativeArticleFactsBridgeAudit = representativeArticleFactsBridgeAudit;
+    emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -8209,6 +8303,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeEvidence
   };
   emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
+  const representativeArticleFactsBridgeAudit = buildRepresentativeArticleFactsBridgeAudit_(representativeEvidence, payload.geoSignalsV1 && payload.geoSignalsV1.articleSignals || payload.geoSignalsV1 && payload.geoSignalsV1.observed && payload.geoSignalsV1.observed.articleSignals);
+  payload.coverageSignalsV1.representativeArticleFactsBridgeAudit = representativeArticleFactsBridgeAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeArticleFactsBridgeAudit
+  };
+  emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
