@@ -4500,6 +4500,56 @@ function buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, o
   };
 }
 
+function buildRoleBasedSelectedCandidates_(candidates, opts = {}) {
+  const maxObserve = Math.max(0, Number(opts && opts.maxObserve || 0) || 0);
+  if (!maxObserve) {
+    const priorityConfig = getRoleRepresentativePriorityConfig_(opts && (opts.siteType || opts.siteMode) || 'default');
+    return {
+      siteTypeForRolePriority: priorityConfig.siteTypeForRolePriority,
+      rolePriority: priorityConfig.rolePriority,
+      candidates: []
+    };
+  }
+  const priorityConfig = getRoleRepresentativePriorityConfig_(opts && (opts.siteType || opts.siteMode) || 'default');
+  const byType = {};
+  (Array.isArray(candidates) ? candidates : []).forEach((candidate, index) => {
+    if (!candidate || !candidate.url) return;
+    const pageType = inferDiscoverCandidatePageType_(candidate, opts && opts.siteMode || 'generic');
+    if (!pageType || pageType === 'unknown' || pageType === 'category_or_detail') return;
+    byType[pageType] = byType[pageType] || [];
+    byType[pageType].push(Object.assign({}, candidate, {
+      pageType,
+      __roleBasedIndex: index
+    }));
+  });
+  Object.keys(byType).forEach(pageType => {
+    byType[pageType] = byType[pageType].sort((a, b) => {
+      const scoreDiff = Number(b && b.score || 0) - Number(a && a.score || 0);
+      if (scoreDiff) return scoreDiff;
+      return Number(a && a.__roleBasedIndex || 0) - Number(b && b.__roleBasedIndex || 0);
+    });
+  });
+  const selected = [];
+  const seen = new Set();
+  const pageTypes = Array.from(new Set(priorityConfig.rolePriority.concat(Object.keys(byType))));
+  pageTypes.forEach(pageType => {
+    if (selected.length >= maxObserve) return;
+    const candidate = Array.isArray(byType[pageType]) ? byType[pageType][0] : null;
+    if (!candidate) return;
+    const key = discoverSubpageCandidateKey(candidate.url);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    const cleaned = Object.assign({}, candidate);
+    delete cleaned.__roleBasedIndex;
+    selected.push(cleaned);
+  });
+  return {
+    siteTypeForRolePriority: priorityConfig.siteTypeForRolePriority,
+    rolePriority: priorityConfig.rolePriority,
+    candidates: selected
+  };
+}
+
 function buildRepresentativePagesAudit_(legacyRepresentativePages, roleRepresentativeCandidates, opts = {}) {
   const legacy = (Array.isArray(legacyRepresentativePages) ? legacyRepresentativePages : [])
     .map(page => compactRepresentativePageAuditItem_(page))
@@ -5921,7 +5971,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       })();
       const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
       const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
-      const pageType = page.pageType || inferSubpageSignalsPageType_(page);
+      const candidatePageType = inferDiscoverCandidatePageType_(candidate, payload && payload.siteMode || 'generic');
+      const pageType = candidatePageType && candidatePageType !== 'unknown' && candidatePageType !== 'category_or_detail'
+        ? candidatePageType
+        : (page.pageType || inferSubpageSignalsPageType_(page));
       const legalOperatorInfo = page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null;
       return {
         url: page.url || '',
@@ -5956,6 +6009,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   });
   emitRepresentativePagesRoleAudit_(payload && payload.origin || '', representativePagesAudit);
   const observationPlanAudit = buildObservationPlanAudit_(representativePagesAudit);
+  if (payload && payload.candidateSummary && payload.candidateSummary.activeObservationInput) {
+    observationPlanAudit.activeObservationInput = payload.candidateSummary.activeObservationInput;
+    observationPlanAudit.activeObservationInputChanged = payload.candidateSummary.activeObservationInputChanged === true;
+  }
   emitObservationPlanRoleAudit_(payload && payload.origin || '', observationPlanAudit);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
@@ -6056,6 +6113,8 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     return {
       mode: audit && audit.mode || 'audit_only_not_used_for_observation',
       siteTypeForRolePriority: audit && audit.siteTypeForRolePriority || 'default',
+      activeObservationInput: audit && audit.activeObservationInput || '',
+      activeObservationInputChanged: audit && audit.activeObservationInputChanged === true,
       legacyObservationPlan: compactPlan(audit && audit.legacyObservationPlan),
       roleBasedObservationPlan: compactPlan(audit && audit.roleBasedObservationPlan),
       diff: {
@@ -6163,17 +6222,27 @@ function buildSubpageSignalsSummary_(pages) {
 
 function buildSubpageSignalsV1FromSubpageObservation_(payload) {
   const observations = Array.isArray(payload && payload.observations) ? payload.observations : [];
+  const candidates = Array.isArray(payload && payload.candidates) ? payload.candidates : [];
+  const candidateByUrl = new Map();
+  candidates.forEach(candidate => {
+    if (!candidate || !candidate.url) return;
+    candidateByUrl.set(String(candidate.url), candidate);
+  });
   const pages = observations
     .filter(page => page && page.ok === true)
     .slice(0, 5)
     .map(page => {
+      const candidate = candidateByUrl.get(String(page.url || '')) || {};
       const finalUrl = page.finalUrl || page.url || '';
       const path = (() => {
         try { return new URL(String(finalUrl || page.url || '')).pathname || '/'; } catch (_) { return ''; }
       })();
       const h1Texts = Array.isArray(page.h1Texts) ? page.h1Texts : [];
       const jsonLdTypes = Array.isArray(page.jsonldTypes) ? page.jsonldTypes.slice(0, 50) : [];
-      const pageType = inferSubpageSignalsPageType_(page);
+      const candidatePageType = normalizeSubpageJsonLdText(candidate && candidate.pageType);
+      const pageType = candidatePageType && candidatePageType !== 'unknown' && candidatePageType !== 'category_or_detail'
+        ? candidatePageType
+        : inferSubpageSignalsPageType_(page);
       return {
         url: page.url || '',
         finalUrl,
@@ -6499,8 +6568,28 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       memoryGuardScopedProbeSubpageObservation
     });
     const prioritizedCandidates = sortCoverageObserveCandidates_(discovered.candidates, siteMode);
-    const selectedCandidates = prioritizedCandidates.slice(0, maxObserve);
+    const legacySelectedCandidates = prioritizedCandidates.slice(0, maxObserve);
+    const roleBasedSelection = buildRoleBasedSelectedCandidates_(discovered.candidates, { siteMode, maxObserve });
+    const roleBasedSelectedCandidates = Array.isArray(roleBasedSelection.candidates) ? roleBasedSelection.candidates : [];
+    const selectedCandidates = roleBasedSelectedCandidates.length ? roleBasedSelectedCandidates : legacySelectedCandidates;
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    const legacySelectedPaths = legacySelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    const roleBasedSelectedPaths = roleBasedSelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+    try {
+      console.log('[DEBUG][ROLE_BASED_SELECTED_CANDIDATES_AUDIT]', JSON.stringify({
+        origin: normalized.origin,
+        mode: 'active_for_scrape_observation',
+        siteTypeForRolePriority: roleBasedSelection.siteTypeForRolePriority || 'default',
+        rolePriority: Array.isArray(roleBasedSelection.rolePriority) ? roleBasedSelection.rolePriority : [],
+        legacySelectedPaths,
+        roleBasedSelectedPaths,
+        finalSelectedPaths: selectedPaths,
+        finalSelectedPageTypes: selectedCandidates.map(candidate => inferDiscoverCandidatePageType_(candidate, siteMode)).filter(Boolean),
+        usedRoleBasedSelection: roleBasedSelectedCandidates.length > 0,
+        maxObserve,
+        note: 'scrape_observation_input_switched_to_role_based'
+      }));
+    } catch (_) {}
     try {
       const selectedUrlSet = new Set(selectedCandidates.map(candidate => String(candidate && candidate.url || '')));
       const legalAuditCandidates = prioritizedCandidates
@@ -6864,6 +6953,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
         roleRepresentativeCandidates: discovered.roleRepresentativeCandidates,
+        activeObservationInput: roleBasedSelectedCandidates.length ? 'role_based_selected_candidates' : 'legacy_selected_candidates',
+        activeObservationInputChanged: roleBasedSelectedCandidates.length > 0,
         totalCandidates: discovered.totalCandidates,
         observedCount: observations.length
       },
