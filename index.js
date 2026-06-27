@@ -7280,6 +7280,118 @@ function emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFac
   } catch (_) {}
 }
 
+function buildRepresentativeArticleFactsBridgeDryRun_(representativeArticleFacts, representativeArticleFactsBridgeGateAudit, articleSignals) {
+  const facts = representativeArticleFacts && typeof representativeArticleFacts === 'object' ? representativeArticleFacts : null;
+  const gate = representativeArticleFactsBridgeGateAudit && typeof representativeArticleFactsBridgeGateAudit === 'object'
+    ? representativeArticleFactsBridgeGateAudit
+    : {};
+  const valueFor_ = (obj, key) => {
+    const value = obj && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : null;
+    return value == null || value === '' ? null : value;
+  };
+  const gatePassed = gate.gatePassed === true;
+  const writeBlockedReason = gatePassed ? null : (gate.gateBlockedReason || 'gate_not_passed');
+  const headline = valueFor_(facts, 'headline');
+  const datePublished = valueFor_(facts, 'datePublished');
+  const datePublishedPrecision = valueFor_(facts, 'datePublishedPrecision');
+  const dateModified = valueFor_(facts, 'dateModified');
+  const authorName = valueFor_(facts, 'authorName');
+  const publisherName = valueFor_(facts, 'publisherName');
+  const canonicalUrl = valueFor_(facts, 'canonicalUrl');
+  const sourceUrl = valueFor_(facts, 'sourceUrl');
+  const evidencePath = valueFor_(facts, 'evidencePath') || '';
+  const mainEntityOfPage = canonicalUrl || sourceUrl || null;
+  const payload = gatePassed ? {
+    checked: true,
+    source: {
+      representativeArticleFacts: true,
+      jsonLd: false,
+      meta: false
+    },
+    jsonLd: {
+      hasArticleJsonLd: null,
+      hasNewsArticleJsonLd: null,
+      hasBlogPostingJsonLd: null,
+      types: [],
+      headline,
+      datePublished,
+      datePublishedPrecision,
+      dateModified,
+      authorName,
+      authorType: null,
+      publisherName,
+      publisherType: null,
+      publisherLogo: null,
+      mainEntityOfPage,
+      articleSection: null,
+      articleTags: []
+    },
+    meta: {
+      publishedTime: datePublished,
+      modifiedTime: dateModified,
+      author: authorName,
+      section: null,
+      tags: []
+    },
+    summary: {
+      hasArticleType: true,
+      hasHeadline: !!headline,
+      hasPublishedDate: !!datePublished,
+      hasModifiedDate: !!dateModified,
+      hasAuthor: !!authorName,
+      hasPublisher: !!publisherName
+    },
+    representativeBridge: {
+      generatedFrom: 'representativeArticleFacts',
+      datePublishedPrecision,
+      sourceUrl,
+      canonicalUrl,
+      evidencePath,
+      dryRun: true
+    }
+  } : null;
+  return {
+    version: 1,
+    generatedFrom: 'representativeArticleFacts',
+    target: 'facts.articleSignals',
+    dryRun: true,
+    connectedToFactsBridge: false,
+    connectedToDiagnosis: false,
+    wouldWriteFactsArticleSignals: gatePassed,
+    writeBlockedReason,
+    payload,
+    currentArticleSignalsChecked: articleSignals && articleSignals.checked === true
+  };
+}
+
+function emitRepresentativeArticleFactsBridgeDryRunAudit_(representativeArticleFactsBridgeDryRun) {
+  try {
+    const audit = representativeArticleFactsBridgeDryRun || {};
+    const payload = audit.payload && typeof audit.payload === 'object' ? audit.payload : {};
+    const summary = payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
+    const bridge = payload.representativeBridge && typeof payload.representativeBridge === 'object' ? payload.representativeBridge : {};
+    const jsonLd = payload.jsonLd && typeof payload.jsonLd === 'object' ? payload.jsonLd : {};
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_BRIDGE_DRY_RUN_AUDIT]', JSON.stringify({
+      gatePassed: audit.wouldWriteFactsArticleSignals === true,
+      wouldWriteFactsArticleSignals: audit.wouldWriteFactsArticleSignals === true,
+      writeBlockedReason: audit.writeBlockedReason || null,
+      payloadSummary: {
+        checked: payload.checked === true,
+        hasHeadline: summary.hasHeadline === true,
+        hasPublishedDate: summary.hasPublishedDate === true,
+        hasModifiedDate: summary.hasModifiedDate === true,
+        hasAuthor: summary.hasAuthor === true,
+        hasPublisher: summary.hasPublisher === true
+      },
+      datePublished: jsonLd.datePublished || null,
+      datePublishedPrecision: bridge.datePublishedPrecision || null,
+      connectedToFactsBridge: false,
+      connectedToDiagnosis: false,
+      dryRun: true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -8101,6 +8213,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsBridgeGateAudit = buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFacts, representativeArticleFactsAdoptionAudit, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
     geoSignalsV1.representativeArticleFactsBridgeGateAudit = representativeArticleFactsBridgeGateAudit;
     emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFactsBridgeGateAudit);
+    const representativeArticleFactsBridgeDryRun = buildRepresentativeArticleFactsBridgeDryRun_(representativeArticleFacts, representativeArticleFactsBridgeGateAudit, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
+    geoSignalsV1.representativeArticleFactsBridgeDryRun = representativeArticleFactsBridgeDryRun;
+    emitRepresentativeArticleFactsBridgeDryRunAudit_(representativeArticleFactsBridgeDryRun);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -8776,6 +8891,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeArticleFactsBridgeGateAudit
   };
   emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFactsBridgeGateAudit);
+  const representativeArticleFactsBridgeDryRun = buildRepresentativeArticleFactsBridgeDryRun_(representativeArticleFacts, representativeArticleFactsBridgeGateAudit, payload.geoSignalsV1 && payload.geoSignalsV1.articleSignals || payload.geoSignalsV1 && payload.geoSignalsV1.observed && payload.geoSignalsV1.observed.articleSignals);
+  payload.coverageSignalsV1.representativeArticleFactsBridgeDryRun = representativeArticleFactsBridgeDryRun;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeArticleFactsBridgeDryRun
+  };
+  emitRepresentativeArticleFactsBridgeDryRunAudit_(representativeArticleFactsBridgeDryRun);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -12621,6 +12743,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.representativeArticleFactsBridgeGateAudit && typeof g.representativeArticleFactsBridgeGateAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsBridgeGateAudit = g.representativeArticleFactsBridgeGateAudit;
+  }
+  if (g.representativeArticleFactsBridgeDryRun && typeof g.representativeArticleFactsBridgeDryRun === 'object') {
+    shortGeoSignalsV1.representativeArticleFactsBridgeDryRun = g.representativeArticleFactsBridgeDryRun;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
