@@ -4361,6 +4361,19 @@ function inferDiscoverCandidatePageType_(candidate, siteMode = 'generic') {
   if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
   const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || candidate.path) || '');
   if (isDiscoverArticleCandidatePath_(url) || candidate && candidate.source === 'article') return 'article';
+  const path = (() => {
+    try { return new URL(url).pathname.toLowerCase(); } catch (_) { return url.toLowerCase(); }
+  })();
+  if (/\/(?:about|company|corporate|profile|outline|about-us|company-profile)(?:\/|$|-|_)/i.test(path)) return 'about';
+  if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) return 'business';
+  if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) return 'service';
+  if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) return 'case';
+  if (/\/(?:faq|faqs|guide|guides|help|support)(?:\/|$|-|_)/i.test(path)) return 'faq';
+  if (/\/(?:product|products|item|items)(?:\/|$|-|_)/i.test(path)) return 'product';
+  if (/\/(?:category|categories|collections|collection)(?:\/|$|-|_)/i.test(path)) return 'category';
+  if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) return 'recruit';
+  if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) return 'contact';
+  if (/\/(?:privacy|policy|terms|law|legal|cookie|security|sitemap)(?:\/|$|-|_)/i.test(path)) return 'legal';
   return inferSubpageJsonLdPageType(url, siteMode, []);
 }
 
@@ -4423,6 +4436,94 @@ function emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandid
         ])
       ),
       note: 'audit_only_not_used_for_observation'
+    }));
+  } catch (_) {}
+}
+
+function compactRepresentativePageAuditItem_(page, fallbackPageType = '') {
+  const url = page && (page.url || page.finalUrl || page.href) || '';
+  const path = page && page.path || (() => {
+    try { return new URL(String(url || '')).pathname || ''; } catch (_) { return ''; }
+  })();
+  return {
+    url,
+    path,
+    pageType: page && page.pageType || fallbackPageType || '',
+    score: Number(page && page.score || 0),
+    source: page && page.source || '',
+    roleSource: page && page.roleSource || ''
+  };
+}
+
+function buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, opts = {}) {
+  const mode = normalizeSubpageJsonLdText(opts && opts.siteMode || 'generic').toLowerCase();
+  const baseOrder = mode === 'media'
+    ? ['article', 'about', 'contact', 'faq', 'category', 'business', 'service', 'legal']
+    : ['about', 'business', 'service', 'article', 'faq', 'product', 'category', 'recruit', 'contact', 'legal'];
+  const pageTypes = Array.from(new Set(baseOrder.concat(Object.keys(roleRepresentativeCandidates || {}))));
+  const seen = new Set();
+  const out = [];
+  pageTypes.forEach(pageType => {
+    if (out.length >= 3) return;
+    const items = Array.isArray(roleRepresentativeCandidates && roleRepresentativeCandidates[pageType])
+      ? roleRepresentativeCandidates[pageType]
+      : [];
+    const item = items[0];
+    if (!item) return;
+    const key = discoverSubpageCandidateKey(item.url || item.path || '');
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(Object.assign(compactRepresentativePageAuditItem_(item, pageType), {
+      roleSource: 'roleRepresentativeCandidates'
+    }));
+  });
+  return out;
+}
+
+function buildRepresentativePagesAudit_(legacyRepresentativePages, roleRepresentativeCandidates, opts = {}) {
+  const legacy = (Array.isArray(legacyRepresentativePages) ? legacyRepresentativePages : [])
+    .map(page => compactRepresentativePageAuditItem_(page))
+    .filter(page => page.path || page.url);
+  const roleBased = buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, opts);
+  const pathOf = page => {
+    const raw = page && (page.path || page.url || page.href) || '';
+    const path = (() => {
+      try { return new URL(String(raw || '')).pathname || ''; } catch (_) { return String(raw || ''); }
+    })();
+    return path && path !== '/' ? path.replace(/\/$/, '') : path;
+  };
+  const legacyPaths = legacy.map(pathOf).filter(Boolean);
+  const roleBasedPaths = roleBased.map(pathOf).filter(Boolean);
+  const legacySet = new Set(legacyPaths);
+  const roleSet = new Set(roleBasedPaths);
+  return {
+    mode: 'audit_only_not_used_for_observation',
+    legacyRepresentativePages: legacy,
+    roleBasedRepresentativePages: roleBased,
+    diff: {
+      legacyPaths,
+      roleBasedPaths,
+      addedByRoleBased: roleBasedPaths.filter(path => !legacySet.has(path)),
+      missingFromRoleBased: legacyPaths.filter(path => !roleSet.has(path))
+    }
+  };
+}
+
+function emitRepresentativePagesRoleAudit_(origin, representativePagesAudit) {
+  try {
+    const audit = representativePagesAudit || {};
+    const legacyPages = Array.isArray(audit.legacyRepresentativePages) ? audit.legacyRepresentativePages : [];
+    const rolePages = Array.isArray(audit.roleBasedRepresentativePages) ? audit.roleBasedRepresentativePages : [];
+    const diff = audit.diff || {};
+    console.log('[DEBUG][REPRESENTATIVE_PAGES_ROLE_AUDIT]', JSON.stringify({
+      origin,
+      mode: 'audit_only_not_used_for_observation',
+      legacyPaths: legacyPages.map(x => x.path || x.url || x.href).filter(Boolean),
+      roleBasedPaths: rolePages.map(x => x.path || x.url || x.href).filter(Boolean),
+      addedByRoleBased: Array.isArray(diff.addedByRoleBased) ? diff.addedByRoleBased : [],
+      missingFromRoleBased: Array.isArray(diff.missingFromRoleBased) ? diff.missingFromRoleBased : [],
+      legacyCount: legacyPages.length,
+      roleBasedCount: rolePages.length
     }));
   } catch (_) {}
 }
@@ -5741,6 +5842,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       return String(a.url || '').localeCompare(String(b.url || ''));
     })
     .slice(0, 10);
+  const representativePagesAudit = buildRepresentativePagesAudit_(representativePages, roleRepresentativeCandidates, {
+    siteMode: payload && payload.siteMode || 'generic'
+  });
+  emitRepresentativePagesRoleAudit_(payload && payload.origin || '', representativePagesAudit);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
@@ -5774,6 +5879,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     hasObservedBreadcrumbList: observedBreadcrumbPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
     representativePages,
+    representativePagesAudit,
     representativeObservationQuality: representativeQualityAudit.quality,
     representativeExtractionDiagnostics: representativeQualityAudit.diagnostics,
     notes
@@ -5800,6 +5906,28 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     });
     return out;
   };
+  const compactRepresentativePagesAudit = (audit) => {
+    const compactPages = pages => (Array.isArray(pages) ? pages : []).slice(0, 5).map(page => ({
+      url: page && page.url || '',
+      path: page && page.path || '',
+      pageType: page && page.pageType || '',
+      score: Number(page && page.score || 0),
+      source: page && page.source || '',
+      roleSource: page && page.roleSource || ''
+    }));
+    const diff = audit && audit.diff || {};
+    return {
+      mode: audit && audit.mode || 'audit_only_not_used_for_observation',
+      legacyRepresentativePages: compactPages(audit && audit.legacyRepresentativePages),
+      roleBasedRepresentativePages: compactPages(audit && audit.roleBasedRepresentativePages),
+      diff: {
+        legacyPaths: Array.isArray(diff.legacyPaths) ? diff.legacyPaths.slice(0, 10) : [],
+        roleBasedPaths: Array.isArray(diff.roleBasedPaths) ? diff.roleBasedPaths.slice(0, 10) : [],
+        addedByRoleBased: Array.isArray(diff.addedByRoleBased) ? diff.addedByRoleBased.slice(0, 10) : [],
+        missingFromRoleBased: Array.isArray(diff.missingFromRoleBased) ? diff.missingFromRoleBased.slice(0, 10) : []
+      }
+    };
+  };
   const qualityPages = coverageSignalsV1.representativeObservationQuality &&
     Array.isArray(coverageSignalsV1.representativeObservationQuality.pages)
     ? coverageSignalsV1.representativeObservationQuality.pages
@@ -5823,6 +5951,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     },
     candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
     roleRepresentativeCandidates: compactRoleRepresentativeCandidates(coverageSignalsV1.roleRepresentativeCandidates),
+    representativePagesAudit: compactRepresentativePagesAudit(coverageSignalsV1.representativePagesAudit),
     representativePages: representativePages.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
