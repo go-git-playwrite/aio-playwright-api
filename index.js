@@ -4395,6 +4395,7 @@ function buildRoleRepresentativeCandidates_(candidates, opts = {}) {
       path: getCoverageCandidatePath_(candidate),
       pageType,
       score: Number(candidate.score || 0),
+      label: candidate.label || '',
       source: candidate.source || '',
       sources: Array.isArray(candidate.sources) ? candidate.sources.slice(0, 8) : (candidate.source ? [candidate.source] : []),
       index
@@ -4409,6 +4410,7 @@ function buildRoleRepresentativeCandidates_(candidates, opts = {}) {
         path: item.path,
         pageType: item.pageType,
         score: item.score,
+        label: item.label,
         source: item.source,
         sources: item.sources
       }));
@@ -7077,14 +7079,45 @@ function extractRepresentativeArticleDateFromPath_(path) {
 
 function extractRepresentativeArticleDateFromText_(text) {
   const value = normalizeSubpageJsonLdText(text);
-  const match = value.match(/\b(20\d{2})[./-](0?[1-9]|1[0-2])(?:[./-](0?[1-9]|[12]\d|3[01]))?\b/);
-  if (!match) return { value: null, precision: null };
-  const year = match[1];
-  const month = String(match[2]).padStart(2, '0');
-  const day = match[3] ? String(match[3]).padStart(2, '0') : '';
+  const dayMatch = value.match(/\b(20\d{2})[./-](0?[1-9]|1[0-2])[./-](0?[1-9]|[12]\d|3[01])\b/) ||
+    value.match(/\b(20\d{2})年\s*(0?[1-9]|1[0-2])月\s*(0?[1-9]|[12]\d|3[01])日\b/);
+  if (dayMatch) {
+    const year = dayMatch[1];
+    const month = String(dayMatch[2]).padStart(2, '0');
+    const day = String(dayMatch[3]).padStart(2, '0');
+    return { value: `${year}-${month}-${day}`, precision: 'day' };
+  }
+  const monthMatch = value.match(/\b(20\d{2})[./-](0?[1-9]|1[0-2])\b/) ||
+    value.match(/\b(20\d{2})年\s*(0?[1-9]|1[0-2])月\b/);
+  if (monthMatch) {
+    const year = monthMatch[1];
+    const month = String(monthMatch[2]).padStart(2, '0');
+    return { value: `${year}-${month}`, precision: 'month' };
+  }
+  const yearMatch = value.match(/\b(20\d{2})\b/);
+  if (yearMatch) return { value: yearMatch[1], precision: 'year' };
+  return { value: null, precision: null };
+}
+
+function pickRepresentativeArticleDateCandidate_(items) {
+  for (const item of (Array.isArray(items) ? items : [])) {
+    const source = item && item.source || null;
+    const rawValue = item && item.value;
+    const direct = normalizeSubpageJsonLdText(rawValue).slice(0, 80);
+    const extracted = extractRepresentativeArticleDateFromText_(rawValue);
+    const value = extracted.value || (item && item.allowDirectDate === true ? direct : null) || null;
+    if (!value) continue;
+    const precision = item && item.precision || extracted.precision || inferRepresentativeArticleDatePrecision_(value);
+    return {
+      value,
+      precision: precision || null,
+      source
+    };
+  }
   return {
-    value: day ? `${year}-${month}-${day}` : `${year}-${month}`,
-    precision: day ? 'day' : 'month'
+    value: null,
+    precision: null,
+    source: null
   };
 }
 
@@ -7094,10 +7127,28 @@ function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opt
   const addCandidate = (source, item) => {
     if (!item || typeof item !== 'object') return;
     const facts = item.facts && typeof item.facts === 'object' ? item.facts : item;
+    const articleSignals = item.articleSignals && typeof item.articleSignals === 'object' ? item.articleSignals : {};
+    const articleJsonLd = articleSignals.jsonLd && typeof articleSignals.jsonLd === 'object' ? articleSignals.jsonLd : {};
+    const articleMeta = articleSignals.meta && typeof articleSignals.meta === 'object' ? articleSignals.meta : {};
     const pageType = normalizeSubpageJsonLdText(item.pageType || facts.pageType || '');
     const role = normalizeSubpageJsonLdText(item.role || facts.role || '');
     const rawPath = normalizeSubpageJsonLdText(item.path || facts.path || '');
-    const labelText = normalizeSubpageJsonLdText(item.label || item.text || item.title || facts.label || facts.text || facts.title || '');
+    const labelText = normalizeSubpageJsonLdText(item.label || facts.label || '');
+    const textSample = normalizeSubpageJsonLdText(
+      item.text ||
+      facts.text ||
+      item.summary ||
+      facts.summary ||
+      item.snippet ||
+      facts.snippet ||
+      item.rawText ||
+      facts.rawText ||
+      item.sampledText ||
+      facts.sampledText ||
+      item.bodySample ||
+      facts.bodySample ||
+      ''
+    );
     const rawUrl = item.url || item.finalUrl || item.href || facts.url || facts.sourceUrl || facts.canonicalUrl || rawPath;
     const sourceUrl = resolveRepresentativeArticleUrl_(facts.sourceUrl || item.sourceUrl || rawUrl, baseUrl);
     const canonicalUrl = resolveRepresentativeArticleUrl_(facts.canonicalUrl || item.canonicalUrl || sourceUrl || rawUrl, baseUrl);
@@ -7110,40 +7161,68 @@ function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opt
       /\/(?:post|posts|article|articles|news|topics|column|blog|entry|story|stories|information)(?:\/|$)/i.test(path || sourceUrl || '');
     if (!isArticleLike) return;
     const pathDate = extractRepresentativeArticleDateFromPath_(path);
-    const labelDate = extractRepresentativeArticleDateFromText_(labelText);
+    const dateInputs = [
+      { value: facts.datePublished, source: `${source}.facts.datePublished`, allowDirectDate: true },
+      { value: facts.publishedAt, source: `${source}.facts.publishedAt`, allowDirectDate: true },
+      { value: facts.publishedDate, source: `${source}.facts.publishedDate`, allowDirectDate: true },
+      { value: facts.date, source: `${source}.facts.date`, allowDirectDate: true },
+      { value: facts.datetime, source: `${source}.facts.datetime`, allowDirectDate: true },
+      { value: facts.time, source: `${source}.facts.time`, allowDirectDate: true },
+      { value: facts.modifiedAt, source: `${source}.facts.modifiedAt`, allowDirectDate: true },
+      { value: facts.updatedAt, source: `${source}.facts.updatedAt`, allowDirectDate: true },
+      { value: item.datePublished, source: `${source}.datePublished`, allowDirectDate: true },
+      { value: item.publishedAt, source: `${source}.publishedAt`, allowDirectDate: true },
+      { value: item.publishedDate, source: `${source}.publishedDate`, allowDirectDate: true },
+      { value: item.date, source: `${source}.date`, allowDirectDate: true },
+      { value: item.datetime, source: `${source}.datetime`, allowDirectDate: true },
+      { value: item.time, source: `${source}.time`, allowDirectDate: true },
+      { value: item.modifiedAt, source: `${source}.modifiedAt`, allowDirectDate: true },
+      { value: item.updatedAt, source: `${source}.updatedAt`, allowDirectDate: true },
+      { value: articleJsonLd.datePublished, source: `${source}.articleSignals.jsonLd.datePublished`, allowDirectDate: true },
+      { value: articleMeta.publishedTime, source: `${source}.articleSignals.meta.publishedTime`, allowDirectDate: true },
+      { value: articleJsonLd.dateModified, source: `${source}.articleSignals.jsonLd.dateModified`, allowDirectDate: true },
+      { value: articleMeta.modifiedTime, source: `${source}.articleSignals.meta.modifiedTime`, allowDirectDate: true },
+      { value: labelText, source: `${source}.label` },
+      { value: textSample, source: `${source}.textSample` },
+      { value: item.title || facts.title, source: `${source}.title` },
+      { value: item.h1 || facts.h1, source: `${source}.h1` },
+      { value: pathDate.value, source: `${source}.path`, precision: pathDate.precision, allowDirectDate: true }
+    ];
+    const dateCandidateSources = dateInputs
+      .map(input => {
+        const picked = pickRepresentativeArticleDateCandidate_([input]);
+        return picked.value ? {
+          source: input.source || null,
+          value: picked.value,
+          precision: picked.precision || null
+        } : null;
+      })
+      .filter(Boolean);
+    const pickedDate = dateCandidateSources[0] || { value: null, precision: null, source: null };
     const headline = normalizeSubpageJsonLdText(
       facts.headline ||
+      articleJsonLd.headline ||
       facts.title ||
       item.headline ||
       item.title ||
       item.h1 ||
       labelText
     ).slice(0, 180) || null;
-    const datePublished = normalizeSubpageJsonLdText(
-      facts.datePublished ||
-      facts.publishedAt ||
-      facts.date ||
-      facts.time ||
-      item.datePublished ||
-      item.publishedAt ||
-      item.date ||
-      item.time ||
-      labelDate.value ||
-      pathDate.value
-    ).slice(0, 80) || null;
+    const datePublished = pickedDate.value || null;
     const datePublishedPrecision = facts.datePublishedPrecision ||
       item.datePublishedPrecision ||
-      labelDate.precision ||
-      pathDate.precision ||
+      pickedDate.precision ||
       inferRepresentativeArticleDatePrecision_(datePublished);
     const dateModified = normalizeSubpageJsonLdText(
       facts.dateModified ||
       facts.modifiedAt ||
       item.dateModified ||
-      item.modifiedAt
+      item.modifiedAt ||
+      articleJsonLd.dateModified ||
+      articleMeta.modifiedTime
     ).slice(0, 80) || null;
-    const authorName = normalizeSubpageJsonLdText(facts.authorName || facts.author || item.authorName || item.author).slice(0, 160) || null;
-    const publisherName = normalizeSubpageJsonLdText(facts.publisherName || facts.publisher || item.publisherName || item.publisher).slice(0, 160) || null;
+    const authorName = normalizeSubpageJsonLdText(facts.authorName || facts.author || item.authorName || item.author || articleJsonLd.authorName || articleMeta.author).slice(0, 160) || null;
+    const publisherName = normalizeSubpageJsonLdText(facts.publisherName || facts.publisher || item.publisherName || item.publisher || articleJsonLd.publisherName).slice(0, 160) || null;
     const hasIdentity = !!(headline || sourceUrl || canonicalUrl);
     if (!hasIdentity) return;
     candidates.push({
@@ -7155,6 +7234,8 @@ function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opt
       headline,
       datePublished,
       datePublishedPrecision: datePublishedPrecision || null,
+      datePublishedSource: pickedDate.source || null,
+      dateCandidateSources,
       dateModified,
       authorName,
       publisherName,
@@ -7167,6 +7248,10 @@ function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opt
   const articleSignals = opts && opts.representativeSignals && opts.representativeSignals.roles && opts.representativeSignals.roles.article;
   (Array.isArray(articleSignals && articleSignals.evidencePages) ? articleSignals.evidencePages : [])
     .forEach(item => addCandidate('representativeSignals.roles.article.evidencePages', item));
+  (Array.isArray(opts && opts.observations) ? opts.observations : [])
+    .forEach(item => addCandidate('observations', item));
+  (Array.isArray(opts && opts.subpageSignals && opts.subpageSignals.pages) ? opts.subpageSignals.pages : [])
+    .forEach(item => addCandidate('subpageSignals.pages', item));
   const coverageSignals = opts && opts.coverageSignals && typeof opts.coverageSignals === 'object' ? opts.coverageSignals : {};
   (Array.isArray(coverageSignals.representativePages) ? coverageSignals.representativePages : [])
     .forEach(item => addCandidate('coverageSignals.representativePages', item));
@@ -7226,6 +7311,10 @@ function buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, opt
     selectedCandidateHeadline: selected && selected.headline || null,
     selectedCandidateDatePublished: selected && selected.datePublished || null,
     selectedCandidateDatePublishedPrecision: selected && selected.datePublishedPrecision || null,
+    selectedCandidateDateSource: selected && selected.datePublishedSource || null,
+    dateCandidateSources: selected && Array.isArray(selected.dateCandidateSources) ? selected.dateCandidateSources.slice(0, 8) : [],
+    dateCandidateCount: selected && Array.isArray(selected.dateCandidateSources) ? selected.dateCandidateSources.length : 0,
+    dateExtractionBlockedReason: selected && !selected.datePublished ? 'date_not_found_in_candidate_sources' : null,
     filledKeys,
     missingKeys,
     blockedReason: selected ? null : 'no_article_candidate',
@@ -7283,6 +7372,9 @@ function emitRepresentativeArticleFactsSourceAudit_(audit) {
       selectedCandidateHeadline: audit && audit.selectedCandidateHeadline || null,
       selectedCandidateDatePublished: audit && audit.selectedCandidateDatePublished || null,
       selectedCandidateDatePublishedPrecision: audit && audit.selectedCandidateDatePublishedPrecision || null,
+      selectedCandidateDateSource: audit && audit.selectedCandidateDateSource || null,
+      dateCandidateCount: Number(audit && audit.dateCandidateCount || 0),
+      dateExtractionBlockedReason: audit && audit.dateExtractionBlockedReason || null,
       filledKeys: Array.isArray(audit && audit.filledKeys) ? audit.filledKeys : [],
       missingKeys: Array.isArray(audit && audit.missingKeys) ? audit.missingKeys : [],
       blockedReason: audit && audit.blockedReason || null,
@@ -8784,6 +8876,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsSourceAudit = buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, {
       representativeSignals,
       coverageSignals,
+      observations,
+      subpageSignals,
       topUrl: normalized.topUrl
     });
     geoSignalsV1.representativeArticleFactsSourceAudit = compactRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
@@ -9470,6 +9564,8 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   const representativeArticleFactsSourceAudit = buildRepresentativeArticleFactsSourceAudit_(representativeEvidence, {
     representativeSignals,
     coverageSignals: payload.coverageSignalsV1,
+    observations,
+    subpageSignals,
     topUrl: normalized.topUrl
   });
   payload.coverageSignalsV1.representativeArticleFactsSourceAudit = compactRepresentativeArticleFactsSourceAudit_(representativeArticleFactsSourceAudit);
