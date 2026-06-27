@@ -7515,6 +7515,72 @@ function emitRepresentativeArticleFactsBridgeAdoptionDecisionAudit_(representati
   } catch (_) {}
 }
 
+function buildSelectedArticleSignalsForFactsBridge_(articleSignals, representativeArticleFactsBridgeDryRun, representativeArticleFactsBridgeAdoptionDecisionAudit) {
+  const current = articleSignals && typeof articleSignals === 'object' ? articleSignals : null;
+  const dryRun = representativeArticleFactsBridgeDryRun && typeof representativeArticleFactsBridgeDryRun === 'object'
+    ? representativeArticleFactsBridgeDryRun
+    : {};
+  const adoption = representativeArticleFactsBridgeAdoptionDecisionAudit && typeof representativeArticleFactsBridgeAdoptionDecisionAudit === 'object'
+    ? representativeArticleFactsBridgeAdoptionDecisionAudit
+    : {};
+  const representativePayload = dryRun.payload && typeof dryRun.payload === 'object' ? dryRun.payload : null;
+  const useRepresentative = adoption.adoptionDecision === 'adopt_representative_payload' &&
+    dryRun.wouldWriteFactsArticleSignals === true &&
+    !!representativePayload;
+  const selected = useRepresentative ? representativePayload : current;
+  const selectedJsonLd = selected && selected.jsonLd && typeof selected.jsonLd === 'object' ? selected.jsonLd : {};
+  const selectedSummary = selected && selected.summary && typeof selected.summary === 'object' ? selected.summary : {};
+  const selectedBridge = selected && selected.representativeBridge && typeof selected.representativeBridge === 'object' ? selected.representativeBridge : {};
+  const selectedSource = useRepresentative ? 'representativeArticleFactsBridgeDryRun' : 'currentArticleSignals';
+  const audit = {
+    version: 1,
+    target: 'facts.articleSignals',
+    generatedFrom: 'representativeArticleFactsBridgeAdoptionDecisionAudit',
+    selectedSource,
+    selectedRepresentativePayload: useRepresentative,
+    selectedCurrentArticleSignals: !useRepresentative,
+    connectedToFactsBridge: true,
+    connectedToDiagnosis: false,
+    originalArticleSignalsPreserved: true,
+    representativeDryRunPayloadPreserved: true,
+    adoptionDecision: adoption.adoptionDecision || null,
+    adoptionReason: adoption.adoptionReason || null,
+    adoptionBlockedReason: adoption.adoptionBlockedReason || null,
+    replacementRisk: adoption.replacementRisk || null,
+    selectedChecked: selected && selected.checked === true,
+    selectedHasHeadline: selectedSummary.hasHeadline === true || !!selectedJsonLd.headline,
+    selectedHasPublishedDate: selectedSummary.hasPublishedDate === true || !!selectedJsonLd.datePublished,
+    selectedDatePublished: selectedJsonLd.datePublished || null,
+    selectedDatePublishedPrecision: selectedJsonLd.datePublishedPrecision || selectedBridge.datePublishedPrecision || null,
+    selectedMainEntityOfPage: selectedJsonLd.mainEntityOfPage || null
+  };
+  return {
+    selectedArticleSignalsForFactsBridge: selected || null,
+    selectedArticleSignalsForFactsBridgeAudit: audit
+  };
+}
+
+function emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsForFactsBridgeAudit) {
+  try {
+    const audit = selectedArticleSignalsForFactsBridgeAudit || {};
+    console.log('[DEBUG][SELECTED_ARTICLE_SIGNALS_FOR_FACTS_BRIDGE_AUDIT]', JSON.stringify({
+      selectedSource: audit.selectedSource || null,
+      selectedRepresentativePayload: audit.selectedRepresentativePayload === true,
+      selectedCurrentArticleSignals: audit.selectedCurrentArticleSignals === true,
+      adoptionDecision: audit.adoptionDecision || null,
+      replacementRisk: audit.replacementRisk || null,
+      selectedChecked: audit.selectedChecked === true,
+      selectedHasHeadline: audit.selectedHasHeadline === true,
+      selectedHasPublishedDate: audit.selectedHasPublishedDate === true,
+      selectedDatePublished: audit.selectedDatePublished || null,
+      selectedDatePublishedPrecision: audit.selectedDatePublishedPrecision || null,
+      connectedToFactsBridge: true,
+      connectedToDiagnosis: false,
+      originalArticleSignalsPreserved: true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -8342,6 +8408,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsBridgeAdoptionDecisionAudit = buildRepresentativeArticleFactsBridgeAdoptionDecisionAudit_(geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals, representativeArticleFactsBridgeDryRun, representativeArticleFactsBridgeGateAudit);
     geoSignalsV1.representativeArticleFactsBridgeAdoptionDecisionAudit = representativeArticleFactsBridgeAdoptionDecisionAudit;
     emitRepresentativeArticleFactsBridgeAdoptionDecisionAudit_(representativeArticleFactsBridgeAdoptionDecisionAudit);
+    const selectedArticleSignalsForFactsBridgeResult = buildSelectedArticleSignalsForFactsBridge_(geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals, representativeArticleFactsBridgeDryRun, representativeArticleFactsBridgeAdoptionDecisionAudit);
+    geoSignalsV1.selectedArticleSignalsForFactsBridge = selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridge;
+    geoSignalsV1.selectedArticleSignalsForFactsBridgeAudit = selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit;
+    emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -9031,6 +9101,14 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeArticleFactsBridgeAdoptionDecisionAudit
   };
   emitRepresentativeArticleFactsBridgeAdoptionDecisionAudit_(representativeArticleFactsBridgeAdoptionDecisionAudit);
+  const selectedArticleSignalsForFactsBridgeResult = buildSelectedArticleSignalsForFactsBridge_(payload.geoSignalsV1 && payload.geoSignalsV1.articleSignals || payload.geoSignalsV1 && payload.geoSignalsV1.observed && payload.geoSignalsV1.observed.articleSignals, representativeArticleFactsBridgeDryRun, representativeArticleFactsBridgeAdoptionDecisionAudit);
+  payload.coverageSignalsV1.selectedArticleSignalsForFactsBridgeAudit = selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    selectedArticleSignalsForFactsBridge: selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridge,
+    selectedArticleSignalsForFactsBridgeAudit: selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit
+  };
+  emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -12882,6 +12960,12 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.representativeArticleFactsBridgeAdoptionDecisionAudit && typeof g.representativeArticleFactsBridgeAdoptionDecisionAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsBridgeAdoptionDecisionAudit = g.representativeArticleFactsBridgeAdoptionDecisionAudit;
+  }
+  if (g.selectedArticleSignalsForFactsBridge && typeof g.selectedArticleSignalsForFactsBridge === 'object') {
+    shortGeoSignalsV1.selectedArticleSignalsForFactsBridge = g.selectedArticleSignalsForFactsBridge;
+  }
+  if (g.selectedArticleSignalsForFactsBridgeAudit && typeof g.selectedArticleSignalsForFactsBridgeAudit === 'object') {
+    shortGeoSignalsV1.selectedArticleSignalsForFactsBridgeAudit = g.selectedArticleSignalsForFactsBridgeAudit;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
