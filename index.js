@@ -7630,7 +7630,28 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
   );
   const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
   const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit, { siteMode });
-  const selectedCandidates = discovered.candidates.slice(0, limit);
+  const legacySelectedCandidates = discovered.candidates.slice(0, limit);
+  const roleBasedSelection = buildRoleBasedSelectedCandidates_(discovered.candidates, { siteMode, maxObserve: limit });
+  const roleBasedSelectedCandidates = Array.isArray(roleBasedSelection.candidates) ? roleBasedSelection.candidates : [];
+  const selectedCandidates = roleBasedSelectedCandidates.length ? roleBasedSelectedCandidates : legacySelectedCandidates;
+  const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+  const legacySelectedPaths = legacySelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+  const roleBasedSelectedPaths = roleBasedSelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
+  try {
+    console.log('[DEBUG][DISCOVER_OBSERVE_ROLE_BASED_SELECTED_CANDIDATES_AUDIT]', JSON.stringify({
+      origin: normalized.origin,
+      mode: 'active_for_discover_observe_observation',
+      siteTypeForRolePriority: roleBasedSelection.siteTypeForRolePriority || 'default',
+      rolePriority: Array.isArray(roleBasedSelection.rolePriority) ? roleBasedSelection.rolePriority : [],
+      legacySelectedPaths,
+      roleBasedSelectedPaths,
+      finalSelectedPaths: selectedPaths,
+      finalSelectedPageTypes: selectedCandidates.map(candidate => inferDiscoverCandidatePageType_(candidate, siteMode)).filter(Boolean),
+      usedRoleBasedSelection: roleBasedSelectedCandidates.length > 0,
+      limit,
+      note: 'discover_observe_observation_input_switched_to_role_based'
+    }));
+  } catch (_) {}
   const urls = selectedCandidates.map(candidate => candidate.url);
   const observed = await observeSubpageJsonLdLightUrls_(urls, {
     siteMode,
