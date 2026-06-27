@@ -4534,6 +4534,86 @@ function buildRepresentativePagesAudit_(legacyRepresentativePages, roleRepresent
   };
 }
 
+function normalizeObservationPlanAuditPath_(page) {
+  const raw = page && (page.path || page.url || page.href) || '';
+  const path = (() => {
+    try { return new URL(String(raw || '')).pathname || ''; } catch (_) { return String(raw || ''); }
+  })();
+  return path && path !== '/' ? path.replace(/\/$/, '') : path;
+}
+
+function buildObservationPlanAuditItem_(page, source) {
+  return {
+    url: page && page.url || '',
+    path: page && page.path || normalizeObservationPlanAuditPath_(page),
+    pageType: page && page.pageType || '',
+    score: Number(page && page.score || 0),
+    source
+  };
+}
+
+function uniqueObservationPlanAuditPages_(pages, source) {
+  const seen = new Set();
+  const out = [];
+  (Array.isArray(pages) ? pages : []).forEach(page => {
+    const key = normalizeObservationPlanAuditPath_(page) || String(page && page.url || '');
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(buildObservationPlanAuditItem_(page, source));
+  });
+  return out;
+}
+
+function buildObservationPlanAudit_(representativePagesAudit) {
+  const audit = representativePagesAudit || {};
+  const legacyObservationPlan = uniqueObservationPlanAuditPages_(
+    audit.legacyRepresentativePages,
+    'legacyRepresentativePages'
+  );
+  const roleBasedObservationPlan = uniqueObservationPlanAuditPages_(
+    audit.roleBasedRepresentativePages,
+    'roleBasedRepresentativePages'
+  );
+  const legacyPaths = legacyObservationPlan.map(normalizeObservationPlanAuditPath_).filter(Boolean);
+  const roleBasedPaths = roleBasedObservationPlan.map(normalizeObservationPlanAuditPath_).filter(Boolean);
+  const legacySet = new Set(legacyPaths);
+  const roleSet = new Set(roleBasedPaths);
+  return {
+    mode: 'audit_only_not_used_for_observation',
+    siteTypeForRolePriority: audit.siteTypeForRolePriority || 'default',
+    legacyObservationPlan,
+    roleBasedObservationPlan,
+    diff: {
+      legacyPaths,
+      roleBasedPaths,
+      addedByRoleBased: roleBasedPaths.filter(path => !legacySet.has(path)),
+      missingFromRoleBased: legacyPaths.filter(path => !roleSet.has(path))
+    },
+    note: 'audit_only_observation_target_not_changed'
+  };
+}
+
+function emitObservationPlanRoleAudit_(origin, observationPlanAudit) {
+  try {
+    const audit = observationPlanAudit || {};
+    const legacyObservationPlan = Array.isArray(audit.legacyObservationPlan) ? audit.legacyObservationPlan : [];
+    const roleBasedObservationPlan = Array.isArray(audit.roleBasedObservationPlan) ? audit.roleBasedObservationPlan : [];
+    const diff = audit.diff || {};
+    console.log('[DEBUG][OBSERVATION_PLAN_ROLE_AUDIT]', JSON.stringify({
+      origin,
+      mode: 'audit_only_not_used_for_observation',
+      siteTypeForRolePriority: audit.siteTypeForRolePriority || 'default',
+      legacyObservationPaths: legacyObservationPlan.map(x => x.path || x.url || x.href).filter(Boolean),
+      roleBasedObservationPaths: roleBasedObservationPlan.map(x => x.path || x.url || x.href).filter(Boolean),
+      addedByRoleBased: Array.isArray(diff.addedByRoleBased) ? diff.addedByRoleBased : [],
+      missingFromRoleBased: Array.isArray(diff.missingFromRoleBased) ? diff.missingFromRoleBased : [],
+      legacyCount: legacyObservationPlan.length,
+      roleBasedCount: roleBasedObservationPlan.length,
+      note: 'audit_only_observation_target_not_changed'
+    }));
+  } catch (_) {}
+}
+
 function emitRepresentativePagesRoleAudit_(origin, representativePagesAudit) {
   try {
     const audit = representativePagesAudit || {};
@@ -5875,6 +5955,8 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     siteMode: payload && payload.siteMode || 'generic'
   });
   emitRepresentativePagesRoleAudit_(payload && payload.origin || '', representativePagesAudit);
+  const observationPlanAudit = buildObservationPlanAudit_(representativePagesAudit);
+  emitObservationPlanRoleAudit_(payload && payload.origin || '', observationPlanAudit);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
   const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
@@ -5909,6 +5991,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
     representativePages,
     representativePagesAudit,
+    observationPlanAudit,
     representativeObservationQuality: representativeQualityAudit.quality,
     representativeExtractionDiagnostics: representativeQualityAudit.diagnostics,
     notes
@@ -5961,6 +6044,29 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       }
     };
   };
+  const compactObservationPlanAudit = (audit) => {
+    const compactPlan = pages => (Array.isArray(pages) ? pages : []).slice(0, 5).map(page => ({
+      url: page && page.url || '',
+      path: page && page.path || '',
+      pageType: page && page.pageType || '',
+      score: Number(page && page.score || 0),
+      source: page && page.source || ''
+    }));
+    const diff = audit && audit.diff || {};
+    return {
+      mode: audit && audit.mode || 'audit_only_not_used_for_observation',
+      siteTypeForRolePriority: audit && audit.siteTypeForRolePriority || 'default',
+      legacyObservationPlan: compactPlan(audit && audit.legacyObservationPlan),
+      roleBasedObservationPlan: compactPlan(audit && audit.roleBasedObservationPlan),
+      diff: {
+        legacyPaths: Array.isArray(diff.legacyPaths) ? diff.legacyPaths.slice(0, 10) : [],
+        roleBasedPaths: Array.isArray(diff.roleBasedPaths) ? diff.roleBasedPaths.slice(0, 10) : [],
+        addedByRoleBased: Array.isArray(diff.addedByRoleBased) ? diff.addedByRoleBased.slice(0, 10) : [],
+        missingFromRoleBased: Array.isArray(diff.missingFromRoleBased) ? diff.missingFromRoleBased.slice(0, 10) : []
+      },
+      note: audit && audit.note || 'audit_only_observation_target_not_changed'
+    };
+  };
   const qualityPages = coverageSignalsV1.representativeObservationQuality &&
     Array.isArray(coverageSignalsV1.representativeObservationQuality.pages)
     ? coverageSignalsV1.representativeObservationQuality.pages
@@ -5985,6 +6091,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
     roleRepresentativeCandidates: compactRoleRepresentativeCandidates(coverageSignalsV1.roleRepresentativeCandidates),
     representativePagesAudit: compactRepresentativePagesAudit(coverageSignalsV1.representativePagesAudit),
+    observationPlanAudit: compactObservationPlanAudit(coverageSignalsV1.observationPlanAudit),
     representativePages: representativePages.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
