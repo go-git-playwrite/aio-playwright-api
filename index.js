@@ -4455,12 +4455,27 @@ function compactRepresentativePageAuditItem_(page, fallbackPageType = '') {
   };
 }
 
+function getRoleRepresentativePriorityConfig_(siteType) {
+  const normalized = normalizeSubpageJsonLdText(siteType || '').toLowerCase();
+  const siteTypeForRolePriority = ['media', 'corporate', 'ec', 'service'].includes(normalized)
+    ? normalized
+    : 'default';
+  const priorityByType = {
+    media: ['article', 'about', 'contact', 'faq', 'category', 'legal'],
+    corporate: ['about', 'business', 'service', 'case', 'recruit', 'contact', 'faq', 'legal', 'article'],
+    ec: ['product', 'category', 'faq', 'guide', 'support', 'store', 'about', 'contact', 'legal', 'article'],
+    service: ['service', 'business', 'faq', 'case', 'about', 'contact', 'legal', 'article'],
+    default: ['about', 'business', 'service', 'article', 'faq', 'product', 'category', 'contact', 'legal']
+  };
+  return {
+    siteTypeForRolePriority,
+    rolePriority: priorityByType[siteTypeForRolePriority]
+  };
+}
+
 function buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, opts = {}) {
-  const mode = normalizeSubpageJsonLdText(opts && opts.siteMode || 'generic').toLowerCase();
-  const baseOrder = mode === 'media'
-    ? ['article', 'about', 'contact', 'faq', 'category', 'business', 'service', 'legal']
-    : ['about', 'business', 'service', 'article', 'faq', 'product', 'category', 'recruit', 'contact', 'legal'];
-  const pageTypes = Array.from(new Set(baseOrder.concat(Object.keys(roleRepresentativeCandidates || {}))));
+  const priorityConfig = getRoleRepresentativePriorityConfig_(opts && (opts.siteType || opts.siteMode) || 'default');
+  const pageTypes = Array.from(new Set(priorityConfig.rolePriority.concat(Object.keys(roleRepresentativeCandidates || {}))));
   const seen = new Set();
   const out = [];
   pageTypes.forEach(pageType => {
@@ -4477,14 +4492,20 @@ function buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, o
       roleSource: 'roleRepresentativeCandidates'
     }));
   });
-  return out;
+  return {
+    siteTypeForRolePriority: priorityConfig.siteTypeForRolePriority,
+    rolePriority: priorityConfig.rolePriority,
+    availableRoleTypes: Object.keys(roleRepresentativeCandidates || {}),
+    pages: out
+  };
 }
 
 function buildRepresentativePagesAudit_(legacyRepresentativePages, roleRepresentativeCandidates, opts = {}) {
   const legacy = (Array.isArray(legacyRepresentativePages) ? legacyRepresentativePages : [])
     .map(page => compactRepresentativePageAuditItem_(page))
     .filter(page => page.path || page.url);
-  const roleBased = buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, opts);
+  const roleBasedAudit = buildRoleBasedRepresentativePagesAudit_(roleRepresentativeCandidates, opts);
+  const roleBased = roleBasedAudit.pages;
   const pathOf = page => {
     const raw = page && (page.path || page.url || page.href) || '';
     const path = (() => {
@@ -4498,6 +4519,10 @@ function buildRepresentativePagesAudit_(legacyRepresentativePages, roleRepresent
   const roleSet = new Set(roleBasedPaths);
   return {
     mode: 'audit_only_not_used_for_observation',
+    siteTypeForRolePriority: roleBasedAudit.siteTypeForRolePriority,
+    rolePriority: roleBasedAudit.rolePriority,
+    availableRoleTypes: roleBasedAudit.availableRoleTypes,
+    selectedRoleTypes: roleBased.map(page => page.pageType).filter(Boolean),
     legacyRepresentativePages: legacy,
     roleBasedRepresentativePages: roleBased,
     diff: {
@@ -4518,6 +4543,10 @@ function emitRepresentativePagesRoleAudit_(origin, representativePagesAudit) {
     console.log('[DEBUG][REPRESENTATIVE_PAGES_ROLE_AUDIT]', JSON.stringify({
       origin,
       mode: 'audit_only_not_used_for_observation',
+      siteTypeForRolePriority: audit.siteTypeForRolePriority || 'default',
+      rolePriority: Array.isArray(audit.rolePriority) ? audit.rolePriority : [],
+      availableRoleTypes: Array.isArray(audit.availableRoleTypes) ? audit.availableRoleTypes : [],
+      selectedRoleTypes: Array.isArray(audit.selectedRoleTypes) ? audit.selectedRoleTypes : [],
       legacyPaths: legacyPages.map(x => x.path || x.url || x.href).filter(Boolean),
       roleBasedPaths: rolePages.map(x => x.path || x.url || x.href).filter(Boolean),
       addedByRoleBased: Array.isArray(diff.addedByRoleBased) ? diff.addedByRoleBased : [],
@@ -5918,6 +5947,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     const diff = audit && audit.diff || {};
     return {
       mode: audit && audit.mode || 'audit_only_not_used_for_observation',
+      siteTypeForRolePriority: audit && audit.siteTypeForRolePriority || 'default',
+      rolePriority: Array.isArray(audit && audit.rolePriority) ? audit.rolePriority.slice(0, 20) : [],
+      availableRoleTypes: Array.isArray(audit && audit.availableRoleTypes) ? audit.availableRoleTypes.slice(0, 20) : [],
+      selectedRoleTypes: Array.isArray(audit && audit.selectedRoleTypes) ? audit.selectedRoleTypes.slice(0, 10) : [],
       legacyRepresentativePages: compactPages(audit && audit.legacyRepresentativePages),
       roleBasedRepresentativePages: compactPages(audit && audit.roleBasedRepresentativePages),
       diff: {
@@ -7423,6 +7456,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     mode: 'discoverAndObserveSubpagesLight',
     topUrl: normalized.topUrl,
     origin: normalized.origin,
+    siteMode,
     limit,
     candidateSummary: {
       sourceSummary: discovered.sourceSummary,
