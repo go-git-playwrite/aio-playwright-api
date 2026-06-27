@@ -6676,17 +6676,72 @@ function buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence) {
 
 function buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessCandidate, opts = {}) {
   const representativeUsable = representativeFreshnessCandidate && representativeFreshnessCandidate.usable === true;
+  const rawInput = opts && opts.rawFacts && typeof opts.rawFacts === 'object'
+    ? opts.rawFacts
+    : (opts && opts.freshnessOperationSignals && typeof opts.freshnessOperationSignals === 'object' ? opts.freshnessOperationSignals : {});
+  const rawFacts = {
+    hasDatePublished: rawInput.hasDatePublished === true || !!rawInput.datePublished,
+    hasDateModified: rawInput.hasDateModified === true || !!rawInput.dateModified,
+    datePublished: rawInput.datePublished || rawInput.publishedAt || null,
+    dateModified: rawInput.dateModified || rawInput.modifiedAt || null,
+    latestDate: rawInput.latestDate || null,
+    freshnessChecked: rawInput.checked === true || rawInput.observed === true || rawInput.hasNewsDateEvidence === true || rawInput.hasUpdatedDateEvidence === true,
+    freshnessUsable: rawInput.freshnessUsable === true || rawInput.hasNewsDateEvidence === true || rawInput.hasUpdatedDateEvidence === true || !!(rawInput.datePublished || rawInput.dateModified || rawInput.latestDate)
+  };
+  const currentRawAvailable = typeof (opts && opts.currentRawAvailable) === 'boolean'
+    ? opts.currentRawAvailable
+    : rawFacts.freshnessUsable === true;
+  const representativeCandidate = {
+    hasDatePublished: !!(representativeFreshnessCandidate && representativeFreshnessCandidate.datePublished),
+    hasDateModified: !!(representativeFreshnessCandidate && representativeFreshnessCandidate.dateModified),
+    datePublished: representativeFreshnessCandidate && representativeFreshnessCandidate.datePublished || null,
+    dateModified: representativeFreshnessCandidate && representativeFreshnessCandidate.dateModified || null,
+    evidencePagesCount: representativeUsable ? 1 : 0,
+    source: 'representativeEvidence.article.facts'
+  };
+  const rawHasFreshnessEvidence = rawFacts.freshnessUsable === true;
+  const representativeHasFreshnessEvidence = !!(representativeCandidate.datePublished || representativeCandidate.dateModified);
+  const datePublishedMatches = !!(rawFacts.datePublished && representativeCandidate.datePublished && rawFacts.datePublished === representativeCandidate.datePublished);
+  const dateModifiedMatches = !!(rawFacts.dateModified && representativeCandidate.dateModified && rawFacts.dateModified === representativeCandidate.dateModified);
+  const representativeIsAdditive = !rawHasFreshnessEvidence && representativeHasFreshnessEvidence;
+  const representativeIsMissingRawEvidence = rawHasFreshnessEvidence && !representativeHasFreshnessEvidence;
+  const comparison = {
+    rawHasFreshnessEvidence,
+    representativeHasFreshnessEvidence,
+    rawDatePublished: rawFacts.datePublished,
+    representativeDatePublished: representativeCandidate.datePublished,
+    rawDateModified: rawFacts.dateModified,
+    representativeDateModified: representativeCandidate.dateModified,
+    datePublishedMatches,
+    dateModifiedMatches,
+    representativeIsAdditive,
+    representativeIsMissingRawEvidence,
+    safeToSwitch: false
+  };
+  const decisionReason = !representativeHasFreshnessEvidence
+    ? 'no_representative_candidate_raw_locked'
+    : (representativeIsMissingRawEvidence
+      ? 'representative_missing_raw_evidence_raw_locked'
+      : (representativeIsAdditive
+        ? 'representative_additive_but_raw_locked'
+        : ((datePublishedMatches || dateModifiedMatches)
+          ? 'representative_matches_raw_but_raw_locked'
+          : 'phase1_compare_only_raw_locked')));
   return {
     version: 1,
     target: 'freshness',
     representativeUsable,
-    currentRawAvailable: typeof (opts && opts.currentRawAvailable) === 'boolean' ? opts.currentRawAvailable : false,
+    currentRawAvailable,
     selectedSource: 'raw',
     wouldUseRepresentative: representativeUsable,
     switched: false,
     reason: representativeUsable
       ? 'representative freshness candidate is available, but raw facts remain selected in this phase'
       : 'representative freshness candidate is not available, raw facts remain selected',
+    rawFacts,
+    representativeCandidate,
+    comparison,
+    decisionReason,
     representative: {
       datePublished: representativeFreshnessCandidate && representativeFreshnessCandidate.datePublished || null,
       dateModified: representativeFreshnessCandidate && representativeFreshnessCandidate.dateModified || null,
@@ -6699,17 +6754,11 @@ function buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessCandid
 function emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit) {
   try {
     const representative = freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.representative || {};
-    console.log('[DEBUG][FRESHNESS_FACTS_BRIDGE_V2_DECISION_AUDIT]', JSON.stringify({
-      representativeUsable: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.representativeUsable === true,
-      currentRawAvailable: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.currentRawAvailable === true,
-      selectedSource: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.selectedSource || 'raw',
-      wouldUseRepresentative: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.wouldUseRepresentative === true,
-      switched: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.switched === true,
-      reason: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.reason || '',
+    console.log('[DEBUG][FRESHNESS_FACTS_BRIDGE_V2_DECISION_AUDIT]', JSON.stringify(Object.assign({}, freshnessFactsBridgeV2DecisionAudit || {}, {
       representativeDatePublished: representative.datePublished || null,
       representativeDateModified: representative.dateModified || null,
       representativeEvidencePath: representative.evidencePath || ''
-    }));
+    })));
   } catch (_) {}
 }
 
@@ -7528,7 +7577,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     geoSignalsV1.representativeFactsDiffAudit = representativeFactsDiffAudit;
     emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
     const representativeFreshnessFactsCandidate = buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence);
-    const freshnessFactsBridgeV2DecisionAudit = buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessFactsCandidate);
+    const freshnessFactsBridgeV2DecisionAudit = buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessFactsCandidate, {
+      rawFacts: geoSignalsV1.freshnessOperationSignals || geoSignalsV1.observed && geoSignalsV1.observed.freshnessOperationSignals || null
+    });
     geoSignalsV1.freshnessFactsBridgeV2DecisionAudit = freshnessFactsBridgeV2DecisionAudit;
     emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit);
     geoSignalsV1.coverageSignals = coverageSignals;
@@ -11983,6 +12034,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
       htmlContentLdJsonScan: geoDiagnostics.htmlContentLdJsonScan
     }
   };
+  if (g.freshnessFactsBridgeV2DecisionAudit && typeof g.freshnessFactsBridgeV2DecisionAudit === 'object') {
+    shortGeoSignalsV1.freshnessFactsBridgeV2DecisionAudit = g.freshnessFactsBridgeV2DecisionAudit;
+  }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
   if (Array.isArray(shortLightweightSummary.seoJsonldTypes)) shortLightweightSummary.seoJsonldTypes = shortLightweightSummary.seoJsonldTypes.slice(0, 50);
