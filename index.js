@@ -10358,6 +10358,10 @@ function exposeFreshnessOperationSignalsInScrapeResponse_(payload) {
     };
     payload.geoSignalsV1 = payload.geoSignalsV1 && typeof payload.geoSignalsV1 === 'object' ? payload.geoSignalsV1 : geoSignalsV1;
     payload.geoSignalsV1.freshnessOperationResponseExposureAudit = audit;
+    const pipelineAudit = buildFreshnessPipelineAudit_(payload.geoSignalsV1, payload.url || payload.finalUrl || '');
+    payload.geoSignalsV1.freshnessPipelineAudit = pipelineAudit;
+    payload.geoSignalsV1.sitakkeTopFreshnessPipelineAudit = pipelineAudit;
+    emitFreshnessPipelineAudit_(pipelineAudit);
     console.log('[DEBUG][FRESHNESS_OPERATION_RESPONSE_EXPOSURE_AUDIT]', JSON.stringify(audit));
     return payload;
   } catch (e) {
@@ -10372,6 +10376,92 @@ function exposeFreshnessOperationSignalsInScrapeResponse_(payload) {
     } catch (_) {}
     return payload;
   }
+}
+
+function buildFreshnessPipelineAudit_(geoSignalsV1, url) {
+  const g = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const articleFacts = g.representativeArticleFacts && typeof g.representativeArticleFacts === 'object' ? g.representativeArticleFacts : null;
+  const gate = g.representativeArticleFactsBridgeGateAudit && typeof g.representativeArticleFactsBridgeGateAudit === 'object' ? g.representativeArticleFactsBridgeGateAudit : null;
+  const dryRun = g.representativeArticleFactsBridgeDryRun && typeof g.representativeArticleFactsBridgeDryRun === 'object' ? g.representativeArticleFactsBridgeDryRun : null;
+  const adoption = g.representativeArticleFactsBridgeAdoptionDecisionAudit && typeof g.representativeArticleFactsBridgeAdoptionDecisionAudit === 'object' ? g.representativeArticleFactsBridgeAdoptionDecisionAudit : null;
+  const selected = g.selectedArticleSignalsForFactsBridge && typeof g.selectedArticleSignalsForFactsBridge === 'object' ? g.selectedArticleSignalsForFactsBridge : null;
+  const selectedJsonLd = selected && selected.jsonLd && typeof selected.jsonLd === 'object' ? selected.jsonLd : {};
+  const selectedSummary = selected && selected.summary && typeof selected.summary === 'object' ? selected.summary : {};
+  const freshnessInput = g.freshnessOperationSignalsInputAudit && typeof g.freshnessOperationSignalsInputAudit === 'object' ? g.freshnessOperationSignalsInputAudit : null;
+  const freshness = g.freshnessOperationSignals && typeof g.freshnessOperationSignals === 'object'
+    ? g.freshnessOperationSignals
+    : (g.observed && g.observed.freshnessOperationSignals && typeof g.observed.freshnessOperationSignals === 'object' ? g.observed.freshnessOperationSignals : null);
+  const hasMeaningfulArticleFacts = !!(articleFacts && (
+    articleFacts.headline ||
+    articleFacts.datePublished ||
+    articleFacts.dateModified ||
+    articleFacts.sourceUrl ||
+    articleFacts.canonicalUrl
+  ));
+  let stoppedAt = 'unknown';
+  if (!hasMeaningfulArticleFacts) {
+    stoppedAt = 'representative_article_facts_missing';
+  } else if (gate && gate.gatePassed !== true) {
+    stoppedAt = 'representative_gate_failed';
+  } else if (!dryRun || dryRun.wouldWriteFactsArticleSignals !== true) {
+    stoppedAt = 'representative_dry_run_missing';
+  } else if (adoption && adoption.adoptionDecision !== 'adopt_representative_payload') {
+    stoppedAt = 'representative_adoption_not_selected';
+  } else if (!selected) {
+    stoppedAt = 'selected_article_signals_missing';
+  } else if (selected.checked !== true) {
+    stoppedAt = 'selected_article_signals_not_checked';
+  } else if (!freshnessInput) {
+    stoppedAt = 'freshness_input_missing';
+  } else if (freshnessInput.freshnessOperationSignalsGenerated !== true) {
+    stoppedAt = 'freshness_input_not_generated';
+  } else if (freshness) {
+    stoppedAt = 'freshness_operation_generated';
+  }
+  return {
+    version: 1,
+    url: url || g.url || '',
+    target: 'freshnessOperationSignals',
+    hasRepresentativeArticleFacts: !!articleFacts,
+    representativeArticleFactsHeadline: articleFacts && articleFacts.headline || null,
+    representativeArticleFactsDatePublished: articleFacts && articleFacts.datePublished || null,
+    representativeArticleFactsDatePublishedPrecision: articleFacts && articleFacts.datePublishedPrecision || null,
+    representativeArticleFactsSourceUrl: articleFacts && articleFacts.sourceUrl || null,
+    hasRepresentativeArticleFactsBridgeGateAudit: !!gate,
+    representativeGatePassed: gate ? gate.gatePassed === true : false,
+    representativeGateBlockedReason: gate && gate.gateBlockedReason || null,
+    hasRepresentativeArticleFactsBridgeDryRun: !!dryRun,
+    representativeDryRunWouldWrite: dryRun ? dryRun.wouldWriteFactsArticleSignals === true : false,
+    representativeDryRunBlockedReason: dryRun && dryRun.writeBlockedReason || null,
+    hasRepresentativeArticleFactsBridgeAdoptionDecisionAudit: !!adoption,
+    representativeAdoptionDecision: adoption && adoption.adoptionDecision || null,
+    representativeAdoptionBlockedReason: adoption && adoption.adoptionBlockedReason || null,
+    hasSelectedArticleSignalsForFactsBridge: !!selected,
+    selectedArticleSignalsChecked: selected ? selected.checked === true : false,
+    selectedArticleSignalsHasHeadline: selectedSummary.hasHeadline === true || !!selectedJsonLd.headline,
+    selectedArticleSignalsHasPublishedDate: selectedSummary.hasPublishedDate === true || !!selectedJsonLd.datePublished,
+    selectedArticleSignalsDatePublished: selectedJsonLd.datePublished || null,
+    selectedArticleSignalsDatePublishedPrecision: selectedJsonLd.datePublishedPrecision || null,
+    hasFreshnessOperationSignalsInputAudit: !!freshnessInput,
+    freshnessInputUsedSelectedArticleSignals: freshnessInput ? freshnessInput.usedSelectedArticleSignalsForFreshness === true : false,
+    freshnessInputArticleSignalsChecked: freshnessInput ? freshnessInput.articleSignalsChecked === true : false,
+    freshnessInputHasPublishedDate: freshnessInput ? freshnessInput.hasPublishedDate === true : false,
+    freshnessInputDatePublished: freshnessInput && freshnessInput.datePublished || null,
+    freshnessInputDatePublishedPrecision: freshnessInput && freshnessInput.datePublishedPrecision || null,
+    freshnessInputGenerated: freshnessInput ? freshnessInput.freshnessOperationSignalsGenerated === true : false,
+    freshnessInputNullReason: freshnessInput && freshnessInput.freshnessOperationSignalsNullReason || null,
+    hasFreshnessOperationSignals: !!freshness,
+    freshnessOperationSignalsChecked: freshness ? freshness.checked === true : false,
+    freshnessOperationSignalsDatePublished: freshness && freshness.datePublished || null,
+    freshnessOperationSignalsDatePublishedPrecision: freshness && freshness.datePublishedPrecision || null,
+    stoppedAt
+  };
+}
+
+function emitFreshnessPipelineAudit_(audit) {
+  try {
+    console.log('[DEBUG][SITAKKE_TOP_FRESHNESS_PIPELINE_AUDIT]', JSON.stringify(audit || {}));
+  } catch (_) {}
 }
 
 async function buildGeoSignalsV1(page, url, opts = {}) {
