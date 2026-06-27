@@ -6517,6 +6517,53 @@ function emitRepresentativeEvidenceArticleAudit_(representativeEvidence) {
   } catch (_) {}
 }
 
+function buildRepresentativeFactsReadinessV1_(representativeEvidence) {
+  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+  const buildReadiness = (target) => {
+    const matched = items.filter(item => item && Array.isArray(item.usableFor) && item.usableFor.includes(target));
+    const roles = Array.from(new Set(matched.map(item => String(item && item.role || '').trim()).filter(Boolean)));
+    return {
+      usable: matched.length > 0,
+      evidenceCount: matched.length,
+      roles
+    };
+  };
+  return {
+    version: 1,
+    generatedFrom: 'representativeEvidence',
+    readiness: {
+      freshness: buildReadiness('freshness'),
+      identity: buildReadiness('identity'),
+      contentUnderstanding: buildReadiness('contentUnderstanding')
+    }
+  };
+}
+
+function emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness) {
+  try {
+    const readiness = representativeFactsReadiness && representativeFactsReadiness.readiness || {};
+    const freshness = readiness.freshness || {};
+    const identity = readiness.identity || {};
+    const contentUnderstanding = readiness.contentUnderstanding || {};
+    const rolesSet = new Set();
+    [freshness, identity, contentUnderstanding].forEach(item => {
+      (Array.isArray(item && item.roles) ? item.roles : []).forEach(role => {
+        if (role) rolesSet.add(role);
+      });
+    });
+    console.log('[DEBUG][REPRESENTATIVE_FACTS_READINESS_AUDIT]', JSON.stringify({
+      hasRepresentativeEvidence: !!representativeEvidence,
+      freshnessUsable: freshness.usable === true,
+      identityUsable: identity.usable === true,
+      contentUnderstandingUsable: contentUnderstanding.usable === true,
+      freshnessEvidenceCount: Number(freshness.evidenceCount || 0),
+      identityEvidenceCount: Number(identity.evidenceCount || 0),
+      contentUnderstandingEvidenceCount: Number(contentUnderstanding.evidenceCount || 0),
+      roles: Array.from(rolesSet)
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7322,6 +7369,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
     geoSignalsV1.representativeEvidence = representativeEvidence;
     emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
+    const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
+    geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
+    emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -7946,6 +7996,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeEvidence
   };
   emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
+  const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
+  payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeFactsReadiness
+  };
+  emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
   try {
     const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
     console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
