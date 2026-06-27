@@ -6999,6 +6999,73 @@ function emitRepresentativeArticleFactsAdoptionAudit_(representativeArticleFacts
   } catch (_) {}
 }
 
+function buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFacts, representativeArticleFactsAdoptionAudit, articleSignals) {
+  const facts = representativeArticleFacts && typeof representativeArticleFacts === 'object' ? representativeArticleFacts : null;
+  const adoption = representativeArticleFactsAdoptionAudit && typeof representativeArticleFactsAdoptionAudit === 'object'
+    ? representativeArticleFactsAdoptionAudit
+    : {};
+  const articleSummary = articleSignals && articleSignals.summary && typeof articleSignals.summary === 'object' ? articleSignals.summary : {};
+  const valueFor_ = (obj, key) => {
+    const value = obj && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : null;
+    return value == null || value === '' ? null : value;
+  };
+  const requiredIdentityPassed = !!(
+    valueFor_(facts, 'headline') ||
+    valueFor_(facts, 'canonicalUrl') ||
+    valueFor_(facts, 'sourceUrl')
+  );
+  const requiredDatePassed = !!(
+    valueFor_(facts, 'datePublished') ||
+    valueFor_(facts, 'dateModified')
+  );
+  const adoptionCandidate = adoption.adoptionCandidate === true;
+  const gatePassed = adoptionCandidate && !!facts && requiredIdentityPassed && requiredDatePassed;
+  const gateBlockedReason = gatePassed
+    ? null
+    : (!adoptionCandidate
+      ? 'adoption_candidate_false'
+      : (!facts
+        ? 'representative_article_facts_missing'
+        : (!requiredIdentityPassed
+          ? 'no_identity_fields'
+          : (!requiredDatePassed ? 'no_date_fields' : null))));
+  return {
+    version: 1,
+    generatedFrom: 'representativeArticleFactsAdoptionAudit',
+    target: 'facts.articleSignals',
+    connectedToFactsBridge: false,
+    connectedToDiagnosis: false,
+    wouldWriteFactsArticleSignals: false,
+    gatePassed,
+    gateBlockedReason,
+    requiredIdentityPassed,
+    requiredDatePassed,
+    representativeFilledKeys: Array.isArray(adoption.representativeFilledKeys) ? adoption.representativeFilledKeys : [],
+    representativeMissingKeys: Array.isArray(adoption.representativeMissingKeys) ? adoption.representativeMissingKeys : [],
+    currentArticleSignalsChecked: articleSignals && articleSignals.checked === true,
+    currentArticleSignalsHasArticleType: articleSummary.hasArticleType === true,
+    adoptionCandidate,
+    adoptionBlockedReason: adoption.adoptionBlockedReason || null
+  };
+}
+
+function emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFactsBridgeGateAudit) {
+  try {
+    const audit = representativeArticleFactsBridgeGateAudit || {};
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_BRIDGE_GATE_AUDIT]', JSON.stringify({
+      gatePassed: audit.gatePassed === true,
+      gateBlockedReason: audit.gateBlockedReason || null,
+      requiredIdentityPassed: audit.requiredIdentityPassed === true,
+      requiredDatePassed: audit.requiredDatePassed === true,
+      adoptionCandidate: audit.adoptionCandidate === true,
+      adoptionBlockedReason: audit.adoptionBlockedReason || null,
+      connectedToFactsBridge: false,
+      connectedToDiagnosis: false,
+      wouldWriteFactsArticleSignals: false
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7813,6 +7880,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsAdoptionAudit = buildRepresentativeArticleFactsAdoptionAudit_(representativeArticleFacts, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
     geoSignalsV1.representativeArticleFactsAdoptionAudit = representativeArticleFactsAdoptionAudit;
     emitRepresentativeArticleFactsAdoptionAudit_(representativeArticleFactsAdoptionAudit);
+    const representativeArticleFactsBridgeGateAudit = buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFacts, representativeArticleFactsAdoptionAudit, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
+    geoSignalsV1.representativeArticleFactsBridgeGateAudit = representativeArticleFactsBridgeGateAudit;
+    emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFactsBridgeGateAudit);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -8476,6 +8546,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeArticleFactsAdoptionAudit
   };
   emitRepresentativeArticleFactsAdoptionAudit_(representativeArticleFactsAdoptionAudit);
+  const representativeArticleFactsBridgeGateAudit = buildRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFacts, representativeArticleFactsAdoptionAudit, payload.geoSignalsV1 && payload.geoSignalsV1.articleSignals || payload.geoSignalsV1 && payload.geoSignalsV1.observed && payload.geoSignalsV1.observed.articleSignals);
+  payload.coverageSignalsV1.representativeArticleFactsBridgeGateAudit = representativeArticleFactsBridgeGateAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeArticleFactsBridgeGateAudit
+  };
+  emitRepresentativeArticleFactsBridgeGateAudit_(representativeArticleFactsBridgeGateAudit);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -12315,6 +12392,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.representativeArticleFactsAdoptionAudit && typeof g.representativeArticleFactsAdoptionAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsAdoptionAudit = g.representativeArticleFactsAdoptionAudit;
+  }
+  if (g.representativeArticleFactsBridgeGateAudit && typeof g.representativeArticleFactsBridgeGateAudit === 'object') {
+    shortGeoSignalsV1.representativeArticleFactsBridgeGateAudit = g.representativeArticleFactsBridgeGateAudit;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
