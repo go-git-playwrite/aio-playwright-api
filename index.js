@@ -6657,6 +6657,62 @@ function emitRepresentativeFactsDiffAudit_(representativeEvidence, representativ
   } catch (_) {}
 }
 
+function buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence) {
+  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+  const freshnessItem = items.find(item => item && Array.isArray(item.usableFor) && item.usableFor.includes('freshness')) || null;
+  const facts = freshnessItem && freshnessItem.facts && typeof freshnessItem.facts === 'object' ? freshnessItem.facts : {};
+  const datePublished = freshnessItem ? (facts.datePublished || null) : null;
+  const dateModified = freshnessItem ? (facts.dateModified || null) : null;
+  return {
+    usable: !!(datePublished || dateModified),
+    source: 'representativeEvidence',
+    datePublished,
+    dateModified,
+    evidencePath: freshnessItem && freshnessItem.path || '',
+    evidenceRole: freshnessItem && freshnessItem.role || '',
+    observedSignals: Array.isArray(freshnessItem && freshnessItem.observedSignals) ? freshnessItem.observedSignals.slice(0, 20) : []
+  };
+}
+
+function buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessCandidate, opts = {}) {
+  const representativeUsable = representativeFreshnessCandidate && representativeFreshnessCandidate.usable === true;
+  return {
+    version: 1,
+    target: 'freshness',
+    representativeUsable,
+    currentRawAvailable: typeof (opts && opts.currentRawAvailable) === 'boolean' ? opts.currentRawAvailable : false,
+    selectedSource: 'raw',
+    wouldUseRepresentative: representativeUsable,
+    switched: false,
+    reason: representativeUsable
+      ? 'representative freshness candidate is available, but raw facts remain selected in this phase'
+      : 'representative freshness candidate is not available, raw facts remain selected',
+    representative: {
+      datePublished: representativeFreshnessCandidate && representativeFreshnessCandidate.datePublished || null,
+      dateModified: representativeFreshnessCandidate && representativeFreshnessCandidate.dateModified || null,
+      evidencePath: representativeFreshnessCandidate && representativeFreshnessCandidate.evidencePath || '',
+      evidenceRole: representativeFreshnessCandidate && representativeFreshnessCandidate.evidenceRole || ''
+    }
+  };
+}
+
+function emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit) {
+  try {
+    const representative = freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.representative || {};
+    console.log('[DEBUG][FRESHNESS_FACTS_BRIDGE_V2_DECISION_AUDIT]', JSON.stringify({
+      representativeUsable: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.representativeUsable === true,
+      currentRawAvailable: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.currentRawAvailable === true,
+      selectedSource: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.selectedSource || 'raw',
+      wouldUseRepresentative: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.wouldUseRepresentative === true,
+      switched: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.switched === true,
+      reason: freshnessFactsBridgeV2DecisionAudit && freshnessFactsBridgeV2DecisionAudit.reason || '',
+      representativeDatePublished: representative.datePublished || null,
+      representativeDateModified: representative.dateModified || null,
+      representativeEvidencePath: representative.evidencePath || ''
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7471,6 +7527,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeFactsDiffAudit = buildRepresentativeFactsDiffAuditV1_(representativeEvidence);
     geoSignalsV1.representativeFactsDiffAudit = representativeFactsDiffAudit;
     emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
+    const representativeFreshnessFactsCandidate = buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence);
+    const freshnessFactsBridgeV2DecisionAudit = buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessFactsCandidate);
+    geoSignalsV1.freshnessFactsBridgeV2DecisionAudit = freshnessFactsBridgeV2DecisionAudit;
+    emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit);
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -8116,6 +8176,14 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeFactsDiffAudit
   };
   emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
+  const representativeFreshnessFactsCandidate = buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence);
+  const freshnessFactsBridgeV2DecisionAudit = buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessFactsCandidate);
+  payload.coverageSignalsV1.freshnessFactsBridgeV2DecisionAudit = freshnessFactsBridgeV2DecisionAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    freshnessFactsBridgeV2DecisionAudit
+  };
+  emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit);
   try {
     const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
     console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
