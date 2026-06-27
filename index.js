@@ -4272,6 +4272,12 @@ function isDiscoverDetailLikePath(path) {
   return false;
 }
 
+function isDiscoverArticleCandidatePath_(value) {
+  let path = '';
+  try { path = new URL(String(value || '')).pathname.toLowerCase(); } catch (_) { path = String(value || '').toLowerCase(); }
+  return /\/(?:post|posts|article|articles|news|topics|column|blog|entry|story|stories)\/[^/]+/i.test(path);
+}
+
 function reasonDiscoverSubpageCandidate(url, source, sources) {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
@@ -4290,7 +4296,7 @@ function reasonDiscoverSubpageCandidate(url, source, sources) {
 function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
-  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : 0)));
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : (source === 'article' ? 35 : 0))));
   const depth = path.split('/').filter(Boolean).length;
   const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
@@ -4336,6 +4342,18 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   map.set(key, item);
   if (sourceSummary && Object.prototype.hasOwnProperty.call(sourceSummary, source)) sourceSummary[source] += 1;
   return true;
+}
+
+function addDiscoverArticleCandidatesFromLinks_(links, origin, candidateMap, sourceSummary) {
+  const articleCandidates = [];
+  (Array.isArray(links) ? links : []).forEach(link => {
+    if (!link || !isDiscoverArticleCandidatePath_(link.href || link.url || '')) return;
+    if (articleCandidates.length >= 20) return;
+    if (addDiscoverSubpageCandidate(candidateMap, link, 'article', origin, 'article link from main/body', sourceSummary)) {
+      articleCandidates.push(link);
+    }
+  });
+  return articleCandidates;
 }
 
 async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
@@ -4453,6 +4471,19 @@ async function collectDiscoverLinksFromPage(page) {
 }
 
 async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, sourceSummary, errors, opts = {}) {
+  const logArticleCandidateDiscovery = (topLinks, articleCandidates) => {
+    try {
+      console.log('[DEBUG][ARTICLE_CANDIDATE_DISCOVERY_AUDIT]', JSON.stringify({
+        origin,
+        allLinksCount: Array.isArray(topLinks && topLinks.allLinks) ? topLinks.allLinks.length : 0,
+        articleCandidatesCount: Array.isArray(articleCandidates) ? articleCandidates.length : 0,
+        articleCandidatePaths: (Array.isArray(articleCandidates) ? articleCandidates : []).slice(0, 10).map(link => {
+          try { return new URL(String(link && (link.href || link.url) || '')).pathname || ''; } catch (_) { return String(link && (link.href || link.url) || ''); }
+        }),
+        source: 'main_body_article_links'
+      }));
+    } catch (_) {}
+  };
   if (opts && opts.page) {
     const page = opts.page;
     try {
@@ -4487,6 +4518,8 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       (navFooterLinks.footerLinks || []).forEach(link => {
         addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
       });
+      const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+      logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
     }
@@ -4552,6 +4585,8 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
     (navFooterLinks.footerLinks || []).forEach(link => {
       addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
     });
+    const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+    logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
   } finally {
@@ -4576,7 +4611,7 @@ function normalizeDiscoverTopUrl(rawTopUrl) {
 
 async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts = {}) {
   const normalizedLimit = Math.max(1, Math.min(50, Number(limit || 20) || 20));
-  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0 };
+  const sourceSummary = { sitemap: 0, htmlSitemap: 0, nav: 0, footer: 0, article: 0 };
   const errors = [];
   const candidateMap = new Map();
   await collectDiscoverSitemapCandidates(origin, candidateMap, sourceSummary, errors);
@@ -5279,6 +5314,7 @@ function buildCoverageCandidatePageTypes_(candidates) {
     business: false,
     service: false,
     case: false,
+    article: false,
     recruit: false,
     contact: false,
     legal: false,
@@ -5291,6 +5327,7 @@ function buildCoverageCandidatePageTypes_(candidates) {
     if (/\/(?:business)(?:\/|$|-|_)/i.test(path)) out.business = true;
     if (/\/(?:service|services|solution|solutions)(?:\/|$|-|_)/i.test(path)) out.service = true;
     if (/\/(?:case|cases|works|work|portfolio|projects)(?:\/|$|-|_)/i.test(path)) out.case = true;
+    if (isDiscoverArticleCandidatePath_(path)) out.article = true;
     if (/\/(?:recruit|career|careers|jobs)(?:\/|$|-|_)/i.test(path)) out.recruit = true;
     if (/\/(?:contact|inquiry|inquiries)(?:\/|$|-|_)/i.test(path)) out.contact = true;
     if (/\/(?:privacy|policy|terms|law|legal|cookie|security)(?:\/|$|-|_)/i.test(path)) out.legal = true;
