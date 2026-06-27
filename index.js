@@ -7581,6 +7581,57 @@ function emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsFo
   } catch (_) {}
 }
 
+function buildArticleSignalsFactsBridgeInputAudit_(geoSignalsV1) {
+  const g = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const selected = g.selectedArticleSignalsForFactsBridge && typeof g.selectedArticleSignalsForFactsBridge === 'object'
+    ? g.selectedArticleSignalsForFactsBridge
+    : null;
+  const current = g.articleSignals && typeof g.articleSignals === 'object' ? g.articleSignals : null;
+  const selectedAudit = g.selectedArticleSignalsForFactsBridgeAudit && typeof g.selectedArticleSignalsForFactsBridgeAudit === 'object'
+    ? g.selectedArticleSignalsForFactsBridgeAudit
+    : {};
+  const factsArticleSignals = selected || current;
+  const jsonLd = factsArticleSignals && factsArticleSignals.jsonLd && typeof factsArticleSignals.jsonLd === 'object' ? factsArticleSignals.jsonLd : {};
+  const summary = factsArticleSignals && factsArticleSignals.summary && typeof factsArticleSignals.summary === 'object' ? factsArticleSignals.summary : {};
+  const usedSelectedArticleSignalsForFactsBridge = !!selected;
+  const usedCurrentArticleSignalsFallback = !selected && !!current;
+  return {
+    version: 1,
+    target: 'facts.articleSignals',
+    selectedSource: selectedAudit.selectedSource || (usedSelectedArticleSignalsForFactsBridge ? 'selectedArticleSignalsForFactsBridge' : 'currentArticleSignals'),
+    usedSelectedArticleSignalsForFactsBridge,
+    usedCurrentArticleSignalsFallback,
+    originalArticleSignalsPreserved: true,
+    selectedArticleSignalsForFactsBridgeAvailable: !!selected,
+    factsArticleSignalsChecked: factsArticleSignals && factsArticleSignals.checked === true,
+    factsArticleSignalsHasHeadline: summary.hasHeadline === true || !!jsonLd.headline,
+    factsArticleSignalsHasPublishedDate: summary.hasPublishedDate === true || !!jsonLd.datePublished,
+    factsArticleSignalsDatePublished: jsonLd.datePublished || null,
+    factsArticleSignalsDatePublishedPrecision: jsonLd.datePublishedPrecision || null,
+    connectedToFactsBridge: true,
+    connectedToDiagnosis: true
+  };
+}
+
+function emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInputAudit) {
+  try {
+    const audit = articleSignalsFactsBridgeInputAudit || {};
+    console.log('[DEBUG][ARTICLE_SIGNALS_FACTS_BRIDGE_INPUT_AUDIT]', JSON.stringify({
+      selectedSource: audit.selectedSource || null,
+      usedSelectedArticleSignalsForFactsBridge: audit.usedSelectedArticleSignalsForFactsBridge === true,
+      usedCurrentArticleSignalsFallback: audit.usedCurrentArticleSignalsFallback === true,
+      factsArticleSignalsChecked: audit.factsArticleSignalsChecked === true,
+      factsArticleSignalsHasHeadline: audit.factsArticleSignalsHasHeadline === true,
+      factsArticleSignalsHasPublishedDate: audit.factsArticleSignalsHasPublishedDate === true,
+      factsArticleSignalsDatePublished: audit.factsArticleSignalsDatePublished || null,
+      factsArticleSignalsDatePublishedPrecision: audit.factsArticleSignalsDatePublishedPrecision || null,
+      originalArticleSignalsPreserved: true,
+      connectedToFactsBridge: true,
+      connectedToDiagnosis: true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -8412,6 +8463,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     geoSignalsV1.selectedArticleSignalsForFactsBridge = selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridge;
     geoSignalsV1.selectedArticleSignalsForFactsBridgeAudit = selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit;
     emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit);
+    const articleSignalsFactsBridgeInputAudit = buildArticleSignalsFactsBridgeInputAudit_(geoSignalsV1);
+    geoSignalsV1.articleSignalsFactsBridgeInputAudit = articleSignalsFactsBridgeInputAudit;
+    emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInputAudit);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -9109,6 +9163,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     selectedArticleSignalsForFactsBridgeAudit: selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit
   };
   emitSelectedArticleSignalsForFactsBridgeAudit_(selectedArticleSignalsForFactsBridgeResult.selectedArticleSignalsForFactsBridgeAudit);
+  const articleSignalsFactsBridgeInputAudit = buildArticleSignalsFactsBridgeInputAudit_(payload.geoSignalsV1);
+  payload.coverageSignalsV1.articleSignalsFactsBridgeInputAudit = articleSignalsFactsBridgeInputAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    articleSignalsFactsBridgeInputAudit
+  };
+  emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInputAudit);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -12967,6 +13028,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   if (g.selectedArticleSignalsForFactsBridgeAudit && typeof g.selectedArticleSignalsForFactsBridgeAudit === 'object') {
     shortGeoSignalsV1.selectedArticleSignalsForFactsBridgeAudit = g.selectedArticleSignalsForFactsBridgeAudit;
   }
+  if (g.articleSignalsFactsBridgeInputAudit && typeof g.articleSignalsFactsBridgeInputAudit === 'object') {
+    shortGeoSignalsV1.articleSignalsFactsBridgeInputAudit = g.articleSignalsFactsBridgeInputAudit;
+  }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
   if (Array.isArray(shortLightweightSummary.seoJsonldTypes)) shortLightweightSummary.seoJsonldTypes = shortLightweightSummary.seoJsonldTypes.slice(0, 50);
@@ -16567,7 +16631,9 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
         hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
-        articleSignals: geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object' ? geoSignalsV1.articleSignals : null,
+        articleSignals: geoSignalsV1 && geoSignalsV1.selectedArticleSignalsForFactsBridge && typeof geoSignalsV1.selectedArticleSignalsForFactsBridge === 'object'
+          ? geoSignalsV1.selectedArticleSignalsForFactsBridge
+          : (geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object' ? geoSignalsV1.articleSignals : null),
         structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : true,
         structuredDataObservationScope: structuredObserved.observationScope || 'rendered_dom_only',
         structuredDataRenderedDomObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'renderedDomObserved') ? structuredObserved.renderedDomObserved : true,
