@@ -6564,6 +6564,56 @@ function emitRepresentativeFactsReadinessAudit_(representativeEvidence, represen
   } catch (_) {}
 }
 
+function buildRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness) {
+  const readiness = representativeFactsReadiness && representativeFactsReadiness.readiness || {};
+  const freshnessCanUse = readiness.freshness && readiness.freshness.usable === true;
+  const identityCanUse = readiness.identity && readiness.identity.usable === true;
+  const contentUnderstandingCanUse = readiness.contentUnderstanding && readiness.contentUnderstanding.usable === true;
+  return {
+    version: 1,
+    generatedFrom: 'representativeFactsReadiness',
+    candidates: {
+      freshness: {
+        canUseRepresentativeEvidence: freshnessCanUse,
+        shouldSwitchNow: false,
+        reason: freshnessCanUse
+          ? 'article freshness evidence exists, but existing facts bridge is not switched in this phase'
+          : 'representative freshness evidence is not available'
+      },
+      identity: {
+        canUseRepresentativeEvidence: identityCanUse,
+        shouldSwitchNow: false,
+        reason: identityCanUse
+          ? 'article identity evidence exists, but organization identity evidence is not implemented yet'
+          : 'representative identity evidence is not available'
+      },
+      contentUnderstanding: {
+        canUseRepresentativeEvidence: contentUnderstandingCanUse,
+        shouldSwitchNow: false,
+        reason: contentUnderstandingCanUse
+          ? 'article content evidence exists, but site-level content evidence is not implemented yet'
+          : 'representative content understanding evidence is not available'
+      }
+    }
+  };
+}
+
+function emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, representativeFactsBridgeV2Audit) {
+  try {
+    const candidates = representativeFactsBridgeV2Audit && representativeFactsBridgeV2Audit.candidates || {};
+    const freshness = candidates.freshness || {};
+    const identity = candidates.identity || {};
+    const contentUnderstanding = candidates.contentUnderstanding || {};
+    console.log('[DEBUG][REPRESENTATIVE_FACTS_BRIDGE_V2_AUDIT]', JSON.stringify({
+      hasRepresentativeFactsReadiness: !!representativeFactsReadiness,
+      freshnessCanUseRepresentativeEvidence: freshness.canUseRepresentativeEvidence === true,
+      identityCanUseRepresentativeEvidence: identity.canUseRepresentativeEvidence === true,
+      contentUnderstandingCanUseRepresentativeEvidence: contentUnderstanding.canUseRepresentativeEvidence === true,
+      shouldSwitchNowAny: freshness.shouldSwitchNow === true || identity.shouldSwitchNow === true || contentUnderstanding.shouldSwitchNow === true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7372,6 +7422,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
+    const representativeFactsBridgeV2Audit = buildRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness);
+    geoSignalsV1.representativeFactsBridgeV2Audit = representativeFactsBridgeV2Audit;
+    emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, representativeFactsBridgeV2Audit);
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -8003,6 +8056,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeFactsReadiness
   };
   emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
+  const representativeFactsBridgeV2Audit = buildRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness);
+  payload.coverageSignalsV1.representativeFactsBridgeV2Audit = representativeFactsBridgeV2Audit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeFactsBridgeV2Audit
+  };
+  emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, representativeFactsBridgeV2Audit);
   try {
     const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
     console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
