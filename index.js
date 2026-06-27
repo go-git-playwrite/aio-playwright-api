@@ -4356,6 +4356,77 @@ function addDiscoverArticleCandidatesFromLinks_(links, origin, candidateMap, sou
   return articleCandidates;
 }
 
+function inferDiscoverCandidatePageType_(candidate, siteMode = 'generic') {
+  const existing = normalizeSubpageJsonLdText(candidate && candidate.pageType).toLowerCase();
+  if (existing && existing !== 'unknown' && existing !== 'category_or_detail') return existing;
+  const url = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || candidate.path) || '');
+  if (isDiscoverArticleCandidatePath_(url) || candidate && candidate.source === 'article') return 'article';
+  return inferSubpageJsonLdPageType(url, siteMode, []);
+}
+
+function buildRoleRepresentativeCandidates_(candidates, opts = {}) {
+  const siteMode = opts && opts.siteMode || 'generic';
+  const byType = {};
+  const seenByType = {};
+  (Array.isArray(candidates) ? candidates : []).forEach((candidate, index) => {
+    if (!candidate || !candidate.url) return;
+    const pageType = inferDiscoverCandidatePageType_(candidate, siteMode);
+    if (!pageType || pageType === 'unknown' || pageType === 'category_or_detail') return;
+    const key = discoverSubpageCandidateKey(candidate.url);
+    seenByType[pageType] = seenByType[pageType] || new Set();
+    if (seenByType[pageType].has(key)) return;
+    seenByType[pageType].add(key);
+    byType[pageType] = byType[pageType] || [];
+    byType[pageType].push({
+      url: candidate.url || '',
+      path: getCoverageCandidatePath_(candidate),
+      pageType,
+      score: Number(candidate.score || 0),
+      source: candidate.source || '',
+      sources: Array.isArray(candidate.sources) ? candidate.sources.slice(0, 8) : (candidate.source ? [candidate.source] : []),
+      index
+    });
+  });
+  Object.keys(byType).forEach(pageType => {
+    byType[pageType] = byType[pageType]
+      .sort((a, b) => (b.score - a.score) || (a.index - b.index) || String(a.url || '').localeCompare(String(b.url || '')))
+      .slice(0, 2)
+      .map(item => ({
+        url: item.url,
+        path: item.path,
+        pageType: item.pageType,
+        score: item.score,
+        source: item.source,
+        sources: item.sources
+      }));
+  });
+  return byType;
+}
+
+function emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates) {
+  try {
+    console.log('[DEBUG][ROLE_REPRESENTATIVE_CANDIDATES_AUDIT]', JSON.stringify({
+      origin,
+      pageTypes: Object.keys(roleRepresentativeCandidates || {}),
+      countsByPageType: Object.fromEntries(
+        Object.entries(roleRepresentativeCandidates || {}).map(([k, v]) => [k, Array.isArray(v) ? v.length : 0])
+      ),
+      sampleByPageType: Object.fromEntries(
+        Object.entries(roleRepresentativeCandidates || {}).map(([k, v]) => [
+          k,
+          (Array.isArray(v) ? v : []).slice(0, 2).map(x => ({
+            path: x.path || x.url || x.href,
+            pageType: x.pageType,
+            score: x.score,
+            source: x.source
+          }))
+        ])
+      ),
+      note: 'audit_only_not_used_for_observation'
+    }));
+  } catch (_) {}
+}
+
 async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -4626,8 +4697,11 @@ async function discoverSubpageCandidatesLightData_(topUrl, origin, limit, opts =
       reason: item.reason
     }))
     .sort((a, b) => (b.score - a.score) || (a.url.length - b.url.length) || a.url.localeCompare(b.url));
+  const roleRepresentativeCandidates = buildRoleRepresentativeCandidates_(allCandidates, { siteMode: opts && opts.siteMode || 'generic' });
+  emitRoleRepresentativeCandidatesAudit_(origin, roleRepresentativeCandidates);
   return {
     candidates: allCandidates.slice(0, normalizedLimit),
+    roleRepresentativeCandidates,
     totalCandidates: allCandidates.length,
     sourceSummary,
     errors
@@ -4688,7 +4762,8 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
   const normalized = normalizeDiscoverTopUrl(rawTopUrl);
   if (!normalized.ok) return res.status(400).json({ ok: false, error: normalized.error });
   const limit = Math.max(1, Math.min(50, Number(req.body && req.body.limit || 20) || 20));
-  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, limit);
+  const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, limit, { siteMode });
   return res.status(200).json({
     ok: true,
     mode: 'discoverSubpageCandidatesLight',
@@ -4696,6 +4771,7 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
     origin: normalized.origin,
     limit,
     candidates: discovered.candidates,
+    roleRepresentativeCandidates: discovered.roleRepresentativeCandidates,
     sourceSummary: discovered.sourceSummary,
     errors: discovered.errors
   });
@@ -5596,6 +5672,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const rawSourceSummary = payload && payload.candidateSummary && payload.candidateSummary.sourceSummary
     ? payload.candidateSummary.sourceSummary
     : null;
+  const roleRepresentativeCandidates = payload && payload.candidateSummary && payload.candidateSummary.roleRepresentativeCandidates
+    ? payload.candidateSummary.roleRepresentativeCandidates
+    : buildRoleRepresentativeCandidates_(candidates, { siteMode: payload && payload.siteMode || 'generic' });
   const candidateSourceSummary = rawSourceSummary
     ? {
         sitemap: Number(rawSourceSummary.sitemap || 0),
@@ -5687,6 +5766,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     origin: payload && payload.origin || '',
     candidateSourceSummary,
     candidatePageTypes,
+    roleRepresentativeCandidates,
     observedSubpageCount: observedPages.length,
     observedH1PageCount,
     observedBreadcrumbPageCount,
@@ -5705,6 +5785,21 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
   const representativePages = Array.isArray(coverageSignalsV1.representativePages)
     ? coverageSignalsV1.representativePages
     : [];
+  const compactRoleRepresentativeCandidates = (input) => {
+    const out = {};
+    Object.entries(input && typeof input === 'object' ? input : {}).forEach(([pageType, items]) => {
+      if (!Array.isArray(items)) return;
+      out[pageType] = items.slice(0, 2).map(item => ({
+        url: item && item.url || '',
+        path: item && item.path || '',
+        pageType: item && item.pageType || pageType,
+        score: Number(item && item.score || 0),
+        source: item && item.source || '',
+        sources: Array.isArray(item && item.sources) ? item.sources.slice(0, 8) : []
+      }));
+    });
+    return out;
+  };
   const qualityPages = coverageSignalsV1.representativeObservationQuality &&
     Array.isArray(coverageSignalsV1.representativeObservationQuality.pages)
     ? coverageSignalsV1.representativeObservationQuality.pages
@@ -5727,6 +5822,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       other: 0
     },
     candidatePageTypes: coverageSignalsV1.candidatePageTypes || buildCoverageCandidatePageTypes_([]),
+    roleRepresentativeCandidates: compactRoleRepresentativeCandidates(coverageSignalsV1.roleRepresentativeCandidates),
     representativePages: representativePages.slice(0, 5).map(page => ({
       url: page && page.url || '',
       path: page && page.path || '',
@@ -6122,6 +6218,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           scopedPlaywrightSubpageObservation ? 'scopedPlaywright' : 'htmlFetchOnly'
         )
       : await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, 20, {
+          siteMode,
           page: opts && opts.page,
           context: opts && opts.context,
           reuseBrowser: reusePageForDiscover || reuseContextForObserve
@@ -6497,6 +6594,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       siteMode,
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
+        roleRepresentativeCandidates: discovered.roleRepresentativeCandidates,
         totalCandidates: discovered.totalCandidates,
         observedCount: observations.length
       },
@@ -7171,7 +7269,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     Math.min(50, Number(req.body && req.body.maxCandidates || 0) || Math.max(limit * 3, 20))
   );
   const siteMode = normalizeSubpageJsonLdText(req.body && req.body.siteMode || 'generic').toLowerCase() || 'generic';
-  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit);
+  const discovered = await discoverSubpageCandidatesLightData_(normalized.topUrl, normalized.origin, candidateLimit, { siteMode });
   const selectedCandidates = discovered.candidates.slice(0, limit);
   const urls = selectedCandidates.map(candidate => candidate.url);
   const observed = await observeSubpageJsonLdLightUrls_(urls, {
@@ -7199,6 +7297,7 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     limit,
     candidateSummary: {
       sourceSummary: discovered.sourceSummary,
+      roleRepresentativeCandidates: discovered.roleRepresentativeCandidates,
       totalCandidates: discovered.totalCandidates,
       observedCount: observations.length
     },
