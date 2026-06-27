@@ -7577,8 +7577,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     geoSignalsV1.representativeFactsDiffAudit = representativeFactsDiffAudit;
     emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
     const representativeFreshnessFactsCandidate = buildRepresentativeFreshnessFactsCandidateV1_(representativeEvidence);
+    const rawFreshnessFactsForAudit = geoSignalsV1.freshnessOperationSignals ||
+      geoSignalsV1.observed && geoSignalsV1.observed.freshnessOperationSignals ||
+      buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, { siteMode, url: normalized.topUrl });
     const freshnessFactsBridgeV2DecisionAudit = buildFreshnessFactsBridgeV2DecisionAudit_(representativeFreshnessFactsCandidate, {
-      rawFacts: geoSignalsV1.freshnessOperationSignals || geoSignalsV1.observed && geoSignalsV1.observed.freshnessOperationSignals || null
+      rawFacts: rawFreshnessFactsForAudit
     });
     geoSignalsV1.freshnessFactsBridgeV2DecisionAudit = freshnessFactsBridgeV2DecisionAudit;
     emitFreshnessFactsBridgeV2DecisionAudit_(freshnessFactsBridgeV2DecisionAudit);
