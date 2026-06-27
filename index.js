@@ -6853,6 +6853,56 @@ function emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBr
   } catch (_) {}
 }
 
+function buildRepresentativeArticleFacts_(representativeEvidence) {
+  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+  const articleItem = items.find(item => item && item.role === 'article' && item.facts && typeof item.facts === 'object') || null;
+  const facts = articleItem && articleItem.facts || {};
+  const out = {
+    version: 1,
+    generatedFrom: 'representativeEvidence',
+    evidenceSource: 'representativeEvidence.article.facts',
+    headline: articleItem ? (facts.headline || null) : null,
+    datePublished: articleItem ? (facts.datePublished || null) : null,
+    dateModified: articleItem ? (facts.dateModified || null) : null,
+    authorName: articleItem ? (facts.author || null) : null,
+    publisherName: articleItem ? (facts.publisher || null) : null,
+    canonicalUrl: null,
+    sourceUrl: articleItem ? (articleItem.url || null) : null,
+    evidencePath: articleItem ? (articleItem.path || '') : '',
+    connectedToFactsBridge: false,
+    connectedToDiagnosis: false
+  };
+  out.missingKeys = [
+    'headline',
+    'datePublished',
+    'dateModified',
+    'authorName',
+    'publisherName',
+    'canonicalUrl',
+    'sourceUrl'
+  ].filter(key => out[key] == null || out[key] === '');
+  return out;
+}
+
+function emitRepresentativeArticleFactsPhase2Audit_(representativeEvidence, representativeArticleFacts) {
+  try {
+    const facts = representativeArticleFacts || {};
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_PHASE2_AUDIT]', JSON.stringify({
+      hasRepresentativeEvidence: !!representativeEvidence,
+      generated: !!representativeArticleFacts,
+      headline: facts.headline || null,
+      datePublished: facts.datePublished || null,
+      dateModified: facts.dateModified || null,
+      canonicalUrl: facts.canonicalUrl || null,
+      sourceUrl: facts.sourceUrl || null,
+      missingKeys: Array.isArray(facts.missingKeys) ? facts.missingKeys : [],
+      generatedFrom: 'representativeEvidence',
+      connectedToFactsBridge: false,
+      connectedToDiagnosis: false
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7661,6 +7711,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeArticleFactsBridgeAudit = buildRepresentativeArticleFactsBridgeAudit_(representativeEvidence, geoSignalsV1.articleSignals || geoSignalsV1.observed && geoSignalsV1.observed.articleSignals);
     geoSignalsV1.representativeArticleFactsBridgeAudit = representativeArticleFactsBridgeAudit;
     emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
+    const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence);
+    geoSignalsV1.representativeArticleFacts = representativeArticleFacts;
+    emitRepresentativeArticleFactsPhase2Audit_(representativeEvidence, representativeArticleFacts);
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -8310,6 +8363,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeArticleFactsBridgeAudit
   };
   emitRepresentativeArticleFactsBridgeAudit_(representativeArticleFactsBridgeAudit);
+  const representativeArticleFacts = buildRepresentativeArticleFacts_(representativeEvidence);
+  payload.coverageSignalsV1.representativeArticleFacts = representativeArticleFacts;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeArticleFacts
+  };
+  emitRepresentativeArticleFactsPhase2Audit_(representativeEvidence, representativeArticleFacts);
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -12140,6 +12200,12 @@ function buildBalancedShortResponsePayload(fullPayload) {
   };
   if (g.freshnessFactsBridgeV2DecisionAudit && typeof g.freshnessFactsBridgeV2DecisionAudit === 'object') {
     shortGeoSignalsV1.freshnessFactsBridgeV2DecisionAudit = g.freshnessFactsBridgeV2DecisionAudit;
+  }
+  if (g.representativeArticleFacts && typeof g.representativeArticleFacts === 'object') {
+    shortGeoSignalsV1.representativeArticleFacts = g.representativeArticleFacts;
+  }
+  if (g.representativeArticleFactsBridgeAudit && typeof g.representativeArticleFactsBridgeAudit === 'object') {
+    shortGeoSignalsV1.representativeArticleFactsBridgeAudit = g.representativeArticleFactsBridgeAudit;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
