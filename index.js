@@ -10315,6 +10315,65 @@ function attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummar
   return signals;
 }
 
+function exposeFreshnessOperationSignalsInScrapeResponse_(payload) {
+  try {
+    if (!payload || typeof payload !== 'object') return payload;
+    const geoSignalsV1 = payload.geoSignalsV1 && typeof payload.geoSignalsV1 === 'object' ? payload.geoSignalsV1 : {};
+    const observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
+    const lightweightSummary = payload.lightweightSummary && typeof payload.lightweightSummary === 'object' ? payload.lightweightSummary : {};
+    const signals =
+      (geoSignalsV1.freshnessOperationSignals && typeof geoSignalsV1.freshnessOperationSignals === 'object' ? geoSignalsV1.freshnessOperationSignals : null) ||
+      (observed.freshnessOperationSignals && typeof observed.freshnessOperationSignals === 'object' ? observed.freshnessOperationSignals : null) ||
+      (lightweightSummary.freshnessOperationSignals && typeof lightweightSummary.freshnessOperationSignals === 'object' ? lightweightSummary.freshnessOperationSignals : null) ||
+      null;
+    if (signals) {
+      if (!payload.geoSignalsV1 || typeof payload.geoSignalsV1 !== 'object') payload.geoSignalsV1 = geoSignalsV1;
+      payload.geoSignalsV1.freshnessOperationSignals = payload.geoSignalsV1.freshnessOperationSignals || signals;
+      payload.geoSignalsV1.observed = payload.geoSignalsV1.observed && typeof payload.geoSignalsV1.observed === 'object' ? payload.geoSignalsV1.observed : {};
+      payload.geoSignalsV1.observed.freshnessOperationSignals = payload.geoSignalsV1.observed.freshnessOperationSignals || signals;
+      payload.lightweightSummary = payload.lightweightSummary && typeof payload.lightweightSummary === 'object' ? payload.lightweightSummary : {};
+      payload.lightweightSummary.freshnessOperationSignals = payload.lightweightSummary.freshnessOperationSignals || signals;
+      payload.freshnessOperationSignals = payload.freshnessOperationSignals || signals;
+    }
+    const exposedGeo = !!(payload.geoSignalsV1 && payload.geoSignalsV1.freshnessOperationSignals);
+    const exposedLight = !!(payload.lightweightSummary && payload.lightweightSummary.freshnessOperationSignals);
+    const exposedTop = !!payload.freshnessOperationSignals;
+    const exposedSignals =
+      payload.geoSignalsV1 && payload.geoSignalsV1.freshnessOperationSignals ||
+      payload.lightweightSummary && payload.lightweightSummary.freshnessOperationSignals ||
+      payload.freshnessOperationSignals ||
+      signals ||
+      {};
+    const audit = {
+      hasFreshnessOperationSignalsInternal: !!signals,
+      exposedGeoSignalsFreshnessOperationSignals: exposedGeo,
+      exposedLightweightSummaryFreshnessOperationSignals: exposedLight,
+      exposedTopLevelFreshnessOperationSignals: exposedTop,
+      freshnessOperationSignalsChecked: exposedSignals.checked === true,
+      freshnessOperationSignalsLatestDate: exposedSignals.latestDate || null,
+      freshnessOperationSignalsDatePublished: exposedSignals.datePublished || null,
+      freshnessOperationSignalsDatePublishedPrecision: exposedSignals.datePublishedPrecision || null,
+      freshnessOperationSignalsSource: exposedSignals.source || null,
+      freshnessOperationSignalsExtractionMethod: exposedSignals.extractionMethod || null
+    };
+    payload.geoSignalsV1 = payload.geoSignalsV1 && typeof payload.geoSignalsV1 === 'object' ? payload.geoSignalsV1 : geoSignalsV1;
+    payload.geoSignalsV1.freshnessOperationResponseExposureAudit = audit;
+    console.log('[DEBUG][FRESHNESS_OPERATION_RESPONSE_EXPOSURE_AUDIT]', JSON.stringify(audit));
+    return payload;
+  } catch (e) {
+    try {
+      console.log('[DEBUG][FRESHNESS_OPERATION_RESPONSE_EXPOSURE_AUDIT]', JSON.stringify({
+        hasFreshnessOperationSignalsInternal: false,
+        exposedGeoSignalsFreshnessOperationSignals: false,
+        exposedLightweightSummaryFreshnessOperationSignals: false,
+        exposedTopLevelFreshnessOperationSignals: false,
+        error: String(e && (e.message || e) || 'response_exposure_failed').slice(0, 160)
+      }));
+    } catch (_) {}
+    return payload;
+  }
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -13197,6 +13256,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     diagnostics: shortDiagnostics,
     memoryHints
   };
+  exposeFreshnessOperationSignalsInScrapeResponse_(shortPayload);
   shortPayload.diagnostics.estimatedOriginalBytes = estimatedOriginalBytes;
   shortPayload.diagnostics.responseBytesApprox = null;
   try {
@@ -16937,6 +16997,7 @@ async function scrapeOnce(req, res) {
         diagnostics,
         memoryHints
       };
+      exposeFreshnessOperationSignalsInScrapeResponse_(signalsResponsePayload);
       const logScrapeResponseReadyAudit = payload => {
         try {
           const coverageSignals = payload && payload.geoSignalsV1 && payload.geoSignalsV1.coverageSignals;
