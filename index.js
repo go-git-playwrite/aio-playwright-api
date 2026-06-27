@@ -6458,6 +6458,18 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
     if (page && (page.datePublished || page.dateModified)) usableFor.push('freshness');
     if (page && (page.author || page.publisher)) usableFor.push('identity');
     if (page && page.headline) usableFor.push('contentUnderstanding');
+    const headline = page && page.headline || null;
+    const datePublished = page && page.datePublished || null;
+    const dateModified = page && page.dateModified || null;
+    const author = page && page.author || null;
+    const publisher = page && page.publisher || null;
+    const summaryText = headline
+      ? `記事ページで見出し「${headline}」を確認できます。`
+      : ((datePublished || dateModified)
+        ? '記事ページで日付情報を確認できます。'
+        : ((author || publisher)
+          ? '記事ページで著者または媒体情報を確認できます。'
+          : '記事ページとして観測されていますが、主要な記事情報は限定的です。'));
     return {
       role: 'article',
       pageType: 'article',
@@ -6468,12 +6480,13 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
         : 'weak',
       observedSignals,
       usableFor,
-      summary: {
-        headline: page && page.headline || null,
-        datePublished: page && page.datePublished || null,
-        dateModified: page && page.dateModified || null,
-        author: page && page.author || null,
-        publisher: page && page.publisher || null
+      summaryText,
+      facts: {
+        headline,
+        datePublished,
+        dateModified,
+        author,
+        publisher
       }
     };
   });
