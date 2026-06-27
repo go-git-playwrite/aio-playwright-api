@@ -6614,6 +6614,49 @@ function emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, rep
   } catch (_) {}
 }
 
+function buildRepresentativeFactsDiffAuditV1_(representativeEvidence, opts = {}) {
+  const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+  const freshnessItem = items.find(item => item && Array.isArray(item.usableFor) && item.usableFor.includes('freshness')) || null;
+  const facts = freshnessItem && freshnessItem.facts && typeof freshnessItem.facts === 'object' ? freshnessItem.facts : {};
+  const datePublished = freshnessItem ? (facts.datePublished || null) : null;
+  const dateModified = freshnessItem ? (facts.dateModified || null) : null;
+  const usable = !!(datePublished || dateModified);
+  return {
+    version: 1,
+    generatedFrom: 'representativeEvidence',
+    freshness: {
+      representativeCandidate: {
+        usable,
+        datePublished,
+        dateModified,
+        evidencePath: freshnessItem && freshnessItem.path || '',
+        evidenceRole: freshnessItem && freshnessItem.role || ''
+      },
+      currentRawAvailable: typeof (opts && opts.currentRawAvailable) === 'boolean' ? opts.currentRawAvailable : false,
+      shouldSwitchNow: false,
+      note: usable
+        ? 'representative freshness candidate generated for audit only'
+        : 'representative freshness candidate is not available'
+    }
+  };
+}
+
+function emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit) {
+  try {
+    const freshness = representativeFactsDiffAudit && representativeFactsDiffAudit.freshness || {};
+    const candidate = freshness.representativeCandidate || {};
+    console.log('[DEBUG][REPRESENTATIVE_FACTS_DIFF_AUDIT]', JSON.stringify({
+      hasRepresentativeEvidence: !!representativeEvidence,
+      freshnessCandidateUsable: candidate.usable === true,
+      freshnessDatePublished: candidate.datePublished || null,
+      freshnessDateModified: candidate.dateModified || null,
+      freshnessEvidencePath: candidate.evidencePath || '',
+      currentRawAvailable: freshness.currentRawAvailable === true,
+      shouldSwitchNow: freshness.shouldSwitchNow === true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7425,6 +7468,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const representativeFactsBridgeV2Audit = buildRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness);
     geoSignalsV1.representativeFactsBridgeV2Audit = representativeFactsBridgeV2Audit;
     emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, representativeFactsBridgeV2Audit);
+    const representativeFactsDiffAudit = buildRepresentativeFactsDiffAuditV1_(representativeEvidence);
+    geoSignalsV1.representativeFactsDiffAudit = representativeFactsDiffAudit;
+    emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -8063,6 +8109,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeFactsBridgeV2Audit
   };
   emitRepresentativeFactsBridgeV2Audit_(representativeFactsReadiness, representativeFactsBridgeV2Audit);
+  const representativeFactsDiffAudit = buildRepresentativeFactsDiffAuditV1_(representativeEvidence);
+  payload.coverageSignalsV1.representativeFactsDiffAudit = representativeFactsDiffAudit;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeFactsDiffAudit
+  };
+  emitRepresentativeFactsDiffAudit_(representativeEvidence, representativeFactsDiffAudit);
   try {
     const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
     console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
