@@ -7632,6 +7632,121 @@ function emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInput
   } catch (_) {}
 }
 
+function pickArticleSignalsForFreshnessInput_(geoSignalsV1) {
+  const g = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const selected = g.selectedArticleSignalsForFactsBridge && typeof g.selectedArticleSignalsForFactsBridge === 'object'
+    ? g.selectedArticleSignalsForFactsBridge
+    : null;
+  const current = g.articleSignals && typeof g.articleSignals === 'object'
+    ? g.articleSignals
+    : null;
+  return {
+    articleSignals: selected || current,
+    selectedSource: selected ? 'selectedArticleSignalsForFactsBridge' : (current ? 'currentArticleSignals' : null),
+    usedSelectedArticleSignalsForFreshness: !!selected,
+    usedCurrentArticleSignalsFallback: !selected && !!current
+  };
+}
+
+function summarizeArticleSignalsForFreshness_(articleSignals) {
+  const signals = articleSignals && typeof articleSignals === 'object' ? articleSignals : {};
+  const jsonLd = signals.jsonLd && typeof signals.jsonLd === 'object' ? signals.jsonLd : {};
+  const meta = signals.meta && typeof signals.meta === 'object' ? signals.meta : {};
+  const summary = signals.summary && typeof signals.summary === 'object' ? signals.summary : {};
+  const datePublished = jsonLd.datePublished || meta.publishedTime || null;
+  const dateModified = jsonLd.dateModified || meta.modifiedTime || null;
+  const datePublishedPrecision = jsonLd.datePublishedPrecision || null;
+  const hasPublishedDate = summary.hasPublishedDate === true || !!datePublished;
+  const hasModifiedDate = summary.hasModifiedDate === true || !!dateModified;
+  return {
+    checked: signals.checked === true,
+    hasHeadline: summary.hasHeadline === true || !!jsonLd.headline,
+    hasPublishedDate,
+    hasModifiedDate,
+    datePublished,
+    dateModified,
+    datePublishedPrecision
+  };
+}
+
+function buildFreshnessOperationSignalsFromArticleSignals_(articleSignals, selectedSource) {
+  const articleSummary = summarizeArticleSignalsForFreshness_(articleSignals);
+  if (articleSummary.checked !== true) return null;
+  if (!articleSummary.datePublished && !articleSummary.dateModified) return null;
+  const sampleDates = [articleSummary.datePublished, articleSummary.dateModified].filter(Boolean);
+  return {
+    observed: true,
+    checked: true,
+    hasNewsDateEvidence: true,
+    hasFreshnessSignal: true,
+    hasDatePublished: !!articleSummary.datePublished,
+    hasDateModified: !!articleSummary.dateModified,
+    datePublished: articleSummary.datePublished || null,
+    dateModified: articleSummary.dateModified || null,
+    datePublishedPrecision: articleSummary.datePublishedPrecision || null,
+    latestDate: articleSummary.dateModified || articleSummary.datePublished || null,
+    newsDateEvidenceCount: sampleDates.length,
+    freshnessEvidenceSources: ['articleSignals'],
+    sampleDates,
+    evidenceSamples: sampleDates.map((date) => ({
+      date,
+      source: selectedSource || 'articleSignals',
+      text: '',
+      href: ''
+    })),
+    source: 'article_signals',
+    extractionMethod: 'article_signals_facts_bridge_input',
+    articleSignalsSource: selectedSource || null
+  };
+}
+
+function buildFreshnessOperationSignalsInputAudit_(geoSignalsV1, freshnessOperationSignals) {
+  const picked = pickArticleSignalsForFreshnessInput_(geoSignalsV1);
+  const articleSummary = summarizeArticleSignalsForFreshness_(picked.articleSignals);
+  const generated = !!(freshnessOperationSignals && typeof freshnessOperationSignals === 'object');
+  const nullReason = generated
+    ? null
+    : (articleSummary.checked !== true
+      ? 'article_signals_not_checked'
+      : (!articleSummary.hasPublishedDate && !articleSummary.hasModifiedDate
+        ? 'missing_published_date'
+        : 'not_generated_by_existing_route'));
+  return {
+    version: 1,
+    target: 'freshnessOperationSignals',
+    selectedSource: picked.selectedSource,
+    usedSelectedArticleSignalsForFreshness: picked.usedSelectedArticleSignalsForFreshness,
+    usedCurrentArticleSignalsFallback: picked.usedCurrentArticleSignalsFallback,
+    articleSignalsChecked: articleSummary.checked === true,
+    hasHeadline: articleSummary.hasHeadline === true,
+    hasPublishedDate: articleSummary.hasPublishedDate === true,
+    datePublished: articleSummary.datePublished || null,
+    datePublishedPrecision: articleSummary.datePublishedPrecision || null,
+    freshnessOperationSignalsGenerated: generated,
+    freshnessOperationSignalsNullReason: nullReason,
+    originalArticleSignalsPreserved: true,
+    connectedToFactsBridge: true,
+    connectedToDiagnosis: true
+  };
+}
+
+function emitFreshnessOperationSignalsInputAudit_(freshnessOperationSignalsInputAudit) {
+  try {
+    const audit = freshnessOperationSignalsInputAudit || {};
+    console.log('[DEBUG][FRESHNESS_OPERATION_SIGNALS_INPUT_AUDIT]', JSON.stringify({
+      selectedSource: audit.selectedSource || null,
+      usedSelectedArticleSignalsForFreshness: audit.usedSelectedArticleSignalsForFreshness === true,
+      articleSignalsChecked: audit.articleSignalsChecked === true,
+      hasPublishedDate: audit.hasPublishedDate === true,
+      datePublished: audit.datePublished || null,
+      datePublishedPrecision: audit.datePublishedPrecision || null,
+      freshnessOperationSignalsGenerated: audit.freshnessOperationSignalsGenerated === true,
+      freshnessOperationSignalsNullReason: audit.freshnessOperationSignalsNullReason || null,
+      originalArticleSignalsPreserved: true
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -8466,6 +8581,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const articleSignalsFactsBridgeInputAudit = buildArticleSignalsFactsBridgeInputAudit_(geoSignalsV1);
     geoSignalsV1.articleSignalsFactsBridgeInputAudit = articleSignalsFactsBridgeInputAudit;
     emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInputAudit);
+    attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, null, { siteMode, url: normalized.topUrl });
     const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
     geoSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
     emitRepresentativeFactsReadinessAudit_(representativeEvidence, representativeFactsReadiness);
@@ -9170,6 +9286,9 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     articleSignalsFactsBridgeInputAudit
   };
   emitArticleSignalsFactsBridgeInputAudit_(articleSignalsFactsBridgeInputAudit);
+  attachMediaArticleLinkFreshnessSignals_(payload.geoSignalsV1, null, { siteMode, url: payload.topUrl || normalized.topUrl });
+  payload.coverageSignalsV1.freshnessOperationSignalsInputAudit = payload.geoSignalsV1 && payload.geoSignalsV1.freshnessOperationSignalsInputAudit || null;
+  payload.coverageSignalsV1.freshnessOperationSignals = payload.geoSignalsV1 && payload.geoSignalsV1.freshnessOperationSignals || null;
   const representativeFactsReadiness = buildRepresentativeFactsReadinessV1_(representativeEvidence);
   payload.coverageSignalsV1.representativeFactsReadiness = representativeFactsReadiness;
   payload.geoSignalsV1 = {
@@ -10115,12 +10234,18 @@ function normalizeFreshnessDateYmd_(value) {
 
 function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
   const siteMode = normalizeSubpageJsonLdText(opts.siteMode || '').toLowerCase();
-  if (siteMode !== 'media') return null;
   const g = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
   const existing = g.freshnessOperationSignals && typeof g.freshnessOperationSignals === 'object'
     ? g.freshnessOperationSignals
     : null;
   if (existing && (existing.hasNewsDateEvidence === true || existing.latestDate || existing.hasUpdatedDateEvidence === true)) return existing;
+  const pickedArticleSignals = pickArticleSignalsForFreshnessInput_(g);
+  const articleSignalsFreshness = buildFreshnessOperationSignalsFromArticleSignals_(
+    pickedArticleSignals.articleSignals,
+    pickedArticleSignals.selectedSource
+  );
+  if (articleSignalsFreshness) return articleSignalsFreshness;
+  if (siteMode !== 'media') return null;
   const observed = g.observed && typeof g.observed === 'object' ? g.observed : {};
   const links = observed.links && Array.isArray(observed.links.internalLinksSample)
     ? observed.links.internalLinksSample
@@ -10173,16 +10298,20 @@ function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
 
 function attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, opts = {}) {
   const signals = buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts);
-  if (!signals) return null;
-  geoSignalsV1.freshnessOperationSignals = geoSignalsV1.freshnessOperationSignals || signals;
-  geoSignalsV1.observed = geoSignalsV1.observed || {};
-  geoSignalsV1.observed.freshnessOperationSignals = geoSignalsV1.observed.freshnessOperationSignals || signals;
-  if (lightweightSummary && typeof lightweightSummary === 'object') {
-    lightweightSummary.freshnessOperationSignals = lightweightSummary.freshnessOperationSignals || signals;
-    lightweightSummary.hasNewsDateEvidence = lightweightSummary.hasNewsDateEvidence == null ? signals.hasNewsDateEvidence : lightweightSummary.hasNewsDateEvidence;
-    lightweightSummary.newsDateEvidenceCount = lightweightSummary.newsDateEvidenceCount == null ? signals.newsDateEvidenceCount : lightweightSummary.newsDateEvidenceCount;
-    lightweightSummary.latestDate = lightweightSummary.latestDate || signals.latestDate;
+  if (signals) {
+    geoSignalsV1.freshnessOperationSignals = geoSignalsV1.freshnessOperationSignals || signals;
+    geoSignalsV1.observed = geoSignalsV1.observed || {};
+    geoSignalsV1.observed.freshnessOperationSignals = geoSignalsV1.observed.freshnessOperationSignals || signals;
+    if (lightweightSummary && typeof lightweightSummary === 'object') {
+      lightweightSummary.freshnessOperationSignals = lightweightSummary.freshnessOperationSignals || signals;
+      lightweightSummary.hasNewsDateEvidence = lightweightSummary.hasNewsDateEvidence == null ? signals.hasNewsDateEvidence : lightweightSummary.hasNewsDateEvidence;
+      lightweightSummary.newsDateEvidenceCount = lightweightSummary.newsDateEvidenceCount == null ? signals.newsDateEvidenceCount : lightweightSummary.newsDateEvidenceCount;
+      lightweightSummary.latestDate = lightweightSummary.latestDate || signals.latestDate;
+    }
   }
+  const audit = buildFreshnessOperationSignalsInputAudit_(geoSignalsV1, signals);
+  geoSignalsV1.freshnessOperationSignalsInputAudit = audit;
+  emitFreshnessOperationSignalsInputAudit_(audit);
   return signals;
 }
 
@@ -13030,6 +13159,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.articleSignalsFactsBridgeInputAudit && typeof g.articleSignalsFactsBridgeInputAudit === 'object') {
     shortGeoSignalsV1.articleSignalsFactsBridgeInputAudit = g.articleSignalsFactsBridgeInputAudit;
+  }
+  if (g.freshnessOperationSignalsInputAudit && typeof g.freshnessOperationSignalsInputAudit === 'object') {
+    shortGeoSignalsV1.freshnessOperationSignalsInputAudit = g.freshnessOperationSignalsInputAudit;
   }
   const shortLightweightSummary = Object.assign({}, fullPayload.lightweightSummary || {});
   if (Array.isArray(shortLightweightSummary.jsonldTypes)) shortLightweightSummary.jsonldTypes = shortLightweightSummary.jsonldTypes.slice(0, 50);
