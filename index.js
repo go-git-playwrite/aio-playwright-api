@@ -6444,6 +6444,66 @@ function emitRepresentativeSignalsArticleAudit_(representativeSignals) {
   } catch (_) {}
 }
 
+function buildRepresentativeEvidenceV1_(representativeSignals) {
+  const article = representativeSignals && representativeSignals.roles && representativeSignals.roles.article || {};
+  const pages = Array.isArray(article.evidencePages) ? article.evidencePages : [];
+  const items = pages.slice(0, 5).map(page => {
+    const observedSignals = [];
+    if (page && page.headline) observedSignals.push('headline');
+    if (page && page.datePublished) observedSignals.push('datePublished');
+    if (page && page.dateModified) observedSignals.push('dateModified');
+    if (page && page.author) observedSignals.push('author');
+    if (page && page.publisher) observedSignals.push('publisher');
+    const usableFor = [];
+    if (page && (page.datePublished || page.dateModified)) usableFor.push('freshness');
+    if (page && (page.author || page.publisher)) usableFor.push('identity');
+    if (page && page.headline) usableFor.push('contentUnderstanding');
+    return {
+      role: 'article',
+      pageType: 'article',
+      path: page && page.path || '',
+      url: page && page.url || '',
+      strength: page && (page.strength === 'strong' || page.strength === 'partial' || page.strength === 'weak')
+        ? page.strength
+        : 'weak',
+      observedSignals,
+      usableFor,
+      summary: {
+        headline: page && page.headline || null,
+        datePublished: page && page.datePublished || null,
+        dateModified: page && page.dateModified || null,
+        author: page && page.author || null,
+        publisher: page && page.publisher || null
+      }
+    };
+  });
+  return {
+    version: 1,
+    generatedFrom: 'representativeSignals',
+    items
+  };
+}
+
+function emitRepresentativeEvidenceArticleAudit_(representativeEvidence) {
+  try {
+    const items = Array.isArray(representativeEvidence && representativeEvidence.items) ? representativeEvidence.items : [];
+    const articleItems = items.filter(item => item && item.role === 'article');
+    const usableForSet = new Set();
+    articleItems.forEach(item => {
+      (Array.isArray(item.usableFor) ? item.usableFor : []).forEach(value => {
+        if (value) usableForSet.add(value);
+      });
+    });
+    console.log('[DEBUG][REPRESENTATIVE_EVIDENCE_ARTICLE_AUDIT]', JSON.stringify({
+      hasRepresentativeEvidence: !!representativeEvidence,
+      itemCount: items.length,
+      articleItemCount: articleItems.length,
+      evidencePagePaths: articleItems.map(item => item && item.path || '').filter(Boolean),
+      usableFor: Array.from(usableForSet)
+    }));
+  } catch (_) {}
+}
+
 function buildLightweightSubpageSignalsSummary_(subpageSignals) {
   if (!subpageSignals || typeof subpageSignals !== 'object') return null;
   const summary = subpageSignals.summary || buildSubpageSignalsSummary_(subpageSignals.pages || []);
@@ -7246,6 +7306,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     }, { siteMode });
     geoSignalsV1.representativeSignals = representativeSignals;
     emitRepresentativeSignalsArticleAudit_(representativeSignals);
+    const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
+    geoSignalsV1.representativeEvidence = representativeEvidence;
+    emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
     geoSignalsV1.coverageSignals = coverageSignals;
     emitHeavySiteAudit('attach_done', {
       candidateCount: discovered.totalCandidates,
@@ -7863,6 +7926,13 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     representativeSignals
   };
   emitRepresentativeSignalsArticleAudit_(representativeSignals);
+  const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
+  payload.coverageSignalsV1.representativeEvidence = representativeEvidence;
+  payload.geoSignalsV1 = {
+    ...(payload.geoSignalsV1 || {}),
+    representativeEvidence
+  };
+  emitRepresentativeEvidenceArticleAudit_(representativeEvidence);
   try {
     const representativeQuality = payload.coverageSignalsV1.representativeObservationQuality || {};
     console.log('[DEBUG][REPRESENTATIVE_OBSERVATION_QUALITY_AUDIT]', JSON.stringify({
