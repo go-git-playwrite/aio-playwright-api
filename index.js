@@ -3268,6 +3268,186 @@ function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
   return siteMode === 'ec' && /\/collections?\//i.test(path) ? 'category' : 'unknown';
 }
 
+function normalizeArticleSignalText_(value, maxLen = 240) {
+  if (value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number') {
+    return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const s = normalizeArticleSignalText_(item, maxLen);
+      if (s) return s;
+    }
+    return '';
+  }
+  if (typeof value === 'object') {
+    return normalizeArticleSignalText_(value.name || value.headline || value['@id'] || value.url || value.text || value.value || '', maxLen);
+  }
+  return '';
+}
+
+function normalizeArticleSignalUrl_(value, baseUrl, maxLen = 320) {
+  const raw = normalizeArticleSignalText_(value, maxLen);
+  if (!raw) return '';
+  try { return new URL(raw, baseUrl || undefined).toString().slice(0, maxLen); } catch (_) { return raw.slice(0, maxLen); }
+}
+
+function normalizeArticleSignalArray_(value, maxItems = 10, maxLen = 120) {
+  const out = [];
+  const seen = new Set();
+  const add = (v) => {
+    const s = normalizeArticleSignalText_(v, maxLen);
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  if (Array.isArray(value)) value.forEach(add);
+  else if (typeof value === 'string') value.split(/[,、，]/).forEach(add);
+  else if (value != null) add(value);
+  return out.slice(0, maxItems);
+}
+
+function articleJsonLdTypes_(node) {
+  const raw = node && typeof node === 'object' ? node['@type'] || node.type : null;
+  return (Array.isArray(raw) ? raw : [raw])
+    .map(type => normalizeSubpageJsonLdType(type))
+    .filter(Boolean);
+}
+
+function isArticleJsonLdNode_(node) {
+  return articleJsonLdTypes_(node).some(type => /^(Article|NewsArticle|BlogPosting)$/i.test(type));
+}
+
+function collectArticleJsonLdNodes_(node, out, depth = 0) {
+  if (!node || depth > 8 || out.length >= 20) return;
+  if (Array.isArray(node)) {
+    node.slice(0, 80).forEach(item => collectArticleJsonLdNodes_(item, out, depth + 1));
+    return;
+  }
+  if (typeof node !== 'object') return;
+  if (isArticleJsonLdNode_(node)) out.push(node);
+  if (Array.isArray(node['@graph'])) node['@graph'].slice(0, 80).forEach(item => collectArticleJsonLdNodes_(item, out, depth + 1));
+  ['mainEntity', 'mainEntityOfPage', 'itemListElement'].forEach(key => {
+    if (node[key]) collectArticleJsonLdNodes_(node[key], out, depth + 1);
+  });
+}
+
+function extractArticleMetaFromCheerio_($) {
+  const clean = (v, maxLen = 240) => normalizeArticleSignalText_(v, maxLen);
+  const metaOne = (selector, attr = 'content', maxLen = 240) => clean($(selector).first().attr(attr) || '', maxLen);
+  const metaAll = (selector, attr = 'content') => $(selector).map((_, el) => clean($(el).attr(attr) || '', 120)).get().filter(Boolean).slice(0, 10);
+  const tags = metaAll('meta[property="article:tag" i]');
+  normalizeArticleSignalArray_(metaOne('meta[name="keywords" i]', 'content', 500), 10, 120).forEach(tag => {
+    if (!tags.includes(tag) && tags.length < 10) tags.push(tag);
+  });
+  return {
+    publishedTime: metaOne('meta[property="article:published_time" i]'),
+    modifiedTime: metaOne('meta[property="article:modified_time" i]'),
+    author: metaOne('meta[property="article:author" i]') || metaOne('meta[name="author" i]'),
+    section: metaOne('meta[property="article:section" i]'),
+    tags
+  };
+}
+
+function buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, meta, baseUrl) {
+  const items = Array.isArray(jsonLdItems) ? jsonLdItems : [];
+  const articleNodes = [];
+  items.forEach(item => collectArticleJsonLdNodes_(item, articleNodes, 0));
+  const articleNode = articleNodes[0] || null;
+  const types = Array.from(new Set(articleNodes.reduce((acc, node) => acc.concat(articleJsonLdTypes_(node)), []))).slice(0, 10);
+  const hasType = (name) => types.some(type => new RegExp('^' + name + '$', 'i').test(type));
+  const author = articleNode && Array.isArray(articleNode.author) ? articleNode.author[0] : (articleNode && articleNode.author);
+  const publisher = articleNode && Array.isArray(articleNode.publisher) ? articleNode.publisher[0] : (articleNode && articleNode.publisher);
+  const publisherLogo = publisher && typeof publisher === 'object'
+    ? (publisher.logo && typeof publisher.logo === 'object' ? (publisher.logo.url || publisher.logo['@id']) : publisher.logo)
+    : '';
+  const mainEntity = articleNode && articleNode.mainEntityOfPage;
+  const metaObj = meta && typeof meta === 'object' ? meta : {};
+  const jsonLd = {
+    hasArticleJsonLd: items.length ? hasType('Article') : null,
+    hasNewsArticleJsonLd: items.length ? hasType('NewsArticle') : null,
+    hasBlogPostingJsonLd: items.length ? hasType('BlogPosting') : null,
+    types,
+    headline: normalizeArticleSignalText_(articleNode && (articleNode.headline || articleNode.name), 240) || null,
+    datePublished: normalizeArticleSignalText_(articleNode && articleNode.datePublished, 80) || null,
+    dateModified: normalizeArticleSignalText_(articleNode && articleNode.dateModified, 80) || null,
+    authorName: normalizeArticleSignalText_(author && (typeof author === 'object' ? author.name : author), 160) || null,
+    authorType: normalizeArticleSignalText_(author && typeof author === 'object' ? author['@type'] : '', 80) || null,
+    publisherName: normalizeArticleSignalText_(publisher && (typeof publisher === 'object' ? publisher.name : publisher), 160) || null,
+    publisherType: normalizeArticleSignalText_(publisher && typeof publisher === 'object' ? publisher['@type'] : '', 80) || null,
+    publisherLogo: normalizeArticleSignalUrl_(publisherLogo, baseUrl, 320) || null,
+    mainEntityOfPage: normalizeArticleSignalUrl_(mainEntity && typeof mainEntity === 'object' ? (mainEntity['@id'] || mainEntity.url) : mainEntity, baseUrl, 320) || null,
+    articleSection: normalizeArticleSignalText_(articleNode && articleNode.articleSection, 120) || null,
+    articleTags: normalizeArticleSignalArray_(articleNode && (articleNode.keywords || articleNode.articleTag), 10, 120)
+  };
+  const metaOut = {
+    publishedTime: normalizeArticleSignalText_(metaObj.publishedTime, 80) || null,
+    modifiedTime: normalizeArticleSignalText_(metaObj.modifiedTime, 80) || null,
+    author: normalizeArticleSignalText_(metaObj.author, 160) || null,
+    section: normalizeArticleSignalText_(metaObj.section, 120) || null,
+    tags: normalizeArticleSignalArray_(metaObj.tags, 10, 120)
+  };
+  const hasMeta = !!(metaOut.publishedTime || metaOut.modifiedTime || metaOut.author || metaOut.section || metaOut.tags.length);
+  return {
+    checked: items.length > 0 || hasMeta,
+    source: {
+      jsonLd: articleNodes.length > 0,
+      meta: hasMeta
+    },
+    jsonLd,
+    meta: metaOut,
+    summary: {
+      hasArticleType: types.length ? true : (items.length ? false : null),
+      hasHeadline: !!jsonLd.headline,
+      hasPublishedDate: !!(jsonLd.datePublished || metaOut.publishedTime),
+      hasModifiedDate: !!(jsonLd.dateModified || metaOut.modifiedTime),
+      hasAuthor: !!(jsonLd.authorName || metaOut.author),
+      hasPublisher: !!jsonLd.publisherName
+    }
+  };
+}
+
+async function collectArticleSignalsFromPageLight_(page, baseUrl) {
+  try {
+    if (!page || typeof page.evaluate !== 'function') return buildArticleSignalsFromJsonLdAndMeta_([], {}, baseUrl);
+    const data = await page.evaluate(() => {
+      const clean = (v, max = 240) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
+      const jsonLdItems = [];
+      Array.from(document.querySelectorAll('script[type*="ld+json" i]')).slice(0, 20).forEach(script => {
+        const raw = String(script.textContent || '').trim();
+        if (!raw) return;
+        try { jsonLdItems.push(JSON.parse(raw)); } catch (_) {}
+      });
+      const metaOne = (selector, attr = 'content', max = 240) => {
+        const el = document.querySelector(selector);
+        return el ? clean(el.getAttribute(attr) || '', max) : '';
+      };
+      const tags = Array.from(document.querySelectorAll('meta[property="article:tag" i]'))
+        .map(el => clean(el.getAttribute('content') || '', 120))
+        .filter(Boolean)
+        .slice(0, 10);
+      const keywords = metaOne('meta[name="keywords" i]', 'content', 500)
+        .split(/[,、，]/)
+        .map(v => clean(v, 120))
+        .filter(Boolean);
+      keywords.forEach(tag => { if (!tags.includes(tag) && tags.length < 10) tags.push(tag); });
+      return {
+        jsonLdItems,
+        meta: {
+          publishedTime: metaOne('meta[property="article:published_time" i]'),
+          modifiedTime: metaOne('meta[property="article:modified_time" i]'),
+          author: metaOne('meta[property="article:author" i]') || metaOne('meta[name="author" i]'),
+          section: metaOne('meta[property="article:section" i]'),
+          tags
+        }
+      };
+    });
+    return buildArticleSignalsFromJsonLdAndMeta_(data && data.jsonLdItems, data && data.meta, baseUrl);
+  } catch (_) {
+    return buildArticleSignalsFromJsonLdAndMeta_([], {}, baseUrl);
+  }
+}
+
 function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const $ = cheerio.load(String(html || ''));
   const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
@@ -3282,12 +3462,15 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     if (text && !h1Texts.includes(text) && h1Texts.length < 5) h1Texts.push(text.slice(0, 180));
   });
   const jsonldTypes = [];
+  const jsonLdItems = [];
   let parseErrors = 0;
   $('script[type*="ld+json" i]').each((_, el) => {
     const raw = String($(el).contents().text() || $(el).html() || '').trim();
     if (!raw) return;
     try {
-      collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+      const parsed = JSON.parse(raw);
+      jsonLdItems.push(parsed);
+      collectSubpageJsonLdTypes(parsed, jsonldTypes, 0);
     } catch (_) {
       parseErrors += 1;
     }
@@ -3328,6 +3511,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
     : null;
+  const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url);
   let internalLinkCount = 0;
   let externalLinkCount = 0;
   $('a[href]').slice(0, 1200).each((_, el) => {
@@ -3367,6 +3551,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     bodyTextLength,
     sampledText,
     legalOperatorInfo,
+    articleSignals,
     error: null,
     parseErrors
   };
@@ -4877,10 +5062,13 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       };
     }
     const jsonldTypes = [];
+    const jsonLdItems = [];
     let parseErrors = 0;
     (Array.isArray(observed && observed.jsonldTexts) ? observed.jsonldTexts : []).forEach(raw => {
       try {
-        collectSubpageJsonLdTypes(JSON.parse(raw), jsonldTypes, 0);
+        const parsed = JSON.parse(raw);
+        jsonLdItems.push(parsed);
+        collectSubpageJsonLdTypes(parsed, jsonldTypes, 0);
       } catch (_) {
         parseErrors += 1;
       }
@@ -4943,6 +5131,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       internalLinkCount: Number(observed && observed.internalLinkCount || 0),
       externalLinkCount: Number(observed && observed.externalLinkCount || 0),
       sampledText: normalizeSubpageJsonLdText(observed && observed.sampledText).slice(0, 500),
+      articleSignals: buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, {}, observedFinalUrl || finalUrl || url),
       error: null,
       parseErrors
     };
@@ -5018,6 +5207,7 @@ function compactSubpageJsonLdObservation_(page) {
     externalLinkCount: Number(page && page.externalLinkCount || 0),
     bodyTextLength: Number(page && page.bodyTextLength || 0),
     sampledText: normalizeSubpageJsonLdText(String(page && page.sampledText || '').slice(0, 500)),
+    articleSignals: page && page.articleSignals && typeof page.articleSignals === 'object' ? page.articleSignals : null,
     legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? {
       observed: true,
       pageType: 'legal',
@@ -5604,6 +5794,7 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         hasArticle: page.hasArticleJsonLd === true || page.hasBlogPostingJsonLd === true,
         hasMain: page.hasMain === true || page.hasMainLandmark === true,
         hasMainLandmark: page.hasMainLandmark === true,
+        articleSignals: page.articleSignals && typeof page.articleSignals === 'object' ? page.articleSignals : null,
         metaDescription: normalizeSubpageJsonLdText(page.metaDescription).slice(0, 240),
         ogTitle: normalizeSubpageJsonLdText(page.ogTitle).slice(0, 180),
         ogDescription: normalizeSubpageJsonLdText(page.ogDescription).slice(0, 240),
@@ -9165,12 +9356,28 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
       htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
+    const articleSignals = await collectArticleSignalsFromPageLight_(page, url);
+    console.log('[DEBUG][ARTICLE_SIGNALS_AUDIT]', JSON.stringify({
+      checked: articleSignals.checked === true,
+      hasArticleType: articleSignals.summary && articleSignals.summary.hasArticleType,
+      hasHeadline: articleSignals.summary && articleSignals.summary.hasHeadline,
+      hasPublishedDate: articleSignals.summary && articleSignals.summary.hasPublishedDate,
+      hasModifiedDate: articleSignals.summary && articleSignals.summary.hasModifiedDate,
+      hasAuthor: articleSignals.summary && articleSignals.summary.hasAuthor,
+      hasPublisher: articleSignals.summary && articleSignals.summary.hasPublisher,
+      jsonLdTypes: articleSignals.jsonLd && Array.isArray(articleSignals.jsonLd.types) ? articleSignals.jsonLd.types : [],
+      metaKeys: articleSignals.meta ? Object.keys(articleSignals.meta).filter(key => {
+        const value = articleSignals.meta[key];
+        return Array.isArray(value) ? value.length > 0 : !!value;
+      }) : []
+    }));
 
     const geoSignalsV1 = {
       version: 'geoSignalsV1',
       generatedAt,
       url: String(url || ''),
       structuredData: structuredDataLight,
+      articleSignals,
       headings: {
         h1Count: mergedH1.length,
         h2Count: mergedH2.length,
@@ -9464,6 +9671,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           parseErrorsCount: structuredDataLight.parseErrorsCount,
           scriptSrcError: structuredDataLight.scriptSrcError
         },
+        articleSignals,
         landmarks: {
           hasMainLandmark: hasMainLandmarkFinal,
           hasMainLandmark_final: hasMainLandmarkFinal,
@@ -9950,6 +10158,7 @@ function extractTopPageStaticSignalsFromHtml_(url, finalUrl, status, html) {
     hasSemanticStructure: false,
     jsonLdTypes: [],
     jsonLdCount: 0,
+    articleSignals: null,
     navTextsSample: [],
     internalLinksSample: [],
     footerTextsSample: [],
@@ -9990,6 +10199,7 @@ function extractTopPageStaticSignalsFromHtml_(url, finalUrl, status, html) {
     (Array.isArray(jsonLdItems) ? jsonLdItems : []).forEach(item => collectTypes(item, types, 0));
     out.jsonLdTypes = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
     out.jsonLdCount = Array.isArray(jsonLdItems) ? jsonLdItems.length : 0;
+    out.articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), out.finalUrl || out.url);
     const toAbs = (href) => {
       try { return href ? new URL(String(href), out.finalUrl || out.url).toString() : ''; } catch (_) { return String(href || ''); }
     };
@@ -10082,6 +10292,9 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
   const generatedAt = new Date().toISOString();
   const finalUrl = signals.finalUrl || staticFetchResult && staticFetchResult.finalUrl || url;
   const jsonLdTypes = Array.isArray(signals.jsonLdTypes) ? signals.jsonLdTypes.slice(0, 50) : [];
+  const articleSignals = signals.articleSignals && typeof signals.articleSignals === 'object'
+    ? signals.articleSignals
+    : buildArticleSignalsFromJsonLdAndMeta_([], {}, finalUrl || url);
   const hasJsonLd = Number(signals.jsonLdCount || 0) > 0 || jsonLdTypes.length > 0;
   const headingTexts = Array.isArray(signals.h1Texts) ? signals.h1Texts.slice(0, 10) : [];
   const h1Count = Number(signals.h1Count || 0);
@@ -10109,6 +10322,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
       observationLimited: true,
       observationScope: 'static_html_only'
     },
+    articleSignals,
     headings: {
       h1Count,
       h2Count: 0,
@@ -10196,6 +10410,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
         observed: true
       },
       structuredData: null,
+      articleSignals: null,
       coverage: null,
       landmarks: null,
       body: {
@@ -10224,6 +10439,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
   geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
   geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
   geoSignalsV1.observed.structuredData = geoSignalsV1.structuredData;
+  geoSignalsV1.observed.articleSignals = articleSignals;
   const lightweightSummary = {
     title: signals.title || null,
     metaDescription: signals.metaDescription || null,
@@ -10253,6 +10469,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
     bodyTextLength: Number(signals.bodyTextLength || 0),
     jsonldCount: Number(signals.jsonLdCount || jsonLdTypes.length || 0),
     jsonldTypes: jsonLdTypes,
+    articleSignals,
     qualityStatus: staticFetchResult && staticFetchResult.success ? 'limited' : 'failed',
     coreSignalsReady: staticFetchResult && staticFetchResult.success === true,
     topPageStaticFetch: geoSignalsV1.diagnostics.topPageStaticFetch
@@ -10274,6 +10491,7 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
   if (!(observed.title && observed.title.value) && fg.observed.title) observed.title = fg.observed.title;
   if (!(observed.metaDescription && observed.metaDescription.value) && fg.observed.metaDescription) observed.metaDescription = fg.observed.metaDescription;
   if (!(observed.h1 && Number(observed.h1.count || 0) > 0) && fg.observed.h1) observed.h1 = fg.observed.h1;
+  if (!(geoSignalsV1.articleSignals && geoSignalsV1.articleSignals.checked === true) && fg.articleSignals) geoSignalsV1.articleSignals = fg.articleSignals;
   if (!Number(geoSignalsV1.headings.h1Count || 0) && fg.headings) Object.assign(geoSignalsV1.headings, fg.headings);
   if (!Object.prototype.hasOwnProperty.call(geoSignalsV1.landmarks, 'hasMainLandmark') || geoSignalsV1.landmarks.hasMainLandmark == null) Object.assign(geoSignalsV1.landmarks, fg.landmarks);
   ['hasHeaderElement', 'hasNavElement', 'hasFooterElement', 'hasMainElement', 'hasSemanticStructure'].forEach(key => {
@@ -10284,6 +10502,7 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
   geoSignalsV1.observed.headings = geoSignalsV1.observed.headings || geoSignalsV1.headings;
   geoSignalsV1.observed.landmarks = geoSignalsV1.observed.landmarks || geoSignalsV1.landmarks;
   geoSignalsV1.observed.coverage = geoSignalsV1.observed.coverage || geoSignalsV1.coverage;
+  geoSignalsV1.observed.articleSignals = geoSignalsV1.observed.articleSignals || geoSignalsV1.articleSignals || fg.articleSignals;
   geoSignalsV1.diagnostics = geoSignalsV1.diagnostics || {};
   geoSignalsV1.diagnostics.topPageStaticFetch = {
     used: true,
@@ -10313,6 +10532,7 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
     fill('hasMainElement', fl.hasMainElement);
     fill('hasSemanticStructure', fl.hasSemanticStructure);
     fill('jsonldCount', fl.jsonldCount);
+    if (!(lightweightSummary.articleSignals && lightweightSummary.articleSignals.checked === true) && fl.articleSignals) lightweightSummary.articleSignals = fl.articleSignals;
     if (!Array.isArray(lightweightSummary.jsonldTypes) || !lightweightSummary.jsonldTypes.length) lightweightSummary.jsonldTypes = fl.jsonldTypes;
     lightweightSummary.topPageStaticFetch = geoSignalsV1.diagnostics.topPageStaticFetch;
   }
@@ -12495,6 +12715,21 @@ async function scrapeOnce(req, res) {
         parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
         scriptSrcError: scriptJsonLd.error || null
       };
+      const articleSignals = await collectArticleSignalsFromPageLight_(page, finalUrl || urlToFetch);
+      console.log('[DEBUG][ARTICLE_SIGNALS_AUDIT]', JSON.stringify({
+        checked: articleSignals.checked === true,
+        hasArticleType: articleSignals.summary && articleSignals.summary.hasArticleType,
+        hasHeadline: articleSignals.summary && articleSignals.summary.hasHeadline,
+        hasPublishedDate: articleSignals.summary && articleSignals.summary.hasPublishedDate,
+        hasModifiedDate: articleSignals.summary && articleSignals.summary.hasModifiedDate,
+        hasAuthor: articleSignals.summary && articleSignals.summary.hasAuthor,
+        hasPublisher: articleSignals.summary && articleSignals.summary.hasPublisher,
+        jsonLdTypes: articleSignals.jsonLd && Array.isArray(articleSignals.jsonLd.types) ? articleSignals.jsonLd.types : [],
+        metaKeys: articleSignals.meta ? Object.keys(articleSignals.meta).filter(key => {
+          const value = articleSignals.meta[key];
+          return Array.isArray(value) ? value.length > 0 : !!value;
+        }) : []
+      }));
       const linksObserved = !!(phaseByName('linksAndTrust') && phaseByName('linksAndTrust').ok) || typeof linksTrust.anchorCount === 'number';
       const multimodalObserved = !!(phaseByName('multimodal') && phaseByName('multimodal').ok) || typeof multimodal.imgCount === 'number';
       const linkNumber = (key) => linksObserved && typeof linksTrust[key] === 'number' ? Number(linksTrust[key]) : null;
@@ -12530,6 +12765,7 @@ async function scrapeOnce(req, res) {
         generatedAt: new Date().toISOString(),
         url: String(finalUrl || urlToFetch || ''),
         structuredData: structuredDataLight,
+        articleSignals,
         geoThemeSignals,
         headings: {
           h1Count: Number(headingsLight.h1Count || 0),
@@ -12758,6 +12994,7 @@ async function scrapeOnce(req, res) {
             phaseError: linksObserved ? '' : (phaseByName('linksAndTrust').errorMessage || 'not_observed')
           },
           structuredData: structuredDataLight,
+          articleSignals,
           coverage: null,
           landmarks: null,
           multimodalSignals: null,
@@ -12832,6 +13069,7 @@ async function scrapeOnce(req, res) {
       geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
       geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
       geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
+      geoSignalsV1.observed.articleSignals = articleSignals;
       const lightweightSummary = {
         title: basicDom.title || null,
         metaDescription: basicDom.metaDescription || null,
@@ -12890,6 +13128,7 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: structuredDataLight.hasOrganization,
         hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
         hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        articleSignals,
         structuredDataBreadcrumbObserved: structuredDataLight.breadcrumbObserved,
         structuredDataBreadcrumbMissing: structuredDataLight.breadcrumbMissing,
         organizationSummary: structuredDataLight.organizationSummary,
@@ -14332,6 +14571,7 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
         hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
+        articleSignals: geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object' ? geoSignalsV1.articleSignals : null,
         structuredDataObservationLimited: Object.prototype.hasOwnProperty.call(structuredObserved, 'observationLimited') ? structuredObserved.observationLimited : true,
         structuredDataObservationScope: structuredObserved.observationScope || 'rendered_dom_only',
         structuredDataRenderedDomObserved: Object.prototype.hasOwnProperty.call(structuredObserved, 'renderedDomObserved') ? structuredObserved.renderedDomObserved : true,
