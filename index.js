@@ -6427,6 +6427,172 @@ function buildRepresentativeSignalsV1_(payload, opts = {}) {
   };
 }
 
+function buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, url) {
+  const clean = (value, maxLen = 240) => normalizeSubpageJsonLdText(value).slice(0, maxLen) || null;
+  const articleSignals = geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object'
+    ? geoSignalsV1.articleSignals
+    : (geoSignalsV1 && geoSignalsV1.observed && geoSignalsV1.observed.articleSignals && typeof geoSignalsV1.observed.articleSignals === 'object'
+      ? geoSignalsV1.observed.articleSignals
+      : {});
+  const jsonLd = articleSignals && articleSignals.jsonLd && typeof articleSignals.jsonLd === 'object' ? articleSignals.jsonLd : {};
+  const meta = articleSignals && articleSignals.meta && typeof articleSignals.meta === 'object' ? articleSignals.meta : {};
+  const observed = geoSignalsV1 && geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
+  const headings = geoSignalsV1 && geoSignalsV1.headings && typeof geoSignalsV1.headings === 'object' ? geoSignalsV1.headings : {};
+  const sourceUrlRaw = clean(url || geoSignalsV1 && geoSignalsV1.url, 320);
+  const path = (() => {
+    try { return sourceUrlRaw ? new URL(sourceUrlRaw).pathname || '' : ''; } catch (_) { return ''; }
+  })();
+  const pick = (pairs) => {
+    for (const pair of pairs) {
+      const value = clean(pair && pair.value, pair && pair.maxLen || 240);
+      if (value) return { value, source: pair.source || null };
+    }
+    return { value: null, source: null };
+  };
+  const observedTitle = observed.title && typeof observed.title === 'object' ? observed.title.value : null;
+  const observedH1 = observed.h1 && typeof observed.h1 === 'object' && Array.isArray(observed.h1.values) ? observed.h1.values[0] : null;
+  const headingH1 = Array.isArray(headings.h1Texts) ? headings.h1Texts[0] : null;
+  const pathDate = (() => {
+    const match = String(path || '').match(/\/(20\d{2})\/(0?[1-9]|1[0-2])(?:\/(0?[1-9]|[12]\d|3[01]))?(?:\/|\.|$)/);
+    if (!match) return { value: null, source: null };
+    const year = match[1];
+    const month = String(match[2]).padStart(2, '0');
+    const day = match[3] ? String(match[3]).padStart(2, '0') : '';
+    return { value: day ? `${year}-${month}-${day}` : `${year}-${month}`, source: day ? 'url_path_year_month_day' : 'url_path_year_month' };
+  })();
+  const headline = pick([
+    { value: jsonLd.headline, source: 'jsonld.headline' },
+    { value: observedH1, source: 'h1' },
+    { value: headingH1, source: 'headings.h1Texts' },
+    { value: observedTitle, source: 'title' }
+  ]);
+  const datePublished = pick([
+    { value: jsonLd.datePublished, source: 'jsonld.datePublished', maxLen: 80 },
+    { value: meta.publishedTime, source: 'meta.article:published_time', maxLen: 80 },
+    { value: pathDate.value, source: pathDate.source, maxLen: 80 }
+  ]);
+  const dateModified = pick([
+    { value: jsonLd.dateModified, source: 'jsonld.dateModified', maxLen: 80 },
+    { value: meta.modifiedTime, source: 'meta.article:modified_time', maxLen: 80 }
+  ]);
+  const canonical = pick([
+    { value: jsonLd.mainEntityOfPage, source: 'jsonld.mainEntityOfPage', maxLen: 320 },
+    { value: sourceUrlRaw, source: 'request_url', maxLen: 320 }
+  ]);
+  const sourceUrl = pick([
+    { value: canonical.value, source: canonical.source, maxLen: 320 },
+    { value: sourceUrlRaw, source: 'request_url', maxLen: 320 }
+  ]);
+  const authorName = pick([
+    { value: jsonLd.authorName, source: 'jsonld.author.name', maxLen: 160 },
+    { value: meta.author, source: 'meta.author', maxLen: 160 }
+  ]);
+  const publisherName = pick([
+    { value: jsonLd.publisherName, source: 'jsonld.publisher.name', maxLen: 160 }
+  ]);
+  const hasArticleType = articleSignals && articleSignals.summary && articleSignals.summary.hasArticleType === true;
+  const hasArticleMetaDate = !!(meta.publishedTime || meta.modifiedTime);
+  const isArticleDetailCandidate = /\/(?:information|news|blog|article)(?:\/|$)/i.test(path) ||
+    hasArticleType ||
+    hasArticleMetaDate ||
+    !!pathDate.value;
+  const values = {
+    headline: headline.value,
+    datePublished: datePublished.value,
+    dateModified: dateModified.value,
+    canonicalUrl: canonical.value,
+    sourceUrl: sourceUrl.value,
+    authorName: authorName.value,
+    publisherName: publisherName.value
+  };
+  const filledKeys = Object.keys(values).filter(key => values[key] != null && values[key] !== '');
+  const missingKeys = Object.keys(values).filter(key => values[key] == null || values[key] === '');
+  const evidencePage = isArticleDetailCandidate ? {
+    path,
+    url: sourceUrl.value || sourceUrlRaw || '',
+    role: 'article',
+    pageType: 'article',
+    strength: headline.value && datePublished.value && (authorName.value || publisherName.value) ? 'strong' : (headline.value ? 'partial' : 'weak'),
+    headline: headline.value,
+    datePublished: datePublished.value,
+    dateModified: dateModified.value,
+    author: authorName.value,
+    publisher: publisherName.value,
+    canonicalUrl: canonical.value,
+    sourceUrl: sourceUrl.value || sourceUrlRaw || ''
+  } : null;
+  return {
+    version: 1,
+    target: 'representativeEvidence.article.facts',
+    generatedFrom: 'documentArticleMetadata',
+    url: sourceUrlRaw || '',
+    isArticleDetailCandidate,
+    filledKeys,
+    missingKeys,
+    headlineSource: headline.source,
+    datePublishedSource: datePublished.source,
+    dateModifiedSource: dateModified.source,
+    canonicalUrlSource: canonical.source,
+    sourceUrlSource: sourceUrl.source,
+    authorNameSource: authorName.source,
+    publisherNameSource: publisherName.source,
+    connectedToFactsBridge: false,
+    connectedToDiagnosis: false,
+    evidencePage
+  };
+}
+
+function mergeDocumentArticleFactsIntoRepresentativeSignals_(representativeSignals, extractionAudit) {
+  const evidencePage = extractionAudit && extractionAudit.evidencePage && typeof extractionAudit.evidencePage === 'object'
+    ? extractionAudit.evidencePage
+    : null;
+  if (!representativeSignals || !representativeSignals.roles || !representativeSignals.roles.article || !evidencePage) return representativeSignals;
+  const article = representativeSignals.roles.article;
+  const pages = Array.isArray(article.evidencePages) ? article.evidencePages.slice(0, 5) : [];
+  const key = evidencePage.url || evidencePage.path;
+  const exists = pages.some(page => page && (page.url || page.path) === key);
+  if (!exists && key) pages.unshift(evidencePage);
+  article.evidencePages = pages.slice(0, 5);
+  article.observed = article.evidencePages.length > 0;
+  article.observedPagesCount = article.evidencePages.length;
+  article.hasHeadline = article.evidencePages.some(page => !!(page && page.headline));
+  article.hasAuthor = article.evidencePages.some(page => !!(page && page.author));
+  article.hasPublisher = article.evidencePages.some(page => !!(page && page.publisher));
+  article.hasDatePublished = article.evidencePages.some(page => !!(page && page.datePublished));
+  article.hasDateModified = article.evidencePages.some(page => !!(page && page.dateModified));
+  article.freshnessUsable = article.hasDatePublished || article.hasDateModified;
+  article.identityUsable = article.hasAuthor || article.hasPublisher;
+  article.contentUnderstandingUsable = article.contentUnderstandingUsable === true || article.hasHeadline;
+  article.strength = !article.observed
+    ? 'none'
+    : (article.hasHeadline && article.freshnessUsable && article.identityUsable ? 'strong' : (article.hasHeadline ? 'partial' : 'weak'));
+  return representativeSignals;
+}
+
+function emitRepresentativeArticleFactsExtractionAudit_(audit) {
+  try {
+    console.log('[DEBUG][REPRESENTATIVE_ARTICLE_FACTS_EXTRACTION_AUDIT]', JSON.stringify({
+      url: audit && audit.url || '',
+      isArticleDetailCandidate: audit && audit.isArticleDetailCandidate === true,
+      filledKeys: Array.isArray(audit && audit.filledKeys) ? audit.filledKeys : [],
+      missingKeys: Array.isArray(audit && audit.missingKeys) ? audit.missingKeys : [],
+      headlineSource: audit && audit.headlineSource || null,
+      datePublishedSource: audit && audit.datePublishedSource || null,
+      canonicalUrlSource: audit && audit.canonicalUrlSource || null,
+      sourceUrlSource: audit && audit.sourceUrlSource || null,
+      connectedToFactsBridge: false,
+      connectedToDiagnosis: false
+    }));
+  } catch (_) {}
+}
+
+function compactRepresentativeArticleFactsExtractionAudit_(audit) {
+  if (!audit || typeof audit !== 'object') return null;
+  const out = Object.assign({}, audit);
+  delete out.evidencePage;
+  return out;
+}
+
 function emitRepresentativeSignalsArticleAudit_(representativeSignals) {
   try {
     const article = representativeSignals && representativeSignals.roles && representativeSignals.roles.article || {};
@@ -6454,6 +6620,8 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
     if (page && page.dateModified) observedSignals.push('dateModified');
     if (page && page.author) observedSignals.push('author');
     if (page && page.publisher) observedSignals.push('publisher');
+    if (page && page.canonicalUrl) observedSignals.push('canonicalUrl');
+    if (page && page.sourceUrl) observedSignals.push('sourceUrl');
     const usableFor = [];
     if (page && (page.datePublished || page.dateModified)) usableFor.push('freshness');
     if (page && (page.author || page.publisher)) usableFor.push('identity');
@@ -6463,6 +6631,8 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
     const dateModified = page && page.dateModified || null;
     const author = page && page.author || null;
     const publisher = page && page.publisher || null;
+    const canonicalUrl = page && page.canonicalUrl || null;
+    const sourceUrl = page && (page.sourceUrl || page.url) || null;
     const summaryText = headline
       ? `記事ページで見出し「${headline}」を確認できます。`
       : ((datePublished || dateModified)
@@ -6486,7 +6656,9 @@ function buildRepresentativeEvidenceV1_(representativeSignals) {
         datePublished,
         dateModified,
         author,
-        publisher
+        publisher,
+        canonicalUrl,
+        sourceUrl
       }
     };
   });
@@ -6866,8 +7038,8 @@ function buildRepresentativeArticleFacts_(representativeEvidence) {
     dateModified: articleItem ? (facts.dateModified || null) : null,
     authorName: articleItem ? (facts.author || null) : null,
     publisherName: articleItem ? (facts.publisher || null) : null,
-    canonicalUrl: null,
-    sourceUrl: articleItem ? (articleItem.url || null) : null,
+    canonicalUrl: articleItem ? (facts.canonicalUrl || null) : null,
+    sourceUrl: articleItem ? (facts.sourceUrl || articleItem.url || null) : null,
     evidencePath: articleItem ? (articleItem.path || '') : '',
     connectedToFactsBridge: false,
     connectedToDiagnosis: false
@@ -7866,7 +8038,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       subpageSignals,
       coverageSignals
     }, { siteMode });
+    const representativeArticleFactsExtractionAudit = buildRepresentativeArticleFactsExtractionAudit_(geoSignalsV1, normalized.topUrl);
+    mergeDocumentArticleFactsIntoRepresentativeSignals_(representativeSignals, representativeArticleFactsExtractionAudit);
     geoSignalsV1.representativeSignals = representativeSignals;
+    geoSignalsV1.representativeArticleFactsExtractionAudit = compactRepresentativeArticleFactsExtractionAudit_(representativeArticleFactsExtractionAudit);
+    emitRepresentativeArticleFactsExtractionAudit_(representativeArticleFactsExtractionAudit);
     emitRepresentativeSignalsArticleAudit_(representativeSignals);
     const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
     geoSignalsV1.representativeEvidence = representativeEvidence;
@@ -8512,11 +8688,16 @@ app.post('/discover-and-observe-subpages-light', async (req, res) => {
     candidates: discovered.candidates
   }));
   const representativeSignals = buildRepresentativeSignalsV1_(payload, { siteMode });
+  const representativeArticleFactsExtractionAudit = buildRepresentativeArticleFactsExtractionAudit_(payload.geoSignalsV1, normalized.topUrl);
+  mergeDocumentArticleFactsIntoRepresentativeSignals_(representativeSignals, representativeArticleFactsExtractionAudit);
   payload.coverageSignalsV1.representativeSignals = representativeSignals;
+  payload.coverageSignalsV1.representativeArticleFactsExtractionAudit = compactRepresentativeArticleFactsExtractionAudit_(representativeArticleFactsExtractionAudit);
   payload.geoSignalsV1 = {
     ...(payload.geoSignalsV1 || {}),
-    representativeSignals
+    representativeSignals,
+    representativeArticleFactsExtractionAudit: compactRepresentativeArticleFactsExtractionAudit_(representativeArticleFactsExtractionAudit)
   };
+  emitRepresentativeArticleFactsExtractionAudit_(representativeArticleFactsExtractionAudit);
   emitRepresentativeSignalsArticleAudit_(representativeSignals);
   const representativeEvidence = buildRepresentativeEvidenceV1_(representativeSignals);
   payload.coverageSignalsV1.representativeEvidence = representativeEvidence;
@@ -12386,6 +12567,9 @@ function buildBalancedShortResponsePayload(fullPayload) {
   }
   if (g.representativeArticleFacts && typeof g.representativeArticleFacts === 'object') {
     shortGeoSignalsV1.representativeArticleFacts = g.representativeArticleFacts;
+  }
+  if (g.representativeArticleFactsExtractionAudit && typeof g.representativeArticleFactsExtractionAudit === 'object') {
+    shortGeoSignalsV1.representativeArticleFactsExtractionAudit = g.representativeArticleFactsExtractionAudit;
   }
   if (g.representativeArticleFactsBridgeAudit && typeof g.representativeArticleFactsBridgeAudit === 'object') {
     shortGeoSignalsV1.representativeArticleFactsBridgeAudit = g.representativeArticleFactsBridgeAudit;
