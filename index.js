@@ -10206,6 +10206,21 @@ function collectGeoThemeSignalsLight_(input = {}) {
 }
 function countIf(arr, pred){ return arr.reduce((a,x)=>a+(pred(x)?1:0),0); }
 
+function mergeEntityLinkSignalsLight_(items) {
+  const out = {};
+  ['hasOrgContactPointLink', 'hasOrgOfferCatalogLink', 'hasServiceProviderLink'].forEach((key) => {
+    let observed = false;
+    let hasTrue = false;
+    (Array.isArray(items) ? items : []).forEach((item) => {
+      if (!item || typeof item !== 'object' || typeof item[key] !== 'boolean') return;
+      observed = true;
+      if (item[key] === true) hasTrue = true;
+    });
+    if (observed) out[key] = hasTrue;
+  });
+  return Object.keys(out).length ? out : null;
+}
+
 function summarizeJsonLdTextsLight(texts, source) {
   const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
   const typeNames = (node) => {
@@ -10239,6 +10254,13 @@ function summarizeJsonLdTextsLight(texts, source) {
     address: false,
     telephone: false
   };
+  const entityLinkPresence = {
+    orgNodeObserved: false,
+    orgContactPointLink: false,
+    orgOfferCatalogLink: false,
+    serviceNodeObserved: false,
+    serviceProviderLink: false
+  };
   let orgNodeObserved = false;
   let seoNodeObserved = false;
   const nodeTypes = [];
@@ -10254,15 +10276,23 @@ function summarizeJsonLdTextsLight(texts, source) {
     else if (t) nodeTypes.push(clean(t));
     const types = typeNames(node);
     const isOrg = types.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
+    const isService = types.includes('service');
     const isWebsite = types.includes('website');
     const isPerson = types.includes('person');
     const isContactPoint = types.includes('contactpoint');
     if (isOrg || isWebsite || types.includes('person')) seoNodeObserved = true;
     if (isOrg) {
       orgNodeObserved = true;
+      entityLinkPresence.orgNodeObserved = true;
+      if (hasOwnMeaningful(node, 'contactPoint')) entityLinkPresence.orgContactPointLink = true;
+      if (hasOwnMeaningful(node, 'hasOfferCatalog') || hasOwnMeaningful(node, 'offerCatalog')) entityLinkPresence.orgOfferCatalogLink = true;
       Object.keys(orgFieldPresence).forEach((field) => {
         if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
       });
+    }
+    if (isService) {
+      entityLinkPresence.serviceNodeObserved = true;
+      if (hasOwnMeaningful(node, 'provider')) entityLinkPresence.serviceProviderLink = true;
     }
     if (isContactPoint) {
       Object.keys(contactPointFieldPresence).forEach((field) => {
@@ -10310,6 +10340,14 @@ function summarizeJsonLdTextsLight(texts, source) {
   const contactPointMissingFields = contactPointObserved && hasContactPoint
     ? Object.keys(contactPointFieldPresence).filter((field) => contactPointFieldPresence[field] !== true)
     : [];
+  const entityLinkSignals = {};
+  if (entityLinkPresence.orgNodeObserved) {
+    entityLinkSignals.hasOrgContactPointLink = entityLinkPresence.orgContactPointLink === true;
+    entityLinkSignals.hasOrgOfferCatalogLink = entityLinkPresence.orgOfferCatalogLink === true;
+  }
+  if (entityLinkPresence.serviceNodeObserved) {
+    entityLinkSignals.hasServiceProviderLink = entityLinkPresence.serviceProviderLink === true;
+  }
   return {
     types,
     seoTypes: typeClass.seoTypes,
@@ -10352,6 +10390,7 @@ function summarizeJsonLdTextsLight(texts, source) {
     hasContactPoint: contactPointObserved ? hasContactPoint : null,
     contactPointMissingFields: contactPointMissingFields.slice(0, 8),
     contactPointSource: 'seo_jsonld',
+    entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
     source: source || 'jsonld_light'
   };
 }
@@ -10912,6 +10951,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       };
       const sameAsValues = [];
       const sameAsValuesByType = { organization: [], website: [], person: [] };
+      const entityLinkPresence = {
+        orgNodeObserved: false,
+        orgContactPointLink: false,
+        orgOfferCatalogLink: false,
+        serviceNodeObserved: false,
+        serviceProviderLink: false
+      };
       const walkJsonLd = (node, depth = 0) => {
         if (depth > 8) return;
         if (Array.isArray(node)) {
@@ -10951,6 +10997,24 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           multimodalJsonLd.primaryImageOfPage = absUrl(primaryImageValue);
         }
         const normalizedTypes = currentTypes.map((type) => clean(type).toLowerCase().replace(/^https?:\/\/schema\.org\//i, ''));
+        const isOrgNode = normalizedTypes.some((type) => ['organization', 'corporation', 'localbusiness'].includes(type));
+        const isServiceNode = normalizedTypes.includes('service');
+        if (isOrgNode) {
+          entityLinkPresence.orgNodeObserved = true;
+          if (node.contactPoint != null && (Array.isArray(node.contactPoint) ? node.contactPoint.length > 0 : (typeof node.contactPoint === 'object' ? Object.keys(node.contactPoint).length > 0 : clean(node.contactPoint).length > 0))) {
+            entityLinkPresence.orgContactPointLink = true;
+          }
+          const offerValue = node.hasOfferCatalog != null ? node.hasOfferCatalog : node.offerCatalog;
+          if (offerValue != null && (Array.isArray(offerValue) ? offerValue.length > 0 : (typeof offerValue === 'object' ? Object.keys(offerValue).length > 0 : clean(offerValue).length > 0))) {
+            entityLinkPresence.orgOfferCatalogLink = true;
+          }
+        }
+        if (isServiceNode) {
+          entityLinkPresence.serviceNodeObserved = true;
+          if (node.provider != null && (Array.isArray(node.provider) ? node.provider.length > 0 : (typeof node.provider === 'object' ? Object.keys(node.provider).length > 0 : clean(node.provider).length > 0))) {
+            entityLinkPresence.serviceProviderLink = true;
+          }
+        }
         const sameAs = node.sameAs;
         const sameAsList = Array.isArray(sameAs) ? sameAs : (sameAs ? [sameAs] : []);
         sameAsList.forEach((value) => {
@@ -10980,6 +11044,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const typeList = limit(nodeTypes, 50);
       const typeSet = new Set(typeList.map((t) => String(t || '').toLowerCase()));
       const hasJsonLd = rawJsonLd.length > 0;
+      const entityLinkSignals = {};
+      if (entityLinkPresence.orgNodeObserved) {
+        entityLinkSignals.hasOrgContactPointLink = entityLinkPresence.orgContactPointLink === true;
+        entityLinkSignals.hasOrgOfferCatalogLink = entityLinkPresence.orgOfferCatalogLink === true;
+      }
+      if (entityLinkPresence.serviceNodeObserved) {
+        entityLinkSignals.hasServiceProviderLink = entityLinkPresence.serviceProviderLink === true;
+      }
 
       const titleValue = clean(document.title || '');
       const metaEl = document.querySelector('meta[name="description"],meta[property="og:description"],meta[name="twitter:description"]');
@@ -11451,6 +11523,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
             valuesSample: limit(sameAsValues, 8),
             source: 'seo_jsonld'
           },
+          entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
           htmlScanSkipped: true,
           jsScanSkipped: true,
           chunkScanSkipped: true,
@@ -11875,6 +11948,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const scriptSrcParseableCount = scriptSrcJsonLdSummary && typeof scriptSrcJsonLdSummary.parseableCount === 'number' ? scriptSrcJsonLdSummary.parseableCount : 0;
     const renderedParseErrorsCount = typeof renderedStructured.parseErrorsCount === 'number' ? renderedStructured.parseErrorsCount : 0;
     const htmlParseErrorsCount = htmlContentJsonLdSummary && typeof htmlContentJsonLdSummary.parseErrorsCount === 'number' ? htmlContentJsonLdSummary.parseErrorsCount : 0;
+    const entityLinkSignalsLight = mergeEntityLinkSignalsLight_([
+      renderedStructured.entityLinkSignals,
+      htmlContentJsonLdSummary && htmlContentJsonLdSummary.entityLinkSignals,
+      scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.entityLinkSignals
+    ]);
     const observedMultimodalSignals = observed.multimodalSignals && typeof observed.multimodalSignals === 'object'
       ? observed.multimodalSignals
       : null;
@@ -11993,6 +12071,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       renderedDomParseableCount: renderedParseableCount,
       organizationSummary: renderedStructured.organizationSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.organizationSummary) || null,
       sameAsSummary: renderedStructured.sameAsSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.sameAsSummary) || null,
+      entityLinkSignals: entityLinkSignalsLight,
       htmlScanSkipped: true,
       jsScanSkipped: true,
       chunkScanSkipped: observed.structuredData && typeof observed.structuredData.chunkScanSkipped === 'boolean' ? observed.structuredData.chunkScanSkipped : true,
@@ -12022,6 +12101,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       generatedAt,
       url: String(url || ''),
       structuredData: structuredDataLight,
+      entityLinkSignals: entityLinkSignalsLight,
       articleSignals,
       headings: {
         h1Count: mergedH1.length,
@@ -13414,6 +13494,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const links = observed.links || {};
   const body = observed.body || {};
   const freshnessOperationSignals = g.freshnessOperationSignals || observed.freshnessOperationSignals || fullPayload && fullPayload.lightweightSummary && fullPayload.lightweightSummary.freshnessOperationSignals || null;
+  const entityLinkSignals = g.entityLinkSignals || structuredData.entityLinkSignals || fullPayload && fullPayload.lightweightSummary && fullPayload.lightweightSummary.entityLinkSignals || null;
   const aioCheck = g.aioCheck || observed.aioCheck || fullPayload.aioCheck || {};
   const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
   const geoDiagnostics = g.diagnostics || {};
@@ -13432,6 +13513,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     hasOrganization: structuredData.hasOrganization,
     hasBreadcrumbList: structuredData.hasBreadcrumbList,
     hasFAQPage: structuredData.hasFAQPage,
+    entityLinkSignals,
     hasSitemapXml: Object.prototype.hasOwnProperty.call(structuredData, 'hasSitemapXml') ? structuredData.hasSitemapXml : null,
     sitemapXmlUrl: structuredData.sitemapXmlUrl || null,
     sitemapDiscoveryMethod: structuredData.sitemapDiscoveryMethod || 'not_checked',
@@ -13547,6 +13629,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     generatedAt: g.generatedAt,
     url: g.url,
     structuredData: shortStructuredData,
+    entityLinkSignals,
     headings: shortHeadings,
     balanced: shortBalanced,
     landmarks: shortLandmarks,
@@ -13684,6 +13767,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     sitemapDiscoveryMethod: fullPayload.sitemapDiscoveryMethod || 'not_checked',
     sitemapHttpStatus: Object.prototype.hasOwnProperty.call(fullPayload, 'sitemapHttpStatus') ? fullPayload.sitemapHttpStatus : null,
     sitemapCheckedUrls: arr(fullPayload.sitemapCheckedUrls, 10, 'sitemapCheckedUrls', (v) => str(v, 220)),
+    entityLinkSignals,
     geoSignalsV1: shortGeoSignalsV1,
     lightweightSummary: shortLightweightSummary,
     diagnostics: shortDiagnostics,
@@ -14658,6 +14742,13 @@ async function scrapeOnce(req, res) {
           const contactPointFieldPresence = { telephone: false, email: false, contactType: false };
           const sameAsValues = [];
           const sameAsValuesByType = { organization: [], website: [], person: [] };
+          const entityLinkPresence = {
+            orgNodeObserved: false,
+            orgContactPointLink: false,
+            orgOfferCatalogLink: false,
+            serviceNodeObserved: false,
+            serviceProviderLink: false
+          };
           let orgNodeObserved = false;
           let seoNodeObserved = false;
           const walk = (node, depth = 0) => {
@@ -14669,15 +14760,23 @@ async function scrapeOnce(req, res) {
             else if (t) types.push(clean(t));
             const names = typeNames(node);
             const isOrg = names.some((x) => ['organization', 'corporation', 'localbusiness'].includes(x));
+            const isService = names.includes('service');
             const isWebsite = names.includes('website');
             const isPerson = names.includes('person');
             const isContactPoint = names.includes('contactpoint');
             if (isOrg || isWebsite || isPerson) seoNodeObserved = true;
             if (isOrg) {
               orgNodeObserved = true;
+              entityLinkPresence.orgNodeObserved = true;
+              if (hasOwnMeaningful(node, 'contactPoint')) entityLinkPresence.orgContactPointLink = true;
+              if (hasOwnMeaningful(node, 'hasOfferCatalog') || hasOwnMeaningful(node, 'offerCatalog')) entityLinkPresence.orgOfferCatalogLink = true;
               Object.keys(orgFieldPresence).forEach((field) => {
                 if (hasOwnMeaningful(node, field)) orgFieldPresence[field] = true;
               });
+            }
+            if (isService) {
+              entityLinkPresence.serviceNodeObserved = true;
+              if (hasOwnMeaningful(node, 'provider')) entityLinkPresence.serviceProviderLink = true;
             }
             if (isContactPoint) {
               Object.keys(contactPointFieldPresence).forEach((field) => {
@@ -14704,6 +14803,14 @@ async function scrapeOnce(req, res) {
               parseErrorsCount += 1;
             }
           });
+          const entityLinkSignals = {};
+          if (entityLinkPresence.orgNodeObserved) {
+            entityLinkSignals.hasOrgContactPointLink = entityLinkPresence.orgContactPointLink === true;
+            entityLinkSignals.hasOrgOfferCatalogLink = entityLinkPresence.orgOfferCatalogLink === true;
+          }
+          if (entityLinkPresence.serviceNodeObserved) {
+            entityLinkSignals.hasServiceProviderLink = entityLinkPresence.serviceProviderLink === true;
+          }
           return {
             renderedDomRawCount: texts.length,
             renderedDomParseableCount: parseableCount,
@@ -14739,6 +14846,7 @@ async function scrapeOnce(req, res) {
               ? Object.keys(contactPointFieldPresence).filter((field) => contactPointFieldPresence[field] !== true)
               : [],
             contactPointSource: 'seo_jsonld',
+            entityLinkSignals: Object.keys(entityLinkSignals).length ? entityLinkSignals : null,
             observed: true
           };
         }), 1200, 'structuredDataLight_renderedDom').catch((e) => Object.assign({}, emptyRendered, {
@@ -14760,6 +14868,8 @@ async function scrapeOnce(req, res) {
           htmlOrganizationSummary: htmlSummary && htmlSummary.organizationSummary || null,
           renderedSameAsSummary: rendered.sameAsSummary || null,
           htmlSameAsSummary: htmlSummary && htmlSummary.sameAsSummary || null,
+          renderedEntityLinkSignals: rendered.entityLinkSignals || null,
+          htmlEntityLinkSignals: htmlSummary && htmlSummary.entityLinkSignals || null,
           renderedTrustSummary: {
             addressObserved: rendered.addressObserved,
             hasAddress: rendered.hasAddress,
@@ -15354,6 +15464,11 @@ async function scrapeOnce(req, res) {
         structuredLight.renderedSameAsSummary,
         structuredLight.htmlSameAsSummary
       ], hasJsonLdObserved);
+      const entityLinkSignalsLight = mergeEntityLinkSignalsLight_([
+        structuredLight.renderedEntityLinkSignals,
+        structuredLight.htmlEntityLinkSignals,
+        scriptJsonLd && scriptJsonLd.entityLinkSignals
+      ]);
       const structuredTrustSummary = mergeTrustStructuredSummary([
         structuredLight.renderedTrustSummary,
         structuredLight.htmlTrustSummary
@@ -15376,6 +15491,7 @@ async function scrapeOnce(req, res) {
         breadcrumbMissing: hasJsonLdObserved ? !mergedTypeClass.hasBreadcrumbList : null,
         organizationSummary,
         sameAsSummary,
+        entityLinkSignals: entityLinkSignalsLight,
         typeClassificationSource: mergedTypeClass.typeClassificationSource,
         source: 'shortfast_phase_builder',
         confidence: 'medium',
@@ -15450,6 +15566,7 @@ async function scrapeOnce(req, res) {
         generatedAt: new Date().toISOString(),
         url: String(finalUrl || urlToFetch || ''),
         structuredData: structuredDataLight,
+        entityLinkSignals: entityLinkSignalsLight,
         articleSignals,
         geoThemeSignals,
         headings: {
@@ -15813,6 +15930,7 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: structuredDataLight.hasOrganization,
         hasBreadcrumbJsonLd: structuredDataLight.hasBreadcrumbList,
         hasFaqJsonLd: structuredDataLight.hasFAQPage,
+        entityLinkSignals: structuredDataLight.entityLinkSignals,
         articleSignals,
         structuredDataBreadcrumbObserved: structuredDataLight.breadcrumbObserved,
         structuredDataBreadcrumbMissing: structuredDataLight.breadcrumbMissing,
@@ -16040,6 +16158,7 @@ async function scrapeOnce(req, res) {
           url: urlToFetch,
           finalUrl,
           status,
+          entityLinkSignals: geoSignalsV1.entityLinkSignals || lightweightSummary.entityLinkSignals || null,
           aioCheck: geoSignalsV1.aioCheck,
           geoSignalsV1,
           lightweightSummary,
@@ -16108,6 +16227,7 @@ async function scrapeOnce(req, res) {
         url: urlToFetch,
         finalUrl,
         status,
+        entityLinkSignals: geoSignalsV1.entityLinkSignals || lightweightSummary.entityLinkSignals || null,
         aioCheck: geoSignalsV1.aioCheck,
         geoSignalsV1,
         lightweightSummary,
@@ -17256,6 +17376,7 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
         hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
+        entityLinkSignals: structuredObserved.entityLinkSignals && typeof structuredObserved.entityLinkSignals === 'object' ? structuredObserved.entityLinkSignals : null,
         articleSignals: geoSignalsV1 && geoSignalsV1.selectedArticleSignalsForFactsBridge && typeof geoSignalsV1.selectedArticleSignalsForFactsBridge === 'object'
           ? geoSignalsV1.selectedArticleSignalsForFactsBridge
           : (geoSignalsV1 && geoSignalsV1.articleSignals && typeof geoSignalsV1.articleSignals === 'object' ? geoSignalsV1.articleSignals : null),
@@ -17425,6 +17546,7 @@ async function scrapeOnce(req, res) {
         socialLinksSample: Array.isArray(lightweightSummary.socialLinksSample) ? lightweightSummary.socialLinksSample.slice(0, 10) : [],
         footerExternalLinksSample: Array.isArray(lightweightSummary.footerExternalLinksSample) ? lightweightSummary.footerExternalLinksSample.slice(0, 10) : [],
         externalLinksSample: Array.isArray(lightweightSummary.externalLinksSample) ? lightweightSummary.externalLinksSample.slice(0, 10) : [],
+        entityLinkSignals: geoSignalsV1.entityLinkSignals || lightweightSummary.entityLinkSignals || null,
         geoSignalsV1,
         lightweightSummary,
         diagnostics,
