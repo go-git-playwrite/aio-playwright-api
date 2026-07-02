@@ -10780,16 +10780,26 @@ function pickNewsIndexFreshnessCandidate_(candidates) {
   return null;
 }
 
-function buildNewsIndexFreshnessSignalsFromText_(text, sourceUrl) {
+function buildNewsIndexFreshnessSignalsFromText_(text, sourceUrl, debug) {
   try {
     const normalizedText = normalizeSubpageJsonLdText(text);
+    if (debug) debug.textLength = normalizedText.length;
     if (!normalizedText) return null;
     const dateRe = /(?:\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)/g;
-    const dates = Array.from(new Set((normalizedText.match(dateRe) || [])
+    const rawMatches = normalizedText.match(dateRe) || [];
+    if (debug) debug.rawDateMatchesCount = rawMatches.length;
+    const dates = Array.from(new Set(rawMatches
       .map(normalizeFreshnessDateYmd_)
       .filter(Boolean)))
       .sort();
-    if (!dates.length) return null;
+    if (debug) {
+      debug.normalizedDatesCount = dates.length;
+      debug.sampleDates = dates.slice(-10);
+    }
+    if (!dates.length) {
+      if (debug) debug.reason = 'no_normalized_dates';
+      return null;
+    }
     return {
       checked: true,
       observed: true,
@@ -10803,14 +10813,20 @@ function buildNewsIndexFreshnessSignalsFromText_(text, sourceUrl) {
       extractionMethod: 'news_index_light'
     };
   } catch (_) {
+    if (debug) debug.reason = 'date_extract_error';
     return null;
   }
 }
 
 async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
+  const debug = opts && opts.debug && typeof opts.debug === 'object' ? opts.debug : null;
   try {
+    if (debug) debug.candidateUrl = String(url || '').slice(0, 220);
     const initialUrl = new URL(String(url || ''));
-    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) return null;
+    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) {
+      if (debug) debug.reason = 'blocked_host';
+      return null;
+    }
     const response = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
@@ -10819,13 +10835,25 @@ async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
       }
     }).catch(() => null);
+    if (debug) debug.fetched = !!response;
     const finalUrl = response && response.url ? response.url : url;
+    if (debug) debug.finalUrl = String(finalUrl || '').slice(0, 220);
     let finalParsed = null;
     try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
-    if (finalParsed && finalParsed.origin !== initialUrl.origin) return null;
-    if (!response || !response.ok) return null;
+    if (finalParsed && finalParsed.origin !== initialUrl.origin) {
+      if (debug) debug.reason = 'redirect_origin_mismatch';
+      return null;
+    }
+    if (debug) debug.fetchStatus = response && typeof response.status === 'number' ? response.status : null;
+    if (!response || !response.ok) {
+      if (debug) debug.reason = response ? 'fetch_not_ok' : 'fetch_failed';
+      return null;
+    }
     const contentType = String(response.headers && response.headers.get && response.headers.get('content-type') || '');
-    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) return null;
+    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) {
+      if (debug) debug.reason = 'unsupported_content_type';
+      return null;
+    }
     const html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
     const $ = cheerio.load(html);
     const bodyClone = $('body').first().clone();
@@ -10836,8 +10864,11 @@ async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
       finalUrl,
       url
     ].join(' ');
-    return buildNewsIndexFreshnessSignalsFromText_(text, finalUrl || url);
+    const signals = buildNewsIndexFreshnessSignalsFromText_(text, finalUrl || url, debug);
+    if (signals && debug) debug.reason = 'generated';
+    return signals;
   } catch (_) {
+    if (debug) debug.reason = 'fetch_exception';
     return null;
   }
 }
@@ -10850,9 +10881,24 @@ async function attachNewsIndexFreshnessSignalsLight_(geoSignalsV1, candidates, o
     if (geoSignalsV1.freshnessOperationSignals && typeof geoSignalsV1.freshnessOperationSignals === 'object') {
       return geoSignalsV1.freshnessOperationSignals;
     }
+    const debug = {
+      candidateUrl: null,
+      fetched: false,
+      fetchStatus: null,
+      textLength: 0,
+      rawDateMatchesCount: 0,
+      normalizedDatesCount: 0,
+      sampleDates: [],
+      reason: ''
+    };
     const candidate = pickNewsIndexFreshnessCandidate_(candidates);
-    if (!candidate) return null;
-    const signals = await fetchNewsIndexFreshnessSignalsLight_(candidate.url || candidate.href || '', { siteMode });
+    if (!candidate) {
+      debug.reason = 'no_news_candidate';
+      geoSignalsV1.newsIndexFreshnessDebug = debug;
+      return null;
+    }
+    const signals = await fetchNewsIndexFreshnessSignalsLight_(candidate.url || candidate.href || '', { siteMode, debug });
+    geoSignalsV1.newsIndexFreshnessDebug = debug;
     if (!signals) return null;
     geoSignalsV1.freshnessOperationSignals = signals;
     geoSignalsV1.observed = geoSignalsV1.observed || {};
