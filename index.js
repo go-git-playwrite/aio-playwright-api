@@ -3252,6 +3252,51 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
   }
 }
 
+function extractContactSignalsFromHtml_(html, sourceUrl) {
+  const empty = {
+    hasPhone: false,
+    telephone: null
+  };
+  try {
+    const $ = cheerio.load(String(html || ''));
+    const normalizePhone = v => normalizeSubpageJsonLdText(v)
+      .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+      .replace(/[ー‐‑‒–—−]/g, '-')
+      .replace(/[（）]/g, m => (m === '（' ? '(' : ')'))
+      .replace(/\s+/g, '');
+    const extractJapanesePhone = value => {
+      const text = normalizePhone(value);
+      if (/[A-Za-z]/.test(text)) return '';
+      const match = text.match(/(?:0120-\d{2,4}-\d{3,4}|0\d{1,4}-\d{1,4}-\d{3,4}|0\d{9,10})/);
+      return match ? match[0] : '';
+    };
+    let telephone = '';
+    $('a[href^="tel:" i]').each((_, el) => {
+      if (telephone) return;
+      telephone = extractJapanesePhone(String($(el).attr('href') || '').replace(/^tel:/i, ''));
+    });
+    if (!telephone) {
+      const bodyClone = $('body').clone();
+      bodyClone.find('script,style,noscript,svg').remove();
+      bodyClone.find('br,p,div,li,tr,dt,dd,th,td,section,article').append('\n');
+      const visibleLines = bodyClone.text()
+        .split(/\n+/)
+        .map(line => normalizeSubpageJsonLdText(line))
+        .filter(Boolean);
+      for (const line of visibleLines) {
+        telephone = extractJapanesePhone(line);
+        if (telephone) break;
+      }
+    }
+    return {
+      hasPhone: !!telephone,
+      telephone: telephone || null
+    };
+  } catch (_) {
+    return empty;
+  }
+}
+
 function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
   const typeSet = new Set((Array.isArray(jsonldTypes) ? jsonldTypes : []).map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
   const path = (() => {
@@ -3508,8 +3553,12 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   bodyClone.find('script,style,noscript,svg,nav,footer').remove();
   const sampledText = normalizeSubpageJsonLdText(bodyClone.text()).slice(0, 500);
   const bodyTextLength = normalizeSubpageJsonLdText($('body').first().text()).length;
+  const pageType = legalPageType || inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes);
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
+    : null;
+  const contactSignals = pageType === 'contact'
+    ? extractContactSignalsFromHtml_(html, finalUrl || url)
     : null;
   const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url);
   let internalLinkCount = 0;
@@ -3529,7 +3578,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     finalUrl: finalUrl || url,
     status,
     ok: true,
-    pageType: legalPageType || inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes),
+    pageType,
     title,
     canonical,
     h1Count: $('h1').length,
@@ -3551,6 +3600,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     bodyTextLength,
     sampledText,
     legalOperatorInfo,
+    contactSignals,
     articleSignals,
     error: null,
     parseErrors
@@ -5581,6 +5631,10 @@ function compactSubpageJsonLdObservation_(page) {
     bodyTextLength: Number(page && page.bodyTextLength || 0),
     sampledText: normalizeSubpageJsonLdText(String(page && page.sampledText || '').slice(0, 500)),
     articleSignals: page && page.articleSignals && typeof page.articleSignals === 'object' ? page.articleSignals : null,
+    contactSignals: page && page.contactSignals && typeof page.contactSignals === 'object' ? {
+      hasPhone: page.contactSignals.hasPhone === true,
+      telephone: normalizeSubpageJsonLdText(page.contactSignals.telephone).slice(0, 60)
+    } : null,
     legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? {
       observed: true,
       pageType: 'legal',
@@ -8106,6 +8160,18 @@ function pickBestLegalOperatorInfo_(pages) {
   };
 }
 
+function pickBestContactSignals_(pages) {
+  const candidates = (Array.isArray(pages) ? pages : [])
+    .map(page => page && page.contactSignals)
+    .filter(info => info && info.hasPhone === true && normalizeSubpageJsonLdText(info.telephone));
+  if (!candidates.length) return null;
+  const best = candidates[0];
+  return {
+    hasPhone: true,
+    telephone: normalizeSubpageJsonLdText(best.telephone).slice(0, 60)
+  };
+}
+
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
   const normalized = normalizeDiscoverTopUrl(topUrl);
   const siteMode = inferSiteModeForRepresentativeObservation_(topUrl,
@@ -8770,6 +8836,15 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         ? geoSignalsV1.trustSignals
         : {};
       geoSignalsV1.trustSignals.legalOperatorInfo = legalOperatorInfo;
+    }
+    const contactSignals = pickBestContactSignals_(observations);
+    if (contactSignals) {
+      geoSignalsV1.trustSignals = geoSignalsV1.trustSignals && typeof geoSignalsV1.trustSignals === 'object'
+        ? geoSignalsV1.trustSignals
+        : {};
+      geoSignalsV1.trustSignals.hasPhone = true;
+      geoSignalsV1.trustSignals.telephone = contactSignals.telephone;
+      geoSignalsV1.trustSignals.contactSignals = contactSignals;
     }
     try {
       console.log('[DEBUG][COVERAGE_CANDIDATE_PAGE_TYPES]', JSON.stringify({
