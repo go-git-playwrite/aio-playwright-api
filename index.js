@@ -8403,6 +8403,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           context: opts && opts.context,
           reuseBrowser: reusePageForDiscover || reuseContextForObserve
         });
+    await attachNewsIndexFreshnessSignalsLight_(geoSignalsV1, discovered.candidates, { siteMode });
     emitHeavySiteAudit('discover_end', {
       candidateCount: discovered.totalCandidates,
       sourceSummary: discovered.sourceSummary,
@@ -10760,6 +10761,80 @@ function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
       ? (primarySource === 'media_article_links' ? 'internal_links_sample' : 'body_sample')
       : 'non_media_news_date_light'
   };
+}
+
+function isNewsIndexFreshnessCandidate_(candidate) {
+  const urlLike = String(candidate && (candidate.url || candidate.href || candidate.path) || '');
+  return /\/(?:news|press|topics|information|info)(?:\/|$)/i.test(urlLike);
+}
+
+function pickNewsIndexFreshnessCandidate_(candidates) {
+  const seen = new Set();
+  for (const candidate of (Array.isArray(candidates) ? candidates : [])) {
+    if (!candidate || !isNewsIndexFreshnessCandidate_(candidate)) continue;
+    const url = String(candidate.url || candidate.href || '');
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    return candidate;
+  }
+  return null;
+}
+
+function buildNewsIndexFreshnessSignalsFromPage_(page) {
+  try {
+    if (!page || page.ok !== true) return null;
+    const text = normalizeSubpageJsonLdText([
+      page.title,
+      page.sampledText,
+      page.finalUrl,
+      page.url
+    ].filter(Boolean).join(' '));
+    if (!text) return null;
+    const dateRe = /(?:\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)/g;
+    const dates = Array.from(new Set((text.match(dateRe) || [])
+      .map(normalizeFreshnessDateYmd_)
+      .filter(Boolean)))
+      .sort();
+    if (!dates.length) return null;
+    return {
+      checked: true,
+      observed: true,
+      hasFreshnessSignal: true,
+      hasNewsDateEvidence: true,
+      latestDate: dates[dates.length - 1],
+      dateCount: dates.length,
+      sampleDates: dates.slice(-10),
+      source: 'news_index',
+      sourceUrl: String(page.finalUrl || page.url || '').slice(0, 220),
+      extractionMethod: 'news_index_light'
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function attachNewsIndexFreshnessSignalsLight_(geoSignalsV1, candidates, opts = {}) {
+  try {
+    if (!geoSignalsV1 || typeof geoSignalsV1 !== 'object') return null;
+    const siteMode = normalizeSubpageJsonLdText(opts && opts.siteMode || '').toLowerCase();
+    if (siteMode === 'media') return null;
+    if (geoSignalsV1.freshnessOperationSignals && typeof geoSignalsV1.freshnessOperationSignals === 'object') {
+      return geoSignalsV1.freshnessOperationSignals;
+    }
+    const candidate = pickNewsIndexFreshnessCandidate_(candidates);
+    if (!candidate) return null;
+    const page = await fetchSubpageHtmlLight(candidate.url || candidate.href || '', {
+      siteMode
+    });
+    const signals = buildNewsIndexFreshnessSignalsFromPage_(page);
+    if (!signals) return null;
+    geoSignalsV1.freshnessOperationSignals = signals;
+    geoSignalsV1.observed = geoSignalsV1.observed || {};
+    geoSignalsV1.observed.freshnessOperationSignals = geoSignalsV1.observed.freshnessOperationSignals || signals;
+    return signals;
+  } catch (_) {
+    return null;
+  }
 }
 
 function attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, opts = {}) {
