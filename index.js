@@ -10780,18 +10780,12 @@ function pickNewsIndexFreshnessCandidate_(candidates) {
   return null;
 }
 
-function buildNewsIndexFreshnessSignalsFromPage_(page) {
+function buildNewsIndexFreshnessSignalsFromText_(text, sourceUrl) {
   try {
-    if (!page || page.ok !== true) return null;
-    const text = normalizeSubpageJsonLdText([
-      page.title,
-      page.sampledText,
-      page.finalUrl,
-      page.url
-    ].filter(Boolean).join(' '));
-    if (!text) return null;
+    const normalizedText = normalizeSubpageJsonLdText(text);
+    if (!normalizedText) return null;
     const dateRe = /(?:\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)/g;
-    const dates = Array.from(new Set((text.match(dateRe) || [])
+    const dates = Array.from(new Set((normalizedText.match(dateRe) || [])
       .map(normalizeFreshnessDateYmd_)
       .filter(Boolean)))
       .sort();
@@ -10805,9 +10799,44 @@ function buildNewsIndexFreshnessSignalsFromPage_(page) {
       dateCount: dates.length,
       sampleDates: dates.slice(-10),
       source: 'news_index',
-      sourceUrl: String(page.finalUrl || page.url || '').slice(0, 220),
+      sourceUrl: String(sourceUrl || '').slice(0, 220),
       extractionMethod: 'news_index_light'
     };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fetchNewsIndexFreshnessSignalsLight_(url, opts = {}) {
+  try {
+    const initialUrl = new URL(String(url || ''));
+    if (isBlockedSubpageJsonLdHost(initialUrl.hostname)) return null;
+    const response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+      }
+    }).catch(() => null);
+    const finalUrl = response && response.url ? response.url : url;
+    let finalParsed = null;
+    try { finalParsed = new URL(String(finalUrl || '')); } catch (_) {}
+    if (finalParsed && finalParsed.origin !== initialUrl.origin) return null;
+    if (!response || !response.ok) return null;
+    const contentType = String(response.headers && response.headers.get && response.headers.get('content-type') || '');
+    if (contentType && !/(?:text\/html|application\/xhtml\+xml|text\/plain)/i.test(contentType)) return null;
+    const html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
+    const $ = cheerio.load(html);
+    const bodyClone = $('body').first().clone();
+    bodyClone.find('script,style,noscript,svg').remove();
+    const text = [
+      $('title').first().text(),
+      bodyClone.text(),
+      finalUrl,
+      url
+    ].join(' ');
+    return buildNewsIndexFreshnessSignalsFromText_(text, finalUrl || url);
   } catch (_) {
     return null;
   }
@@ -10823,10 +10852,7 @@ async function attachNewsIndexFreshnessSignalsLight_(geoSignalsV1, candidates, o
     }
     const candidate = pickNewsIndexFreshnessCandidate_(candidates);
     if (!candidate) return null;
-    const page = await fetchSubpageHtmlLight(candidate.url || candidate.href || '', {
-      siteMode
-    });
-    const signals = buildNewsIndexFreshnessSignalsFromPage_(page);
+    const signals = await fetchNewsIndexFreshnessSignalsLight_(candidate.url || candidate.href || '', { siteMode });
     if (!signals) return null;
     geoSignalsV1.freshnessOperationSignals = signals;
     geoSignalsV1.observed = geoSignalsV1.observed || {};
