@@ -10679,11 +10679,11 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
 }
 
 function normalizeFreshnessDateYmd_(value) {
-  const m = String(value || '').match(/\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b/);
+  const m = String(value || '').match(/(?:\b(20\d{2})[.\-\/](\d{1,2})[.\-\/](\d{1,2})\b|(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日)/);
   if (!m) return '';
-  const y = m[1];
-  const mm = String(m[2]).padStart(2, '0');
-  const dd = String(m[3]).padStart(2, '0');
+  const y = m[1] || m[4];
+  const mm = String(m[2] || m[5]).padStart(2, '0');
+  const dd = String(m[3] || m[6]).padStart(2, '0');
   return `${y}-${mm}-${dd}`;
 }
 
@@ -10700,13 +10700,18 @@ function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
     pickedArticleSignals.selectedSource
   );
   if (articleSignalsFreshness) return articleSignalsFreshness;
-  if (siteMode !== 'media') return null;
   const observed = g.observed && typeof g.observed === 'object' ? g.observed : {};
   const links = observed.links && Array.isArray(observed.links.internalLinksSample)
     ? observed.links.internalLinksSample
     : [];
-  const dateRe = /\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b/g;
-  const articleUrlRe = /\/(?:post|posts|article|articles|news|story|stories|entry|entries|contents?)\/|\/20\d{2}\/\d{1,2}\//i;
+  const newsContextRe = /\/(?:news|press|topics|information|info)(?:\/|$)|プレスリリース|お知らせ|ニュース/i;
+  const hasNewsContext = links.some((link) => newsContextRe.test(String(link && (link.href || link.url || '') || '') + ' ' + String(link && (link.text || link.label) || ''))) ||
+    newsContextRe.test(String(observed.body && observed.body.sample || ''));
+  if (siteMode !== 'media' && !hasNewsContext) return null;
+  const dateRe = /(?:\b20\d{2}[.\-\/]\d{1,2}[.\-\/]\d{1,2}\b|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)/g;
+  const articleUrlRe = siteMode === 'media'
+    ? /\/(?:post|posts|article|articles|news|story|stories|entry|entries|contents?)\/|\/20\d{2}\/\d{1,2}\//i
+    : /\/(?:news|press|topics|information|info)(?:\/|$)/i;
   const picked = [];
   const seen = new Set();
   const addDate_ = (date, source, text, href) => {
@@ -10723,31 +10728,37 @@ function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
   links.forEach((link) => {
     const text = String(link && (link.text || link.label) || '');
     const href = String(link && (link.href || link.url) || '');
-    if (!articleUrlRe.test(href)) return;
+    if (!articleUrlRe.test(href) && !(siteMode !== 'media' && newsContextRe.test(text))) return;
     const matches = text.match(dateRe) || [];
-    matches.forEach((date) => addDate_(date, 'internal_link_date', text, href));
+    matches.forEach((date) => addDate_(date, siteMode === 'media' ? 'internal_link_date' : 'news_link_date', text, href));
   });
   if (!picked.length) {
     const bodySample = String(observed.body && observed.body.sample || '');
-    const matches = bodySample.match(dateRe) || [];
-    matches.slice(0, 10).forEach((date) => addDate_(date, 'body_sample_date', bodySample, ''));
+    if (siteMode === 'media' || newsContextRe.test(bodySample)) {
+      const matches = bodySample.match(dateRe) || [];
+      matches.slice(0, 10).forEach((date) => addDate_(date, siteMode === 'media' ? 'body_sample_date' : 'news_body_sample_date', bodySample, ''));
+    }
   }
   if (!picked.length) return null;
   const sampleDates = Array.from(new Set(picked.map((item) => item.date))).sort();
   const latestDate = sampleDates[sampleDates.length - 1] || null;
-  const primarySource = picked.some((item) => item.source === 'internal_link_date')
-    ? 'media_article_links'
-    : 'media_body_sample';
+  const primarySource = siteMode === 'media'
+    ? (picked.some((item) => item.source === 'internal_link_date') ? 'media_article_links' : 'media_body_sample')
+    : 'news_links';
   return {
     observed: true,
     hasNewsDateEvidence: true,
     newsDateEvidenceCount: sampleDates.length,
     latestDate,
-    freshnessEvidenceSources: [primarySource === 'media_article_links' ? 'internal_link_date' : 'body_sample_date'],
+    freshnessEvidenceSources: [siteMode === 'media'
+      ? (primarySource === 'media_article_links' ? 'internal_link_date' : 'body_sample_date')
+      : 'news_date'],
     sampleDates: sampleDates.slice(-10),
     evidenceSamples: picked.slice(0, 10),
     source: primarySource,
-    extractionMethod: primarySource === 'media_article_links' ? 'internal_links_sample' : 'body_sample'
+    extractionMethod: siteMode === 'media'
+      ? (primarySource === 'media_article_links' ? 'internal_links_sample' : 'body_sample')
+      : 'non_media_news_date_light'
   };
 }
 
