@@ -3307,6 +3307,7 @@ function inferSubpageJsonLdPageType(url, siteMode, jsonldTypes) {
   if (typeSet.has('faqpage')) return 'faq';
   if (typeSet.has('article') || typeSet.has('newsarticle') || typeSet.has('blogposting')) return 'article';
   if (typeSet.has('breadcrumblist')) return 'category_or_detail';
+  if (/\/(?:contact|contact-us|inquiry|inquiries|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(path)) return 'contact';
   if (/\/(?:faq|faqs|guide|guides|help|support)(?:\/|$|-|_)/i.test(path)) return 'faq';
   if (/\/(?:product|products|item|items)(?:\/|$|-|_)/i.test(path)) return 'product';
   if (/\/(?:category|categories|collections|collection)(?:\/|$|-|_)/i.test(path)) return 'category';
