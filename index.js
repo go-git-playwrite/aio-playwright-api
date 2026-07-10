@@ -10528,6 +10528,109 @@ function extractSchemaTypesFromScriptTextLight(text) {
   return Array.from(new Set(types)).slice(0, 50);
 }
 
+function extractOrganizationProfileFromScriptTextLight(text) {
+  const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+  const decodeEscapedText = (v) => {
+    let raw = String(v || '');
+    try {
+      raw = raw.replace(/\\\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      raw = raw.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+      raw = raw.replace(/\\"/g, '"').replace(/\\\//g, '/');
+      return raw;
+    } catch (_) {
+      return String(v || '');
+    }
+  };
+  const body = String(text || '');
+  const schemaOrgTypeRe = /^(Organization|Corporation|LocalBusiness|NGO|EducationalOrganization|GovernmentOrganization)$/i;
+  const keyValueText = (chunk, key, maxLen = 160) => {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const patterns = [
+      new RegExp(`(?:^|[^A-Za-z0-9_$])["\\\\]?${escapedKey}["\\\\]?\\s*:\\s*\\\\?["']((?:\\\\.|[^"'\\\\]){1,${maxLen}})\\\\?["']`, 'i'),
+      new RegExp(`(?:^|[^A-Za-z0-9_$])${escapedKey}\\s*[:=]\\s*\\\\?["']((?:\\\\.|[^"'\\\\]){1,${maxLen}})\\\\?["']`, 'i')
+    ];
+    for (const re of patterns) {
+      const m = String(chunk || '').match(re);
+      const v = clean(decodeEscapedText(m && m[1]));
+      if (v) return v.slice(0, maxLen);
+    }
+    return '';
+  };
+  const addressObjectFromChunk = (chunk) => {
+    const postalCode = keyValueText(chunk, 'postalCode', 40);
+    const addressRegion = keyValueText(chunk, 'addressRegion', 80);
+    const addressLocality = keyValueText(chunk, 'addressLocality', 80);
+    const streetAddress = keyValueText(chunk, 'streetAddress', 160);
+    const addressCountry = keyValueText(chunk, 'addressCountry', 40);
+    const hasPostalAddress = /PostalAddress/i.test(String(chunk || ''));
+    if (!hasPostalAddress && !postalCode && !addressRegion && !addressLocality && !streetAddress) return null;
+    return {
+      ...(postalCode ? { postalCode } : {}),
+      ...(addressRegion ? { addressRegion } : {}),
+      ...(addressLocality ? { addressLocality } : {}),
+      ...(streetAddress ? { streetAddress } : {}),
+      ...(addressCountry ? { addressCountry } : {})
+    };
+  };
+  const findAddress = (chunk) => {
+    const addressIdx = String(chunk || '').search(/["\\]?address["\\]?\s*:/i);
+    if (addressIdx >= 0) {
+      const addressWindow = String(chunk || '').slice(addressIdx, addressIdx + 1600);
+      const obj = addressObjectFromChunk(addressWindow);
+      if (obj) return obj;
+    }
+    const postalIdx = String(chunk || '').search(/PostalAddress/i);
+    if (postalIdx >= 0) {
+      const postalWindow = String(chunk || '').slice(Math.max(0, postalIdx - 300), postalIdx + 1600);
+      const obj = addressObjectFromChunk(postalWindow);
+      if (obj) return obj;
+    }
+    const direct = keyValueText(chunk, 'address', 180);
+    if (direct && !/^PostalAddress$/i.test(direct)) return direct;
+    return null;
+  };
+  const typeMatches = [];
+  const typeRe = /["@]type["']?\s*:\s*["']([^"']{1,100})["']|\\"@type\\"\s*:\s*\\"([^"\\]{1,100})\\"|@type\\?["']?\s*[:=]\s*\\?["']([^"'\\]{1,100})/gi;
+  let m;
+  while ((m = typeRe.exec(body)) && typeMatches.length < 80) {
+    const typeName = clean(m[1] || m[2] || m[3]);
+    if (schemaOrgTypeRe.test(typeName)) typeMatches.push({ index: m.index, typeName });
+  }
+  if (!typeMatches.length) {
+    return { telephone: null, address: null };
+  }
+  const chunks = typeMatches.length
+    ? typeMatches.map((hit) => body.slice(Math.max(0, hit.index - 1200), hit.index + 8000))
+    : [body];
+  let telephone = '';
+  let address = null;
+  for (const chunk of chunks) {
+    if (!telephone) {
+      telephone = keyValueText(chunk, 'telephone', 80);
+    }
+    if (!address) {
+      address = findAddress(chunk);
+    }
+    if (telephone && address) break;
+  }
+  return {
+    telephone: telephone || null,
+    address: address || null
+  };
+}
+
+function mergeOrganizationProfilesLight_(profiles) {
+  const items = Array.isArray(profiles) ? profiles : [];
+  const out = { telephone: null, address: null };
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    if (!out.telephone && item.telephone) out.telephone = String(item.telephone).trim().slice(0, 80);
+    if (!out.address && item.address) out.address = item.address;
+    if (out.telephone && out.address) break;
+  }
+  return out;
+}
+
 async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}) {
   const MAX_SCRIPTS = Math.max(1, Math.min(10, Number(opts && opts.maxScripts || 10)));
   const MAX_BYTES_PER_SCRIPT = Math.max(100000, Math.min(1000000, Number(opts && opts.maxBytesPerScript || 1000000)));
@@ -10558,6 +10661,10 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     servicePathSample: '',
     privacyPathFound: null,
     privacyPathSample: '',
+    organizationProfile: {
+      telephone: null,
+      address: null
+    },
     error: null,
     fetchErrorsCount: 0,
     fetchErrorsSample: []
@@ -10596,6 +10703,7 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
       appIndexDetected: sameOriginScripts.some((u) => /\/app-index\.js(?:[?#]|$)/.test(String(u || '')))
     });
     const types = [];
+    const organizationProfiles = [];
     let scannedScriptForTrust = false;
     const pickTrustSample = (text, re) => {
       const match = String(text || '').match(re);
@@ -10643,6 +10751,8 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
         if (hasContext || hasType || hasSchemaOrg || scriptTypes.length) {
           out.candidateCount += 1;
           scriptTypes.forEach((t) => types.push(t));
+          const orgProfile = extractOrganizationProfileFromScriptTextLight(text);
+          if (orgProfile && (orgProfile.telephone || orgProfile.address)) organizationProfiles.push(orgProfile);
         }
       } catch (e) {
         out.fetchErrorsCount += 1;
@@ -10655,6 +10765,7 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
       }
     }
     out.types = Array.from(new Set(types.filter(Boolean))).slice(0, 50);
+    out.organizationProfile = mergeOrganizationProfilesLight_(organizationProfiles);
     out.parseableCount = 0;
     out.hasJsonLd = out.candidateCount > 0;
     const typeClass = classifyJsonLdTypesForSeo(out.types);
@@ -12295,6 +12406,11 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       if (scriptVal === false && (renderedVal === false || renderedVal == null) && (htmlVal === false || htmlVal == null)) return false;
       return null;
     };
+    const organizationProfileLight = mergeOrganizationProfilesLight_([
+      renderedStructured && renderedStructured.organizationProfile,
+      htmlContentJsonLdSummary && htmlContentJsonLdSummary.organizationProfile,
+      scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.organizationProfile
+    ]);
     const mergedJsonLdTypeClass = classifyJsonLdTypesForSeo(mergedJsonLdTypes);
     const structuredDataLight = {
       types: mergedJsonLdTypes,
@@ -12329,6 +12445,12 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       renderedDomRawCount: renderedRawCount,
       renderedDomParseableCount: renderedParseableCount,
       organizationSummary: renderedStructured.organizationSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.organizationSummary) || null,
+      organizationProfile: organizationProfileLight,
+      organizationProfileAudit: {
+        hasTelephone: !!organizationProfileLight.telephone,
+        hasAddress: !!organizationProfileLight.address,
+        source: (organizationProfileLight.telephone || organizationProfileLight.address) ? 'jsonld_profile_summary' : 'not_observed'
+      },
       sameAsSummary: renderedStructured.sameAsSummary || (htmlContentJsonLdSummary && htmlContentJsonLdSummary.sameAsSummary) || null,
       entityLinkSignals: entityLinkSignalsLight,
       htmlScanSkipped: true,
@@ -15732,6 +15854,10 @@ async function scrapeOnce(req, res) {
         structuredLight.renderedTrustSummary,
         structuredLight.htmlTrustSummary
       ]);
+      const organizationProfileLight = mergeOrganizationProfilesLight_([
+        structuredLight.organizationProfile,
+        scriptJsonLd && scriptJsonLd.organizationProfile
+      ]);
       const structuredDataLight = {
         types: mergedTypes,
         seoTypes: mergedTypeClass.seoTypes,
@@ -15749,6 +15875,12 @@ async function scrapeOnce(req, res) {
         breadcrumbObserved: hasJsonLdObserved ? true : null,
         breadcrumbMissing: hasJsonLdObserved ? !mergedTypeClass.hasBreadcrumbList : null,
         organizationSummary,
+        organizationProfile: organizationProfileLight,
+        organizationProfileAudit: {
+          hasTelephone: !!organizationProfileLight.telephone,
+          hasAddress: !!organizationProfileLight.address,
+          source: (organizationProfileLight.telephone || organizationProfileLight.address) ? 'jsonld_profile_summary' : 'not_observed'
+        },
         sameAsSummary,
         entityLinkSignals: entityLinkSignalsLight,
         typeClassificationSource: mergedTypeClass.typeClassificationSource,
@@ -19440,6 +19572,13 @@ async function scrapeOnce(req, res) {
         .filter(u => /^https?:\/\//i.test(u))
         .filter(u => ALLOW_HOST_SNS.test((() => { try { return new URL(u).hostname; } catch { return ''; } })()))
     ));
+    const scriptSrcOrganizationProfile = mergeOrganizationProfilesLight_(
+      (Array.isArray(tappedAppIndexBodies) ? tappedAppIndexBodies : [])
+        .map(txt => extractOrganizationProfileFromScriptTextLight(txt))
+        .filter(profile => profile && (profile.telephone || profile.address))
+    );
+    const structuredPhone = pickedPhone || scriptSrcOrganizationProfile.telephone || null;
+    const structuredAddress = pickedAddress || scriptSrcOrganizationProfile.address || null;
 
     // === ここから追記（“採点に使う素材”を決定：Rendered > 静的HTML）===
     const scoringHtml  = (aboutHtml || topHtml || payloadHtml || '');
@@ -19543,8 +19682,8 @@ async function scrapeOnce(req, res) {
 
     // ---- 返却ペイロードを組み立て ----
     const structured = {
-      telephone: pickedPhone || null,
-      address: pickedAddress || null,
+      telephone: structuredPhone,
+      address: structuredAddress,
       foundingDate: foundFoundingDate || null,
       sameAs: sameAsClean
     };
@@ -19704,8 +19843,8 @@ async function scrapeOnce(req, res) {
       "@type": "Organization",
       "url": normalizeUrl(urlToFetch),
       "name": "企業情報",
-      ...(pickedPhone ? { "telephone": pickedPhone } : {}),
-      ...(pickedAddress ? { "address": { "@type": "PostalAddress", ...pickedAddress } } : {}),
+      ...(structuredPhone ? { "telephone": structuredPhone } : {}),
+      ...(structuredAddress ? { "address": (typeof structuredAddress === 'object' ? { "@type": "PostalAddress", ...structuredAddress } : structuredAddress) } : {}),
       ...(sameAsClean && sameAsClean.length ? { "sameAs": sameAsClean } : {}),
       ...(foundFoundingDate ? { "foundingDate": foundFoundingDate } : {})
     }];
