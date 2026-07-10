@@ -13909,6 +13909,12 @@ function buildBalancedShortResponsePayload(fullPayload) {
     htmlContentLdJsonObserved: structuredData.htmlContentLdJsonObserved,
     htmlContentRawCount: structuredData.htmlContentRawCount,
     htmlContentParseableCount: structuredData.htmlContentParseableCount,
+    organizationProfile: structuredData.organizationProfile || { telephone: null, address: null },
+    organizationProfileAudit: structuredData.organizationProfileAudit || {
+      hasTelephone: false,
+      hasAddress: false,
+      source: 'not_observed'
+    },
     scriptSrcJsonLdObserved: structuredData.scriptSrcJsonLdObserved,
     scriptSrcCandidateCount: structuredData.scriptSrcCandidateCount,
     scriptSrcFetchedCount: structuredData.scriptSrcFetchedCount,
@@ -15286,6 +15292,7 @@ async function scrapeOnce(req, res) {
           skippedLargeCount: summary.skippedLargeCount,
           candidateCount: summary.candidateCount,
           types: Array.isArray(summary.types) ? summary.types.slice(0, 20) : [],
+          organizationProfile: summary.organizationProfile || { telephone: null, address: null },
           appIndexDetected: !!summary.appIndexDetected,
           totalFetchedBytes: summary.totalFetchedBytes,
           maxScriptLength: summary.maxScriptLength,
@@ -16326,6 +16333,12 @@ async function scrapeOnce(req, res) {
         structuredDataBreadcrumbObserved: structuredDataLight.breadcrumbObserved,
         structuredDataBreadcrumbMissing: structuredDataLight.breadcrumbMissing,
         organizationSummary: structuredDataLight.organizationSummary,
+        organizationProfile: structuredDataLight.organizationProfile || { telephone: null, address: null },
+        organizationProfileAudit: structuredDataLight.organizationProfileAudit || {
+          hasTelephone: false,
+          hasAddress: false,
+          source: 'not_observed'
+        },
         sameAsSummary: structuredDataLight.sameAsSummary,
         orgMissingFields: structuredDataLight.organizationSummary && Array.isArray(structuredDataLight.organizationSummary.missingFields)
           ? structuredDataLight.organizationSummary.missingFields.slice(0, 12)
