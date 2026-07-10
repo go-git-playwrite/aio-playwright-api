@@ -13880,6 +13880,10 @@ function buildBalancedShortResponsePayload(fullPayload) {
   const diagnostics = fullPayload && fullPayload.diagnostics ? fullPayload.diagnostics : {};
   const geoDiagnostics = g.diagnostics || {};
   const balanced = g.balanced || {};
+  const profilePresence = (profile) => ({
+    hasTelephone: !!(profile && profile.telephone),
+    hasAddress: !!(profile && profile.address)
+  });
   const shortStructuredData = {
     types: arr(structuredData.types, 50, 'geoSignalsV1.structuredData.types'),
     seoTypes: arr(structuredData.seoTypes, 50, 'geoSignalsV1.structuredData.seoTypes'),
@@ -14159,6 +14163,13 @@ function buildBalancedShortResponsePayload(fullPayload) {
     lightweightSummary: shortLightweightSummary,
     diagnostics: shortDiagnostics,
     memoryHints
+  };
+  shortPayload.organizationProfileFlowAudit = {
+    phaseProfile: (diagnostics.sameOriginScriptJsonLdPhaseDebug && diagnostics.sameOriginScriptJsonLdPhaseDebug.phaseProfile) || { hasTelephone: false, hasAddress: false },
+    scriptJsonLdProfile: (diagnostics.sameOriginScriptJsonLdPhaseDebug && diagnostics.sameOriginScriptJsonLdPhaseDebug.scriptJsonLdProfile) || { hasTelephone: false, hasAddress: false },
+    structuredDataLightProfile: (diagnostics.sameOriginScriptJsonLdPhaseDebug && diagnostics.sameOriginScriptJsonLdPhaseDebug.structuredDataLightProfile) || { hasTelephone: false, hasAddress: false },
+    fullStructuredDataProfile: profilePresence(structuredData.organizationProfile),
+    lightweightSummaryProfile: profilePresence(shortLightweightSummary.organizationProfile)
   };
   exposeFreshnessOperationSignalsInScrapeResponse_(shortPayload);
   shortPayload.diagnostics.estimatedOriginalBytes = estimatedOriginalBytes;
@@ -15293,6 +15304,10 @@ async function scrapeOnce(req, res) {
           candidateCount: summary.candidateCount,
           types: Array.isArray(summary.types) ? summary.types.slice(0, 20) : [],
           organizationProfile: summary.organizationProfile || { telephone: null, address: null },
+          organizationProfileFlowPhaseProfile: {
+            hasTelephone: !!(summary.organizationProfile && summary.organizationProfile.telephone),
+            hasAddress: !!(summary.organizationProfile && summary.organizationProfile.address)
+          },
           appIndexDetected: !!summary.appIndexDetected,
           totalFetchedBytes: summary.totalFetchedBytes,
           maxScriptLength: summary.maxScriptLength,
@@ -15674,6 +15689,10 @@ async function scrapeOnce(req, res) {
       });
       const structuredLight = phaseResult('structuredDataLight');
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
+      const profilePresence = (profile) => ({
+        hasTelephone: !!(profile && profile.telephone),
+        hasAddress: !!(profile && profile.address)
+      });
       const linksTrust = phaseResult('linksAndTrust');
       const multimodal = phaseResult('multimodal');
       const aioCheck = phaseResult('aioCheck');
@@ -15756,6 +15775,8 @@ async function scrapeOnce(req, res) {
           Number(scriptJsonLd.candidateCount || 0) === 0 &&
           !(Array.isArray(scriptJsonLd.types) && scriptJsonLd.types.length)
         ),
+        phaseProfile: scriptJsonLd.organizationProfileFlowPhaseProfile || profilePresence(null),
+        scriptJsonLdProfile: profilePresence(scriptJsonLd.organizationProfile),
         fetchErrorsCount: Number(scriptJsonLd.fetchErrorsCount || 0),
         fetchErrorsSample: Array.isArray(scriptJsonLd.fetchErrorsSample) ? scriptJsonLd.fetchErrorsSample.slice(0, 5) : []
       };
@@ -15914,6 +15935,7 @@ async function scrapeOnce(req, res) {
         parseErrorsCount: Number(structuredLight.parseErrorsCount || 0),
         scriptSrcError: scriptJsonLd.error || null
       };
+      sameOriginScriptJsonLdPhaseDebug.structuredDataLightProfile = profilePresence(structuredDataLight.organizationProfile);
       const articleSignals = await collectArticleSignalsFromPageLight_(page, finalUrl || urlToFetch);
       console.log('[DEBUG][ARTICLE_SIGNALS_AUDIT]', JSON.stringify({
         checked: articleSignals.checked === true,
@@ -16637,6 +16659,13 @@ async function scrapeOnce(req, res) {
         lightweightSummary,
         diagnostics,
         memoryHints
+      };
+      dedicatedPayload.organizationProfileFlowAudit = {
+        phaseProfile: sameOriginScriptJsonLdPhaseDebug.phaseProfile || profilePresence(null),
+        scriptJsonLdProfile: sameOriginScriptJsonLdPhaseDebug.scriptJsonLdProfile || profilePresence(null),
+        structuredDataLightProfile: sameOriginScriptJsonLdPhaseDebug.structuredDataLightProfile || profilePresence(null),
+        fullStructuredDataProfile: profilePresence(geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.organizationProfile),
+        lightweightSummaryProfile: profilePresence(lightweightSummary && lightweightSummary.organizationProfile)
       };
       mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
       attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
