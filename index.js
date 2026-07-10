@@ -12288,6 +12288,14 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         ? { maxScripts: 3, maxBytesPerScript: 512000 }
         : {})
       : null;
+    const scriptSrcOrganizationProfileSummary = balancedMode
+      ? null
+      : await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, {
+        maxScripts: 3,
+        maxBytesPerScript: 512000,
+        requestTimeoutMs: 3000
+      }).catch(() => null);
+    const scriptSrcOrganizationProfileSource = scriptSrcJsonLdSummary || scriptSrcOrganizationProfileSummary;
     phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
     logHeavySiteBuildGeoAudit('jsonld_parse_end', {
       source: 'html_content_and_same_origin_script_src',
@@ -12409,7 +12417,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     const organizationProfileLight = mergeOrganizationProfilesLight_([
       renderedStructured && renderedStructured.organizationProfile,
       htmlContentJsonLdSummary && htmlContentJsonLdSummary.organizationProfile,
-      scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.organizationProfile
+      scriptSrcOrganizationProfileSource && scriptSrcOrganizationProfileSource.organizationProfile
     ]);
     const mergedJsonLdTypeClass = classifyJsonLdTypesForSeo(mergedJsonLdTypes);
     const structuredDataLight = {
@@ -12775,6 +12783,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           jsScanSkipped: structuredDataLight.jsScanSkipped,
           chunkScanSkipped: structuredDataLight.chunkScanSkipped,
           parseErrorsCount: structuredDataLight.parseErrorsCount,
+          organizationProfile: structuredDataLight.organizationProfile,
+          organizationProfileAudit: structuredDataLight.organizationProfileAudit,
           scriptSrcError: structuredDataLight.scriptSrcError
         },
         articleSignals,
@@ -17827,6 +17837,12 @@ async function scrapeOnce(req, res) {
         structuredDataExcludedFromSeoTypes: Array.isArray(structuredObserved.excludedFromSeoTypes) ? structuredObserved.excludedFromSeoTypes.slice(0, 50) : [],
         structuredDataTypeClassificationSource: structuredObserved.typeClassificationSource || '',
         organizationSummary: structuredObserved.organizationSummary || null,
+        organizationProfile: structuredObserved.organizationProfile || { telephone: null, address: null },
+        organizationProfileAudit: structuredObserved.organizationProfileAudit || {
+          hasTelephone: false,
+          hasAddress: false,
+          source: 'not_observed'
+        },
         sameAsSummary: structuredObserved.sameAsSummary || null,
         sameAsObserved: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.observed : null,
         sameAsCount: structuredObserved.sameAsSummary ? structuredObserved.sameAsSummary.count : null,
