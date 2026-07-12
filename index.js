@@ -11677,10 +11677,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const termsRe = /terms|利用規約|規約/;
       const privacyPolicyRe = /privacy|privacy\s*policy|プライバシーポリシー|個人情報保護方針|個人情報/;
       const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
+      const pricingRe = /(?:\b(?:price|pricing|plan|plans|fee)\b|料金|価格|プラン|商品|購入|\bproducts?\b|\bcart\b)/i;
       const legalLike = hasLike(legalRe);
       const termsLike = hasLike(termsRe);
       const faqLink = hasLike(faqRe);
       const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
+      const pricingLink = hasLike(pricingRe);
+      const pricingNav = anchors.length ? anchors.some((a) => a.navLike && pricingRe.test(textHref(a))) : null;
       const faqSectionEl = queryAllDeep([
         'section[aria-label*="faq" i]',
         'section[aria-label*="よくある質問" i]',
@@ -11856,6 +11859,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           faqLinkSample: firstLikeLink(faqRe),
           faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
           faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
+          hasPricingLink: pricingLink,
+          hasPricingNav: pricingNav,
+          pricingLinkSample: firstLikeLink(pricingRe),
+          pricingLinkSource: pricingLink === true ? 'dom_link_text' : 'not_observed',
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
@@ -15389,8 +15396,11 @@ async function scrapeOnce(req, res) {
         const contactLike = hasLike(/contact|inquiry|support|お問い合わせ|問い合わせ|連絡|サポート/);
         const privacyLike = hasLike(/privacy|プライバシー|個人情報/);
         const faqRe = /(?:\bfaq\b|よくあるご?質問|q\s*&\s*a|q＆a|ヘルプ|help)/i;
+        const pricingRe = /(?:\b(?:price|pricing|plan|plans|fee)\b|料金|価格|プラン|商品|購入|\bproducts?\b|\bcart\b)/i;
         const faqLink = hasLike(faqRe);
         const faqNav = anchors.length ? anchors.some((a) => a.navLike && faqRe.test(textHref(a))) : null;
+        const pricingLink = hasLike(pricingRe);
+        const pricingNav = anchors.length ? anchors.some((a) => a.navLike && pricingRe.test(textHref(a))) : null;
         const navTextItems = uniqueBy(
           anchors.filter((a) => a.navLike && a.text),
           (a) => a.text,
@@ -15490,6 +15500,10 @@ async function scrapeOnce(req, res) {
           hasFaqSection: !!(faqSectionEl || faqHeadingEl),
           faqSectionSource: (faqSectionEl || faqHeadingEl) ? 'dom_heading_or_section' : 'not_observed',
           faqSectionTextSample: faqSectionText ? faqSectionText.slice(0, 120) : '',
+          hasPricingLink: pricingLink,
+          hasPricingNav: pricingNav,
+          pricingLinkSample: firstLike(pricingRe),
+          pricingLinkSource: sourceFor(pricingLink),
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
@@ -16139,6 +16153,10 @@ async function scrapeOnce(req, res) {
           faqLinkSample: linksTrust.faqLinkSample || null,
           faqSectionSource: linksTrust.faqSectionSource || (linksObserved ? 'not_observed' : 'phase_failed'),
           faqSectionTextSample: linksTrust.faqSectionTextSample || '',
+          hasPricingLink: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasPricingLink') ? linksTrust.hasPricingLink : null,
+          hasPricingNav: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasPricingNav') ? linksTrust.hasPricingNav : null,
+          pricingLinkSample: linksTrust.pricingLinkSample || null,
+          pricingLinkSource: linksTrust.pricingLinkSource || (linksObserved ? 'not_observed' : 'phase_failed'),
           breadcrumbUiObserved: linksObserved ? (linksTrust.breadcrumbUiObserved === true) : null,
           hasBreadcrumbUi: linksObserved && Object.prototype.hasOwnProperty.call(linksTrust, 'hasBreadcrumbUi') ? !!linksTrust.hasBreadcrumbUi : null,
           breadcrumbUiSource: linksTrust.breadcrumbUiSource || (linksObserved ? 'dom_scan' : 'not_observed'),
@@ -16393,6 +16411,10 @@ async function scrapeOnce(req, res) {
         hasFaqLink: geoSignalsV1.coverage.hasFaqLink,
         hasFaqNav: geoSignalsV1.coverage.hasFaqNav,
         hasFaqSection: geoSignalsV1.coverage.hasFaqSection,
+        hasPricingLink: geoSignalsV1.coverage.hasPricingLink,
+        hasPricingNav: geoSignalsV1.coverage.hasPricingNav,
+        pricingLinkSample: geoSignalsV1.coverage.pricingLinkSample,
+        pricingLinkSource: geoSignalsV1.coverage.pricingLinkSource,
         breadcrumbUiObserved: geoSignalsV1.coverage.breadcrumbUiObserved,
         hasBreadcrumbUi: geoSignalsV1.coverage.hasBreadcrumbUi,
         breadcrumbUiSource: geoSignalsV1.coverage.breadcrumbUiSource,
