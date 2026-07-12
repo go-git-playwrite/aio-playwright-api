@@ -11879,6 +11879,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasOrganization: hasJsonLd ? (typeSet.has('organization') || typeSet.has('corporation') || typeSet.has('localbusiness')) : false,
           hasBreadcrumbList: hasJsonLd ? typeSet.has('breadcrumblist') : false,
           hasFAQPage: hasJsonLd ? typeSet.has('faqpage') : false,
+          hasProductJsonLd: hasJsonLd ? (typeSet.has('product') || typeSet.has('offer')) : null,
           source: 'rendered_dom_jsonld_light',
           confidence: 'medium',
           observationLimited: true,
@@ -12446,6 +12447,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       hasOrganization: balancedMode ? mergedJsonLdTypeClass.hasOrganization : (observed.structuredData ? observed.structuredData.hasOrganization : null),
       hasBreadcrumbList: balancedMode ? mergedJsonLdTypeClass.hasBreadcrumbList : (observed.structuredData ? observed.structuredData.hasBreadcrumbList : null),
       hasFAQPage: balancedMode ? mergedJsonLdTypeClass.hasFAQPage : (observed.structuredData ? observed.structuredData.hasFAQPage : null),
+      hasProductJsonLd: balancedMode
+        ? (pickStructuredBool('hasJsonLd') === true
+          ? mergedJsonLdTypes.some(type => /^(?:product|offer)$/i.test(String(type || '').replace(/^https?:\/\/schema\.org\//i, '')))
+          : null)
+        : (observed.structuredData && typeof observed.structuredData.hasProductJsonLd === 'boolean'
+          ? observed.structuredData.hasProductJsonLd
+          : null),
       typeClassificationSource: mergedJsonLdTypeClass.typeClassificationSource,
       source: balancedMode ? 'rendered_dom_plus_html_ldjson_plus_script_src_jsonld_light' : (observed.structuredData && observed.structuredData.source ? observed.structuredData.source : 'rendered_dom_jsonld_light'),
       confidence: observed.structuredData && observed.structuredData.confidence ? observed.structuredData.confidence : 'medium',
@@ -12773,6 +12781,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           hasOrganization: structuredDataLight.hasOrganization,
           hasBreadcrumbList: structuredDataLight.hasBreadcrumbList,
           hasFAQPage: structuredDataLight.hasFAQPage,
+          hasProductJsonLd: structuredDataLight.hasProductJsonLd,
           typeClassificationSource: structuredDataLight.typeClassificationSource,
           source: structuredDataLight.source,
           confidence: structuredDataLight.confidence,
@@ -13445,6 +13454,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
       hasOrganization: jsonLdTypes.some(t => /^(organization|corporation|localbusiness)$/i.test(t)),
       hasBreadcrumbList: jsonLdTypes.some(t => /^breadcrumblist$/i.test(t)),
       hasFAQPage: jsonLdTypes.some(t => /^faqpage$/i.test(t)),
+      hasProductJsonLd: hasJsonLd ? jsonLdTypes.some(t => /^(product|offer)$/i.test(t)) : null,
       source: 'top_page_static_html_fetch',
       confidence: hasJsonLd ? 'medium' : 'low',
       observationLimited: true,
@@ -13597,6 +13607,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
     bodyTextLength: Number(signals.bodyTextLength || 0),
     jsonldCount: Number(signals.jsonLdCount || jsonLdTypes.length || 0),
     jsonldTypes: jsonLdTypes,
+    hasProductJsonLd: hasJsonLd ? jsonLdTypes.some(t => /^(product|offer)$/i.test(t)) : null,
     articleSignals,
     qualityStatus: staticFetchResult && staticFetchResult.success ? 'limited' : 'failed',
     coreSignalsReady: staticFetchResult && staticFetchResult.success === true,
@@ -13920,6 +13931,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     hasOrganization: structuredData.hasOrganization,
     hasBreadcrumbList: structuredData.hasBreadcrumbList,
     hasFAQPage: structuredData.hasFAQPage,
+    hasProductJsonLd: structuredData.hasProductJsonLd,
     entityLinkSignals,
     hasSitemapXml: Object.prototype.hasOwnProperty.call(structuredData, 'hasSitemapXml') ? structuredData.hasSitemapXml : null,
     sitemapXmlUrl: structuredData.sitemapXmlUrl || null,
@@ -17846,6 +17858,7 @@ async function scrapeOnce(req, res) {
         hasOrgJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasOrganization') ? structuredObserved.hasOrganization : null,
         hasBreadcrumbJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasBreadcrumbList') ? structuredObserved.hasBreadcrumbList : null,
         hasFaqJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasFAQPage') ? structuredObserved.hasFAQPage : null,
+        hasProductJsonLd: Object.prototype.hasOwnProperty.call(structuredObserved, 'hasProductJsonLd') ? structuredObserved.hasProductJsonLd : null,
         entityLinkSignals: structuredObserved.entityLinkSignals && typeof structuredObserved.entityLinkSignals === 'object' ? structuredObserved.entityLinkSignals : null,
         articleSignals: geoSignalsV1 && geoSignalsV1.selectedArticleSignalsForFactsBridge && typeof geoSignalsV1.selectedArticleSignalsForFactsBridge === 'object'
           ? geoSignalsV1.selectedArticleSignalsForFactsBridge
