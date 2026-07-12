@@ -11861,6 +11861,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         'link[rel="apple-touch-icon-precomposed"][href]'
       ]);
       const imgNodes = queryAllDeep('img');
+      const altTotal = Array.isArray(imgNodes) ? imgNodes.length : null;
+      const altMissingCount = Array.isArray(imgNodes)
+        ? imgNodes.reduce((count, img) => count + (clean(img && img.getAttribute && img.getAttribute('alt')) ? 0 : 1), 0)
+        : null;
       const primaryImageCandidate = ogImageUrl || twitterImageUrl || multimodalJsonLd.primaryImageOfPage || multimodalJsonLd.structuredLogoUrl ||
         absUrl((imgNodes.find((img) => clean(img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src'))) || {}).currentSrc ||
           (imgNodes.find((img) => clean(img.getAttribute && (img.getAttribute('src') || img.getAttribute('data-src')))) || {}).getAttribute?.('src') ||
@@ -11907,6 +11911,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         imageObjectCount: multimodalJsonLd.imageObjectCount,
         structuredImageCount: multimodalJsonLd.structuredImageCount,
         imgCount: imgNodes.length,
+        altTotal,
+        altMissingCount,
         primaryImageOfPage: primaryImageCandidate || '',
         sampleImageUrls: [ogImageUrl, twitterImageUrl, multimodalJsonLd.primaryImageOfPage, multimodalJsonLd.structuredLogoUrl].filter(Boolean).slice(0, 5),
         source: 'balanced_light'
@@ -18024,6 +18030,8 @@ async function scrapeOnce(req, res) {
         imageObjectCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'imageObjectCount') ? multimodalObserved.imageObjectCount : null,
         structuredImageCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'structuredImageCount') ? multimodalObserved.structuredImageCount : null,
         imgCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'imgCount') ? multimodalObserved.imgCount : null,
+        altTotal: Object.prototype.hasOwnProperty.call(multimodalObserved, 'altTotal') ? multimodalObserved.altTotal : null,
+        altMissingCount: Object.prototype.hasOwnProperty.call(multimodalObserved, 'altMissingCount') ? multimodalObserved.altMissingCount : null,
         hasContactLink: Object.prototype.hasOwnProperty.call(trustObserved, 'hasContactLink') ? trustObserved.hasContactLink : null,
         contactPathFound: Object.prototype.hasOwnProperty.call(trustObserved, 'contactPathFound') ? trustObserved.contactPathFound : null,
         contactObservedFromDom: Object.prototype.hasOwnProperty.call(trustObserved, 'contactObservedFromDom') ? trustObserved.contactObservedFromDom : null,
