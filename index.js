@@ -11648,6 +11648,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const semanticHeaderCount = queryAllDeep('header,[role="banner"]').length;
       const semanticNavCount = queryAllDeep('nav,[role="navigation"]').length;
       const semanticFooterCount = queryAllDeep('footer,[role="contentinfo"]').length;
+      const mainElement = document.querySelector('main');
+      const mainSectionCount = mainElement ? mainElement.querySelectorAll('section').length : null;
+      const mainArticleCount = mainElement ? mainElement.querySelectorAll('article').length : null;
       const semanticElements = {
         hasHeaderElement: semanticHeaderCount > 0,
         hasNavElement: semanticNavCount > 0,
@@ -11655,6 +11658,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         headerCount: semanticHeaderCount,
         navCount: semanticNavCount,
         footerCount: semanticFooterCount,
+        mainSectionCount,
+        mainArticleCount,
         semanticElementsObserved: true,
         source: 'rendered_dom_light'
       };
