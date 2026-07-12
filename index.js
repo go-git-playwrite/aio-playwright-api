@@ -6265,6 +6265,8 @@ function buildSubpageSignalsSummary_(pages) {
   const jsonLdTypesAll = Array.from(new Set([].concat(...okPages.map(page => (
     Array.isArray(page.jsonLdTypes) ? page.jsonLdTypes : (Array.isArray(page.jsonldTypes) ? page.jsonldTypes : [])
   ))).map(normalizeSubpageJsonLdType).filter(Boolean))).slice(0, 50);
+  const productJsonLdObservedPageCount = okPages.filter(page => page.productJsonLdObserved === true).length;
+  const productJsonLdPageCount = okPages.filter(page => page.hasProductJsonLd === true).length;
   return {
     observedPageTypes: pageTypes,
     hasAnyJsonLd: okPages.some(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0),
@@ -6273,7 +6275,10 @@ function buildSubpageSignalsSummary_(pages) {
     jsonLdTypesAll,
     pagesWithH1Count: okPages.filter(page => Number(page.h1Count || 0) > 0 || !!normalizeSubpageJsonLdText(page.h1)).length,
     pagesWithJsonLdCount: okPages.filter(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0).length,
-    pagesWithBreadcrumbListCount: okPages.filter(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0).length
+    pagesWithBreadcrumbListCount: okPages.filter(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0).length,
+    hasProductJsonLdOnSubpage: productJsonLdPageCount > 0 ? true : null,
+    productJsonLdObservedPageCount,
+    productJsonLdPageCount
   };
 }
 
@@ -6313,6 +6318,8 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         jsonLdTypes,
         jsonLdCount: Number(page.jsonLdCount || page.jsonldCount || page.deepJsonLdScriptCount || jsonLdTypes.length || 0),
         hasJsonLd: page.hasJsonLd === true || jsonLdTypes.length > 0,
+        productJsonLdObserved: Array.isArray(page.jsonldTypes) ? true : null,
+        hasProductJsonLd: page.hasProductJsonLd === true ? true : null,
         hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
         hasBreadcrumbUi: page.hasBreadcrumbUi === true,
         hasOrganization: page.hasOrganization === true,
@@ -8124,10 +8131,13 @@ function buildLightweightSubpageSignalsSummary_(subpageSignals) {
     observedPageTypes: Array.isArray(summary.observedPageTypes) ? summary.observedPageTypes.slice(0, 20) : [],
     hasAnyJsonLd: summary.hasAnyJsonLd === true,
     hasAnyBreadcrumbList: summary.hasAnyBreadcrumbList === true,
+    hasProductJsonLdOnSubpage: summary.hasProductJsonLdOnSubpage === true ? true : null,
     jsonLdTypesAll: Array.isArray(summary.jsonLdTypesAll) ? summary.jsonLdTypesAll.slice(0, 50) : [],
     pagesWithH1Count: Number(summary.pagesWithH1Count || 0),
     pagesWithJsonLdCount: Number(summary.pagesWithJsonLdCount || 0),
-    pagesWithBreadcrumbListCount: Number(summary.pagesWithBreadcrumbListCount || 0)
+    pagesWithBreadcrumbListCount: Number(summary.pagesWithBreadcrumbListCount || 0),
+    productJsonLdObservedPageCount: Number(summary.productJsonLdObservedPageCount || 0),
+    productJsonLdPageCount: Number(summary.productJsonLdPageCount || 0)
   };
 }
 
