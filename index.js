@@ -2040,6 +2040,105 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
   };
 }
 
+async function collectProductSpecComparisonSignalsLight_(page, options = {}) {
+  const hasProductJsonLd = options.hasProductJsonLd === true;
+  const dom = await page.evaluate(() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const head = (s, n) => norm(s).slice(0, n || 80);
+    const SPEC_RE = /(仕様|スペック|サイズ|重量|重さ|価格|料金|材質|素材|対応|型番|品番|SKU|容量|寸法|幅|高さ|奥行|カラー|色|spec|specification|size|weight|price|material|model|sku|capacity|dimension|color)/i;
+    const COMP_RE = /(比較|違い|選び方|おすすめ|一覧|ラインアップ|性能差|compare|comparison|versus|vs\.?|difference|choose|ranking)/i;
+    const qa = (root, selector) => {
+      try { return Array.from(root.querySelectorAll(selector)); } catch (_) { return []; }
+    };
+
+    const evidenceSources = [];
+    let specLikeTablesCount = 0;
+    let comparisonLikeTablesCount = 0;
+    let specDlCount = 0;
+    let comparisonCueCount = 0;
+
+    const tables = qa(document, 'table').slice(0, 12);
+    tables.forEach((table) => {
+      const caption = head((table.querySelector('caption') || {}).innerText || '', 60);
+      const thTexts = qa(table, 'th').slice(0, 16).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const tdTexts = qa(table, 'td').slice(0, 32).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const rowCount = qa(table, 'tr').length;
+      const colCount = qa(table, 'tr:first-child th, tr:first-child td').length;
+      const text = [caption].concat(thTexts, tdTexts).join(' ');
+      const hasSpecCue = SPEC_RE.test(text);
+      const hasComparisonCue = COMP_RE.test(text);
+      if (hasSpecCue) {
+        specLikeTablesCount++;
+        if (evidenceSources.length < 6) evidenceSources.push('table: ' + head(caption || thTexts.join(' / ') || tdTexts.join(' / '), 80));
+      }
+      if (hasComparisonCue || (hasSpecCue && rowCount >= 3 && colCount >= 3)) {
+        comparisonLikeTablesCount++;
+        comparisonCueCount++;
+        if (evidenceSources.length < 6) evidenceSources.push('comparison-table: rows=' + rowCount + ', cols=' + colCount);
+      }
+    });
+
+    const dls = qa(document, 'dl').slice(0, 12);
+    dls.forEach((dl) => {
+      const labels = qa(dl, 'dt').slice(0, 20).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const values = qa(dl, 'dd').slice(0, 20).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
+      const text = labels.concat(values).join(' ');
+      if (labels.length >= 3 && SPEC_RE.test(text)) {
+        specDlCount++;
+        if (evidenceSources.length < 6) evidenceSources.push('dl: ' + head(labels.join(' / '), 80));
+      }
+      if (COMP_RE.test(text)) comparisonCueCount++;
+    });
+
+    const headingTexts = qa(document, 'h1,h2,h3,h4,[role="heading"]').slice(0, 60)
+      .map(el => norm(el.innerText || el.textContent))
+      .filter(Boolean);
+    headingTexts.forEach((text) => {
+      if (COMP_RE.test(text)) comparisonCueCount++;
+    });
+
+    return {
+      observed: true,
+      specLikeTablesCount,
+      comparisonLikeTablesCount,
+      specDlCount,
+      comparisonCueCount,
+      evidenceSources: evidenceSources.slice(0, 6)
+    };
+  }).catch(() => null);
+
+  if (!dom || dom.observed !== true) return null;
+  const hasStructuredProductInfo = (
+    dom.specLikeTablesCount > 0 ||
+    dom.specDlCount > 0 ||
+    hasProductJsonLd
+  ) ? true : null;
+  const hasMaterial = hasStructuredProductInfo === true || dom.comparisonLikeTablesCount > 0;
+  if (!hasMaterial) return null;
+
+  const hasComparisonReadyShape = dom.comparisonLikeTablesCount > 0
+    ? true
+    : (dom.specLikeTablesCount > 0 || dom.specDlCount > 0 || hasProductJsonLd ? false : null);
+  let structuredSpecScore = 0;
+  if (dom.specLikeTablesCount > 0) structuredSpecScore += 35;
+  if (dom.specDlCount > 0) structuredSpecScore += 20;
+  if (hasProductJsonLd) structuredSpecScore += 10;
+  if (dom.comparisonLikeTablesCount > 0) structuredSpecScore += 25;
+  if (hasComparisonReadyShape === true) structuredSpecScore += 10;
+  structuredSpecScore = Math.max(0, Math.min(100, structuredSpecScore));
+
+  return {
+    hasStructuredProductInfo,
+    hasComparisonReadyShape,
+    structuredSpecScore,
+    comparisonReadinessLevel: structuredSpecScore >= 70 ? 'strong' : (structuredSpecScore >= 40 ? 'medium' : 'weak'),
+    specLikeTablesCount: dom.specLikeTablesCount,
+    comparisonLikeTablesCount: dom.comparisonLikeTablesCount,
+    evidenceSources: (hasProductJsonLd ? ['structuredData.hasProductJsonLd'] : []).concat(dom.evidenceSources).slice(0, 8),
+    observationLimited: true
+  };
+}
+
 async function collectMultimodalSignals(page, jsonldForFlags) {
   function compactUrl(v) {
     return String(v || '').trim();
@@ -17796,6 +17895,15 @@ async function scrapeOnce(req, res) {
         geoSignalsV1.observed = geoSignalsV1.observed || {};
         geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
       }
+      let productSpecComparisonSignalsLight = null;
+      if (!balancedShortFastResponse) {
+        productSpecComparisonSignalsLight = await collectProductSpecComparisonSignalsLight_(page, {
+          hasProductJsonLd: !!(geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasProductJsonLd)
+        });
+        if (productSpecComparisonSignalsLight && geoSignalsV1 && typeof geoSignalsV1 === 'object') {
+          geoSignalsV1.productSpecComparisonSignals = productSpecComparisonSignalsLight;
+        }
+      }
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
         metaDescription: observed.metaDescription && typeof observed.metaDescription.value === 'string' ? observed.metaDescription.value : null,
@@ -17938,6 +18046,9 @@ async function scrapeOnce(req, res) {
         termsLinkSource: trustObserved.termsLinkSource || linksObserved.termsLinkSource || null,
         contactConfidence: trustObserved.contactConfidence || null
       };
+      if (productSpecComparisonSignalsLight) {
+        lightweightSummary.productSpecComparisonSignals = productSpecComparisonSignalsLight;
+      }
       if (geoSignalsV1 && geoSignalsV1.subpageSignals) {
         lightweightSummary.subpageSignals = buildLightweightSubpageSignalsSummary_(geoSignalsV1.subpageSignals);
       }
