@@ -4070,6 +4070,69 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       let canonical = canonicalRaw;
       try { if (canonicalRaw) canonical = new URL(canonicalRaw, location.href).toString(); } catch (_) {}
       const metaDescription = clean(document.querySelector('meta[name="description" i]')?.getAttribute('content') || '').slice(0, 240);
+      const formSignals = (() => {
+        const forms = Array.from(document.querySelectorAll('form'));
+        const iframeCount = document.querySelectorAll('iframe').length;
+        const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
+        let limited = document.readyState !== 'complete' || iframeCount > 0 || shadowHostCount > 0;
+        let hasContactForm = contactPagePath && forms.length > 0;
+        let hasTextarea = false;
+        let hasConsentCheckboxNearForm = false;
+        let hasPrivacyNoticeNearForm = false;
+        const personalDataFieldTypes = [];
+        const addFieldType = type => {
+          if (type && personalDataFieldTypes.indexOf(type) < 0) personalDataFieldTypes.push(type);
+        };
+        forms.forEach(form => {
+          const action = clean(form.getAttribute('action') || '');
+          let externalAction = false;
+          try { externalAction = !!action && new URL(action, location.href).origin !== location.origin; } catch (_) {}
+          if (externalAction) {
+            limited = true;
+            return;
+          }
+          const formText = clean([
+            form.getAttribute('id'), form.getAttribute('class'), form.getAttribute('name'),
+            form.getAttribute('aria-label'), action, form.innerText || form.textContent
+          ].join(' '));
+          if (/contact|inquiry|support|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/.test(formText)) hasContactForm = true;
+          const inputs = Array.from(form.querySelectorAll('input,textarea,select'));
+          if (inputs.some(el => String(el.tagName || '').toLowerCase() === 'textarea')) hasTextarea = true;
+          inputs.forEach(input => {
+            const inputType = String(input.getAttribute('type') || '').toLowerCase();
+            if (inputType === 'hidden' || input.disabled) return;
+            const hay = clean([
+              inputType, input.getAttribute('name'), input.getAttribute('id'), input.getAttribute('autocomplete'),
+              input.getAttribute('aria-label'), input.getAttribute('placeholder'), input.closest('label') && input.closest('label').innerText
+            ].join(' ')).toLowerCase();
+            if (inputType === 'email' || /e-?mail|メール/.test(hay)) addFieldType('email');
+            if (inputType === 'tel' || /phone|tel|telephone|電話/.test(hay)) addFieldType('tel');
+            if (/name|fullname|full-name|お名前|氏名|名前/.test(hay)) addFieldType('name');
+            if (/address|addr|住所|郵便/.test(hay)) addFieldType('address');
+          });
+          if (form.querySelector('input[type="checkbox"]') && /同意|consent|agree|承諾|プライバシー|privacy|個人情報/.test(clean(form.innerText || form.textContent))) {
+            hasConsentCheckboxNearForm = true;
+          }
+          const context = form.parentElement && form.parentElement.parentElement;
+          if (/privacy|プライバシー|個人情報|個人情報保護方針/.test(clean([
+            form.innerText || form.textContent,
+            context && (context.innerText || context.textContent)
+          ].join(' ')))) {
+            hasPrivacyNoticeNearForm = true;
+          }
+        });
+        const boolOrUnknown = value => value === true ? true : (limited ? null : false);
+        return {
+          hasContactForm: boolOrUnknown(hasContactForm),
+          hasPersonalDataCollectionForm: boolOrUnknown(personalDataFieldTypes.length > 0),
+          personalDataFieldTypes,
+          hasTextarea: boolOrUnknown(hasTextarea),
+          hasConsentCheckboxNearForm: boolOrUnknown(hasConsentCheckboxNearForm),
+          hasPrivacyNoticeNearForm: boolOrUnknown(hasPrivacyNoticeNearForm),
+          formObservationLimited: limited,
+          observationScope: 'contact_subpage'
+        };
+      })();
       const head = document.head;
       const docEl = document.documentElement;
       const htmlOuter = String(docEl && docEl.outerHTML || '');
@@ -4125,6 +4188,7 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
         jsonldTypes: Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50),
         hasBreadcrumbUi: !!document.querySelector('[aria-label*="breadcrumb" i], nav[class*="breadcrumb" i], .breadcrumb, [class*="breadcrumb" i]'),
         hasMain: !!document.querySelector('main,article,[role="main"]'),
+        formSignals,
         internalLinkCount,
         externalLinkCount,
         bodyTextLength: scopedText.length,
@@ -4296,6 +4360,7 @@ async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
       hasBreadcrumbUi: observed.hasBreadcrumbUi === true,
       hasMain: observed.hasMain === true,
       hasMainLandmark: observed.hasMain === true,
+      formSignals: observed.formSignals && typeof observed.formSignals === 'object' ? observed.formSignals : null,
       internalLinkCount: Number(observed.internalLinkCount || 0),
       externalLinkCount: Number(observed.externalLinkCount || 0),
       bodyTextLength: Number(observed.bodyTextLength || 0),
@@ -6517,6 +6582,16 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         internalLinkCount: Number(page.internalLinkCount || 0),
         externalLinkCount: Number(page.externalLinkCount || 0),
         sampledText: normalizeSubpageJsonLdText(page.sampledText).slice(0, 500),
+        formSignals: page.formSignals && typeof page.formSignals === 'object' ? {
+          hasContactForm: typeof page.formSignals.hasContactForm === 'boolean' ? page.formSignals.hasContactForm : null,
+          hasPersonalDataCollectionForm: typeof page.formSignals.hasPersonalDataCollectionForm === 'boolean' ? page.formSignals.hasPersonalDataCollectionForm : null,
+          personalDataFieldTypes: Array.isArray(page.formSignals.personalDataFieldTypes) ? page.formSignals.personalDataFieldTypes.slice(0, 8) : [],
+          hasTextarea: typeof page.formSignals.hasTextarea === 'boolean' ? page.formSignals.hasTextarea : null,
+          hasConsentCheckboxNearForm: typeof page.formSignals.hasConsentCheckboxNearForm === 'boolean' ? page.formSignals.hasConsentCheckboxNearForm : null,
+          hasPrivacyNoticeNearForm: typeof page.formSignals.hasPrivacyNoticeNearForm === 'boolean' ? page.formSignals.hasPrivacyNoticeNearForm : null,
+          formObservationLimited: typeof page.formSignals.formObservationLimited === 'boolean' ? page.formSignals.formObservationLimited : null,
+          observationScope: page.formSignals.observationScope === 'contact_subpage' ? 'contact_subpage' : null
+        } : null,
         legalOperatorInfo: page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null
       };
     });
@@ -8607,7 +8682,23 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const legacySelectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const roleBasedSelection = buildRoleBasedSelectedCandidates_(discovered.candidates, { siteMode, maxObserve });
     const roleBasedSelectedCandidates = Array.isArray(roleBasedSelection.candidates) ? roleBasedSelection.candidates : [];
-    const selectedCandidates = roleBasedSelectedCandidates.length ? roleBasedSelectedCandidates : legacySelectedCandidates;
+    const selectedCandidates = (roleBasedSelectedCandidates.length ? roleBasedSelectedCandidates : legacySelectedCandidates).slice();
+    const isContactFormCandidate = candidate => {
+      const haystack = [
+        candidate && candidate.url,
+        candidate && candidate.finalUrl,
+        candidate && candidate.href,
+        candidate && candidate.path,
+        candidate && candidate.label
+      ].map(value => normalizeSubpageJsonLdText(value)).join(' ').toLowerCase();
+      return /(?:\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase)(?:\/|$|-|_)|お問い合わせ|お問合せ|問い合わせ|問合せ|資料請求|contact|inquiry|request|quote)/i.test(haystack);
+    };
+    const selectedCandidateKeys = new Set(selectedCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
+    const contactFormCandidate = prioritizedCandidates.find(candidate => {
+      const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+      return !!key && !selectedCandidateKeys.has(key) && isContactFormCandidate(candidate);
+    });
+    if (contactFormCandidate) selectedCandidates.push(contactFormCandidate);
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const legacySelectedPaths = legacySelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const roleBasedSelectedPaths = roleBasedSelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
@@ -8813,7 +8904,10 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       ? []
       : selectedCandidates.filter((candidate, index) => {
           const candidateUrl = String(candidate && candidate.url || '');
-          return !scopedFallbackCandidateUrls.has(candidateUrl) && !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
+          return !scopedFallbackCandidateUrls.has(candidateUrl) && (
+            isContactFormCandidate(candidate) ||
+            !isSubpageHtmlLightObservationSufficient_(htmlPages[index])
+          );
         });
     const scopedFallbackPages = [];
     if (scopedFallbackCandidates.length) {
