@@ -5532,6 +5532,69 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       if (!sampledText) sampledText = clean((document.body && document.body.innerText) || '').slice(0, 500);
       const allNodes = Array.from(document.querySelectorAll('*')).slice(0, 3000);
       const shadowHostCount = allNodes.filter(el => !!el.shadowRoot).length;
+      const formSignals = (() => {
+        const forms = Array.from(document.querySelectorAll('form'));
+        const iframeCount = document.querySelectorAll('iframe').length;
+        const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
+        let limited = document.readyState !== 'complete' || iframeCount > 0 || shadowHostCount > 0;
+        let hasContactForm = contactPagePath && forms.length > 0;
+        let hasTextarea = false;
+        let hasConsentCheckboxNearForm = false;
+        let hasPrivacyNoticeNearForm = false;
+        const personalDataFieldTypes = [];
+        const addFieldType = (type) => {
+          if (type && personalDataFieldTypes.indexOf(type) < 0) personalDataFieldTypes.push(type);
+        };
+        forms.forEach((form) => {
+          const action = clean(form.getAttribute('action') || '');
+          let externalAction = false;
+          try { externalAction = !!action && new URL(action, location.href).origin !== location.origin; } catch (_) {}
+          if (externalAction) {
+            limited = true;
+            return;
+          }
+          const formText = clean([
+            form.getAttribute('id'), form.getAttribute('class'), form.getAttribute('name'),
+            form.getAttribute('aria-label'), action, form.innerText || form.textContent
+          ].join(' '));
+          if (/contact|inquiry|support|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/.test(formText)) hasContactForm = true;
+          const inputs = Array.from(form.querySelectorAll('input,textarea,select'));
+          if (inputs.some((el) => String(el.tagName || '').toLowerCase() === 'textarea')) hasTextarea = true;
+          inputs.forEach((input) => {
+            const inputType = String(input.getAttribute('type') || '').toLowerCase();
+            if (inputType === 'hidden' || input.disabled) return;
+            const hay = clean([
+              inputType, input.getAttribute('name'), input.getAttribute('id'), input.getAttribute('autocomplete'),
+              input.getAttribute('aria-label'), input.getAttribute('placeholder'), input.closest('label') && input.closest('label').innerText
+            ].join(' ')).toLowerCase();
+            if (inputType === 'email' || /e-?mail|メール/.test(hay)) addFieldType('email');
+            if (inputType === 'tel' || /phone|tel|telephone|電話/.test(hay)) addFieldType('tel');
+            if (/name|fullname|full-name|お名前|氏名|名前/.test(hay)) addFieldType('name');
+            if (/address|addr|住所|郵便/.test(hay)) addFieldType('address');
+          });
+          if (form.querySelector('input[type="checkbox"]') && /同意|consent|agree|承諾|プライバシー|privacy|個人情報/.test(clean(form.innerText || form.textContent))) {
+            hasConsentCheckboxNearForm = true;
+          }
+          const context = form.parentElement && form.parentElement.parentElement;
+          if (/privacy|プライバシー|個人情報|個人情報保護方針/.test(clean([
+            form.innerText || form.textContent,
+            context && (context.innerText || context.textContent)
+          ].join(' ')))) {
+            hasPrivacyNoticeNearForm = true;
+          }
+        });
+        const boolOrUnknown = (value) => value === true ? true : (limited ? null : false);
+        return {
+          hasContactForm: boolOrUnknown(hasContactForm),
+          hasPersonalDataCollectionForm: boolOrUnknown(personalDataFieldTypes.length > 0),
+          personalDataFieldTypes,
+          hasTextarea: boolOrUnknown(hasTextarea),
+          hasConsentCheckboxNearForm: boolOrUnknown(hasConsentCheckboxNearForm),
+          hasPrivacyNoticeNearForm: boolOrUnknown(hasPrivacyNoticeNearForm),
+          formObservationLimited: limited,
+          observationScope: 'contact_subpage'
+        };
+      })();
       return {
         finalUrl: location.href,
         readyState: document.readyState || '',
@@ -5557,6 +5620,7 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
         hasMain: mainCandidates.length > 0,
         hasMainLandmark: mainCandidates.length > 0,
         hasBreadcrumbUi,
+        formSignals,
         internalLinkCount,
         externalLinkCount,
         sampledText,
@@ -5600,12 +5664,16 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
     const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
     const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
     const observedFinalUrl = observed && observed.finalUrl ? observed.finalUrl : finalUrl;
+    const observedPageType = inferSubpageJsonLdPageType(observedFinalUrl || finalUrl || url, opts.siteMode, uniqueTypes);
+    const isContactCandidate = (() => {
+      try { return /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(new URL(observedFinalUrl || finalUrl || url).pathname); } catch (_) { return false; }
+    })();
     return {
       url,
       finalUrl: observedFinalUrl || finalUrl || url,
       status,
       ok: true,
-      pageType: inferSubpageJsonLdPageType(observedFinalUrl || finalUrl || url, opts.siteMode, uniqueTypes),
+      pageType: observedPageType,
       title: normalizeSubpageJsonLdText(observed && observed.title).slice(0, 180),
       canonical: normalizeSubpageJsonLdText(observed && observed.canonical),
       metaDescription: normalizeSubpageJsonLdText(observed && observed.metaDescription).slice(0, 240),
@@ -5649,6 +5717,9 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
       hasWebPage: lowerTypes.has('webpage') || lowerTypes.has('aboutpage') || lowerTypes.has('contactpage') || lowerTypes.has('collectionpage'),
       hasService: lowerTypes.has('service'),
       hasBreadcrumbUi: !!(observed && observed.hasBreadcrumbUi),
+      formSignals: (observedPageType === 'contact' || isContactCandidate) && observed && observed.formSignals && typeof observed.formSignals === 'object'
+        ? observed.formSignals
+        : null,
       hasMain: !!(observed && observed.hasMain),
       hasMainLandmark: !!(observed && observed.hasMainLandmark),
       internalLinkCount: Number(observed && observed.internalLinkCount || 0),
@@ -5734,6 +5805,16 @@ function compactSubpageJsonLdObservation_(page) {
     contactSignals: page && page.contactSignals && typeof page.contactSignals === 'object' ? {
       hasPhone: page.contactSignals.hasPhone === true,
       telephone: normalizeSubpageJsonLdText(page.contactSignals.telephone).slice(0, 60)
+    } : null,
+    formSignals: page && page.formSignals && typeof page.formSignals === 'object' ? {
+      hasContactForm: typeof page.formSignals.hasContactForm === 'boolean' ? page.formSignals.hasContactForm : null,
+      hasPersonalDataCollectionForm: typeof page.formSignals.hasPersonalDataCollectionForm === 'boolean' ? page.formSignals.hasPersonalDataCollectionForm : null,
+      personalDataFieldTypes: Array.isArray(page.formSignals.personalDataFieldTypes) ? page.formSignals.personalDataFieldTypes.slice(0, 8) : [],
+      hasTextarea: typeof page.formSignals.hasTextarea === 'boolean' ? page.formSignals.hasTextarea : null,
+      hasConsentCheckboxNearForm: typeof page.formSignals.hasConsentCheckboxNearForm === 'boolean' ? page.formSignals.hasConsentCheckboxNearForm : null,
+      hasPrivacyNoticeNearForm: typeof page.formSignals.hasPrivacyNoticeNearForm === 'boolean' ? page.formSignals.hasPrivacyNoticeNearForm : null,
+      formObservationLimited: typeof page.formSignals.formObservationLimited === 'boolean' ? page.formSignals.formObservationLimited : null,
+      observationScope: page.formSignals.observationScope === 'contact_subpage' ? 'contact_subpage' : null
     } : null,
     legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? {
       observed: true,
@@ -11873,6 +11954,75 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
       const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
       const privacyRe = /privacy|policy|プライバシー|個人情報|プライバシーポリシー|個人情報保護方針/;
+      // Form signals intentionally inspect only the top-level DOM. Iframes and shadow roots
+      // can contain independent or externally hosted forms, so they keep negatives unknown.
+      const formSignals = (() => {
+        const forms = Array.from(document.querySelectorAll('form'));
+        const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
+        const shadowHostCount = Array.from(document.querySelectorAll('*')).filter((el) => !!el.shadowRoot).length;
+        const iframeCount = document.querySelectorAll('iframe').length;
+        const domComplete = document.readyState === 'complete';
+        let limited = !domComplete || iframeCount > 0 || shadowHostCount > 0;
+        let hasContactForm = contactPagePath && forms.length > 0;
+        let hasPersonalDataCollectionForm = false;
+        let hasTextarea = false;
+        let hasConsentCheckboxNearForm = false;
+        let hasPrivacyNoticeNearForm = false;
+        const fieldTypes = [];
+        const addFieldType = (type) => {
+          if (type && fieldTypes.indexOf(type) < 0) fieldTypes.push(type);
+        };
+        forms.forEach((form) => {
+          const action = clean(form.getAttribute('action') || '');
+          let externalAction = false;
+          try { externalAction = !!action && new URL(action, location.href).origin !== location.origin; } catch (_) {}
+          if (externalAction) {
+            limited = true;
+            return;
+          }
+          const formText = clean([
+            form.getAttribute('id'), form.getAttribute('class'), form.getAttribute('name'),
+            form.getAttribute('aria-label'), action, form.innerText || form.textContent
+          ].join(' '));
+          if (contactRe.test(formText)) hasContactForm = true;
+          const inputs = Array.from(form.querySelectorAll('input,textarea,select'));
+          if (inputs.some((el) => String(el.tagName || '').toLowerCase() === 'textarea')) hasTextarea = true;
+          inputs.forEach((input) => {
+            const inputType = String(input.getAttribute('type') || '').toLowerCase();
+            if (inputType === 'hidden' || input.disabled) return;
+            const hay = clean([
+              inputType, input.getAttribute('name'), input.getAttribute('id'), input.getAttribute('autocomplete'),
+              input.getAttribute('aria-label'), input.getAttribute('placeholder'), input.closest('label') && input.closest('label').innerText
+            ].join(' ')).toLowerCase();
+            if (inputType === 'email' || /e-?mail|メール/.test(hay)) addFieldType('email');
+            if (inputType === 'tel' || /phone|tel|telephone|電話/.test(hay)) addFieldType('tel');
+            if (/name|fullname|full-name|お名前|氏名|名前/.test(hay)) addFieldType('name');
+            if (/address|addr|住所|郵便/.test(hay)) addFieldType('address');
+          });
+          if (form.querySelector('input[type="checkbox"]')) {
+            const consentText = clean(form.innerText || form.textContent);
+            if (/同意|consent|agree|承諾|プライバシー|privacy|個人情報/.test(consentText)) hasConsentCheckboxNearForm = true;
+          }
+          const context = form.parentElement && form.parentElement.parentElement;
+          const contextText = clean([
+            form.innerText || form.textContent,
+            context && (context.innerText || context.textContent)
+          ].join(' '));
+          if (/privacy|プライバシー|個人情報|個人情報保護方針/.test(contextText)) hasPrivacyNoticeNearForm = true;
+        });
+        hasPersonalDataCollectionForm = fieldTypes.length > 0;
+        const boolOrUnknown = (value) => value === true ? true : (limited ? null : false);
+        return {
+          hasContactForm: boolOrUnknown(hasContactForm),
+          hasPersonalDataCollectionForm: boolOrUnknown(hasPersonalDataCollectionForm),
+          personalDataFieldTypes: fieldTypes,
+          hasTextarea: boolOrUnknown(hasTextarea),
+          hasConsentCheckboxNearForm: boolOrUnknown(hasConsentCheckboxNearForm),
+          hasPrivacyNoticeNearForm: boolOrUnknown(hasPrivacyNoticeNearForm),
+          formObservationLimited: limited,
+          observationScope: 'top_page'
+        };
+      })();
       const trustSignals = {
         hasContactLink: hasLike(contactRe),
         contactPathFound: hasLike(contactRe),
@@ -11964,6 +12114,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         },
         multimodalSignals,
         clarity: claritySignals,
+        formSignals,
         trustSignals,
         coverage: {
           semanticElements,
@@ -12749,6 +12900,16 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         ctaObserved: null,
         source: 'not_observed'
       },
+      formSignals: observed.formSignals && typeof observed.formSignals === 'object' ? observed.formSignals : {
+        hasContactForm: null,
+        hasPersonalDataCollectionForm: null,
+        personalDataFieldTypes: [],
+        hasTextarea: null,
+        hasConsentCheckboxNearForm: null,
+        hasPrivacyNoticeNearForm: null,
+        formObservationLimited: true,
+        observationScope: 'top_page'
+      },
       trustSignals: trustSignalsLight,
       coverage: observedCoverageSignals || {
         semanticElements: {
@@ -12940,6 +13101,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         },
         multimodalSignals: observedMultimodalSignals || null,
         clarity: observed.clarity || null,
+        formSignals: observed.formSignals && typeof observed.formSignals === 'object' ? observed.formSignals : null,
         trustSignals: trustSignalsLight,
         coverage: observedCoverageSignals || null,
         body: {
@@ -15594,6 +15756,70 @@ async function scrapeOnce(req, res) {
         }) || null;
         const faqSectionText = clean((faqSectionEl || faqHeadingEl) && ((faqSectionEl || faqHeadingEl).innerText || (faqSectionEl || faqHeadingEl).textContent));
         const footerObserved = footerAnchors.length > 0 || queryAllDeep('footer,[role="contentinfo"]').length > 0;
+        const formSignals = (() => {
+          const forms = Array.from(document.querySelectorAll('form'));
+          const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test(location.pathname || '');
+          const shadowHostCount = Array.from(document.querySelectorAll('*')).filter((el) => !!el.shadowRoot).length;
+          const iframeCount = document.querySelectorAll('iframe').length;
+          let limited = document.readyState !== 'complete' || iframeCount > 0 || shadowHostCount > 0;
+          let hasContactForm = contactPagePath && forms.length > 0;
+          let hasTextarea = false;
+          let hasConsentCheckboxNearForm = false;
+          let hasPrivacyNoticeNearForm = false;
+          const personalDataFieldTypes = [];
+          const addFieldType = (type) => {
+            if (type && personalDataFieldTypes.indexOf(type) < 0) personalDataFieldTypes.push(type);
+          };
+          forms.forEach((form) => {
+            const action = clean(form.getAttribute('action') || '');
+            let externalAction = false;
+            try { externalAction = !!action && new URL(action, location.href).origin !== location.origin; } catch (_) {}
+            if (externalAction) {
+              limited = true;
+              return;
+            }
+            const formText = clean([
+              form.getAttribute('id'), form.getAttribute('class'), form.getAttribute('name'),
+              form.getAttribute('aria-label'), action, form.innerText || form.textContent
+            ].join(' '));
+            if (/contact|inquiry|support|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/.test(formText)) hasContactForm = true;
+            const inputs = Array.from(form.querySelectorAll('input,textarea,select'));
+            if (inputs.some((el) => String(el.tagName || '').toLowerCase() === 'textarea')) hasTextarea = true;
+            inputs.forEach((input) => {
+              const inputType = String(input.getAttribute('type') || '').toLowerCase();
+              if (inputType === 'hidden' || input.disabled) return;
+              const hay = clean([
+                inputType, input.getAttribute('name'), input.getAttribute('id'), input.getAttribute('autocomplete'),
+                input.getAttribute('aria-label'), input.getAttribute('placeholder'), input.closest('label') && input.closest('label').innerText
+              ].join(' ')).toLowerCase();
+              if (inputType === 'email' || /e-?mail|メール/.test(hay)) addFieldType('email');
+              if (inputType === 'tel' || /phone|tel|telephone|電話/.test(hay)) addFieldType('tel');
+              if (/name|fullname|full-name|お名前|氏名|名前/.test(hay)) addFieldType('name');
+              if (/address|addr|住所|郵便/.test(hay)) addFieldType('address');
+            });
+            if (form.querySelector('input[type="checkbox"]') && /同意|consent|agree|承諾|プライバシー|privacy|個人情報/.test(clean(form.innerText || form.textContent))) {
+              hasConsentCheckboxNearForm = true;
+            }
+            const context = form.parentElement && form.parentElement.parentElement;
+            if (/privacy|プライバシー|個人情報|個人情報保護方針/.test(clean([
+              form.innerText || form.textContent,
+              context && (context.innerText || context.textContent)
+            ].join(' ')))) {
+              hasPrivacyNoticeNearForm = true;
+            }
+          });
+          const boolOrUnknown = (value) => value === true ? true : (limited ? null : false);
+          return {
+            hasContactForm: boolOrUnknown(hasContactForm),
+            hasPersonalDataCollectionForm: boolOrUnknown(personalDataFieldTypes.length > 0),
+            personalDataFieldTypes,
+            hasTextarea: boolOrUnknown(hasTextarea),
+            hasConsentCheckboxNearForm: boolOrUnknown(hasConsentCheckboxNearForm),
+            hasPrivacyNoticeNearForm: boolOrUnknown(hasPrivacyNoticeNearForm),
+            formObservationLimited: limited,
+            observationScope: 'top_page'
+          };
+        })();
         return {
           anchorCount: anchors.length,
           rawNavAnchorCount: anchors.filter((a) => a.navLike).length,
@@ -15635,6 +15861,7 @@ async function scrapeOnce(req, res) {
           hasBreadcrumbUi: !!breadcrumbEl,
           breadcrumbUiSource: 'dom_scan',
           breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
+          formSignals,
           footerSignals: {
             observed: footerObserved,
             linkCount: footerObserved ? footerAnchors.length : null,
@@ -16239,6 +16466,16 @@ async function scrapeOnce(req, res) {
           sampleImageUrls: [ogImageUrl, twitterImageUrl].filter(Boolean).slice(0, 5),
           source: 'shortfast_phase_builder'
         },
+        formSignals: linksTrust.formSignals && typeof linksTrust.formSignals === 'object' ? linksTrust.formSignals : {
+          hasContactForm: null,
+          hasPersonalDataCollectionForm: null,
+          personalDataFieldTypes: [],
+          hasTextarea: null,
+          hasConsentCheckboxNearForm: null,
+          hasPrivacyNoticeNearForm: null,
+          formObservationLimited: true,
+          observationScope: 'top_page'
+        },
         trustSignals: {
           hasContactLink: linkBoolean('hasContactLikeLink'),
           contactPathFound: linkBoolean('hasContactLikeLink'),
@@ -16448,6 +16685,7 @@ async function scrapeOnce(req, res) {
       });
       geoSignalsV1.observed.landmarks = geoSignalsV1.landmarks;
       geoSignalsV1.observed.multimodalSignals = geoSignalsV1.multimodalSignals;
+      geoSignalsV1.observed.formSignals = geoSignalsV1.formSignals;
       geoSignalsV1.observed.trustSignals = geoSignalsV1.trustSignals;
       geoSignalsV1.observed.coverage = geoSignalsV1.coverage;
       geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
@@ -16493,6 +16731,7 @@ async function scrapeOnce(req, res) {
         ctaTexts: Array.isArray(geoSignalsV1.clarity.ctaTexts) ? geoSignalsV1.clarity.ctaTexts.slice(0, 10) : [],
         ctaCandidatesCount: geoSignalsV1.clarity.ctaCandidatesCount,
         ctaObserved: geoSignalsV1.clarity.ctaObserved,
+        formSignals: geoSignalsV1.formSignals,
         bodyTextLength: unifiedBodyTextLength,
         bodyTextSample: unifiedBodyTextSample || null,
         mainTextHead: unifiedBodyTextSample || null,
@@ -17958,6 +18197,9 @@ async function scrapeOnce(req, res) {
         ctaTexts: Array.isArray(clarityObserved.ctaTexts) ? clarityObserved.ctaTexts.slice(0, 10) : [],
         ctaCandidatesCount: typeof clarityObserved.ctaCandidatesCount === 'number' ? clarityObserved.ctaCandidatesCount : null,
         ctaObserved: Object.prototype.hasOwnProperty.call(clarityObserved, 'ctaObserved') ? clarityObserved.ctaObserved : null,
+        formSignals: geoSignalsV1 && geoSignalsV1.formSignals && typeof geoSignalsV1.formSignals === 'object'
+          ? geoSignalsV1.formSignals
+          : null,
         hasHeaderElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasHeaderElement') ? semanticObserved.hasHeaderElement : null,
         hasNavElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasNavElement') ? semanticObserved.hasNavElement : null,
         hasFooterElement: Object.prototype.hasOwnProperty.call(semanticObserved, 'hasFooterElement') ? semanticObserved.hasFooterElement : null,
