@@ -3660,6 +3660,68 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const contactSignals = pageType === 'contact'
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
     : null;
+  const formSignals = (() => {
+    if (pageType !== 'contact') return null;
+    const forms = $('form');
+    const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test((() => {
+      try { return new URL(finalUrl || url).pathname || ''; } catch (_) { return ''; }
+    })());
+    let limited = $('iframe').length > 0 || $('template[shadowrootmode],template[shadowroot]').length > 0;
+    let hasContactForm = contactPagePath && forms.length > 0;
+    let hasTextarea = false;
+    let hasConsentCheckboxNearForm = false;
+    let hasPrivacyNoticeNearForm = false;
+    const personalDataFieldTypes = [];
+    const addFieldType = type => {
+      if (type && !personalDataFieldTypes.includes(type)) personalDataFieldTypes.push(type);
+    };
+    forms.each((_, form) => {
+      const formEl = $(form);
+      const action = normalizeSubpageJsonLdText(formEl.attr('action') || '');
+      let externalAction = false;
+      try { externalAction = !!action && new URL(action, finalUrl || url).origin !== new URL(finalUrl || url).origin; } catch (_) {}
+      if (externalAction) {
+        limited = true;
+        return;
+      }
+      const formText = normalizeSubpageJsonLdText([
+        formEl.attr('id'), formEl.attr('class'), formEl.attr('name'), formEl.attr('aria-label'), action, formEl.text()
+      ].join(' '));
+      if (/contact|inquiry|support|お問い合わせ|お問合せ|問い合わせ|連絡|サポート|相談/.test(formText)) hasContactForm = true;
+      if (formEl.find('textarea').length > 0) hasTextarea = true;
+      formEl.find('input,textarea,select').each((__, input) => {
+        const inputEl = $(input);
+        const inputType = String(inputEl.attr('type') || '').toLowerCase();
+        if (inputType === 'hidden' || inputEl.is(':disabled')) return;
+        const labelText = inputEl.closest('label').text();
+        const haystack = normalizeSubpageJsonLdText([
+          inputType, inputEl.attr('name'), inputEl.attr('id'), inputEl.attr('autocomplete'), inputEl.attr('aria-label'), inputEl.attr('placeholder'), labelText
+        ].join(' ')).toLowerCase();
+        if (inputType === 'email' || /e-?mail|メール/.test(haystack)) addFieldType('email');
+        if (inputType === 'tel' || /phone|tel|telephone|電話/.test(haystack)) addFieldType('tel');
+        if (/name|fullname|full-name|お名前|氏名|名前/.test(haystack)) addFieldType('name');
+        if (/address|addr|住所|郵便/.test(haystack)) addFieldType('address');
+      });
+      if (formEl.find('input[type="checkbox"]').length > 0 && /同意|consent|agree|承諾|プライバシー|privacy|個人情報/.test(formText)) {
+        hasConsentCheckboxNearForm = true;
+      }
+      const context = formEl.parent().parent();
+      if (/privacy|プライバシー|個人情報|個人情報保護方針/.test(normalizeSubpageJsonLdText([formText, context.text()].join(' ')))) {
+        hasPrivacyNoticeNearForm = true;
+      }
+    });
+    const boolOrUnknown = value => value === true ? true : (limited ? null : false);
+    return {
+      hasContactForm: boolOrUnknown(hasContactForm),
+      hasPersonalDataCollectionForm: boolOrUnknown(personalDataFieldTypes.length > 0),
+      personalDataFieldTypes,
+      hasTextarea: boolOrUnknown(hasTextarea),
+      hasConsentCheckboxNearForm: boolOrUnknown(hasConsentCheckboxNearForm),
+      hasPrivacyNoticeNearForm: boolOrUnknown(hasPrivacyNoticeNearForm),
+      formObservationLimited: limited,
+      observationScope: 'contact_subpage'
+    };
+  })();
   const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url);
   let internalLinkCount = 0;
   let externalLinkCount = 0;
@@ -3701,6 +3763,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     sampledText,
     legalOperatorInfo,
     contactSignals,
+    formSignals,
     articleSignals,
     error: null,
     parseErrors
