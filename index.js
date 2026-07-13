@@ -3661,11 +3661,11 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     ? extractContactSignalsFromHtml_(html, finalUrl || url)
     : null;
   const formSignals = (() => {
-    if (pageType !== 'contact') return null;
-    const forms = $('form');
     const contactPagePath = /\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase|お問い合わせ)(?:\/|$|-|_)/i.test((() => {
       try { return new URL(finalUrl || url).pathname || ''; } catch (_) { return ''; }
     })());
+    if (!contactPagePath) return null;
+    const forms = $('form');
     let limited = $('iframe').length > 0 || $('template[shadowrootmode],template[shadowroot]').length > 0;
     let hasContactForm = contactPagePath && forms.length > 0;
     let hasTextarea = false;
