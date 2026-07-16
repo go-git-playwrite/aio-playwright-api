@@ -6319,7 +6319,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
   const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
   const observedPages = observations.filter(page => page && page.ok === true);
-  const hasBreadcrumb = page => {
+  const hasBreadcrumbList = page => {
     const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
     return page && (
       page.hasBreadcrumbJsonLd === true ||
@@ -6327,6 +6327,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       types.some(type => normalizeSubpageJsonLdType(type).toLowerCase() === 'breadcrumblist')
     );
   };
+  const hasBreadcrumbUi = page => page && page.hasBreadcrumbUi === true;
   const representativePages = observedPages
     .map(page => {
       const candidate = candidateByUrl.get(String(page.url || '')) || {};
@@ -6349,7 +6350,8 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         title: normalizeSubpageJsonLdText(page.title).slice(0, 180),
         h1: normalizeSubpageJsonLdText(h1Texts[0] || ''),
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
-        hasBreadcrumbList: hasBreadcrumb(page),
+        hasBreadcrumbList: hasBreadcrumbList(page),
+        hasBreadcrumbUi: hasBreadcrumbUi(page),
         jsonLdTypes,
         legalOperatorInfo,
         matchedCandidateSources: Array.isArray(candidate.sources)
@@ -6380,7 +6382,8 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   }
   emitObservationPlanRoleAudit_(payload && payload.origin || '', observationPlanAudit);
   const observedH1PageCount = observedPages.filter(page => Number(page.h1Count || 0) > 0 || (Array.isArray(page.h1Texts) && page.h1Texts.length > 0)).length;
-  const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumb(page)).length;
+  const observedBreadcrumbPageCount = observedPages.filter(page => hasBreadcrumbUi(page)).length;
+  const observedBreadcrumbListPageCount = observedPages.filter(page => hasBreadcrumbList(page)).length;
   const representativeQualityAudit = buildRepresentativeObservationQualityAudit_(representativePages, observations);
   const notes = [];
   if (Array.isArray(payload && payload.notes)) {
@@ -6408,8 +6411,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     observedSubpageCount: observedPages.length,
     observedH1PageCount,
     observedBreadcrumbPageCount,
+    observedBreadcrumbListPageCount,
     hasObservedSubpageH1: observedH1PageCount > 0,
-    hasObservedBreadcrumbList: observedBreadcrumbPageCount > 0,
+    hasObservedBreadcrumbList: observedBreadcrumbListPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
     representativePages,
     representativePagesAudit,
@@ -6503,6 +6507,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     observedSubpageCount: Number(coverageSignalsV1.observedSubpageCount || 0),
     observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
     observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
+    observedBreadcrumbListPageCount: Number(coverageSignalsV1.observedBreadcrumbListPageCount || 0),
     hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
     hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
     hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
@@ -6524,6 +6529,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       h1: page && page.h1 || '',
       hasH1: !!(page && page.hasH1),
       hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
+      hasBreadcrumbUi: !!(page && page.hasBreadcrumbUi),
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
       legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
@@ -12010,13 +12016,21 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         semanticElementsObserved: true,
         source: 'rendered_dom_light'
       };
+      const isVisibleBreadcrumbElement = (el) => {
+        if (!el || !el.isConnected) return false;
+        const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse')) return false;
+        if (style && Number(style.opacity) === 0) return false;
+        return !el.getClientRects || el.getClientRects().length > 0;
+      };
       const breadcrumbEl = queryAllDeep([
         '[aria-label*="breadcrumb" i]',
         '[class*="breadcrumb" i]',
         '[id*="breadcrumb" i]',
         'nav[aria-label*="パンくず" i]',
-        '[class*="パンくず" i]'
-      ].join(','))[0] || null;
+        '[class*="パンくず" i]',
+        '[id*="パンくず" i]'
+      ].join(',')).find(isVisibleBreadcrumbElement) || null;
       const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
       const footerAnchors = anchors.filter((a) => a.footerLike);
       const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
