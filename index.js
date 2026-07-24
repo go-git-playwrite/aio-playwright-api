@@ -3770,7 +3770,45 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   };
 }
 
-async function fetchSubpageHtmlLight(url, opts = {}) {
+function getTrailingSlashRetryUrl_(url, result) {
+  if (!result || result.status !== 404) return '';
+  try {
+    const parsed = new URL(String(url || ''));
+    if (!/^https?:$/.test(parsed.protocol)) return '';
+    parsed.search = '';
+    parsed.hash = '';
+    const pathname = parsed.pathname || '/';
+    if (pathname === '/' || pathname.endsWith('/')) return '';
+    const lastSegment = pathname.slice(pathname.lastIndexOf('/') + 1);
+    if (!lastSegment || /\.[A-Za-z0-9]{1,16}$/.test(lastSegment)) return '';
+    parsed.pathname = pathname + '/';
+    return parsed.toString();
+  } catch (_) {
+    return '';
+  }
+}
+
+async function fetchSubpageWithTrailingSlashRetry_(url, fetchOnce) {
+  const first = await fetchOnce(url);
+  const retryUrl = getTrailingSlashRetryUrl_(url, first);
+  if (!retryUrl) return first;
+  const retry = await fetchOnce(retryUrl);
+  if (retry && retry.ok === true) {
+    return Object.assign({}, retry, {
+      url,
+      trailingSlashRetryAttempted: true,
+      trailingSlashRetryUrl: retryUrl
+    });
+  }
+  return Object.assign({}, first, {
+    trailingSlashRetryAttempted: true,
+    trailingSlashRetryUrl: retryUrl,
+    trailingSlashRetryStatus: retry && typeof retry.status === 'number' ? retry.status : null,
+    trailingSlashRetryError: retry && retry.error || null
+  });
+}
+
+async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
   const buildFetchError = (stage, error, meta) => {
     const cause = error && error.cause ? error.cause : null;
     const parts = [];
@@ -3873,6 +3911,10 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
   }
 }
 
+async function fetchSubpageHtmlLight(url, opts = {}) {
+  return fetchSubpageWithTrailingSlashRetry_(url, retryUrl => fetchSubpageHtmlLightOnce_(retryUrl, opts));
+}
+
 async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   const pages = [];
   for (const url of (Array.isArray(urls) ? urls : [])) {
@@ -3881,7 +3923,7 @@ async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   return { pages };
 }
 
-async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
+async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
   const context = opts && opts.context;
   const debugHeavySite = opts && opts.debugHeavySite === true;
   const emitScopedAudit = (phase, details = {}) => {
@@ -4967,6 +5009,10 @@ function emitRepresentativePagesRoleAudit_(origin, representativePagesAudit) {
   } catch (_) {}
 }
 
+async function fetchSubpagePlaywrightScopedLight(url, opts = {}) {
+  return fetchSubpageWithTrailingSlashRetry_(url, retryUrl => fetchSubpagePlaywrightScopedLightOnce_(retryUrl, opts));
+}
+
 async function fetchDiscoverSubpageText(url, timeoutMs = 8000) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
@@ -5320,7 +5366,7 @@ app.post('/discover-subpage-candidates-light', async (req, res) => {
 // Render check:
 // curl -sS -X POST "https://aio-playwright-api-2.onrender.com/discover-subpage-candidates-light" -H "content-type: application/json" --max-time 180 -d '{"topUrl":"https://www.fork.co.jp/","limit":20}' | jq
 
-async function fetchSubpageJsonLdLight(url, opts = {}) {
+async function fetchSubpageJsonLdLightOnce_(url, opts = {}) {
   const maxHtmlBytes = 2 * 1024 * 1024;
   const timeoutMs = Math.max(1000, Math.min(15000, Number(opts.timeout || 8000) || 8000));
   const context = opts.context;
@@ -5880,6 +5926,10 @@ async function fetchSubpageJsonLdLight(url, opts = {}) {
   } finally {
     try { if (page) await page.close(); } catch (_) {}
   }
+}
+
+async function fetchSubpageJsonLdLight(url, opts = {}) {
+  return fetchSubpageWithTrailingSlashRetry_(url, retryUrl => fetchSubpageJsonLdLightOnce_(retryUrl, opts));
 }
 
 function compactSubpageJsonLdObservation_(page) {
