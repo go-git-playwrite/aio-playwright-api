@@ -1842,6 +1842,29 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
     function qa(root, sel) {
       try { return root ? Array.from(root.querySelectorAll(sel)) : []; } catch (_) { return []; }
     }
+    function isTimelineDl(dl, labels) {
+      const DATE_RE = /^(?:20\d{2}[.\/-]\d{1,2}[.\/-]\d{1,2}|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)(?:\s|$)/;
+      const TIMELINE_CONTEXT_RE = /(お知らせ|ニュース|新着|更新情報?|プレスリリース|press\s*release|\bIR\b|投資家情報|イベント|トピックス|topics?)/i;
+      const dateLabelCount = labels.filter(label => DATE_RE.test(label)).length;
+      const hasDateMajority = dateLabelCount >= 2 && dateLabelCount * 2 > labels.length;
+      if (!hasDateMajority) return false;
+
+      const contextParts = [];
+      let node = dl;
+      for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+        const attrs = [node.getAttribute && node.getAttribute('aria-label'), node.id, node.className]
+          .map(norm)
+          .filter(Boolean);
+        const headings = qa(node, 'h1,h2,h3,h4,[role="heading"]')
+          .slice(0, 4)
+          .map(el => norm(el.innerText || el.textContent))
+          .filter(Boolean);
+        contextParts.push.apply(contextParts, attrs.concat(headings));
+      }
+      const hasTimelineContext = TIMELINE_CONTEXT_RE.test(contextParts.join(' '));
+      const ddWithLinksCount = qa(dl, 'dd').filter(dd => qa(dd, 'a[href]').length > 0).length;
+      return hasTimelineContext || ddWithLinksCount >= 2;
+    }
     function openRoots() {
       const roots = [];
       try {
@@ -1895,7 +1918,7 @@ async function collectProductSpecComparisonSignals(page, jsonldForFlags) {
       const labels = qa(dl, 'dt').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
       const values = qa(dl, 'dd').slice(0, 30).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
       const text = labels.concat(values.slice(0, 10)).join(' ');
-      if (labels.length >= 3 && SPEC_RE.test(text)) {
+      if (labels.length >= 3 && SPEC_RE.test(text) && !isTimelineDl(dl, labels)) {
         specDlCount++;
         specCueCount++;
         if (evidenceSources.length < 8) evidenceSources.push('dl: ' + head(labels.join(' / '), 80));
@@ -2050,6 +2073,29 @@ async function collectProductSpecComparisonSignalsLight_(page, options = {}) {
     const qa = (root, selector) => {
       try { return Array.from(root.querySelectorAll(selector)); } catch (_) { return []; }
     };
+    const isTimelineDl = (dl, labels) => {
+      const DATE_RE = /^(?:20\d{2}[.\/-]\d{1,2}[.\/-]\d{1,2}|20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)(?:\s|$)/;
+      const TIMELINE_CONTEXT_RE = /(お知らせ|ニュース|新着|更新情報?|プレスリリース|press\s*release|\bIR\b|投資家情報|イベント|トピックス|topics?)/i;
+      const dateLabelCount = labels.filter(label => DATE_RE.test(label)).length;
+      const hasDateMajority = dateLabelCount >= 2 && dateLabelCount * 2 > labels.length;
+      if (!hasDateMajority) return false;
+
+      const contextParts = [];
+      let node = dl;
+      for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {
+        const attrs = [node.getAttribute && node.getAttribute('aria-label'), node.id, node.className]
+          .map(norm)
+          .filter(Boolean);
+        const headings = qa(node, 'h1,h2,h3,h4,[role="heading"]')
+          .slice(0, 4)
+          .map(el => norm(el.innerText || el.textContent))
+          .filter(Boolean);
+        contextParts.push.apply(contextParts, attrs.concat(headings));
+      }
+      const hasTimelineContext = TIMELINE_CONTEXT_RE.test(contextParts.join(' '));
+      const ddWithLinksCount = qa(dl, 'dd').filter(dd => qa(dd, 'a[href]').length > 0).length;
+      return hasTimelineContext || ddWithLinksCount >= 2;
+    };
 
     const evidenceSources = [];
     let specLikeTablesCount = 0;
@@ -2083,7 +2129,7 @@ async function collectProductSpecComparisonSignalsLight_(page, options = {}) {
       const labels = qa(dl, 'dt').slice(0, 20).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
       const values = qa(dl, 'dd').slice(0, 20).map(el => norm(el.innerText || el.textContent)).filter(Boolean);
       const text = labels.concat(values).join(' ');
-      if (labels.length >= 3 && SPEC_RE.test(text)) {
+      if (labels.length >= 3 && SPEC_RE.test(text) && !isTimelineDl(dl, labels)) {
         specDlCount++;
         if (evidenceSources.length < 6) evidenceSources.push('dl: ' + head(labels.join(' / '), 80));
       }
