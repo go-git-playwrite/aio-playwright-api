@@ -3277,6 +3277,7 @@ function extractLegalOperatorInfoFromHtml_(html, sourceUrl, meta = {}) {
     extractionMethod: 'html_text',
     evidenceLabels: []
   };
+  let timeoutId = null;
   try {
     const $ = cheerio.load(String(html || ''));
     const title = normalizeSubpageJsonLdText((meta && meta.title) || $('title').first().text());
@@ -14145,21 +14146,17 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     }
     const timeoutMs = Math.max(1000, Math.min(15000, Number(opts && opts.timeoutMs || 8000) || 8000));
     const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timeoutId = controller ? setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs) : null;
+    timeoutId = controller ? setTimeout(() => { try { controller.abort(); } catch (_) {} }, timeoutMs) : null;
     let response = null;
-    try {
-      response = await fetch(url, {
-        method: 'GET',
-        redirect: 'follow',
-        signal: controller ? controller.signal : undefined,
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
-      });
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-    }
+    response = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller ? controller.signal : undefined,
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+      }
+    });
     result.status = response && typeof response.status === 'number' ? response.status : null;
     result.finalUrl = response && response.url ? response.url : String(url || '');
     const contentType = String(response && response.headers && response.headers.get && response.headers.get('content-type') || '');
@@ -14179,6 +14176,7 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     result.error = String(e && (e.message || e) || 'top_page_static_fetch_failed').slice(0, 180);
     return result;
   } finally {
+    if (timeoutId) clearTimeout(timeoutId);
     result.elapsedMs = Math.max(0, Date.now() - startedAt);
   }
 }
@@ -14611,7 +14609,23 @@ const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.
 
 function createLightRequestBudget_(requestStartedAt) {
   const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
-  return { startedAt, deadlineAt: startedAt + LIGHT_REQUEST_BUDGET_MS, budgetMs: LIGHT_REQUEST_BUDGET_MS, skipped: [] };
+  return {
+    startedAt,
+    deadlineAt: startedAt + LIGHT_REQUEST_BUDGET_MS,
+    budgetMs: LIGHT_REQUEST_BUDGET_MS,
+    skipped: [],
+    activeStage: 'queue_wait',
+    timeoutStage: '',
+    timedOut: false,
+    queueStartedAt: 0,
+    stageMs: {
+      topPageStaticFetchMs: 0,
+      browserLaunchMs: 0,
+      browserContextMs: 0,
+      pageCreateMs: 0,
+      initScriptMs: 0
+    }
+  };
 }
 function getLightBudgetRemainingMs_(budget, reserveMs = 0) {
   if (!budget) return Number.POSITIVE_INFINITY;
@@ -14636,7 +14650,12 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     totalRequestMs: Math.max(0, now - budget.startedAt),
     overallBudgetMs: budget.budgetMs,
     remainingMs: getLightBudgetRemainingMs_(budget),
-    skippedDueToBudget: Array.from(new Set(budget.skipped || []))
+    skippedDueToBudget: Array.from(new Set(budget.skipped || [])),
+    topPageStaticFetchMs: Number(budget.stageMs && budget.stageMs.topPageStaticFetchMs || 0),
+    browserLaunchMs: Number(budget.stageMs && budget.stageMs.browserLaunchMs || 0),
+    browserContextMs: Number(budget.stageMs && budget.stageMs.browserContextMs || 0),
+    pageCreateMs: Number(budget.stageMs && budget.stageMs.pageCreateMs || 0),
+    initScriptMs: Number(budget.stageMs && budget.stageMs.initScriptMs || 0)
   };
 }
 function createLightBudgetError_(stage, message) {
@@ -14644,6 +14663,130 @@ function createLightBudgetError_(stage, message) {
   error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
   error.lightBudgetStage = stage || 'unknown';
   return error;
+}
+
+const LIGHT_STAGE_TIMING_KEY_ = Object.freeze({
+  top_static_fetch: 'topPageStaticFetchMs',
+  browser_launch: 'browserLaunchMs',
+  browser_context: 'browserContextMs',
+  page_create: 'pageCreateMs',
+  init_script: 'initScriptMs'
+});
+
+function recordLightStageMs_(budget, stage, startedAt) {
+  if (!budget || !budget.stageMs) return;
+  const key = LIGHT_STAGE_TIMING_KEY_[stage];
+  if (!key) return;
+  budget.stageMs[key] = Math.max(0, Date.now() - Number(startedAt || Date.now()));
+}
+
+function sendLightBudgetTimeout_(res, budget, processingStartedAt, stage) {
+  if (!budget || !res || res.headersSent) return false;
+  const timeoutStage = String(stage || budget.activeStage || 'queue_wait');
+  budget.timedOut = true;
+  budget.timeoutStage = timeoutStage;
+  budget.skipped.push(timeoutStage);
+  const elapsedMs = Math.max(0, Date.now() - budget.startedAt);
+  res.status(504).json({
+    ok: false,
+    error: 'light_scrape_timeout',
+    code: 'LIGHT_REQUEST_BUDGET_EXHAUSTED',
+    stage: timeoutStage,
+    message: `light request budget exhausted at ${timeoutStage}`,
+    diagnostics: Object.assign({
+      qualityStatus: 'failed',
+      coreSignalsReady: false,
+      deadlineExceeded: true,
+      elapsedMs
+    }, buildLightRequestTiming_(budget, processingStartedAt || budget.queueStartedAt || Date.now()))
+  });
+  return true;
+}
+
+async function runLightBudgetStage_(budget, stage, ownMaxMs, operation, opts = {}) {
+  if (!budget) return operation(Number(ownMaxMs || 0));
+  budget.activeStage = String(stage || 'unknown');
+  const startedAt = Date.now();
+  const timeoutMs = takeLightBudgetTimeoutMs_(budget, budget.activeStage, ownMaxMs, 0, 1);
+  if (!timeoutMs || budget.timedOut) {
+    recordLightStageMs_(budget, budget.activeStage, startedAt);
+    throw createLightBudgetError_(budget.timeoutStage || budget.activeStage);
+  }
+
+  let timedOut = false;
+  let timer = null;
+  let operationPromise;
+  try {
+    operationPromise = Promise.resolve().then(() => operation(timeoutMs));
+    // A timed-out launch can resolve later. Dispose its resource independently of
+    // scrapeOnce's finally block, which never received that late value.
+    operationPromise.then((value) => {
+      if (timedOut && typeof opts.onLateResolve === 'function') {
+        Promise.resolve(opts.onLateResolve(value)).catch(() => {});
+      }
+    }).catch(() => {});
+    return await new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        budget.timedOut = true;
+        budget.timeoutStage = budget.activeStage;
+        budget.skipped.push(budget.activeStage);
+        reject(createLightBudgetError_(budget.activeStage));
+      }, timeoutMs);
+      operationPromise.then(resolve, reject);
+    });
+  } finally {
+    if (timer) clearTimeout(timer);
+    recordLightStageMs_(budget, budget.activeStage, startedAt);
+  }
+}
+
+async function closePlaywrightResourceWithin_(resource, timeoutMs = 1500) {
+  if (!resource || typeof resource.close !== 'function') return;
+  let timer = null;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => resource.close()),
+      new Promise((resolve) => { timer = setTimeout(resolve, Math.max(1, Number(timeoutMs || 1500))); })
+    ]);
+  } catch (_) {
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function closeLatePlaywrightResource_(resource, kind) {
+  try {
+    if (!resource) return;
+    if (kind === 'browser' || kind === 'context' || kind === 'page') await closePlaywrightResourceWithin_(resource);
+  } catch (_) {}
+}
+
+function enqueueLightScrapeWithDeadline_(queueRef, req, res, lightBudget, scrape) {
+  const deadlineDelayMs = lightBudget
+    ? Math.max(0, Number(lightBudget.deadlineAt || Date.now()) - Date.now())
+    : 0;
+  const deadlineTimer = lightBudget ? setTimeout(() => {
+    sendLightBudgetTimeout_(res, lightBudget, lightBudget.queueStartedAt || Date.now(), lightBudget.activeStage || 'queue_wait');
+  }, deadlineDelayMs) : null;
+  const queuedScrape = queueRef.add(async () => {
+    if (lightBudget) {
+      lightBudget.queueStartedAt = Date.now();
+      if (lightBudget.timedOut || getLightBudgetRemainingMs_(lightBudget) <= 0) {
+        sendLightBudgetTimeout_(res, lightBudget, lightBudget.queueStartedAt, lightBudget.timeoutStage || 'queue_wait');
+        return null;
+      }
+    }
+    return scrape();
+  });
+  return queuedScrape.catch(err => {
+    if (!res.headersSent) {
+      const status = err && err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' ? 504 : 500;
+      res.status(status).json({ ok: false, error: status === 504 ? 'light_scrape_timeout' : 'queue_error', message: String(err) });
+    }
+  }).finally(() => {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+  });
 }
 
 console.log('[BOOT][MEMO]', JSON.stringify({
@@ -14677,12 +14820,9 @@ app.get('/scrape', async (req, res) => {
   const lightBudget = requestedSignalsMode === 'light' || requestedResponseMode === 'signals-first' || requestedResponseMode === 'signalsfirst'
     ? createLightRequestBudget_(requestStartedAt)
     : null;
-  return queue.add(() => scrapeOnce(req, res, lightBudget)).catch(err => {
-    if (!res.headersSent) {
-      const status = err && err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' ? 504 : 500;
-      res.status(status).json({ ok: false, error: status === 504 ? 'light_scrape_timeout' : 'queue_error', message: String(err) });
-    }
-  });
+  // PQueue does not cancel a pending task. The deadline response is therefore
+  // armed at route entry and a dequeued expired task is a no-op.
+  return enqueueLightScrapeWithDeadline_(queue, req, res, lightBudget, () => scrapeOnce(req, res, lightBudget));
 });
 
 function buildBalancedShortResponsePayload(fullPayload) {
@@ -15256,7 +15396,10 @@ async function scrapeOnce(req, res, lightBudget = null) {
   try {
     if (signalsFirstLight || signalsFirstBalanced) {
       const __timingTopPageStaticFetchStart = Date.now();
-      topPageStaticFetchResult = await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode });
+      topPageStaticFetchResult = signalsFirstLight
+        ? await runLightBudgetStage_(lightBudget, 'top_static_fetch', 8000,
+          (timeoutMs) => fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, timeoutMs }))
+        : await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode });
       scrapeTiming.spans.top_page_static_fetch = Math.max(0, Date.now() - __timingTopPageStaticFetchStart);
       logSf('TOP_PAGE_STATIC_FETCH_DONE', {
         success: topPageStaticFetchResult && topPageStaticFetchResult.success,
@@ -15279,7 +15422,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
       step: 'chromium_launch'
     });
     playwrightStarted = true;
-    browser = await chromium.launch({
+    const launchBrowser = () => chromium.launch({
       headless: true,
       // 共有メモリ不足・GPU初期化失敗・権限周りのクラッシュを抑止
       args: [
@@ -15293,13 +15436,18 @@ async function scrapeOnce(req, res, lightBudget = null) {
         '--no-default-browser-check'
       ]
     });
+    browser = signalsFirstLight
+      ? await runLightBudgetStage_(lightBudget, 'browser_launch', 12000, launchBrowser, {
+          onLateResolve: (lateBrowser) => closeLatePlaywrightResource_(lateBrowser, 'browser')
+        })
+      : await launchBrowser();
     scrapeTiming.browserReadyMs = Math.max(0, Date.now() - __timingBrowserStart);
     logHeavySiteTopPageAudit('browser_page_setup_progress', {
       browserReadyMs: scrapeTiming.browserReadyMs
     });
 
     const __timingPageReadyStart = Date.now();
-    context = await browser.newContext({
+    const createContext = () => browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
                  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
                  'Chrome/122.0.0.0 Safari/537.36',
@@ -15309,16 +15457,31 @@ async function scrapeOnce(req, res, lightBudget = null) {
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo'
     });
+    context = signalsFirstLight
+      ? await runLightBudgetStage_(lightBudget, 'browser_context', 5000, createContext, {
+          onLateResolve: (lateContext) => closeLatePlaywrightResource_(lateContext, 'context')
+        })
+      : await createContext();
 
-    page = await context.newPage();
+    const createPage = () => context.newPage();
+    page = signalsFirstLight
+      ? await runLightBudgetStage_(lightBudget, 'page_create', 5000, createPage, {
+          onLateResolve: (latePage) => closeLatePlaywrightResource_(latePage, 'page')
+        })
+      : await createPage();
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
     page.setDefaultTimeout(NAV_TIMEOUT_MS);
 
-    await page.addInitScript(() => {
+    const addInitScript = () => page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    if (signalsFirstLight) {
+      await runLightBudgetStage_(lightBudget, 'init_script', 1500, addInitScript);
+    } else {
+      await addInitScript();
+    }
     scrapeTiming.pageReadyMs = Math.max(0, Date.now() - __timingPageReadyStart);
     addScrapeSpan('browser_launch_context', __timingBrowserStart);
     logHeavySiteTopPageAudit('browser_page_setup_end', {
@@ -21758,6 +21921,10 @@ async function scrapeOnce(req, res, lightBudget = null) {
     // 正常診断材料として返さない。GAS 側は既存の失敗経路で停止する。
     if (signalsFirstLight && err && (err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' || err.code === 'LIGHT_CORE_SIGNALS_UNAVAILABLE') && !res.headersSent) {
       const deadlineExceeded = err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+      if (deadlineExceeded) {
+        sendLightBudgetTimeout_(res, lightBudget, t0, err.lightBudgetStage || (lightBudget && lightBudget.activeStage) || 'unknown');
+        return;
+      }
       return res.status(deadlineExceeded ? 504 : 502).json({
         ok: false,
         error: deadlineExceeded ? 'light_scrape_timeout' : 'light_scrape_core_signals_unavailable',
@@ -21825,9 +21992,9 @@ async function scrapeOnce(req, res, lightBudget = null) {
       }));
     } catch (_) {}
     // 終了順：page → context → browser（全て握りつぶし）
-    try { if (page)    await page.close(); } catch(_) {}
-    try { if (context) await context.close(); } catch(_) {}
-    try { if (browser) await browser.close(); } catch(_) {}
+    await closePlaywrightResourceWithin_(page);
+    await closePlaywrightResourceWithin_(context);
+    await closePlaywrightResourceWithin_(browser);
   }
 }
 
@@ -22057,13 +22224,25 @@ app.get('/api/score', async (req, res) => {
   res.json(payload);
 });
 
-app.listen(PORT, () => {
-  console.log('[BOOT][LISTENING]', JSON.stringify({
-    build: BUILD_TAG,
-    port: PORT,
-    pid: process.pid,
-    rss: process.memoryUsage().rss,
-    ts: new Date().toISOString()
-  }));
-  console.log(`[${BUILD_TAG}] running on ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log('[BOOT][LISTENING]', JSON.stringify({
+      build: BUILD_TAG,
+      port: PORT,
+      pid: process.pid,
+      rss: process.memoryUsage().rss,
+      ts: new Date().toISOString()
+    }));
+    console.log(`[${BUILD_TAG}] running on ${PORT}`);
+  });
+}
+
+module.exports.__lightBudgetTestHooks = {
+  createLightRequestBudget_,
+  getLightBudgetRemainingMs_,
+  buildLightRequestTiming_,
+  sendLightBudgetTimeout_,
+  runLightBudgetStage_,
+  closePlaywrightResourceWithin_,
+  enqueueLightScrapeWithDeadline_
+};
