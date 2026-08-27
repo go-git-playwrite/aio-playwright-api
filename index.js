@@ -3855,6 +3855,9 @@ async function fetchSubpageWithTrailingSlashRetry_(url, fetchOnce) {
 }
 
 async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
+  const timeoutMs = Math.max(0, Number(opts && opts.timeoutMs || 0));
+  const controller = timeoutMs > 0 && typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   const buildFetchError = (stage, error, meta) => {
     const cause = error && error.cause ? error.cause : null;
     const parts = [];
@@ -3907,10 +3910,12 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
         headers: {
           'Accept': 'text/html,application/xhtml+xml,text/plain,*/*;q=0.8',
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
+        },
+        signal: controller ? controller.signal : undefined
       });
     } catch (e) {
-      return emptyHtmlFetchResult(url, null, buildFetchError('fetch', e), 'fetch');
+      const timedOut = !!(controller && controller.signal && controller.signal.aborted);
+      return emptyHtmlFetchResult(url, null, buildFetchError(timedOut ? 'timeout' : 'fetch', e), timedOut ? 'timeout' : 'fetch');
     }
     const status = response && typeof response.status === 'number' ? response.status : null;
     const finalUrl = response && response.url ? response.url : url;
@@ -3966,6 +3971,8 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
     }
   } catch (e) {
     return emptyHtmlFetchResult(url, null, buildFetchError('fetch', e), 'fetch');
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 
@@ -3976,7 +3983,14 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
 async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   const pages = [];
   for (const url of (Array.isArray(urls) ? urls : [])) {
-    pages.push(await fetchSubpageHtmlLight(url, opts));
+    const timeoutMs = opts && opts.lightBudget
+      ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_html_fetch', 4000, LIGHT_CORE_RESERVE_MS, 750)
+      : 0;
+    if (opts && opts.lightBudget && !timeoutMs) {
+      pages.push({ url, finalUrl: url, ok: false, error: 'overall_budget_exhausted', errorStage: 'budget', observationSource: 'html-fetch-light', observationMethod: 'html_fetch_light' });
+      continue;
+    }
+    pages.push(await fetchSubpageHtmlLight(url, Object.assign({}, opts, { timeoutMs })));
   }
   return { pages };
 }
@@ -8731,6 +8745,7 @@ function pickBestContactSignals_(pages) {
 }
 
 async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opts = {}) {
+  const lightBudget = opts && opts.lightBudget || null;
   const normalized = normalizeDiscoverTopUrl(topUrl);
   const siteMode = inferSiteModeForRepresentativeObservation_(topUrl,
     opts && opts.siteMode ||
@@ -8840,6 +8855,19 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       })));
       console.log('[DEBUG][GEOSIGNALS_COVERAGE_INTEGRATION]', JSON.stringify(logPayload));
       return null;
+    }
+    // coverage は core DOM の後段補助観測。残予算が少なければ core response を
+    // 守るために丸ごと skip し、partial core response を失敗扱いにはしない。
+    if (lightBudget && getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS) < 1200) {
+      lightBudget.skipped.push('coverage');
+      geoSignalsV1.coverageSignals = {
+        checked: false,
+        skippedDueToBudget: true,
+        skipReason: 'overall_budget_exhausted',
+        observedSubpageCount: 0,
+        representativePages: []
+      };
+      return geoSignalsV1.coverageSignals;
     }
     if (!normalized.ok) {
       logPayload.reason = normalized.error || 'invalid_top_url';
@@ -9105,9 +9133,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         selectedCandidateUrls: selectedCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
       });
       for (const candidate of selectedCandidates) {
+        const scopedTimeoutMs = lightBudget
+          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_scoped_playwright', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+          : 8000;
+        if (!scopedTimeoutMs) {
+          if (lightBudget) lightBudget.skipped.push('coverage_scoped_playwright');
+          break;
+        }
         scopedPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
           siteMode,
-          timeout: 8000,
+          timeout: scopedTimeoutMs,
           context: opts && opts.context,
           debugHeavySite: opts && opts.debugHeavySite === true
         }));
@@ -9144,7 +9179,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const htmlObserved = scopedPlaywrightSubpageObservation
       ? { pages: [] }
       : await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
-          siteMode
+          siteMode,
+          lightBudget
         });
     if (!scopedPlaywrightSubpageObservation) {
       const htmlObservedItemsForAudit = Array.isArray(htmlObserved && htmlObserved.pages)
@@ -9201,10 +9237,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       ? []
       : selectedCandidates.filter((candidate, index) => {
           const candidateUrl = String(candidate && candidate.url || '');
-          return !scopedFallbackCandidateUrls.has(candidateUrl) && (
-            isContactFormCandidate(candidate) ||
-            !isSubpageHtmlLightObservationSufficient_(htmlPages[index])
-          );
+          return !scopedFallbackCandidateUrls.has(candidateUrl) && !isSubpageHtmlLightObservationSufficient_(htmlPages[index]);
         });
     const scopedFallbackPages = [];
     if (scopedFallbackCandidates.length) {
@@ -9213,9 +9246,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         selectedCandidateUrls: scopedFallbackCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
       });
       for (const candidate of scopedFallbackCandidates) {
+        const scopedTimeoutMs = lightBudget
+          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_tls_fallback', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+          : 8000;
+        if (!scopedTimeoutMs) {
+          if (lightBudget) lightBudget.skipped.push('coverage_playwright_tls_fallback');
+          break;
+        }
         scopedFallbackPages.push(await fetchSubpagePlaywrightScopedLight(candidate && candidate.url || '', {
           siteMode,
-          timeout: 8000,
+          timeout: scopedTimeoutMs,
           context: opts && opts.context,
           debugHeavySite: opts && opts.debugHeavySite === true
         }));
@@ -9239,14 +9279,19 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateCount: playwrightCandidates.length,
       candidateUrls: playwrightCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
     });
-    const playwrightObserved = playwrightCandidates.length
+    const playwrightTimeoutMs = lightBudget
+      ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_fallback', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+      : 8000;
+    if (playwrightCandidates.length && !playwrightTimeoutMs && lightBudget) lightBudget.skipped.push('coverage_playwright_fallback');
+    const playwrightObserved = playwrightCandidates.length && playwrightTimeoutMs
       ? await observeSubpageJsonLdLightUrls_(playwrightCandidates.map(candidate => candidate.url), {
           siteMode,
-          timeout: 8000,
+          timeout: playwrightTimeoutMs,
           concurrency: reuseContextForObserve ? 1 : 3,
           context: opts && opts.context,
           reuseBrowser: reuseContextForObserve,
-          sequential: reuseContextForObserve
+          sequential: reuseContextForObserve,
+          lightBudget
         })
       : { pages: [] };
     emitHeavySiteAudit('playwright_fallback_end', {
@@ -9763,7 +9808,19 @@ async function observeSubpageJsonLdLightUrls_(urls, opts = {}) {
               observeCount: normalizedUrls.length
             }));
           } catch (_) {}
-          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout, context });
+          const pageTimeoutMs = opts && opts.lightBudget
+            ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_playwright_page', timeout, LIGHT_CORE_RESERVE_MS, 1000)
+            : timeout;
+          if (!pageTimeoutMs) {
+            pages[index] = {
+              url, finalUrl: url, status: null, ok: false,
+              pageType: inferSubpageJsonLdPageType(url, siteMode, []), title: '', canonical: '',
+              h1Count: 0, h1Texts: [], jsonldTypes: [], hasBreadcrumbJsonLd: false,
+              error: 'overall_budget_exhausted', errorStage: 'budget'
+            };
+            continue;
+          }
+          pages[index] = await fetchSubpageJsonLdLight(url, { siteMode, timeout: pageTimeoutMs, context });
           try {
             console.log('[DEBUG][COVERAGE_MEMORY_TRACE]', JSON.stringify({
               phase: 'observe_page_after',
@@ -11296,7 +11353,14 @@ async function collectSameOriginScriptSrcJsonLdSummaryLight(page, url, opts = {}
     };
     for (const scriptUrl of sameOriginScripts.slice(0, MAX_SCRIPTS)) {
       try {
-        const r = await page.request.get(scriptUrl, { timeout: REQUEST_TIMEOUT_MS });
+        const requestTimeoutMs = opts && opts.lightBudget
+          ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'same_origin_script_scan', REQUEST_TIMEOUT_MS, LIGHT_CORE_RESERVE_MS, 500)
+          : REQUEST_TIMEOUT_MS;
+        if (!requestTimeoutMs) {
+          out.skippedDueToBudget = true;
+          break;
+        }
+        const r = await page.request.get(scriptUrl, { timeout: requestTimeoutMs });
         const headers = typeof r.headers === 'function' ? r.headers() : {};
         const contentLength = Number(headers['content-length'] || headers['Content-Length'] || 0);
         if (contentLength > MAX_BYTES_PER_SCRIPT) {
@@ -11810,6 +11874,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
   const hydrationMetrics = opts && opts.hydrationMetrics && typeof opts.hydrationMetrics === 'object'
     ? opts.hydrationMetrics
     : {};
+  const lightBudget = opts && opts.lightBudget || null;
   const phaseTimings = {
     gotoMs: typeof opts.gotoMs === 'number' ? opts.gotoMs : null,
     basicDomMs: null,
@@ -12970,13 +13035,27 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         ? { maxScripts: 3, maxBytesPerScript: 512000 }
         : {})
       : null;
+    const renderedStructuredForScriptScan = observed.structuredData && typeof observed.structuredData === 'object'
+      ? observed.structuredData
+      : {};
+    const renderedOrganizationProfile = renderedStructuredForScriptScan.organizationProfile || {};
+    // rendered DOM / JSON-LD が既に運営主体の根拠を持つ場合、同一オリジン bundle の
+    // 直列走査は補助情報の重複になるため light では行わない。
+    const needsOrganizationScriptScan = renderedStructuredForScriptScan.hasOrganization !== true &&
+      !renderedOrganizationProfile.telephone && !renderedOrganizationProfile.address;
+    const scriptScanTimeoutMs = lightBudget && needsOrganizationScriptScan
+      ? takeLightBudgetTimeoutMs_(lightBudget, 'same_origin_script_scan', 2000, LIGHT_CORE_RESERVE_MS, 750)
+      : (needsOrganizationScriptScan ? 3000 : 0);
     const scriptSrcOrganizationProfileSummary = balancedMode
       ? null
-      : await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, {
-        maxScripts: 3,
-        maxBytesPerScript: 512000,
-        requestTimeoutMs: 3000
-      }).catch(() => null);
+      : (scriptScanTimeoutMs
+        ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, {
+            maxScripts: 3,
+            maxBytesPerScript: 512000,
+            requestTimeoutMs: scriptScanTimeoutMs,
+            lightBudget
+          }).catch(() => null)
+        : { observed: false, skippedDueToBudget: !!lightBudget, skippedAsRedundant: !needsOrganizationScriptScan, source: 'same_origin_script_src_jsonld_light' });
     const scriptSrcOrganizationProfileSource = scriptSrcJsonLdSummary || scriptSrcOrganizationProfileSummary;
     phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
     logHeavySiteBuildGeoAudit('jsonld_parse_end', {
@@ -14525,6 +14604,47 @@ function buildScoresFromScrape(scraped) {
 // 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
 const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
 const queue = new PQueue({ concurrency: CONCURRENCY });
+// GAS の light fetch は 60 秒で打ち切られる。キュー待ちも含めて Render 側で
+// 先に制御し、core signal がない partial 200 を返さないための request budget。
+const LIGHT_REQUEST_BUDGET_MS = Math.max(30000, Math.min(55000, Number(process.env.LIGHT_REQUEST_BUDGET_MS || 48000) || 48000));
+const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.LIGHT_CORE_RESERVE_MS || 6000) || 6000));
+
+function createLightRequestBudget_(requestStartedAt) {
+  const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
+  return { startedAt, deadlineAt: startedAt + LIGHT_REQUEST_BUDGET_MS, budgetMs: LIGHT_REQUEST_BUDGET_MS, skipped: [] };
+}
+function getLightBudgetRemainingMs_(budget, reserveMs = 0) {
+  if (!budget) return Number.POSITIVE_INFINITY;
+  return Math.max(0, Number(budget.deadlineAt || 0) - Date.now() - Math.max(0, Number(reserveMs || 0)));
+}
+function takeLightBudgetTimeoutMs_(budget, stage, ownMaxMs, reserveMs = 0, minimumMs = 0) {
+  if (!budget) return Math.max(0, Number(ownMaxMs || 0));
+  const remainingMs = getLightBudgetRemainingMs_(budget, reserveMs);
+  const timeoutMs = Math.min(Math.max(0, Number(ownMaxMs || 0)), remainingMs);
+  if (timeoutMs < Math.max(0, Number(minimumMs || 0))) {
+    budget.skipped.push(String(stage || 'unknown'));
+    return 0;
+  }
+  return Math.floor(timeoutMs);
+}
+function buildLightRequestTiming_(budget, processingStartedAt) {
+  if (!budget) return null;
+  const now = Date.now();
+  return {
+    queueWaitMs: Math.max(0, Number(processingStartedAt || now) - budget.startedAt),
+    processingMs: Math.max(0, now - Number(processingStartedAt || now)),
+    totalRequestMs: Math.max(0, now - budget.startedAt),
+    overallBudgetMs: budget.budgetMs,
+    remainingMs: getLightBudgetRemainingMs_(budget),
+    skippedDueToBudget: Array.from(new Set(budget.skipped || []))
+  };
+}
+function createLightBudgetError_(stage, message) {
+  const error = new Error(message || `light request budget exhausted at ${stage}`);
+  error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+  error.lightBudgetStage = stage || 'unknown';
+  return error;
+}
 
 console.log('[BOOT][MEMO]', JSON.stringify({
   initialized: [
@@ -14551,9 +14671,16 @@ app.get('/scrape', async (req, res) => {
   });
   logSfMemory('scrape_enter_route');
   // キューに積んだ Promise を必ず返す（Express が先に切られないように）
-  return queue.add(() => scrapeOnce(req, res)).catch(err => {
+  const requestStartedAt = Date.now();
+  const requestedSignalsMode = String(req && req.query && req.query.signalsMode || '').toLowerCase();
+  const requestedResponseMode = String(req && req.query && req.query.responseMode || '').toLowerCase();
+  const lightBudget = requestedSignalsMode === 'light' || requestedResponseMode === 'signals-first' || requestedResponseMode === 'signalsfirst'
+    ? createLightRequestBudget_(requestStartedAt)
+    : null;
+  return queue.add(() => scrapeOnce(req, res, lightBudget)).catch(err => {
     if (!res.headersSent) {
-      res.status(500).json({ error: 'queue_error', message: String(err) });
+      const status = err && err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' ? 504 : 500;
+      res.status(status).json({ ok: false, error: status === 504 ? 'light_scrape_timeout' : 'queue_error', message: String(err) });
     }
   });
 });
@@ -14897,7 +15024,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
   return shortPayload;
 }
 
-async function scrapeOnce(req, res) {
+async function scrapeOnce(req, res, lightBudget = null) {
   const urlToFetch = req.query.url;
 
   // allow: /scrape?url=...&nocache=1 でキャッシュをバイパス
@@ -15025,6 +15152,13 @@ async function scrapeOnce(req, res) {
   let context = null;
   let page = null;
   const t0 = Date.now();
+  const lightRequestTiming = () => signalsFirstLight ? buildLightRequestTiming_(lightBudget, t0) : null;
+  const requireLightCoreBudget = (stage, ownMaxMs, minimumMs) => {
+    if (!signalsFirstLight) return Math.max(0, Number(ownMaxMs || 0));
+    const timeoutMs = takeLightBudgetTimeoutMs_(lightBudget, stage, ownMaxMs, 0, minimumMs);
+    if (!timeoutMs) throw createLightBudgetError_(stage);
+    return timeoutMs;
+  };
   const scrapeTiming = {
     spans: {
       browser_launch_context: 0,
@@ -17647,11 +17781,20 @@ async function scrapeOnce(req, res) {
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
+    const topGotoTimeoutMs = signalsFirstLight
+      ? requireLightCoreBudget('top_page_goto', 25000, 4000)
+      : 60000;
     logHeavySiteTopPageAudit('page_goto_start', {
       waitUntil: 'domcontentloaded',
-      timeoutMs: 60000
+      timeoutMs: topGotoTimeoutMs
     });
-    const resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    let resp;
+    try {
+      resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
+    } catch (err) {
+      if (signalsFirstLight) throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
+      throw err;
+    }
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
     logHeavySiteTopPageAudit('page_goto_end', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
@@ -18390,7 +18533,10 @@ async function scrapeOnce(req, res) {
         responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : 'default')
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const boundedHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      const normalHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      const boundedHydrationWaitMs = signalsFirstLight && lightBudget
+        ? Math.min(normalHydrationWaitMs, getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS))
+        : normalHydrationWaitMs;
       logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_start', {
         boundedHydrationWaitMs,
         shortFastMode: balancedShortFastResponse
@@ -18437,8 +18583,21 @@ async function scrapeOnce(req, res) {
           ? scrapeTiming.gotoMs
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null),
         debugHeavySite,
-        debugHeavySiteStartedAt
+        debugHeavySiteStartedAt,
+        lightBudget: signalsFirstLight ? lightBudget : null
       });
+      if (signalsFirstLight) {
+        const observedCore = geoSignalsV1 && geoSignalsV1.observed || {};
+        const hasCoreSignals = observedCore.body && observedCore.links && observedCore.headings &&
+          ((geoSignalsV1 && geoSignalsV1.landmarks) || observedCore.landmarks) &&
+          ((geoSignalsV1 && geoSignalsV1.multimodalSignals) || observedCore.multimodalSignals);
+        if (!hasCoreSignals) {
+          const coreError = new Error('light core signals were not established');
+          coreError.code = 'LIGHT_CORE_SIGNALS_UNAVAILABLE';
+          coreError.lightBudgetStage = 'build_geo_signals';
+          throw coreError;
+        }
+      }
       logHeavySiteTopPageAudit('buildGeoSignalsV1_end', {
         hasGeoSignalsV1: !!geoSignalsV1,
         geoKeys: geoSignalsV1 && typeof geoSignalsV1 === 'object' ? Object.keys(geoSignalsV1).slice(0, 40) : []
@@ -18480,7 +18639,8 @@ async function scrapeOnce(req, res) {
         siteMode,
         signalsMode,
         debugHeavySite,
-        debugHeavySiteStartedAt
+        debugHeavySiteStartedAt,
+        lightBudget: signalsFirstLight ? lightBudget : null
       });
       logHeavySiteTopPageAudit('attachCoverageSignalsToGeoSignalsLight_call_end', {
         hasCoverageSignals: !!(geoSignalsV1 && geoSignalsV1.coverageSignals),
@@ -18745,6 +18905,11 @@ async function scrapeOnce(req, res) {
         sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
         timeoutGuardMs: balancedShortFastResponse ? 60000 : null
       };
+      if (signalsFirstLight) {
+        diagnostics.qualityStatus = lightweightSummary.qualityStatus || 'ready';
+        diagnostics.coreSignalsReady = lightweightSummary.coreSignalsReady !== false;
+      }
+      if (signalsFirstLight) Object.assign(diagnostics, lightRequestTiming() || {});
       const memoryHints = {
         avoidedHeavyBlocks: [
           'html',
@@ -18818,6 +18983,9 @@ async function scrapeOnce(req, res) {
         diagnostics,
         memoryHints
       };
+      if (signalsFirstLight && signalsResponsePayload.diagnostics) {
+        Object.assign(signalsResponsePayload.diagnostics, lightRequestTiming() || {});
+      }
       exposeFreshnessOperationSignalsInScrapeResponse_(signalsResponsePayload);
       const logScrapeResponseReadyAudit = payload => {
         try {
@@ -21586,6 +21754,24 @@ async function scrapeOnce(req, res) {
     });
     logSfMemory('scrape_catch');
     const elapsedMs = Date.now() - t0;
+    // core light signals が未成立の deadline / navigation failure は static fallback を
+    // 正常診断材料として返さない。GAS 側は既存の失敗経路で停止する。
+    if (signalsFirstLight && err && (err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED' || err.code === 'LIGHT_CORE_SIGNALS_UNAVAILABLE') && !res.headersSent) {
+      const deadlineExceeded = err.code === 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+      return res.status(deadlineExceeded ? 504 : 502).json({
+        ok: false,
+        error: deadlineExceeded ? 'light_scrape_timeout' : 'light_scrape_core_signals_unavailable',
+        code: err.code,
+        stage: err.lightBudgetStage || 'unknown',
+        message: String(err.message || err).slice(0, 240),
+        diagnostics: Object.assign({
+          qualityStatus: 'failed',
+          coreSignalsReady: false,
+          deadlineExceeded,
+          elapsedMs
+        }, lightRequestTiming() || {})
+      });
+    }
     if ((signalsFirstLight || signalsFirstBalanced) && topPageStaticFetchResult && topPageStaticFetchResult.success && !res.headersSent) {
       const fallback = buildStaticFallbackGeoSignalsPayload_(urlToFetch, topPageStaticFetchResult, {
         playwrightTimedOut: /timeout/i.test(String(err && (err.message || err) || '')),
@@ -21602,6 +21788,7 @@ async function scrapeOnce(req, res) {
         errorMessage: err && err.message ? String(err.message).slice(0, 240) : String(err).slice(0, 240),
         elapsedMs
       };
+      if (signalsFirstLight) Object.assign(diagnostics, lightRequestTiming() || {});
       fallback.geoSignalsV1.diagnostics.topPageStaticFetch.usedAsFallback = true;
       diagnostics.topPageStaticFetch.usedAsFallback = true;
       return res.status(200).json({
