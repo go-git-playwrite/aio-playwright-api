@@ -15,6 +15,8 @@ const {
   isLightTopGotoTimeoutError_,
   assessLightDomFallbackSentinel_,
   probeLightDomReadiness_,
+  getLightNavigationRecoveryTimeoutMs_,
+  recoverLightTopPageNavigation_,
   lightSetupRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
@@ -497,6 +499,61 @@ function probePage(sequence, options = {}) {
     evaluate: () => new Promise(() => {})
   }, 'https://sitakke.jp/', budgetFor(48000), { maxMs: 5, pollMs: 1 });
   assert.strictEqual(evaluateTimeoutDom.reason, 'probe_evaluate_timeout');
+
+  // A-D/F-G/I: a timed-out goto may wait on the same live Page once, then
+  // reuse the production probe. This is not a fresh-browser retry.
+  const recoveryAttempt = { browser: { isConnected: () => true } };
+  const recoveredPage = {
+    isClosed: () => false,
+    url: () => 'https://www.irischitose.co.jp/',
+    waitForLoadState: async (state) => { assert.strictEqual(state, 'domcontentloaded'); }
+  };
+  const recoveryBudget = budgetFor(150000);
+  const recovered = await recoverLightTopPageNavigation_(recoveredPage, 'https://www.irischitose.co.jp/', recoveryBudget, recoveryAttempt);
+  assert.deepStrictEqual({ attempted: recovered.attempted, accepted: recovered.accepted, timedOut: recovered.timedOut, reason: recovered.reason }, {
+    attempted: true, accepted: true, timedOut: false, reason: 'domcontentloaded'
+  });
+  const recoveredDom = await probeLightDomReadiness_(probePage([domCandidate(), domCandidate()]), 'https://sitakke.jp/', recoveryBudget, probeOptions);
+  assert.strictEqual(recoveredDom.accepted, true);
+  const noSecondRecovery = await recoverLightTopPageNavigation_(recoveredPage, 'https://www.irischitose.co.jp/', recoveryBudget, recoveryAttempt);
+  assert.strictEqual(noSecondRecovery.reason, 'already_attempted');
+
+  const recoveryTimeoutBudget = budgetFor(150000);
+  recoveryTimeoutBudget.deadlineAt = Date.now() + 41025; // 25ms after the 41s recovery reserve
+  assert(getLightNavigationRecoveryTimeoutMs_(recoveryTimeoutBudget) > 0);
+  const timedOutRecovery = await recoverLightTopPageNavigation_({
+    isClosed: () => false,
+    url: () => 'https://www.irischitose.co.jp/',
+    waitForLoadState: () => new Promise(() => {})
+  }, 'https://www.irischitose.co.jp/', recoveryTimeoutBudget, recoveryAttempt);
+  assert.strictEqual(timedOutRecovery.attempted, true);
+  assert.strictEqual(timedOutRecovery.timedOut, true);
+  const timedOutThenReady = await probeLightDomReadiness_(probePage([domCandidate(), domCandidate()]), 'https://sitakke.jp/', recoveryTimeoutBudget, probeOptions);
+  assert.strictEqual(timedOutThenReady.accepted, true);
+  const timedOutThenUnavailable = await probeLightDomReadiness_({
+    isClosed: () => false,
+    evaluate: () => new Promise(() => {})
+  }, 'https://sitakke.jp/', recoveryTimeoutBudget, { maxMs: 5, pollMs: 1 });
+  assert.strictEqual(timedOutThenUnavailable.reason, 'probe_evaluate_timeout');
+
+  const disconnectedRecovery = await recoverLightTopPageNavigation_(recoveredPage, 'https://www.irischitose.co.jp/', budgetFor(150000), { browser: { isConnected: () => false } });
+  assert.strictEqual(disconnectedRecovery.attempted, false);
+  assert.strictEqual(disconnectedRecovery.reason, 'browser_disconnected');
+  const closedRecovery = await recoverLightTopPageNavigation_({ isClosed: () => true }, 'https://www.irischitose.co.jp/', budgetFor(150000), recoveryAttempt);
+  assert.strictEqual(closedRecovery.attempted, false);
+  assert.strictEqual(closedRecovery.reason, 'page_closed');
+  const insufficientRecoveryBudget = budgetFor(150000);
+  insufficientRecoveryBudget.deadlineAt = Date.now() + 41000;
+  const insufficientRecovery = await recoverLightTopPageNavigation_(recoveredPage, 'https://www.irischitose.co.jp/', insufficientRecoveryBudget, recoveryAttempt);
+  assert.strictEqual(insufficientRecovery.attempted, false);
+  assert.strictEqual(insufficientRecovery.reason, 'insufficient_remaining');
+  const crossOriginRecovery = await recoverLightTopPageNavigation_({
+    isClosed: () => false,
+    url: () => 'https://unexpected.example/',
+    waitForLoadState: async () => { throw new Error('must not wait'); }
+  }, 'https://www.irischitose.co.jp/', budgetFor(150000), recoveryAttempt);
+  assert.strictEqual(crossOriginRecovery.attempted, false);
+  assert.strictEqual(crossOriginRecovery.reason, 'origin_mismatch');
 
   // Completion-first hydration is bounded as a whole (including evaluate),
   // yet a usable DOM lets the light path continue after the helper times out.
