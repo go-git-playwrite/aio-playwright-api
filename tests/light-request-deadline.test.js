@@ -742,7 +742,7 @@ function probePage(sequence, options = {}) {
   const retryBudget = budgetFor(150000);
   const retryResponse = responseSpy();
   let attempts = 0;
-  let firstClosed = 0;
+  let firstBrowserClosed = 0;
   let firstAttemptId = '';
   let secondAttemptId = '';
   await runLightScrapeWithSetupRetry_(null, retryResponse, retryBudget, async () => {
@@ -750,7 +750,9 @@ function probePage(sequence, options = {}) {
     const attempt = createLightAttempt_(retryBudget);
     if (attempts === 1) {
       firstAttemptId = attempt.id;
-      attempt.page = { close: async () => { firstClosed += 1; } };
+      attempt.page = { isClosed: () => false };
+      attempt.context = { close: async () => {} };
+      attempt.browser = { isConnected: () => true, close: async () => { firstBrowserClosed += 1; } };
       const error = new Error('page create transient failure');
       error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
       error.lightBudgetStage = 'page_create';
@@ -761,51 +763,74 @@ function probePage(sequence, options = {}) {
     retryResponse.status(200).json({ ok: true, freshAttempt: attempt.id });
   });
   assert.strictEqual(attempts, 2);
-  assert.strictEqual(firstClosed, 1);
+  assert.strictEqual(firstBrowserClosed, 1);
   assert.notStrictEqual(firstAttemptId, secondAttemptId);
   assert.strictEqual(retryResponse.statusCode, 200);
   assert.strictEqual(retryBudget.resilience.retryPerformed, true);
   assert.strictEqual(retryBudget.resilience.firstFailureStage, 'page_create');
 
-  // A cleanup barrier failure, a late failure, insufficient budget, and a
-  // post-goto failure are not admitted to retry.
+  // Retry cleanup follows the resource hierarchy: context then browser. A
+  // parent close is authoritative for its Page; the browser is authoritative
+  // for first-attempt isolation before a fresh retry.
   const successfulCleanupBudget = budgetFor(150000);
   const successfulCleanupAttempt = createLightAttempt_(successfulCleanupBudget);
-  successfulCleanupAttempt.page = { close: async () => {} };
+  let pageCloseCalled = 0;
+  successfulCleanupAttempt.page = { isClosed: () => false, close: async () => { pageCloseCalled += 1; } };
   successfulCleanupAttempt.context = { close: async () => {} };
-  successfulCleanupAttempt.browser = { close: async () => {} };
+  successfulCleanupAttempt.browser = { isConnected: () => true, close: async () => {} };
   const successfulCleanup = await cleanupLightAttempt_(successfulCleanupAttempt, 'fixture');
   assert.strictEqual(successfulCleanup.completed, true);
   assert.strictEqual(successfulCleanupAttempt.cleanupComplete, true);
+  assert.strictEqual(successfulCleanup.diagnostics.page, 'closed_by_parent');
+  assert.strictEqual(successfulCleanup.diagnostics.context, 'closed');
+  assert.strictEqual(successfulCleanup.diagnostics.browser, 'closed');
+  assert.strictEqual(pageCloseCalled, 0);
   assert.strictEqual(lightSetupRetryAdmission_(successfulCleanupBudget, successfulCleanupAttempt, 'page_create').allowed, true);
 
-  // Any individual close exception blocks retry; a resource must never be
-  // treated as cleaned merely because its close error was absorbed.
-  for (const resourceName of ['page', 'context', 'browser']) {
-    const budget = budgetFor(150000);
-    const attempt = createLightAttempt_(budget);
-    attempt[resourceName] = { close: async () => { throw new Error(`${resourceName}_close_failed`); } };
-    const cleanup = await cleanupLightAttempt_(attempt, 'fixture');
-    assert.strictEqual(cleanup.completed, false, resourceName);
-    assert.strictEqual(attempt.cleanupComplete, false, resourceName);
-    assert.strictEqual(lightSetupRetryAdmission_(budget, attempt, 'page_create').reason, 'cleanup_incomplete', resourceName);
-  }
+  const alreadyClosedAttempt = createLightAttempt_(budgetFor(150000));
+  alreadyClosedAttempt.page = { isClosed: () => true, close: async () => { throw new Error('must_not_close_page'); } };
+  alreadyClosedAttempt.context = { close: async () => {} };
+  alreadyClosedAttempt.browser = { isConnected: () => true, close: async () => {} };
+  const alreadyClosedCleanup = await cleanupLightAttempt_(alreadyClosedAttempt, 'fixture');
+  assert.strictEqual(alreadyClosedCleanup.completed, true);
+  assert.strictEqual(alreadyClosedCleanup.diagnostics.page, 'already_closed');
+
+  let disconnected = true;
+  const disconnectedBrowserAttempt = createLightAttempt_(budgetFor(150000));
+  disconnectedBrowserAttempt.browser = {
+    isConnected: () => disconnected,
+    close: async () => { disconnected = false; throw new Error('browser_close_raced_with_disconnect'); }
+  };
+  const disconnectedBrowserCleanup = await cleanupLightAttempt_(disconnectedBrowserAttempt, 'fixture');
+  assert.strictEqual(disconnectedBrowserCleanup.completed, true);
+  assert.strictEqual(disconnectedBrowserCleanup.diagnostics.browser, 'disconnected');
+
+  const liveBrowserFailureBudget = budgetFor(150000);
+  const liveBrowserFailureAttempt = createLightAttempt_(liveBrowserFailureBudget);
+  liveBrowserFailureAttempt.browser = { isConnected: () => true, close: async () => { throw new Error('browser_close_failed'); } };
+  const liveBrowserFailureCleanup = await cleanupLightAttempt_(liveBrowserFailureAttempt, 'fixture');
+  assert.strictEqual(liveBrowserFailureCleanup.completed, false);
+  assert.strictEqual(liveBrowserFailureCleanup.diagnostics.browser, 'error');
+  assert.strictEqual(lightSetupRetryAdmission_(liveBrowserFailureBudget, liveBrowserFailureAttempt, 'page_create').reason, 'cleanup_incomplete');
 
   // Per-resource timeout and the aggregate cleanup-barrier timeout both block retry.
   const closeTimeoutBudget = budgetFor(150000);
   const closeTimeoutAttempt = createLightAttempt_(closeTimeoutBudget);
-  closeTimeoutAttempt.page = { close: () => sleep(40) };
+  closeTimeoutAttempt.browser = { isConnected: () => true, close: () => sleep(40) };
   await cleanupLightAttempt_(closeTimeoutAttempt, 'fixture', { timeoutMs: 40, resourceTimeoutMs: 5 });
   assert.strictEqual(closeTimeoutAttempt.cleanupComplete, false);
+  assert.strictEqual(closeTimeoutAttempt.cleanupDiagnostics.browser, 'timeout');
   assert.strictEqual(lightSetupRetryAdmission_(closeTimeoutBudget, closeTimeoutAttempt, 'page_create').reason, 'cleanup_incomplete');
 
   const barrierTimeoutBudget = budgetFor(150000);
   const barrierTimeoutAttempt = createLightAttempt_(barrierTimeoutBudget);
-  barrierTimeoutAttempt.page = { close: () => sleep(40) };
+  barrierTimeoutAttempt.context = { close: async () => {} };
+  barrierTimeoutAttempt.browser = { isConnected: () => true, close: () => sleep(40) };
   await cleanupLightAttempt_(barrierTimeoutAttempt, 'fixture', { timeoutMs: 5, resourceTimeoutMs: 40 });
   assert.strictEqual(barrierTimeoutAttempt.cancelled, true);
   assert.strictEqual(barrierTimeoutAttempt.controller.signal.aborted, true);
   assert.strictEqual(barrierTimeoutAttempt.cleanupComplete, false);
+  assert.strictEqual(barrierTimeoutAttempt.cleanupDiagnostics.barrierTimedOut, true);
   assert.strictEqual(lightSetupRetryAdmission_(barrierTimeoutBudget, barrierTimeoutAttempt, 'page_create').reason, 'cleanup_incomplete');
 
   // The production retry runner observes cleanupComplete and does not begin a
@@ -816,7 +841,7 @@ function probePage(sequence, options = {}) {
   await runLightScrapeWithSetupRetry_(null, cleanupFailureResponse, cleanupFailureBudget, async () => {
     cleanupFailureAttempts += 1;
     const attempt = createLightAttempt_(cleanupFailureBudget);
-    attempt.page = { close: async () => { throw new Error('close_failed'); } };
+    attempt.browser = { isConnected: () => true, close: async () => { throw new Error('close_failed'); } };
     const error = new Error('page create transient failure');
     error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
     error.lightBudgetStage = 'page_create';
@@ -867,12 +892,15 @@ function probePage(sequence, options = {}) {
   let firstNavigationAttemptId = '';
   let secondNavigationAttemptId = '';
   let firstNavigationResponseSent = null;
+  let firstNavigationBrowserClosed = 0;
   await runLightScrapeWithSetupRetry_(null, navigationRetryResponse, navigationRetryBudget, async () => {
     navigationAttempts += 1;
     const attempt = createLightAttempt_(navigationRetryBudget);
     if (navigationAttempts === 1) {
       firstNavigationAttemptId = attempt.id;
-      attempt.page = { close: async () => {} };
+      attempt.page = { isClosed: () => false };
+      attempt.context = { close: async () => {} };
+      attempt.browser = { isConnected: () => true, close: async () => { firstNavigationBrowserClosed += 1; } };
       firstNavigationResponseSent = navigationRetryResponse.headersSent;
       const error = new Error('probe evaluate timed out');
       error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
@@ -885,6 +913,7 @@ function probePage(sequence, options = {}) {
     navigationRetryResponse.status(200).json({ ok: true, freshAttempt: attempt.id });
   });
   assert.strictEqual(navigationAttempts, 2);
+  assert.strictEqual(firstNavigationBrowserClosed, 1);
   assert.strictEqual(firstNavigationResponseSent, false);
   assert.notStrictEqual(firstNavigationAttemptId, secondNavigationAttemptId);
   assert.strictEqual(navigationRetryResponse.statusCode, 200);
@@ -919,7 +948,7 @@ function probePage(sequence, options = {}) {
   await runLightScrapeWithSetupRetry_(null, navigationCleanupFailureResponse, navigationCleanupFailureBudget, async () => {
     navigationCleanupFailureAttempts += 1;
     const attempt = createLightAttempt_(navigationCleanupFailureBudget);
-    attempt.page = { close: async () => { throw new Error('close_failed'); } };
+    attempt.browser = { isConnected: () => true, close: async () => { throw new Error('close_failed'); } };
     const error = new Error('probe evaluate timed out');
     error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
     error.lightBudgetStage = 'top_page_dom_fallback';

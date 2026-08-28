@@ -14899,6 +14899,7 @@ function createLightRequestBudget_(requestStartedAt) {
       retryKind: '',
       retryAdmission: '',
       cleanupMs: 0,
+      cleanup: null,
       secondAttemptStage: ''
     },
     coverageTrace: {
@@ -14954,22 +14955,51 @@ async function cleanupLightAttempt_(attempt, reason, opts = {}) {
       try { attempt.controller.abort(reason || 'light_attempt_cancelled'); } catch (_) {}
     }
     attempt.cleanupStartedAt = Date.now();
-    const resources = [attempt.page, attempt.context, attempt.browser].filter(Boolean);
     const cleanupTimeoutMs = Math.max(1, Number(opts && opts.timeoutMs || LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS));
     const resourceTimeoutMs = Math.max(1, Number(opts && opts.resourceTimeoutMs || cleanupTimeoutMs));
+    const diagnostics = {
+      page: getPlaywrightResourceTerminalState_(attempt.page, 'page') || (attempt.page ? 'unknown' : 'absent'),
+      context: attempt.context ? 'unknown' : 'absent',
+      browser: getPlaywrightResourceTerminalState_(attempt.browser, 'browser') || (attempt.browser ? 'unknown' : 'absent'),
+      barrierTimedOut: false
+    };
     let completed = false;
-    let timer = null;
     try {
-      completed = await Promise.race([
-        Promise.all(resources.map(resource => closePlaywrightResourceWithin_(resource, resourceTimeoutMs))).then(results => results.every(Boolean)),
-        new Promise(resolve => { timer = setTimeout(() => resolve(false), cleanupTimeoutMs); })
-      ]);
+      // Close the parent hierarchy in order. A context/browser close terminates
+      // its child Page, so a concurrent page.close() must not veto a safe fresh
+      // retry merely because the parent won the race.
+      const remainingForBrowser = () => Math.max(0, cleanupTimeoutMs - (Date.now() - attempt.cleanupStartedAt));
+      const browserReserveMs = Math.min(resourceTimeoutMs, Math.max(1, Math.floor(cleanupTimeoutMs / 2)));
+      if (attempt.context) {
+        const contextAvailableMs = remainingForBrowser() - browserReserveMs;
+        const contextTimeoutMs = contextAvailableMs > 0 ? Math.min(resourceTimeoutMs, contextAvailableMs) : 0;
+        diagnostics.context = contextTimeoutMs > 0
+          ? await closePlaywrightResourceWithin_(attempt.context, contextTimeoutMs, { detailed: true, kind: 'context' }).then(result => result.state)
+          : 'timeout';
+      }
+      const browserRemainingMs = remainingForBrowser();
+      const browserDeadlineBound = browserRemainingMs < resourceTimeoutMs;
+      if (attempt.browser) {
+        diagnostics.browser = browserRemainingMs > 0
+          ? await closePlaywrightResourceWithin_(attempt.browser, Math.min(resourceTimeoutMs, browserRemainingMs), { detailed: true, kind: 'browser' }).then(result => result.state)
+          : 'timeout';
+      }
+      diagnostics.barrierTimedOut = Date.now() - attempt.cleanupStartedAt >= cleanupTimeoutMs ||
+        (diagnostics.browser === 'timeout' && browserDeadlineBound);
+      if (attempt.page && diagnostics.page !== 'already_closed') {
+        if (['closed', 'disconnected'].includes(diagnostics.browser) || diagnostics.context === 'closed' || getPlaywrightResourceTerminalState_(attempt.page, 'page') === 'already_closed') {
+          diagnostics.page = 'closed_by_parent';
+        }
+      }
+      // Browser termination is the isolation authority for a fresh attempt.
+      // An absent browser means the failed setup never produced one.
+      completed = !diagnostics.barrierTimedOut && ['closed', 'disconnected', 'absent'].includes(diagnostics.browser);
     } finally {
-      if (timer) clearTimeout(timer);
       attempt.cleanupMs = Math.max(0, Date.now() - attempt.cleanupStartedAt);
       attempt.cleanupComplete = completed === true;
+      attempt.cleanupDiagnostics = diagnostics;
     }
-    return { completed: attempt.cleanupComplete, cleanupMs: attempt.cleanupMs };
+    return { completed: attempt.cleanupComplete, cleanupMs: attempt.cleanupMs, diagnostics };
   })();
   return attempt.cleanupPromise;
 }
@@ -15527,17 +15557,38 @@ async function runLightBudgetStage_(budget, stage, ownMaxMs, operation, opts = {
   }
 }
 
-async function closePlaywrightResourceWithin_(resource, timeoutMs = 1500) {
-  if (!resource || typeof resource.close !== 'function') return true;
+function getPlaywrightResourceTerminalState_(resource, kind) {
+  try {
+    if (kind === 'page' && resource && typeof resource.isClosed === 'function' && resource.isClosed()) return 'already_closed';
+    if (kind === 'browser' && resource && typeof resource.isConnected === 'function' && !resource.isConnected()) return 'disconnected';
+  } catch (_) {}
+  return '';
+}
+
+async function closePlaywrightResourceWithin_(resource, timeoutMs = 1500, opts = {}) {
+  const detailed = opts && opts.detailed === true;
+  const kind = String(opts && opts.kind || '');
+  const finish = (ok, state) => detailed ? { ok: ok === true, state: String(state || (ok ? 'closed' : 'error')) } : ok === true;
+  if (!resource || typeof resource.close !== 'function') return finish(true, 'absent');
+  const terminalBefore = getPlaywrightResourceTerminalState_(resource, kind);
+  if (terminalBefore) return finish(true, terminalBefore);
   let timer = null;
   try {
     const result = await Promise.race([
-      Promise.resolve().then(() => resource.close()).then(() => true, () => false),
-      new Promise((resolve) => { timer = setTimeout(() => resolve(false), Math.max(1, Number(timeoutMs || 1500))); })
+      Promise.resolve().then(() => resource.close()).then(
+        () => ({ ok: true, state: 'closed' }),
+        () => ({ ok: false, state: 'error' })
+      ),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, state: 'timeout' }), Math.max(1, Number(timeoutMs || 1500))); })
     ]);
-    return result === true;
+    // A browser that disconnected while close() reported an error/timeout has
+    // already reached the terminal state required before a fresh attempt.
+    const terminalAfter = getPlaywrightResourceTerminalState_(resource, kind);
+    if (!result.ok && terminalAfter) return finish(true, terminalAfter);
+    return finish(result.ok === true, result.state);
   } catch (_) {
-    return false;
+    const terminalAfter = getPlaywrightResourceTerminalState_(resource, kind);
+    return terminalAfter ? finish(true, terminalAfter) : finish(false, 'error');
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -15619,7 +15670,10 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         lightBudget.resilience.secondAttemptStage = stage;
       }
       const cleanup = await cleanupLightAttempt_(attempt, 'setup_failure');
-      if (lightBudget.resilience) lightBudget.resilience.cleanupMs = Math.max(Number(lightBudget.resilience.cleanupMs || 0), Number(cleanup && cleanup.cleanupMs || 0));
+      if (lightBudget.resilience) {
+        lightBudget.resilience.cleanupMs = Math.max(Number(lightBudget.resilience.cleanupMs || 0), Number(cleanup && cleanup.cleanupMs || 0));
+        lightBudget.resilience.cleanup = cleanup && cleanup.diagnostics || null;
+      }
       const admission = index === 0
         ? (navigationProbeRetry
           ? lightNavigationProbeRetryAdmission_(lightBudget, attempt, stage, failureReason)
