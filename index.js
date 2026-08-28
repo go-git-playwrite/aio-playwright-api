@@ -15102,7 +15102,7 @@ function getLightNavigationRecoveryTimeoutMs_(budget) {
 // same Page once, without creating a second browser attempt or treating a
 // timeout here as the overall request deadline. The existing DOM probe remains
 // the only observation-acceptance gate.
-async function recoverLightTopPageNavigation_(page, targetUrl, budget, attempt) {
+async function recoverLightTopPageNavigation_(page, budget, attempt) {
   const recovery = budget && budget.navigationRecovery;
   const finish = (result) => {
     if (recovery) {
@@ -15125,13 +15125,11 @@ async function recoverLightTopPageNavigation_(page, targetUrl, budget, attempt) 
   }
   let currentUrl = '';
   try { currentUrl = String(typeof page.url === 'function' ? page.url() : ''); } catch (_) {}
-  if (/^about:blank$|^chrome-error:/i.test(currentUrl)) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'blank_or_error_document' });
-  }
-  // A completed cross-origin redirect is not a recoverable top-page navigation.
-  // Reuse the probe's origin contract instead of accepting an unexpected URL.
-  if (!isLightFallbackOriginAllowed_(targetUrl, currentUrl)) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'origin_mismatch' });
+  // The current URL can still be about:blank or an intermediate origin while
+  // the timed-out navigation progresses. Only a browser error is terminal here;
+  // probeLightDomReadiness_ remains the sole origin/challenge acceptance gate.
+  if (/^chrome-error:/i.test(currentUrl)) {
+    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'browser_error_document' });
   }
   if (typeof page.waitForLoadState !== 'function') {
     return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'load_state_unsupported' });
@@ -18770,7 +18768,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
-        await recoverLightTopPageNavigation_(page, urlToFetch, lightBudget, lightAttempt);
+        await recoverLightTopPageNavigation_(page, lightBudget, lightAttempt);
         // A bounded recovery timeout does not itself decide validity. The
         // existing probe can still accept a usable DOM without a DCL event.
         if (lightBudget.timedOut) {
