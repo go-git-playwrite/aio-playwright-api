@@ -1,11 +1,16 @@
 const assert = require('assert');
 const {
   createLightRequestBudget_,
+  createLightAttempt_,
+  cleanupLightAttempt_,
+  getLightPageCreateTimeoutMs_,
+  lightSetupRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   runLightBudgetStage_,
   sendLightBudgetTimeout_,
-  enqueueLightScrapeWithDeadline_
+  enqueueLightScrapeWithDeadline_,
+  runLightScrapeWithSetupRetry_
 } = require('../index.js').__lightBudgetTestHooks;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -40,6 +45,13 @@ function responseSpy() {
   const normalBudget = budgetFor(100);
   const normal = await runLightBudgetStage_(normalBudget, 'browser_launch', 60000, async () => ({ ok: true }));
   assert.deepStrictEqual(normal, { ok: true });
+
+  // Page creation allows a transient 5.4s setup delay when the global budget
+  // is healthy, but retains the 5s response/cleanup reserve.
+  const pageCreateBudget = budgetFor(48000);
+  assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 8000);
+  pageCreateBudget.deadlineAt = Date.now() + 4200;
+  assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 0);
 
   // CP1-CP4: the compact checkpoints preserve ordering and isolate each gap.
   const checkpointBudget = budgetFor(200);
@@ -180,6 +192,125 @@ function responseSpy() {
   ));
   await sleep(45);
   assert.strictEqual(closed, 1);
+
+  // Setup-only retry: a fresh second attempt follows a completed cleanup.
+  const retryBudget = budgetFor(48000);
+  const retryResponse = responseSpy();
+  let attempts = 0;
+  let firstClosed = 0;
+  let firstAttemptId = '';
+  let secondAttemptId = '';
+  await runLightScrapeWithSetupRetry_(null, retryResponse, retryBudget, async () => {
+    attempts += 1;
+    const attempt = createLightAttempt_(retryBudget);
+    if (attempts === 1) {
+      firstAttemptId = attempt.id;
+      attempt.page = { close: async () => { firstClosed += 1; } };
+      const error = new Error('page create transient failure');
+      error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+      error.lightBudgetStage = 'page_create';
+      error.lightAttempt = attempt;
+      throw error;
+    }
+    secondAttemptId = attempt.id;
+    retryResponse.status(200).json({ ok: true, freshAttempt: attempt.id });
+  });
+  assert.strictEqual(attempts, 2);
+  assert.strictEqual(firstClosed, 1);
+  assert.notStrictEqual(firstAttemptId, secondAttemptId);
+  assert.strictEqual(retryResponse.statusCode, 200);
+  assert.strictEqual(retryBudget.resilience.retryPerformed, true);
+  assert.strictEqual(retryBudget.resilience.firstFailureStage, 'page_create');
+
+  // A cleanup barrier failure, a late failure, insufficient budget, and a
+  // post-goto failure are not admitted to retry.
+  const successfulCleanupBudget = budgetFor(48000);
+  const successfulCleanupAttempt = createLightAttempt_(successfulCleanupBudget);
+  successfulCleanupAttempt.page = { close: async () => {} };
+  successfulCleanupAttempt.context = { close: async () => {} };
+  successfulCleanupAttempt.browser = { close: async () => {} };
+  const successfulCleanup = await cleanupLightAttempt_(successfulCleanupAttempt, 'fixture');
+  assert.strictEqual(successfulCleanup.completed, true);
+  assert.strictEqual(successfulCleanupAttempt.cleanupComplete, true);
+  assert.strictEqual(lightSetupRetryAdmission_(successfulCleanupBudget, successfulCleanupAttempt, 'page_create').allowed, true);
+
+  // Any individual close exception blocks retry; a resource must never be
+  // treated as cleaned merely because its close error was absorbed.
+  for (const resourceName of ['page', 'context', 'browser']) {
+    const budget = budgetFor(48000);
+    const attempt = createLightAttempt_(budget);
+    attempt[resourceName] = { close: async () => { throw new Error(`${resourceName}_close_failed`); } };
+    const cleanup = await cleanupLightAttempt_(attempt, 'fixture');
+    assert.strictEqual(cleanup.completed, false, resourceName);
+    assert.strictEqual(attempt.cleanupComplete, false, resourceName);
+    assert.strictEqual(lightSetupRetryAdmission_(budget, attempt, 'page_create').reason, 'cleanup_incomplete', resourceName);
+  }
+
+  // Per-resource timeout and the aggregate cleanup-barrier timeout both block retry.
+  const closeTimeoutBudget = budgetFor(48000);
+  const closeTimeoutAttempt = createLightAttempt_(closeTimeoutBudget);
+  closeTimeoutAttempt.page = { close: () => sleep(40) };
+  await cleanupLightAttempt_(closeTimeoutAttempt, 'fixture', { timeoutMs: 40, resourceTimeoutMs: 5 });
+  assert.strictEqual(closeTimeoutAttempt.cleanupComplete, false);
+  assert.strictEqual(lightSetupRetryAdmission_(closeTimeoutBudget, closeTimeoutAttempt, 'page_create').reason, 'cleanup_incomplete');
+
+  const barrierTimeoutBudget = budgetFor(48000);
+  const barrierTimeoutAttempt = createLightAttempt_(barrierTimeoutBudget);
+  barrierTimeoutAttempt.page = { close: () => sleep(40) };
+  await cleanupLightAttempt_(barrierTimeoutAttempt, 'fixture', { timeoutMs: 5, resourceTimeoutMs: 40 });
+  assert.strictEqual(barrierTimeoutAttempt.cancelled, true);
+  assert.strictEqual(barrierTimeoutAttempt.controller.signal.aborted, true);
+  assert.strictEqual(barrierTimeoutAttempt.cleanupComplete, false);
+  assert.strictEqual(lightSetupRetryAdmission_(barrierTimeoutBudget, barrierTimeoutAttempt, 'page_create').reason, 'cleanup_incomplete');
+
+  // The production retry runner observes cleanupComplete and does not begin a
+  // second attempt when the first attempt's resource close fails.
+  const cleanupFailureResponse = responseSpy();
+  const cleanupFailureBudget = budgetFor(48000);
+  let cleanupFailureAttempts = 0;
+  await runLightScrapeWithSetupRetry_(null, cleanupFailureResponse, cleanupFailureBudget, async () => {
+    cleanupFailureAttempts += 1;
+    const attempt = createLightAttempt_(cleanupFailureBudget);
+    attempt.page = { close: async () => { throw new Error('close_failed'); } };
+    const error = new Error('page create transient failure');
+    error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+    error.lightBudgetStage = 'page_create';
+    error.lightAttempt = attempt;
+    throw error;
+  });
+  assert.strictEqual(cleanupFailureAttempts, 1);
+  assert.strictEqual(cleanupFailureResponse.statusCode, 504);
+  assert.strictEqual(cleanupFailureBudget.resilience.retryPerformed, false);
+  assert.strictEqual(cleanupFailureBudget.resilience.retryAdmission, 'cleanup_incomplete');
+
+  const lateBudget = budgetFor(48000);
+  lateBudget.startedAt = Date.now() - 18001;
+  lateBudget.deadlineAt = lateBudget.startedAt + 48000;
+  const lateAttempt = createLightAttempt_(lateBudget);
+  lateAttempt.cleanupComplete = true;
+  assert.strictEqual(lightSetupRetryAdmission_(lateBudget, lateAttempt, 'page_create').reason, 'admission_elapsed');
+
+  const shortBudget = budgetFor(27000);
+  const shortAttempt = createLightAttempt_(shortBudget);
+  shortAttempt.cleanupComplete = true;
+  assert.strictEqual(lightSetupRetryAdmission_(shortBudget, shortAttempt, 'page_create').reason, 'insufficient_remaining');
+  assert.strictEqual(lightSetupRetryAdmission_(retryBudget, { cleanupComplete: true }, 'build_geo_signals').reason, 'non_setup_stage');
+
+  const secondFailureBudget = budgetFor(48000);
+  const secondFailureResponse = responseSpy();
+  let failures = 0;
+  await runLightScrapeWithSetupRetry_(null, secondFailureResponse, secondFailureBudget, async () => {
+    failures += 1;
+    const attempt = createLightAttempt_(secondFailureBudget);
+    const error = new Error('transient setup failure');
+    error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+    error.lightBudgetStage = 'page_create';
+    error.lightAttempt = attempt;
+    throw error;
+  });
+  assert.strictEqual(failures, 2);
+  assert.strictEqual(secondFailureResponse.statusCode, 504);
+  assert.strictEqual(secondFailureBudget.resilience.secondAttemptStage, 'page_create');
 
   console.log('light-request-deadline fixtures: ok');
 })().catch((error) => {
