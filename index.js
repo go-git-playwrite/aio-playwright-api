@@ -14610,6 +14610,7 @@ const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.
 function createLightRequestBudget_(requestStartedAt) {
   const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
   return {
+    requestId: `l-${startedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     startedAt,
     deadlineAt: startedAt + LIGHT_REQUEST_BUDGET_MS,
     budgetMs: LIGHT_REQUEST_BUDGET_MS,
@@ -14618,6 +14619,7 @@ function createLightRequestBudget_(requestStartedAt) {
     timeoutStage: '',
     timedOut: false,
     queueStartedAt: 0,
+    checkpoints: {},
     stageMs: {
       topPageStaticFetchMs: 0,
       browserLaunchMs: 0,
@@ -14625,6 +14627,15 @@ function createLightRequestBudget_(requestStartedAt) {
       pageCreateMs: 0,
       initScriptMs: 0
     }
+  };
+}
+
+function recordLightCheckpoint_(budget, name) {
+  if (!budget || !name) return;
+  budget.checkpoints[String(name)] = {
+    elapsedMs: Math.max(0, Date.now() - budget.startedAt),
+    remainingMs: getLightBudgetRemainingMs_(budget),
+    activeStage: String(budget.activeStage || '')
   };
 }
 function getLightBudgetRemainingMs_(budget, reserveMs = 0) {
@@ -14655,7 +14666,11 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     browserLaunchMs: Number(budget.stageMs && budget.stageMs.browserLaunchMs || 0),
     browserContextMs: Number(budget.stageMs && budget.stageMs.browserContextMs || 0),
     pageCreateMs: Number(budget.stageMs && budget.stageMs.pageCreateMs || 0),
-    initScriptMs: Number(budget.stageMs && budget.stageMs.initScriptMs || 0)
+    initScriptMs: Number(budget.stageMs && budget.stageMs.initScriptMs || 0),
+    lightStageGapsV1: {
+      requestId: budget.requestId,
+      checkpoints: budget.checkpoints || {}
+    }
   };
 }
 function createLightBudgetError_(stage, message) {
@@ -15469,16 +15484,22 @@ async function scrapeOnce(req, res, lightBudget = null) {
           onLateResolve: (latePage) => closeLatePlaywrightResource_(latePage, 'page')
         })
       : await createPage();
+    if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'page_create_complete');
     // デフォルトタイムアウト（ENV で調整可）
     const NAV_TIMEOUT_MS   = Number(process.env.SCRAPE_NAV_TIMEOUT_MS   || 20000);
     page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
     page.setDefaultTimeout(NAV_TIMEOUT_MS);
+    if (signalsFirstLight) {
+      lightBudget.activeStage = 'page_defaults_configured';
+      recordLightCheckpoint_(lightBudget, 'page_defaults_configured');
+    }
 
     const addInitScript = () => page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
     if (signalsFirstLight) {
       await runLightBudgetStage_(lightBudget, 'init_script', 1500, addInitScript);
+      recordLightCheckpoint_(lightBudget, 'init_script_complete');
     } else {
       await addInitScript();
     }
@@ -17944,6 +17965,10 @@ async function scrapeOnce(req, res, lightBudget = null) {
     const __timingInitialWaitStart = Date.now();
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
+    if (signalsFirstLight) {
+      lightBudget.activeStage = 'top_page_goto';
+      recordLightCheckpoint_(lightBudget, 'before_top_page_goto_budget_check');
+    }
     const topGotoTimeoutMs = signalsFirstLight
       ? requireLightCoreBudget('top_page_goto', 25000, 4000)
       : 60000;
@@ -22239,6 +22264,7 @@ if (require.main === module) {
 
 module.exports.__lightBudgetTestHooks = {
   createLightRequestBudget_,
+  recordLightCheckpoint_,
   getLightBudgetRemainingMs_,
   buildLightRequestTiming_,
   sendLightBudgetTimeout_,

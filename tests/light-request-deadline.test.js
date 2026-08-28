@@ -1,6 +1,7 @@
 const assert = require('assert');
 const {
   createLightRequestBudget_,
+  recordLightCheckpoint_,
   runLightBudgetStage_,
   sendLightBudgetTimeout_,
   enqueueLightScrapeWithDeadline_
@@ -39,6 +40,30 @@ function responseSpy() {
   const normal = await runLightBudgetStage_(normalBudget, 'browser_launch', 60000, async () => ({ ok: true }));
   assert.deepStrictEqual(normal, { ok: true });
 
+  // CP1-CP4: the compact checkpoints preserve ordering and isolate each gap.
+  const checkpointBudget = budgetFor(200);
+  checkpointBudget.activeStage = 'page_create';
+  recordLightCheckpoint_(checkpointBudget, 'page_create_complete');
+  await sleep(8); // fixture: defaults configuration delay
+  checkpointBudget.activeStage = 'page_defaults_configured';
+  recordLightCheckpoint_(checkpointBudget, 'page_defaults_configured');
+  await sleep(8); // fixture: init-script delay
+  checkpointBudget.activeStage = 'init_script';
+  recordLightCheckpoint_(checkpointBudget, 'init_script_complete');
+  await sleep(8); // fixture: post-init delay
+  checkpointBudget.activeStage = 'top_page_goto';
+  recordLightCheckpoint_(checkpointBudget, 'before_top_page_goto_budget_check');
+  const checkpoints = checkpointBudget.checkpoints;
+  assert.deepStrictEqual(Object.keys(checkpoints), [
+    'page_create_complete',
+    'page_defaults_configured',
+    'init_script_complete',
+    'before_top_page_goto_budget_check'
+  ]);
+  assert(checkpoints.page_defaults_configured.elapsedMs > checkpoints.page_create_complete.elapsedMs);
+  assert(checkpoints.init_script_complete.elapsedMs > checkpoints.page_defaults_configured.elapsedMs);
+  assert(checkpoints.before_top_page_goto_budget_check.elapsedMs > checkpoints.init_script_complete.elapsedMs);
+
   // B-E: each setup stage is bounded and reports the actual stage.
   await expectStageTimeout('browser_launch', () => sleep(60));
   await expectStageTimeout('browser_context', () => sleep(60));
@@ -53,6 +78,14 @@ function responseSpy() {
   assert.strictEqual(launchResponse.statusCode, 504);
   assert.strictEqual(launchResponse.body.stage, 'browser_launch');
   assert.strictEqual(launchResponse.body.diagnostics.browserLaunchMs, 0);
+
+  // D-E: an error response retains reached checkpoints under the same request ID.
+  const traceResponse = responseSpy();
+  sendLightBudgetTimeout_(traceResponse, checkpointBudget, Date.now(), 'top_page_goto');
+  const trace = traceResponse.body.diagnostics.lightStageGapsV1;
+  assert.strictEqual(trace.requestId, checkpointBudget.requestId);
+  assert.strictEqual(trace.checkpoints.before_top_page_goto_budget_check.activeStage, 'top_page_goto');
+  assert(traceResponse.body.diagnostics.skippedDueToBudget.includes('top_page_goto'));
 
   // F: an expired queued task returns 504 before the task body can run.
   let queuedTask = null;
