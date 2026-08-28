@@ -14821,11 +14821,6 @@ const LIGHT_DOM_FALLBACK_MAX_MS = 5000;
 const LIGHT_DOM_FALLBACK_POLL_MS = 125;
 const LIGHT_CORE_RESPONSE_RESERVE_MS = LIGHT_CORE_RESERVE_MS + LIGHT_RESPONSE_CLEANUP_RESERVE_MS;
 const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
-// After a goto timeout, keep enough room for core buildGeo, representative
-// coverage, and response cleanup before waiting on the current Page once more.
-const LIGHT_NAVIGATION_RECOVERY_MAX_MS = 30000;
-const LIGHT_NAVIGATION_RECOVERY_COVERAGE_RESERVE_MS = 30000;
-const LIGHT_NAVIGATION_RECOVERY_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS + LIGHT_NAVIGATION_RECOVERY_COVERAGE_RESERVE_MS;
 // Fresh setup retry must leave enough wall-clock time for a useful second
 // navigation/core-observation attempt and the final response reserve.
 const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 110000;
@@ -14848,17 +14843,6 @@ const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 10000;
 const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 2000;
 const LIGHT_HYDRATION_MAX_MS = 20000;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
-// A navigation-probe retry needs a fresh practical setup window, a normal
-// top-page navigation window, core/response reserve, and modest headroom.
-// Coverage remains best-effort on the second attempt and is never fabricated.
-const LIGHT_NAVIGATION_PROBE_RETRY_SETUP_FLOOR_MS = 12000;
-const LIGHT_NAVIGATION_PROBE_RETRY_GOTO_FLOOR_MS = 30000;
-const LIGHT_NAVIGATION_PROBE_RETRY_HEADROOM_MS = 7000;
-const LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS =
-  LIGHT_NAVIGATION_PROBE_RETRY_SETUP_FLOOR_MS +
-  LIGHT_NAVIGATION_PROBE_RETRY_GOTO_FLOOR_MS +
-  LIGHT_CORE_RESPONSE_RESERVE_MS +
-  LIGHT_NAVIGATION_PROBE_RETRY_HEADROOM_MS;
 
 function createLightRequestBudget_(requestStartedAt) {
   const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
@@ -14881,13 +14865,6 @@ function createLightRequestBudget_(requestStartedAt) {
       domFallbackMs: 0,
       domFallbackReason: ''
     },
-    navigationRecovery: {
-      attempted: false,
-      accepted: false,
-      waitMs: 0,
-      timedOut: false,
-      reason: ''
-    },
     currentAttempt: null,
     attemptSequence: 0,
     resilience: {
@@ -14895,8 +14872,6 @@ function createLightRequestBudget_(requestStartedAt) {
       retryPerformed: false,
       firstFailureStage: '',
       firstFailureCode: '',
-      firstFailureReason: '',
-      retryKind: '',
       retryAdmission: '',
       cleanupMs: 0,
       cleanup: null,
@@ -15134,99 +15109,6 @@ async function probeLightDomReadiness_(page, targetUrl, budget, opts = {}) {
   return { accepted: false, ms: Math.max(0, now() - startedAt), reason: lastReason };
 }
 
-function getLightNavigationRecoveryTimeoutMs_(budget) {
-  return Math.max(0, Math.min(
-    LIGHT_NAVIGATION_RECOVERY_MAX_MS,
-    getLightBudgetRemainingMs_(budget) - LIGHT_NAVIGATION_RECOVERY_RESERVE_MS
-  ));
-}
-
-// A goto timeout can leave the original navigation progressing. Wait for that
-// same Page once, without creating a second browser attempt or treating a
-// timeout here as the overall request deadline. The existing DOM probe remains
-// the only observation-acceptance gate.
-async function recoverLightTopPageNavigation_(page, budget, attempt) {
-  const recovery = budget && budget.navigationRecovery;
-  const finish = (result) => {
-    if (recovery) {
-      recovery.attempted = result.attempted === true;
-      recovery.accepted = result.accepted === true;
-      recovery.waitMs = Math.max(0, Number(result.waitMs || 0));
-      recovery.timedOut = result.timedOut === true;
-      recovery.reason = String(result.reason || '');
-    }
-    return result;
-  };
-  if (!page || (typeof page.isClosed === 'function' && page.isClosed())) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'page_closed' });
-  }
-  if (attempt && attempt.browser && typeof attempt.browser.isConnected === 'function' && !attempt.browser.isConnected()) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'browser_disconnected' });
-  }
-  if (budget && budget.timedOut) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'overall_deadline' });
-  }
-  let currentUrl = '';
-  try { currentUrl = String(typeof page.url === 'function' ? page.url() : ''); } catch (_) {}
-  // The current URL can still be about:blank or an intermediate origin while
-  // the timed-out navigation progresses. Only a browser error is terminal here;
-  // probeLightDomReadiness_ remains the sole origin/challenge acceptance gate.
-  if (/^chrome-error:/i.test(currentUrl)) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'browser_error_document' });
-  }
-  if (typeof page.waitForLoadState !== 'function') {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'load_state_unsupported' });
-  }
-  const timeoutMs = getLightNavigationRecoveryTimeoutMs_(budget);
-  if (!timeoutMs) {
-    return finish({ attempted: false, accepted: false, timedOut: false, waitMs: 0, reason: 'insufficient_remaining' });
-  }
-
-  if (recovery && recovery.attempted === true) {
-    return {
-      attempted: true,
-      accepted: recovery.accepted === true,
-      timedOut: recovery.timedOut === true,
-      waitMs: Number(recovery.waitMs || 0),
-      reason: 'already_attempted'
-    };
-  }
-  if (recovery) recovery.attempted = true;
-
-  if (budget) budget.activeStage = 'top_page_navigation_recovery';
-  const startedAt = Date.now();
-  let settled = false;
-  let timer = null;
-  const operation = Promise.resolve().then(() => page.waitForLoadState('domcontentloaded', { timeout: timeoutMs }));
-  operation.catch(() => {});
-  const result = await new Promise(resolve => {
-    timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      resolve({ accepted: false, timedOut: true, reason: 'wait_timeout' });
-    }, timeoutMs);
-    operation.then(
-      () => {
-        if (settled) return;
-        settled = true;
-        resolve({ accepted: true, timedOut: false, reason: 'domcontentloaded' });
-      },
-      error => {
-        if (settled) return;
-        settled = true;
-        const message = String(error && (error.message || error) || 'wait_failed');
-        resolve({
-          accepted: false,
-          timedOut: /timeout/i.test(message),
-          reason: /timeout/i.test(message) ? 'wait_timeout' : 'wait_failed'
-        });
-      }
-    );
-  });
-  if (timer) clearTimeout(timer);
-  return finish(Object.assign({ attempted: true, waitMs: Math.max(0, Date.now() - startedAt) }, result));
-}
-
 function lightSetupRetryAdmission_(budget, attempt, stage) {
   const elapsedMs = budget ? Math.max(0, Date.now() - budget.startedAt) : Number.POSITIVE_INFINITY;
   const remainingMs = getLightBudgetRemainingMs_(budget);
@@ -15235,31 +15117,6 @@ function lightSetupRetryAdmission_(budget, attempt, stage) {
   if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
   return { allowed: true, reason: 'setup_retry_admitted', elapsedMs, remainingMs };
 }
-function isLightNavigationProbeRetryableFailure_(budget, stage, reason) {
-  return !!(
-    budget &&
-    budget.timedOut !== true &&
-    String(stage || '') === 'top_page_dom_fallback' &&
-    String(reason || '') === 'probe_evaluate_timeout' &&
-    budget.gotoFallback && budget.gotoFallback.gotoTimedOut === true &&
-    budget.navigationRecovery && budget.navigationRecovery.attempted === true &&
-    budget.navigationRecovery.accepted === true
-  );
-}
-function lightNavigationProbeRetryAdmission_(budget, attempt, stage, reason) {
-  const remainingMs = getLightBudgetRemainingMs_(budget);
-  if (!isLightNavigationProbeRetryableFailure_(budget, stage, reason)) {
-    return { allowed: false, reason: 'non_navigation_probe_failure', remainingMs };
-  }
-  if (remainingMs < LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS) {
-    return { allowed: false, reason: 'insufficient_remaining', remainingMs };
-  }
-  if (!attempt || attempt.cleanupComplete !== true) {
-    return { allowed: false, reason: 'cleanup_incomplete', remainingMs };
-  }
-  return { allowed: true, reason: 'navigation_probe_retry_admitted', remainingMs };
-}
-
 function recordLightCheckpoint_(budget, name) {
   if (!budget || !name) return;
   budget.checkpoints[String(name)] = {
@@ -15444,11 +15301,6 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     domFallbackAccepted: budget.gotoFallback && budget.gotoFallback.domFallbackAccepted === true,
     domFallbackMs: Number(budget.gotoFallback && budget.gotoFallback.domFallbackMs || 0),
     domFallbackReason: String(budget.gotoFallback && budget.gotoFallback.domFallbackReason || ''),
-    navRecoveryAttempted: budget.navigationRecovery && budget.navigationRecovery.attempted === true,
-    navRecoveryAccepted: budget.navigationRecovery && budget.navigationRecovery.accepted === true,
-    navRecoveryWaitMs: Number(budget.navigationRecovery && budget.navigationRecovery.waitMs || 0),
-    navRecoveryTimedOut: budget.navigationRecovery && budget.navigationRecovery.timedOut === true,
-    navRecoveryReason: String(budget.navigationRecovery && budget.navigationRecovery.reason || ''),
     geoPhaseTimings: budget.geoPhaseTimings && typeof budget.geoPhaseTimings === 'object'
       ? Object.assign({}, budget.geoPhaseTimings)
       : null,
@@ -15657,15 +15509,10 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
       const attempt = err && err.lightAttempt || lightBudget.currentAttempt;
       const stage = String(err && err.lightBudgetStage || attempt && attempt.failureStage || lightBudget.activeStage || 'unknown');
       const code = String(err && err.code || attempt && attempt.failureCode || 'PLAYWRIGHT_SETUP_FAILURE');
-      const failureReason = String(err && err.lightFailureReason || '');
-      const navigationProbeRetry = isLightNavigationProbeRetryableFailure_(lightBudget, stage, failureReason);
       markLightAttemptFailure_(attempt, stage, code);
       if (index === 0 && lightBudget.resilience) {
         lightBudget.resilience.firstFailureStage = stage;
         lightBudget.resilience.firstFailureCode = code;
-        lightBudget.resilience.firstFailureReason = failureReason;
-        lightBudget.resilience.retryKind = navigationProbeRetry ? 'navigation_probe' :
-          (LIGHT_RETRYABLE_SETUP_STAGES.has(stage) ? 'setup' : '');
       } else if (lightBudget.resilience) {
         lightBudget.resilience.secondAttemptStage = stage;
       }
@@ -15675,9 +15522,7 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         lightBudget.resilience.cleanup = cleanup && cleanup.diagnostics || null;
       }
       const admission = index === 0
-        ? (navigationProbeRetry
-          ? lightNavigationProbeRetryAdmission_(lightBudget, attempt, stage, failureReason)
-          : lightSetupRetryAdmission_(lightBudget, attempt, stage))
+        ? lightSetupRetryAdmission_(lightBudget, attempt, stage)
         : { allowed: false, reason: 'retry_limit' };
       if (lightBudget.resilience) lightBudget.resilience.retryAdmission = admission.reason;
       if (index === 0 && admission.allowed && !res.headersSent) {
@@ -15685,7 +15530,7 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         // The first attempt's local timeout must not poison a fresh, admitted attempt.
         lightBudget.timedOut = false;
         lightBudget.timeoutStage = '';
-        lightBudget.activeStage = navigationProbeRetry ? 'retry_navigation_probe' : 'retry_setup';
+        lightBudget.activeStage = 'retry_setup';
         continue;
       }
       if (!res.headersSent) sendLightBudgetTimeout_(res, lightBudget, lightBudget.queueStartedAt || Date.now(), stage);
@@ -18868,12 +18713,6 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
-        await recoverLightTopPageNavigation_(page, lightBudget, lightAttempt);
-        // A bounded recovery timeout does not itself decide validity. The
-        // existing probe can still accept a usable DOM without a DCL event.
-        if (lightBudget.timedOut) {
-          throw createLightBudgetError_('top_page_navigation_recovery', 'overall deadline during navigation recovery');
-        }
         lightBudget.gotoFallback.domFallbackAttempted = true;
         lightBudget.activeStage = 'top_page_dom_fallback';
         const fallback = await probeLightDomReadiness_(page, urlToFetch, lightBudget, { attempt: lightAttempt });
@@ -22905,10 +22744,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     const elapsedMs = Date.now() - t0;
     const failureStage = String(err && err.lightBudgetStage || lightBudget && lightBudget.activeStage || 'unknown');
     const failureCode = String(err && err.code || 'PLAYWRIGHT_SETUP_FAILURE');
-    const failureReason = String(err && err.lightFailureReason || '');
-    const retryableNavigationProbeFailure = isLightNavigationProbeRetryableFailure_(lightBudget, failureStage, failureReason);
     if (signalsFirstLight && scrapeOptions.deferRetryableSetupFailure && !res.headersSent &&
-      (LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage) || retryableNavigationProbeFailure)) {
+      LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage)) {
       markLightAttemptFailure_(lightAttempt, failureStage, failureCode);
       err.lightBudgetStage = failureStage;
       err.lightAttempt = lightAttempt;
@@ -23260,11 +23097,7 @@ module.exports.__lightBudgetTestHooks = {
   isLightTopGotoTimeoutError_,
   assessLightDomFallbackSentinel_,
   probeLightDomReadiness_,
-  getLightNavigationRecoveryTimeoutMs_,
-  recoverLightTopPageNavigation_,
   lightSetupRetryAdmission_,
-  isLightNavigationProbeRetryableFailure_,
-  lightNavigationProbeRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
@@ -23280,7 +23113,6 @@ module.exports.__lightBudgetTestHooks = {
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
   LIGHT_SETUP_RETRY_MIN_REMAINING_MS,
-  LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS,
   LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
   LIGHT_SUPPLEMENTAL_RESERVE_MS,
   LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
