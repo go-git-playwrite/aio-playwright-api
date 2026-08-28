@@ -23,6 +23,7 @@ const {
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
   getLightSupplementalDiagnosticFlags_,
+  collectLightPostCoverageSupplementals_,
   sendLightBudgetTimeout_,
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_
@@ -318,6 +319,103 @@ function probePage(sequence, options = {}) {
     skippedDueToBudget: true,
     timedOut: false
   });
+
+  // Post-coverage enrichment preserves the response/cleanup reserve. At the
+  // observed ~5s remainder, both enrichments remain unobserved rather than
+  // delaying the already-complete core response.
+  const postCoverageSkipBudget = budgetFor(48000);
+  postCoverageSkipBudget.deadlineAt = Date.now() + 4900;
+  let postCoverageFetchStarted = false;
+  let postCoverageEvaluateStarted = false;
+  const postCoverageSkipped = await collectLightPostCoverageSupplementals_({
+    request: { get: async () => { postCoverageFetchStarted = true; throw new Error('must not run'); } },
+    evaluate: async () => { postCoverageEvaluateStarted = true; throw new Error('must not run'); }
+  }, 'https://sitakke.jp/', {
+    lightBudget: postCoverageSkipBudget,
+    shouldCollectProductSpec: true,
+    hasProductJsonLd: false
+  });
+  assert.strictEqual(postCoverageSkipBudget.activeStage, 'post_coverage_supplemental');
+  assert.strictEqual(postCoverageFetchStarted, false);
+  assert.strictEqual(postCoverageEvaluateStarted, false);
+  assert.strictEqual(postCoverageSkipped.sitemapDiscovery.exists, null);
+  assert.deepStrictEqual(postCoverageSkipped.sitemapFlags, { skippedDueToBudget: true, timedOut: false });
+  assert.strictEqual(postCoverageSkipped.productSpecComparisonSignals, null);
+  assert.deepStrictEqual(postCoverageSkipped.productSpecFlags, { skippedDueToBudget: true, timedOut: false });
+
+  const sitemapResponse = (status, text = '', contentType = 'text/plain') => ({
+    ok: () => status >= 200 && status < 300,
+    status: () => status,
+    headers: () => ({ 'content-type': contentType }),
+    text: async () => text
+  });
+  const sitemapRequests = [];
+  const normalPostCoverage = await collectLightPostCoverageSupplementals_({
+    request: {
+      get: async (url) => {
+        sitemapRequests.push(url);
+        return /robots\.txt$/.test(url)
+          ? sitemapResponse(404)
+          : sitemapResponse(200, '<urlset></urlset>', 'application/xml');
+      }
+    },
+    evaluate: async () => ({ observed: true, specLikeTablesCount: 1, comparisonLikeTablesCount: 0, specDlCount: 0, comparisonCueCount: 0, evidenceSources: [] })
+  }, 'https://sitakke.jp/', {
+    lightBudget: budgetFor(48000),
+    shouldCollectProductSpec: true,
+    hasProductJsonLd: false
+  });
+  assert.deepStrictEqual(sitemapRequests, ['https://sitakke.jp/robots.txt', 'https://sitakke.jp/sitemap.xml']);
+  assert.strictEqual(normalPostCoverage.sitemapDiscovery.exists, true);
+  assert.deepStrictEqual(normalPostCoverage.sitemapFlags, { skippedDueToBudget: false, timedOut: false });
+  assert.strictEqual(normalPostCoverage.productSpecComparisonSignals.hasStructuredProductInfo, true);
+  assert.deepStrictEqual(normalPostCoverage.productSpecFlags, { skippedDueToBudget: false, timedOut: false });
+
+  const notFoundSitemapRequests = [];
+  const sitemapNotFound = await collectLightPostCoverageSupplementals_({
+    request: {
+      get: async (url) => {
+        notFoundSitemapRequests.push(url);
+        return sitemapResponse(404);
+      }
+    },
+    evaluate: async () => ({ observed: true, specLikeTablesCount: 0, comparisonLikeTablesCount: 0, specDlCount: 0, comparisonCueCount: 0, evidenceSources: [] })
+  }, 'https://sitakke.jp/', {
+    lightBudget: budgetFor(48000),
+    shouldCollectProductSpec: false,
+    hasProductJsonLd: false
+  });
+  assert.strictEqual(notFoundSitemapRequests.length, 6);
+  assert.strictEqual(sitemapNotFound.sitemapDiscovery.exists, false);
+  assert.deepStrictEqual(sitemapNotFound.sitemapFlags, { skippedDueToBudget: false, timedOut: false });
+
+  const sitemapHangBudget = budgetFor(48000);
+  const sitemapTimedOut = await collectLightPostCoverageSupplementals_({
+    request: {
+      get: async (url) => /robots\.txt$/.test(url)
+        ? sitemapResponse(404)
+        : new Promise(() => {})
+    },
+    evaluate: async () => ({ observed: true, specLikeTablesCount: 0, comparisonLikeTablesCount: 0, specDlCount: 0, comparisonCueCount: 0, evidenceSources: [] })
+  }, 'https://sitakke.jp/', {
+    lightBudget: sitemapHangBudget,
+    shouldCollectProductSpec: false,
+    hasProductJsonLd: false
+  });
+  assert.strictEqual(sitemapTimedOut.sitemapDiscovery.exists, null);
+  assert.deepStrictEqual(sitemapTimedOut.sitemapFlags, { skippedDueToBudget: false, timedOut: true });
+
+  const productHangBudget = budgetFor(48000);
+  const productTimedOut = await collectLightPostCoverageSupplementals_({
+    request: { get: async () => sitemapResponse(404) },
+    evaluate: async () => new Promise(() => {})
+  }, 'https://sitakke.jp/', {
+    lightBudget: productHangBudget,
+    shouldCollectProductSpec: true,
+    hasProductJsonLd: false
+  });
+  assert.strictEqual(productTimedOut.productSpecComparisonSignals, null);
+  assert.deepStrictEqual(productTimedOut.productSpecFlags, { skippedDueToBudget: false, timedOut: true });
 
   // Page creation allows a transient 5.4s setup delay when the global budget
   // is healthy, but retains the 5s response/cleanup reserve.

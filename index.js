@@ -14780,6 +14780,13 @@ const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
 const LIGHT_SUPPLEMENTAL_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
 const LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS = 2500;
 const LIGHT_ARTICLE_SIGNALS_MAX_MS = 1500;
+// Post-coverage work cannot consume the reserve needed to build and send the
+// already-complete core response. These are helper-wide limits, not per-URL
+// request limits.
+const LIGHT_SITEMAP_DISCOVERY_MAX_MS = 2500;
+const LIGHT_PRODUCT_SPEC_COMPARISON_MAX_MS = 1500;
+const LIGHT_POST_COVERAGE_MIN_BUDGET_MS = 750;
+const LIGHT_MEMORY_HINT_MAX_MS = 500;
 // Coverage is post-core work.  Its first two reachability candidates share a
 // bounded HTML-only allowance while the response/cleanup reserve remains intact.
 const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 2500;
@@ -15116,6 +15123,82 @@ function getLightSupplementalDiagnosticFlags_(result) {
   return {
     skippedDueToBudget: state === 'skipped_due_to_budget',
     timedOut: state === 'timed_out'
+  };
+}
+
+function buildLightSitemapDiscoveryUnavailable_(reason) {
+  return {
+    checked: false,
+    exists: null,
+    url: null,
+    httpStatus: null,
+    discoveryMethod: String(reason || 'not_checked'),
+    checkedUrls: [],
+    robotsHttpStatus: null,
+    robotsTxtUrl: null,
+    observationLimited: true
+  };
+}
+
+async function collectLightPostCoverageSupplementals_(page, finalUrl, options = {}) {
+  const lightBudget = options && options.lightBudget || null;
+  const shouldCollectProductSpec = options && options.shouldCollectProductSpec === true;
+  const hasProductJsonLd = options && options.hasProductJsonLd === true;
+  if (lightBudget) lightBudget.activeStage = 'post_coverage_supplemental';
+
+  const sitemapTask = await runLightSupplementalBudgetTask_(
+    lightBudget,
+    'sitemap_discovery',
+    LIGHT_SITEMAP_DISCOVERY_MAX_MS,
+    async (timeoutMs) => {
+      let origin = '';
+      try { origin = new URL(String(finalUrl || '')).origin; } catch (_) {}
+      if (!origin) return buildLightSitemapDiscoveryUnavailable_('not_checked');
+      const fetchTextWithPageRequest = async (targetUrl, requestTimeoutMs = timeoutMs) => {
+        try {
+          const response = await page.request.get(targetUrl, {
+            timeout: Math.max(1, Math.min(Number(requestTimeoutMs || timeoutMs), Number(timeoutMs || 1))),
+            headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
+          });
+          const status = response && typeof response.status === 'function' ? response.status() : null;
+          const headers = response && typeof response.headers === 'function' ? response.headers() : {};
+          const contentType = String((headers && (headers['content-type'] || headers['Content-Type'])) || '');
+          if (!response || !response.ok()) return { ok: false, status, text: '', contentType };
+          const text = String(await response.text() || '').slice(0, 120000);
+          return { ok: true, status, text, contentType };
+        } catch (e) {
+          return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
+        }
+      };
+      return discoverSitemapFromOrigin_(origin, fetchTextWithPageRequest, { timeoutMs });
+    },
+    {
+      reserveMs: LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
+      minimumMs: LIGHT_POST_COVERAGE_MIN_BUDGET_MS
+    }
+  );
+  const sitemapDiscovery = sitemapTask.state === 'completed' && sitemapTask.value
+    ? sitemapTask.value
+    : buildLightSitemapDiscoveryUnavailable_(sitemapTask.state);
+
+  let productSpecTask = { state: 'completed', value: null, timeoutMs: 0 };
+  if (shouldCollectProductSpec) {
+    productSpecTask = await runLightSupplementalBudgetTask_(
+      lightBudget,
+      'product_spec_comparison',
+      LIGHT_PRODUCT_SPEC_COMPARISON_MAX_MS,
+      () => collectProductSpecComparisonSignalsLight_(page, { hasProductJsonLd }),
+      {
+        reserveMs: LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
+        minimumMs: LIGHT_POST_COVERAGE_MIN_BUDGET_MS
+      }
+    );
+  }
+  return {
+    sitemapDiscovery,
+    productSpecComparisonSignals: productSpecTask.state === 'completed' ? productSpecTask.value : null,
+    sitemapFlags: getLightSupplementalDiagnosticFlags_(sitemapTask),
+    productSpecFlags: getLightSupplementalDiagnosticFlags_(productSpecTask)
   };
 }
 function buildLightRequestTiming_(budget, processingStartedAt) {
@@ -19434,28 +19517,12 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         ? coverageObserved.semanticElements
         : {};
       const bodyObserved = observed.body || {};
-      const sitemapDiscoveryLight = await (async () => {
-        let origin = '';
-        try { origin = new URL(String(finalUrl || urlToFetch || '')).origin; } catch (_) {}
-        if (!origin) return { checked: false, exists: null, url: null, httpStatus: null, discoveryMethod: 'not_checked', checkedUrls: [], robotsHttpStatus: null, robotsTxtUrl: null };
-        const fetchTextWithPageRequest = async (targetUrl, timeoutMs = 1500) => {
-          try {
-            const response = await page.request.get(targetUrl, {
-              timeout: timeoutMs,
-              headers: { 'Accept': 'application/xml,text/xml,text/plain,*/*;q=0.8' }
-            });
-            const status = response && typeof response.status === 'function' ? response.status() : null;
-            const headers = response && typeof response.headers === 'function' ? response.headers() : {};
-            const contentType = String((headers && (headers['content-type'] || headers['Content-Type'])) || '');
-            if (!response || !response.ok()) return { ok: false, status, text: '', contentType };
-            const text = String(await response.text() || '').slice(0, 120000);
-            return { ok: true, status, text, contentType };
-          } catch (e) {
-            return { ok: false, status: null, text: '', contentType: '', errorMessage: String(e && (e.message || e) || '').slice(0, 160) };
-          }
-        };
-        return discoverSitemapFromOrigin_(origin, fetchTextWithPageRequest, { timeoutMs: 2500 });
-      })();
+      const postCoverageSupplementals = await collectLightPostCoverageSupplementals_(page, finalUrl || urlToFetch, {
+        lightBudget: signalsFirstLight ? lightBudget : null,
+        shouldCollectProductSpec: !balancedShortFastResponse,
+        hasProductJsonLd: !!(geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasProductJsonLd)
+      });
+      const sitemapDiscoveryLight = postCoverageSupplementals.sitemapDiscovery;
       const aioCheckLight = {
         checked: sitemapDiscoveryLight.checked === true,
         hasRobotsTxt: sitemapDiscoveryLight.robotsHttpStatus === 200 ? true : (sitemapDiscoveryLight.robotsHttpStatus === 404 ? false : null),
@@ -19477,14 +19544,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         geoSignalsV1.observed = geoSignalsV1.observed || {};
         geoSignalsV1.observed.aioCheck = geoSignalsV1.aioCheck;
       }
-      let productSpecComparisonSignalsLight = null;
-      if (!balancedShortFastResponse) {
-        productSpecComparisonSignalsLight = await collectProductSpecComparisonSignalsLight_(page, {
-          hasProductJsonLd: !!(geoSignalsV1 && geoSignalsV1.structuredData && geoSignalsV1.structuredData.hasProductJsonLd)
-        });
-        if (productSpecComparisonSignalsLight && geoSignalsV1 && typeof geoSignalsV1 === 'object') {
-          geoSignalsV1.productSpecComparisonSignals = productSpecComparisonSignalsLight;
-        }
+      const productSpecComparisonSignalsLight = postCoverageSupplementals.productSpecComparisonSignals;
+      if (productSpecComparisonSignalsLight && geoSignalsV1 && typeof geoSignalsV1 === 'object') {
+        geoSignalsV1.productSpecComparisonSignals = productSpecComparisonSignalsLight;
       }
       const lightweightSummary = {
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
@@ -19678,6 +19740,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         sitemapCheckedUrls: Array.isArray(sitemapDiscoveryLight.checkedUrls) ? sitemapDiscoveryLight.checkedUrls.slice(0, 10) : [],
         sitemapResolvedUrl: sitemapDiscoveryLight.url,
         sitemapHttpStatus: sitemapDiscoveryLight.httpStatus,
+        sitemapDiscoverySkippedDueToBudget: postCoverageSupplementals.sitemapFlags.skippedDueToBudget,
+        sitemapDiscoveryTimedOut: postCoverageSupplementals.sitemapFlags.timedOut,
+        productSpecSkippedDueToBudget: postCoverageSupplementals.productSpecFlags.skippedDueToBudget,
+        productSpecTimedOut: postCoverageSupplementals.productSpecFlags.timedOut,
         timeoutGuardMs: balancedShortFastResponse ? 60000 : null
       };
       if (signalsFirstLight) {
@@ -19698,12 +19764,18 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         ],
         estimatedSavedBytes: null
       };
-      try {
-        const htmlEstimate = await page.evaluate(() => {
+      const memoryHintTask = await runLightSupplementalBudgetTask_(
+        signalsFirstLight ? lightBudget : null,
+        'memory_html_estimate',
+        LIGHT_MEMORY_HINT_MAX_MS,
+        () => page.evaluate(() => {
           try { return String((document.documentElement && document.documentElement.outerHTML) || '').length; } catch (_) { return 0; }
-        }).catch(() => 0);
-        memoryHints.estimatedSavedBytes = Math.max(0, Number(htmlEstimate || 0) * 2);
-      } catch (_) {}
+        }).catch(() => 0),
+        { reserveMs: LIGHT_RESPONSE_CLEANUP_RESERVE_MS, minimumMs: 1 }
+      );
+      if (memoryHintTask.state === 'completed') {
+        memoryHints.estimatedSavedBytes = Math.max(0, Number(memoryHintTask.value || 0) * 2);
+      }
       mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary, topPageStaticFetchResult);
       attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, lightweightSummary, { siteMode, url: finalUrl || urlToFetch });
       if (geoSignalsV1 && geoSignalsV1.diagnostics) {
@@ -19877,12 +19949,16 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           navLinkCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.navLinkCount,
           jsonldCount: shortPayload && shortPayload.lightweightSummary && shortPayload.lightweightSummary.jsonldCount
         });
-        logScrapeResponseReadyAudit(shortPayload);
+        if (!signalsFirstLight || getLightBudgetRemainingMs_(lightBudget, LIGHT_RESPONSE_CLEANUP_RESERVE_MS) > 0) {
+          logScrapeResponseReadyAudit(shortPayload);
+        }
         res.status(200).json(shortPayload);
         logScrapeResponseSentAudit(shortPayload);
         return;
       }
-      logScrapeResponseReadyAudit(signalsResponsePayload);
+      if (!signalsFirstLight || getLightBudgetRemainingMs_(lightBudget, LIGHT_RESPONSE_CLEANUP_RESERVE_MS) > 0) {
+        logScrapeResponseReadyAudit(signalsResponsePayload);
+      }
       res.status(200).json(signalsResponsePayload);
       logScrapeResponseSentAudit(signalsResponsePayload);
       return;
@@ -22892,6 +22968,8 @@ module.exports.__lightBudgetTestHooks = {
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
   getLightSupplementalDiagnosticFlags_,
+  buildLightSitemapDiscoveryUnavailable_,
+  collectLightPostCoverageSupplementals_,
   closePlaywrightResourceWithin_,
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
@@ -22900,5 +22978,9 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
   LIGHT_SUPPLEMENTAL_RESERVE_MS,
   LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
-  LIGHT_ARTICLE_SIGNALS_MAX_MS
+  LIGHT_ARTICLE_SIGNALS_MAX_MS,
+  LIGHT_SITEMAP_DISCOVERY_MAX_MS,
+  LIGHT_PRODUCT_SPEC_COMPARISON_MAX_MS,
+  LIGHT_POST_COVERAGE_MIN_BUDGET_MS,
+  LIGHT_MEMORY_HINT_MAX_MS
 };
