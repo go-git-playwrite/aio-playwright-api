@@ -11876,14 +11876,15 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     ? opts.hydrationMetrics
     : {};
   const lightBudget = opts && opts.lightBudget || null;
-  const phaseTimings = {
-    gotoMs: typeof opts.gotoMs === 'number' ? opts.gotoMs : null,
-    basicDomMs: null,
-    structuredDataMs: null,
-    linksMs: null,
-    multimodalMs: null,
-    totalMs: null
-  };
+  const phaseTimings = opts && opts.phaseTimingsTarget && typeof opts.phaseTimingsTarget === 'object'
+    ? opts.phaseTimingsTarget
+    : {};
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'gotoMs')) phaseTimings.gotoMs = typeof opts.gotoMs === 'number' ? opts.gotoMs : null;
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'basicDomMs')) phaseTimings.basicDomMs = null;
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'structuredDataMs')) phaseTimings.structuredDataMs = null;
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'linksMs')) phaseTimings.linksMs = null;
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'multimodalMs')) phaseTimings.multimodalMs = null;
+  if (!Object.prototype.hasOwnProperty.call(phaseTimings, 'totalMs')) phaseTimings.totalMs = null;
   const buildGeoMemorySnapshot = () => {
     try {
       const memory = process.memoryUsage();
@@ -14620,6 +14621,12 @@ function createLightRequestBudget_(requestStartedAt) {
     timedOut: false,
     queueStartedAt: 0,
     checkpoints: {},
+    geoPhaseTimings: null,
+    coverageTrace: {
+      started: false,
+      skippedDueToBudget: false,
+      completed: false
+    },
     stageMs: {
       topPageStaticFetchMs: 0,
       browserLaunchMs: 0,
@@ -14637,6 +14644,11 @@ function recordLightCheckpoint_(budget, name) {
     remainingMs: getLightBudgetRemainingMs_(budget),
     activeStage: String(budget.activeStage || '')
   };
+}
+function markLightStageCheckpoint_(budget, stage, checkpoint) {
+  if (!budget) return;
+  budget.activeStage = String(stage || budget.activeStage || 'unknown');
+  if (checkpoint) recordLightCheckpoint_(budget, checkpoint);
 }
 function getLightBudgetRemainingMs_(budget, reserveMs = 0) {
   if (!budget) return Number.POSITIVE_INFINITY;
@@ -14667,6 +14679,16 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     browserContextMs: Number(budget.stageMs && budget.stageMs.browserContextMs || 0),
     pageCreateMs: Number(budget.stageMs && budget.stageMs.pageCreateMs || 0),
     initScriptMs: Number(budget.stageMs && budget.stageMs.initScriptMs || 0),
+    geoPhaseTimings: budget.geoPhaseTimings && typeof budget.geoPhaseTimings === 'object'
+      ? Object.assign({}, budget.geoPhaseTimings)
+      : null,
+    coverageTrace: budget.coverageTrace && typeof budget.coverageTrace === 'object'
+      ? {
+          started: budget.coverageTrace.started === true,
+          skippedDueToBudget: budget.coverageTrace.skippedDueToBudget === true,
+          completed: budget.coverageTrace.completed === true
+        }
+      : null,
     lightStageGapsV1: {
       requestId: budget.requestId,
       checkpoints: budget.checkpoints || {}
@@ -17966,7 +17988,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
     logSf('BEFORE_GOTO', { url: String(urlToFetch || '').slice(0, 180) });
     logSfMemory('before_goto');
     if (signalsFirstLight) {
-      lightBudget.activeStage = 'top_page_goto';
+      markLightStageCheckpoint_(lightBudget, 'top_page_goto', 'top_page_goto_start');
       recordLightCheckpoint_(lightBudget, 'before_top_page_goto_budget_check');
     }
     const topGotoTimeoutMs = signalsFirstLight
@@ -17983,6 +18005,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
       if (signalsFirstLight) throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
       throw err;
     }
+    if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'top_page_goto_end');
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
     logHeavySiteTopPageAudit('page_goto_end', {
       status: resp && typeof resp.status === 'function' ? resp.status() : null,
@@ -18729,6 +18752,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
         boundedHydrationWaitMs,
         shortFastMode: balancedShortFastResponse
       });
+      if (signalsFirstLight) lightBudget.activeStage = 'hydration';
       const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, {
         shortFastMode: balancedShortFastResponse,
         debugHeavySite,
@@ -18736,6 +18760,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
         url: String(urlToFetch || ''),
         finalUrl: String(finalUrl || '')
       });
+      if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'hydration_end');
       logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_end', {
         waitMs: hydrationMetrics && hydrationMetrics.waitMs,
         bodyTextBeforeWait: hydrationMetrics && hydrationMetrics.bodyTextBeforeWait,
@@ -18761,6 +18786,17 @@ async function scrapeOnce(req, res, lightBudget = null) {
         balancedMode: signalsFirstBalanced,
         shortFastMode: balancedShortFastResponse
       });
+      if (signalsFirstLight) {
+        markLightStageCheckpoint_(lightBudget, 'build_geo_signals', 'build_geo_signals_start');
+        lightBudget.geoPhaseTimings = {
+          gotoMs: typeof scrapeTiming.gotoMs === 'number' ? scrapeTiming.gotoMs : null,
+          basicDomMs: null,
+          structuredDataMs: null,
+          linksMs: null,
+          multimodalMs: null,
+          totalMs: null
+        };
+      }
       const geoSignalsV1 = await buildGeoSignalsV1(page, finalUrl || urlToFetch, {
         balancedMode: signalsFirstBalanced,
         shortFastMode: balancedShortFastResponse,
@@ -18772,8 +18808,10 @@ async function scrapeOnce(req, res, lightBudget = null) {
           : (scrapeTiming && scrapeTiming.spans ? Number(scrapeTiming.spans.initial_goto_and_waits || 0) : null),
         debugHeavySite,
         debugHeavySiteStartedAt,
-        lightBudget: signalsFirstLight ? lightBudget : null
+        lightBudget: signalsFirstLight ? lightBudget : null,
+        phaseTimingsTarget: signalsFirstLight ? lightBudget.geoPhaseTimings : null
       });
+      if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
         const observedCore = geoSignalsV1 && geoSignalsV1.observed || {};
         const hasCoreSignals = observedCore.body && observedCore.links && observedCore.headings &&
@@ -18818,7 +18856,11 @@ async function scrapeOnce(req, res, lightBudget = null) {
         subpageObservationMode,
         maxObserve: 2
       });
-      await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch, {
+      if (signalsFirstLight) {
+        markLightStageCheckpoint_(lightBudget, 'coverage', 'coverage_start');
+        lightBudget.coverageTrace.started = true;
+      }
+      const coverageSignals = await attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, finalUrl || urlToFetch, {
         page,
         context,
         reuseBrowser: true,
@@ -18830,6 +18872,14 @@ async function scrapeOnce(req, res, lightBudget = null) {
         debugHeavySiteStartedAt,
         lightBudget: signalsFirstLight ? lightBudget : null
       });
+      if (signalsFirstLight) {
+        const coverageSkippedDueToBudget = !!(coverageSignals && coverageSignals.skippedDueToBudget === true);
+        lightBudget.coverageTrace.skippedDueToBudget = coverageSkippedDueToBudget;
+        if (!coverageSkippedDueToBudget) {
+          lightBudget.coverageTrace.completed = true;
+          recordLightCheckpoint_(lightBudget, 'coverage_end');
+        }
+      }
       logHeavySiteTopPageAudit('attachCoverageSignalsToGeoSignalsLight_call_end', {
         hasCoverageSignals: !!(geoSignalsV1 && geoSignalsV1.coverageSignals),
         observedSubpageCount: geoSignalsV1 && geoSignalsV1.coverageSignals && geoSignalsV1.coverageSignals.observedSubpageCount
@@ -19056,6 +19106,7 @@ async function scrapeOnce(req, res, lightBudget = null) {
       if (geoSignalsV1 && geoSignalsV1.contactDestination) {
         lightweightSummary.contactDestination = normalizeContactDestination_(geoSignalsV1.contactDestination);
       }
+      if (signalsFirstLight) lightBudget.activeStage = 'response_build';
       const diagnostics = {
         evaluateCount: geoSignalsV1 && geoSignalsV1.diagnostics && typeof geoSignalsV1.diagnostics.evaluateCount === 'number'
           ? geoSignalsV1.diagnostics.evaluateCount
@@ -22265,6 +22316,7 @@ if (require.main === module) {
 module.exports.__lightBudgetTestHooks = {
   createLightRequestBudget_,
   recordLightCheckpoint_,
+  markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
   buildLightRequestTiming_,
   sendLightBudgetTimeout_,

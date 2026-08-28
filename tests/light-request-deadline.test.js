@@ -2,6 +2,7 @@ const assert = require('assert');
 const {
   createLightRequestBudget_,
   recordLightCheckpoint_,
+  markLightStageCheckpoint_,
   runLightBudgetStage_,
   sendLightBudgetTimeout_,
   enqueueLightScrapeWithDeadline_
@@ -64,6 +65,34 @@ function responseSpy() {
   assert(checkpoints.init_script_complete.elapsedMs > checkpoints.page_defaults_configured.elapsedMs);
   assert(checkpoints.before_top_page_goto_budget_check.elapsedMs > checkpoints.init_script_complete.elapsedMs);
 
+  // Post-goto checkpoints use the same request-scoped trace and preserve stage order.
+  const postGotoBudget = budgetFor(200);
+  markLightStageCheckpoint_(postGotoBudget, 'top_page_goto', 'top_page_goto_start');
+  await sleep(2);
+  recordLightCheckpoint_(postGotoBudget, 'top_page_goto_end');
+  postGotoBudget.activeStage = 'hydration';
+  await sleep(2);
+  recordLightCheckpoint_(postGotoBudget, 'hydration_end');
+  markLightStageCheckpoint_(postGotoBudget, 'build_geo_signals', 'build_geo_signals_start');
+  await sleep(2);
+  recordLightCheckpoint_(postGotoBudget, 'build_geo_signals_end');
+  markLightStageCheckpoint_(postGotoBudget, 'coverage', 'coverage_start');
+  postGotoBudget.coverageTrace.started = true;
+  await sleep(2);
+  postGotoBudget.coverageTrace.completed = true;
+  recordLightCheckpoint_(postGotoBudget, 'coverage_end');
+  assert.deepStrictEqual(Object.keys(postGotoBudget.checkpoints), [
+    'top_page_goto_start',
+    'top_page_goto_end',
+    'hydration_end',
+    'build_geo_signals_start',
+    'build_geo_signals_end',
+    'coverage_start',
+    'coverage_end'
+  ]);
+  assert.strictEqual(postGotoBudget.activeStage, 'coverage');
+  assert.strictEqual(postGotoBudget.coverageTrace.completed, true);
+
   // B-E: each setup stage is bounded and reports the actual stage.
   await expectStageTimeout('browser_launch', () => sleep(60));
   await expectStageTimeout('browser_context', () => sleep(60));
@@ -86,6 +115,48 @@ function responseSpy() {
   assert.strictEqual(trace.requestId, checkpointBudget.requestId);
   assert.strictEqual(trace.checkpoints.before_top_page_goto_budget_check.activeStage, 'top_page_goto');
   assert(traceResponse.body.diagnostics.skippedDueToBudget.includes('top_page_goto'));
+
+  const gotoDeadlineResponse = responseSpy();
+  const gotoDeadlineBudget = budgetFor(200);
+  markLightStageCheckpoint_(gotoDeadlineBudget, 'top_page_goto', 'top_page_goto_start');
+  sendLightBudgetTimeout_(gotoDeadlineResponse, gotoDeadlineBudget, Date.now(), gotoDeadlineBudget.activeStage);
+  assert.strictEqual(gotoDeadlineResponse.body.stage, 'top_page_goto');
+  assert(gotoDeadlineResponse.body.diagnostics.lightStageGapsV1.checkpoints.top_page_goto_start);
+  assert.strictEqual(gotoDeadlineResponse.body.diagnostics.lightStageGapsV1.checkpoints.top_page_goto_end, undefined);
+
+  // Post-goto deadline diagnostics retain only reached checkpoints, current stage,
+  // existing geo phase timings, and coverage start/skip state.
+  const buildDeadlineResponse = responseSpy();
+  const buildDeadlineBudget = budgetFor(200);
+  markLightStageCheckpoint_(buildDeadlineBudget, 'build_geo_signals', 'build_geo_signals_start');
+  buildDeadlineBudget.geoPhaseTimings = {
+    gotoMs: 12000,
+    basicDomMs: 31,
+    structuredDataMs: null,
+    linksMs: 4,
+    multimodalMs: 3,
+    totalMs: null
+  };
+  sendLightBudgetTimeout_(buildDeadlineResponse, buildDeadlineBudget, Date.now(), buildDeadlineBudget.activeStage);
+  assert.strictEqual(buildDeadlineResponse.body.stage, 'build_geo_signals');
+  assert(buildDeadlineResponse.body.diagnostics.lightStageGapsV1.checkpoints.build_geo_signals_start);
+  assert.strictEqual(buildDeadlineResponse.body.diagnostics.lightStageGapsV1.checkpoints.build_geo_signals_end, undefined);
+  assert.strictEqual(buildDeadlineResponse.body.diagnostics.geoPhaseTimings.basicDomMs, 31);
+
+  const coverageSkipResponse = responseSpy();
+  const coverageSkipBudget = budgetFor(200);
+  markLightStageCheckpoint_(coverageSkipBudget, 'coverage', 'coverage_start');
+  coverageSkipBudget.coverageTrace.started = true;
+  coverageSkipBudget.coverageTrace.skippedDueToBudget = true;
+  sendLightBudgetTimeout_(coverageSkipResponse, coverageSkipBudget, Date.now(), coverageSkipBudget.activeStage);
+  assert.strictEqual(coverageSkipResponse.body.stage, 'coverage');
+  assert(coverageSkipResponse.body.diagnostics.lightStageGapsV1.checkpoints.coverage_start);
+  assert.strictEqual(coverageSkipResponse.body.diagnostics.lightStageGapsV1.checkpoints.coverage_end, undefined);
+  assert.deepStrictEqual(coverageSkipResponse.body.diagnostics.coverageTrace, {
+    started: true,
+    skippedDueToBudget: true,
+    completed: false
+  });
 
   // F: an expired queued task returns 504 before the task body can run.
   let queuedTask = null;
