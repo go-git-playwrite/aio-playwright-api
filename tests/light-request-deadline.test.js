@@ -22,6 +22,7 @@ const {
   buildLightRequestTiming_,
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
+  collectLightHydrationMetricsWithinBudget_,
   getLightSupplementalDiagnosticFlags_,
   collectLightPostCoverageSupplementals_,
   sendLightBudgetTimeout_,
@@ -88,6 +89,18 @@ function probePage(sequence, options = {}) {
 }
 
 (async () => {
+  // Completion-first retains a hard safety boundary, while a simulated
+  // 90-second Render response still has room to return under the 150-second
+  // request budget.
+  const completionBudget = budgetFor(150000);
+  completionBudget.startedAt = Date.now() - 90000;
+  completionBudget.deadlineAt = completionBudget.startedAt + 150000;
+  assert(getLightBudgetRemainingMs_(completionBudget) >= 59000);
+  assert.deepStrictEqual(
+    await runLightBudgetStage_(completionBudget, 'browser_launch', 30000, async () => ({ ok: true })),
+    { ok: true }
+  );
+
   // A: normal setup stage keeps its result.
   const normalBudget = budgetFor(100);
   const normal = await runLightBudgetStage_(normalBudget, 'browser_launch', 60000, async () => ({ ok: true }));
@@ -419,8 +432,8 @@ function probePage(sequence, options = {}) {
 
   // Page creation allows a transient 5.4s setup delay when the global budget
   // is healthy, but retains the 5s response/cleanup reserve.
-  const pageCreateBudget = budgetFor(48000);
-  assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 8000);
+  const pageCreateBudget = budgetFor(150000);
+  assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 15000);
   pageCreateBudget.deadlineAt = Date.now() + 4200;
   assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 0);
 
@@ -484,6 +497,27 @@ function probePage(sequence, options = {}) {
     evaluate: () => new Promise(() => {})
   }, 'https://sitakke.jp/', budgetFor(48000), { maxMs: 5, pollMs: 1 });
   assert.strictEqual(evaluateTimeoutDom.reason, 'probe_evaluate_timeout');
+
+  // Completion-first hydration is bounded as a whole (including evaluate),
+  // yet a usable DOM lets the light path continue after the helper times out.
+  let hydrationEvaluateCount = 0;
+  const hydrationPage = {
+    isClosed: () => false,
+    evaluate: async () => {
+      hydrationEvaluateCount += 1;
+      if (hydrationEvaluateCount === 1) return new Promise(() => {});
+      return domCandidate();
+    }
+  };
+  const hydrationBudget = budgetFor(15000);
+  const hydration = await collectLightHydrationMetricsWithinBudget_(
+    hydrationPage,
+    'https://sitakke.jp/',
+    hydrationBudget,
+    { waitMs: 20, maxMs: 20, pollMs: 1 }
+  );
+  assert.strictEqual(hydration.state, 'timed_out');
+  assert.strictEqual(hydration.domReady, true);
 
   // CP1-CP4: the compact checkpoints preserve ordering and isolate each gap.
   const checkpointBudget = budgetFor(200);
@@ -628,7 +662,7 @@ function probePage(sequence, options = {}) {
   assert.strictEqual(closed, 1);
 
   // Setup-only retry: a fresh second attempt follows a completed cleanup.
-  const retryBudget = budgetFor(48000);
+  const retryBudget = budgetFor(150000);
   const retryResponse = responseSpy();
   let attempts = 0;
   let firstClosed = 0;
@@ -658,7 +692,7 @@ function probePage(sequence, options = {}) {
 
   // A cleanup barrier failure, a late failure, insufficient budget, and a
   // post-goto failure are not admitted to retry.
-  const successfulCleanupBudget = budgetFor(48000);
+  const successfulCleanupBudget = budgetFor(150000);
   const successfulCleanupAttempt = createLightAttempt_(successfulCleanupBudget);
   successfulCleanupAttempt.page = { close: async () => {} };
   successfulCleanupAttempt.context = { close: async () => {} };
@@ -671,7 +705,7 @@ function probePage(sequence, options = {}) {
   // Any individual close exception blocks retry; a resource must never be
   // treated as cleaned merely because its close error was absorbed.
   for (const resourceName of ['page', 'context', 'browser']) {
-    const budget = budgetFor(48000);
+    const budget = budgetFor(150000);
     const attempt = createLightAttempt_(budget);
     attempt[resourceName] = { close: async () => { throw new Error(`${resourceName}_close_failed`); } };
     const cleanup = await cleanupLightAttempt_(attempt, 'fixture');
@@ -681,14 +715,14 @@ function probePage(sequence, options = {}) {
   }
 
   // Per-resource timeout and the aggregate cleanup-barrier timeout both block retry.
-  const closeTimeoutBudget = budgetFor(48000);
+  const closeTimeoutBudget = budgetFor(150000);
   const closeTimeoutAttempt = createLightAttempt_(closeTimeoutBudget);
   closeTimeoutAttempt.page = { close: () => sleep(40) };
   await cleanupLightAttempt_(closeTimeoutAttempt, 'fixture', { timeoutMs: 40, resourceTimeoutMs: 5 });
   assert.strictEqual(closeTimeoutAttempt.cleanupComplete, false);
   assert.strictEqual(lightSetupRetryAdmission_(closeTimeoutBudget, closeTimeoutAttempt, 'page_create').reason, 'cleanup_incomplete');
 
-  const barrierTimeoutBudget = budgetFor(48000);
+  const barrierTimeoutBudget = budgetFor(150000);
   const barrierTimeoutAttempt = createLightAttempt_(barrierTimeoutBudget);
   barrierTimeoutAttempt.page = { close: () => sleep(40) };
   await cleanupLightAttempt_(barrierTimeoutAttempt, 'fixture', { timeoutMs: 5, resourceTimeoutMs: 40 });
@@ -700,7 +734,7 @@ function probePage(sequence, options = {}) {
   // The production retry runner observes cleanupComplete and does not begin a
   // second attempt when the first attempt's resource close fails.
   const cleanupFailureResponse = responseSpy();
-  const cleanupFailureBudget = budgetFor(48000);
+  const cleanupFailureBudget = budgetFor(150000);
   let cleanupFailureAttempts = 0;
   await runLightScrapeWithSetupRetry_(null, cleanupFailureResponse, cleanupFailureBudget, async () => {
     cleanupFailureAttempts += 1;
@@ -717,20 +751,20 @@ function probePage(sequence, options = {}) {
   assert.strictEqual(cleanupFailureBudget.resilience.retryPerformed, false);
   assert.strictEqual(cleanupFailureBudget.resilience.retryAdmission, 'cleanup_incomplete');
 
-  const lateBudget = budgetFor(48000);
+  const lateBudget = budgetFor(150000);
   lateBudget.startedAt = Date.now() - 18001;
-  lateBudget.deadlineAt = lateBudget.startedAt + 48000;
+  lateBudget.deadlineAt = lateBudget.startedAt + 150000;
   const lateAttempt = createLightAttempt_(lateBudget);
   lateAttempt.cleanupComplete = true;
-  assert.strictEqual(lightSetupRetryAdmission_(lateBudget, lateAttempt, 'page_create').reason, 'admission_elapsed');
+  assert.strictEqual(lightSetupRetryAdmission_(lateBudget, lateAttempt, 'page_create').allowed, true);
 
-  const shortBudget = budgetFor(27000);
+  const shortBudget = budgetFor(74000);
   const shortAttempt = createLightAttempt_(shortBudget);
   shortAttempt.cleanupComplete = true;
   assert.strictEqual(lightSetupRetryAdmission_(shortBudget, shortAttempt, 'page_create').reason, 'insufficient_remaining');
   assert.strictEqual(lightSetupRetryAdmission_(retryBudget, { cleanupComplete: true }, 'build_geo_signals').reason, 'non_setup_stage');
 
-  const secondFailureBudget = budgetFor(48000);
+  const secondFailureBudget = budgetFor(150000);
   const secondFailureResponse = responseSpy();
   let failures = 0;
   await runLightScrapeWithSetupRetry_(null, secondFailureResponse, secondFailureBudget, async () => {

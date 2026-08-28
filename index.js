@@ -9239,7 +9239,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       });
       for (const candidate of selectedCandidates) {
         const scopedTimeoutMs = lightBudget
-          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_scoped_playwright', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_scoped_playwright', 15000, LIGHT_RESPONSE_CLEANUP_RESERVE_MS, 1000)
           : 8000;
         if (!scopedTimeoutMs) {
           if (lightBudget) lightBudget.skipped.push('coverage_scoped_playwright');
@@ -9359,7 +9359,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       });
       for (const candidate of scopedFallbackCandidates) {
         const scopedTimeoutMs = lightBudget
-          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_tls_fallback', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+          ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_tls_fallback', 15000, LIGHT_RESPONSE_CLEANUP_RESERVE_MS, 1000)
           : 8000;
         if (!scopedTimeoutMs) {
           if (lightBudget) lightBudget.skipped.push('coverage_playwright_tls_fallback');
@@ -9392,7 +9392,7 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateUrls: playwrightCandidates.map(candidate => candidate && candidate.url || '').slice(0, 10)
     });
     const playwrightTimeoutMs = lightBudget
-      ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_fallback', 6500, LIGHT_CORE_RESERVE_MS, 1000)
+      ? takeLightBudgetTimeoutMs_(lightBudget, 'coverage_playwright_fallback', 15000, LIGHT_RESPONSE_CLEANUP_RESERVE_MS, 1000)
       : 8000;
     if (playwrightCandidates.length && !playwrightTimeoutMs && lightBudget) lightBudget.skipped.push('coverage_playwright_fallback');
     const playwrightObserved = playwrightCandidates.length && playwrightTimeoutMs
@@ -13846,7 +13846,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
 }
 
 async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
-  const maxWaitMs = Math.max(0, Math.min(5000, Number(waitMs || 0)));
+  const configuredMaxWaitMs = Number(opts && opts.maxWaitMs || 5000);
+  const maxWaitMs = Math.max(0, Math.min(configuredMaxWaitMs, Number(waitMs || 0)));
   const shortFastMode = !!(opts && opts.shortFastMode);
   const debugHeavySite = opts && opts.debugHeavySite === true;
   const debugStartedAt = Number(opts && opts.debugHeavySiteStartedAt || Date.now()) || Date.now();
@@ -14076,6 +14077,54 @@ async function collectBalancedHydrationMetrics(page, waitMs, opts = {}) {
       error: String(e && (e.message || e) || '').slice(0, 180)
     });
   }
+}
+
+// Hydration is allowed to improve a slow page, but its complete helper
+// (including both page.evaluate calls) cannot consume the light request.  A
+// timeout retains an already usable DOM; a missing DOM remains a real failure.
+async function collectLightHydrationMetricsWithinBudget_(page, targetUrl, budget, opts = {}) {
+  const timeoutMs = takeLightBudgetTimeoutMs_(
+    budget,
+    'hydration',
+    LIGHT_HYDRATION_MAX_MS,
+    LIGHT_CORE_RESPONSE_RESERVE_MS,
+    1
+  );
+  if (!timeoutMs || (budget && budget.timedOut)) {
+    return { state: 'skipped_due_to_budget', metrics: null, timeoutMs: 0, domReady: false };
+  }
+  const waitMs = Math.min(timeoutMs, Math.max(0, Number(opts.waitMs || timeoutMs)));
+  let settled = false;
+  let timer = null;
+  const operation = collectBalancedHydrationMetrics(page, waitMs, Object.assign({}, opts, { maxWaitMs: timeoutMs }));
+  operation.catch(() => {});
+  const result = await new Promise(resolve => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ state: 'timed_out', metrics: null, timeoutMs });
+    }, timeoutMs);
+    operation.then(
+      metrics => {
+        if (settled) return;
+        settled = true;
+        resolve({ state: 'completed', metrics, timeoutMs });
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        resolve({ state: 'failed', metrics: null, timeoutMs });
+      }
+    );
+  });
+  if (timer) clearTimeout(timer);
+  if (result.state !== 'timed_out') return Object.assign(result, { domReady: result.state === 'completed' });
+
+  const fallback = await probeLightDomReadiness_(page, targetUrl, budget, opts);
+  if (fallback && fallback.accepted === true) {
+    return Object.assign(result, { domReady: true, fallback });
+  }
+  return Object.assign(result, { domReady: false, fallback: fallback || null });
 }
 
 function analyzeHtmlBasics(html) {
@@ -14763,34 +14812,36 @@ function buildScoresFromScrape(scraped) {
 // 同時実行を抑制して OOM を予防（環境変数 SCRAPE_CONCURRENCY で調整可能）
 const CONCURRENCY = Number(process.env.SCRAPE_CONCURRENCY || 2);
 const queue = new PQueue({ concurrency: CONCURRENCY });
-// GAS の light fetch は 60 秒で打ち切られる。キュー待ちも含めて Render 側で
-// 先に制御し、core signal がない partial 200 を返さないための request budget。
-const LIGHT_REQUEST_BUDGET_MS = Math.max(30000, Math.min(55000, Number(process.env.LIGHT_REQUEST_BUDGET_MS || 48000) || 48000));
+// completion-first の light request は、キュー待ちも含む安全上限だけを持つ。
+// core signal がない partial 200 は返さず、遅いサイトには観測完了の時間を与える。
+const LIGHT_REQUEST_BUDGET_MS = Math.max(60000, Math.min(180000, Number(process.env.LIGHT_REQUEST_BUDGET_MS || 150000) || 150000));
 const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.LIGHT_CORE_RESERVE_MS || 6000) || 6000));
 const LIGHT_RESPONSE_CLEANUP_RESERVE_MS = 5000;
-const LIGHT_DOM_FALLBACK_MAX_MS = 3000;
+const LIGHT_DOM_FALLBACK_MAX_MS = 5000;
 const LIGHT_DOM_FALLBACK_POLL_MS = 125;
 const LIGHT_CORE_RESPONSE_RESERVE_MS = LIGHT_CORE_RESERVE_MS + LIGHT_RESPONSE_CLEANUP_RESERVE_MS;
 const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
-const LIGHT_SETUP_RETRY_ADMISSION_MS = 18000;
-const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 28000;
+// Fresh setup retry must leave enough wall-clock time for a useful second
+// navigation/core-observation attempt and the final response reserve.
+const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 110000;
 const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
 // 補助観測は core DOM signal / response cleanup のための時間を侵食させない。
 // これらは rendered DOM の正本を補強するだけなので、上限到達は scrape 失敗ではなく skip とする。
 const LIGHT_SUPPLEMENTAL_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
-const LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS = 2500;
-const LIGHT_ARTICLE_SIGNALS_MAX_MS = 1500;
+const LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS = 8000;
+const LIGHT_ARTICLE_SIGNALS_MAX_MS = 5000;
 // Post-coverage work cannot consume the reserve needed to build and send the
 // already-complete core response. These are helper-wide limits, not per-URL
 // request limits.
-const LIGHT_SITEMAP_DISCOVERY_MAX_MS = 2500;
-const LIGHT_PRODUCT_SPEC_COMPARISON_MAX_MS = 1500;
+const LIGHT_SITEMAP_DISCOVERY_MAX_MS = 10000;
+const LIGHT_PRODUCT_SPEC_COMPARISON_MAX_MS = 5000;
 const LIGHT_POST_COVERAGE_MIN_BUDGET_MS = 750;
 const LIGHT_MEMORY_HINT_MAX_MS = 500;
 // Coverage is post-core work.  Its first two reachability candidates share a
 // bounded HTML-only allowance while the response/cleanup reserve remains intact.
-const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 2500;
-const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 750;
+const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 10000;
+const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 2000;
+const LIGHT_HYDRATION_MAX_MS = 20000;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
 
 function createLightRequestBudget_(requestStartedAt) {
@@ -14898,7 +14949,7 @@ async function cleanupLightAttempt_(attempt, reason, opts = {}) {
   return attempt.cleanupPromise;
 }
 function getLightPageCreateTimeoutMs_(budget) {
-  return Math.max(0, Math.min(8000, getLightBudgetRemainingMs_(budget) - LIGHT_RESPONSE_CLEANUP_RESERVE_MS));
+  return Math.max(0, Math.min(15000, getLightBudgetRemainingMs_(budget) - LIGHT_RESPONSE_CLEANUP_RESERVE_MS));
 }
 function getLightDomFallbackTimeoutMs_(budget) {
   return Math.max(0, Math.min(
@@ -15031,7 +15082,6 @@ function lightSetupRetryAdmission_(budget, attempt, stage) {
   const elapsedMs = budget ? Math.max(0, Date.now() - budget.startedAt) : Number.POSITIVE_INFINITY;
   const remainingMs = getLightBudgetRemainingMs_(budget);
   if (!LIGHT_RETRYABLE_SETUP_STAGES.has(String(stage || ''))) return { allowed: false, reason: 'non_setup_stage', elapsedMs, remainingMs };
-  if (elapsedMs > LIGHT_SETUP_RETRY_ADMISSION_MS) return { allowed: false, reason: 'admission_elapsed', elapsedMs, remainingMs };
   if (remainingMs < LIGHT_SETUP_RETRY_MIN_REMAINING_MS) return { allowed: false, reason: 'insufficient_remaining', elapsedMs, remainingMs };
   if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
   return { allowed: true, reason: 'setup_retry_admitted', elapsedMs, remainingMs };
@@ -16030,7 +16080,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     if (signalsFirstLight || signalsFirstBalanced) {
       const __timingTopPageStaticFetchStart = Date.now();
       topPageStaticFetchResult = signalsFirstLight
-        ? await runLightBudgetStage_(lightBudget, 'top_static_fetch', 8000,
+      ? await runLightBudgetStage_(lightBudget, 'top_static_fetch', 20000,
           (timeoutMs) => fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, timeoutMs, signal: lightAttempt && lightAttempt.controller && lightAttempt.controller.signal }))
         : await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode });
       scrapeTiming.spans.top_page_static_fetch = Math.max(0, Date.now() - __timingTopPageStaticFetchStart);
@@ -16070,7 +16120,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       ]
     });
     browser = signalsFirstLight
-      ? await runLightBudgetStage_(lightBudget, 'browser_launch', 12000, launchBrowser, {
+      ? await runLightBudgetStage_(lightBudget, 'browser_launch', 30000, launchBrowser, {
           onLateResolve: (lateBrowser) => closeLatePlaywrightResource_(lateBrowser, 'browser')
         })
       : await launchBrowser();
@@ -16092,7 +16142,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       timezoneId: 'Asia/Tokyo'
     });
     context = signalsFirstLight
-      ? await runLightBudgetStage_(lightBudget, 'browser_context', 5000, createContext, {
+      ? await runLightBudgetStage_(lightBudget, 'browser_context', 15000, createContext, {
           onLateResolve: (lateContext) => closeLatePlaywrightResource_(lateContext, 'context')
         })
       : await createContext();
@@ -16122,7 +16172,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
     if (signalsFirstLight) {
-      await runLightBudgetStage_(lightBudget, 'init_script', 1500, addInitScript);
+      await runLightBudgetStage_(lightBudget, 'init_script', 5000, addInitScript);
       recordLightCheckpoint_(lightBudget, 'init_script_complete');
     } else {
       await addInitScript();
@@ -18594,7 +18644,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       recordLightCheckpoint_(lightBudget, 'before_top_page_goto_budget_check');
     }
     const topGotoTimeoutMs = signalsFirstLight
-      ? requireLightCoreBudget('top_page_goto', 25000, 4000)
+      ? requireLightCoreBudget('top_page_goto', 60000, 4000)
       : 60000;
     logHeavySiteTopPageAudit('page_goto_start', {
       waitUntil: 'domcontentloaded',
@@ -19361,16 +19411,45 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         responseMode: balancedShortFastResponse ? 'shortFast' : (balancedShortResponse ? 'short' : 'default')
       });
       logSfMemory(signalsFirstBalanced ? 'signals_first_balanced_enter' : 'signals_first_light_enter');
-      const normalHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 3500;
+      const normalHydrationWaitMs = signalsFirstBalanced ? (balancedShortFastResponse ? 1200 : 3500) : 15000;
       const boundedHydrationWaitMs = signalsFirstLight && lightBudget
-        ? Math.min(normalHydrationWaitMs, getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESERVE_MS))
+        ? Math.min(normalHydrationWaitMs, getLightBudgetRemainingMs_(lightBudget, LIGHT_CORE_RESPONSE_RESERVE_MS))
         : normalHydrationWaitMs;
       logHeavySiteTopPageAudit('collectBalancedHydrationMetrics_start', {
         boundedHydrationWaitMs,
         shortFastMode: balancedShortFastResponse
       });
       if (signalsFirstLight) lightBudget.activeStage = 'hydration';
-      const hydrationMetrics = await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, {
+      const lightHydrationResult = signalsFirstLight
+        ? await collectLightHydrationMetricsWithinBudget_(page, finalUrl || urlToFetch, lightBudget, {
+          waitMs: boundedHydrationWaitMs,
+          shortFastMode: balancedShortFastResponse,
+          debugHeavySite,
+          debugHeavySiteStartedAt,
+          url: String(urlToFetch || ''),
+          finalUrl: String(finalUrl || ''),
+          attempt: lightAttempt
+        })
+        : null;
+      if (signalsFirstLight && lightHydrationResult && lightHydrationResult.domReady !== true) {
+        throw createLightBudgetError_('hydration', String(lightHydrationResult.state || 'dom_unavailable'));
+      }
+      const hydrationMetrics = signalsFirstLight
+        ? (lightHydrationResult.metrics || {
+          waitMs: 0,
+          bodyTextBeforeWait: 0,
+          bodyTextAfterWait: 0,
+          anchorCountBeforeWait: 0,
+          anchorCountAfterWait: 0,
+          navLinkCountBeforeWait: 0,
+          navLinkCountAfterWait: 0,
+          improvedBodyText: false,
+          improvedLinks: false,
+          warningTextBeforeWait: false,
+          warningTextAfterWait: false,
+          error: String(lightHydrationResult.state || 'timed_out')
+        })
+        : await collectBalancedHydrationMetrics(page, boundedHydrationWaitMs, {
         shortFastMode: balancedShortFastResponse,
         debugHeavySite,
         debugHeavySiteStartedAt,
@@ -22967,13 +23046,13 @@ module.exports.__lightBudgetTestHooks = {
   sendLightBudgetTimeout_,
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
+  collectLightHydrationMetricsWithinBudget_,
   getLightSupplementalDiagnosticFlags_,
   buildLightSitemapDiscoveryUnavailable_,
   collectLightPostCoverageSupplementals_,
   closePlaywrightResourceWithin_,
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
-  LIGHT_SETUP_RETRY_ADMISSION_MS,
   LIGHT_SETUP_RETRY_MIN_REMAINING_MS,
   LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
   LIGHT_SUPPLEMENTAL_RESERVE_MS,
