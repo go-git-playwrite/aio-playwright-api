@@ -20,6 +20,9 @@ const {
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
+  attachLightMainFrameNavigationTrace_,
+  markLightMainFrameGotoTrace_,
+  buildLightStaticFetchTrace_,
   buildLightRequestTiming_,
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
@@ -89,7 +92,108 @@ function probePage(sequence, options = {}) {
   };
 }
 
+function navigationTracePage() {
+  const handlers = {};
+  const mainFrame = { url: () => 'https://example.test/' };
+  return {
+    on(name, handler) { handlers[name] = handler; },
+    mainFrame: () => mainFrame,
+    url: () => 'https://example.test/',
+    isClosed: () => false,
+    emit(name, value) { if (handlers[name]) handlers[name](value); },
+    frame: mainFrame
+  };
+}
+
+function mainDocumentRequest(page, options = {}) {
+  return {
+    resourceType: () => options.resourceType || 'document',
+    isNavigationRequest: () => options.navigation !== false,
+    frame: () => options.frame || page.frame,
+    url: () => options.url || 'https://example.test/',
+    method: () => options.method || 'GET',
+    failure: () => ({ errorText: options.errorText || 'net::ERR_CONNECTION_TIMED_OUT' })
+  };
+}
+
 (async () => {
+  // Main-frame trace records only document/navigation lifecycle events and
+  // never participates in navigation control flow.
+  const navigationTraceBudget = budgetFor(150000);
+  const navigationPage = navigationTracePage();
+  const navigationTrace = attachLightMainFrameNavigationTrace_(navigationPage, navigationTraceBudget);
+  const tracedRequest = mainDocumentRequest(navigationPage);
+  navigationPage.emit('request', tracedRequest);
+  navigationPage.emit('response', {
+    request: () => tracedRequest,
+    url: () => 'https://example.test/',
+    status: () => 200
+  });
+  navigationPage.emit('framenavigated', navigationPage.frame);
+  navigationPage.emit('domcontentloaded');
+  navigationPage.emit('load');
+  markLightMainFrameGotoTrace_(navigationTraceBudget, navigationPage, { gotoStartMs: 0, gotoOutcome: 'success', gotoMs: 12, gotoResponsePresent: true });
+  assert.strictEqual(navigationTrace.requests.length, 1);
+  assert.strictEqual(navigationTrace.responses[0].status, 200);
+  assert.strictEqual(navigationTrace.frameNavigations.length, 1);
+  assert.notStrictEqual(navigationTrace.domContentLoadedMs, null);
+  assert.notStrictEqual(navigationTrace.loadMs, null);
+  assert.strictEqual(navigationTrace.traceError, false);
+
+  // A failed document request is distinguishable from a request that simply
+  // has not produced a response or DCL by the time goto times out.
+  const failedTraceBudget = budgetFor(150000);
+  const failedTracePage = navigationTracePage();
+  const failedTrace = attachLightMainFrameNavigationTrace_(failedTracePage, failedTraceBudget);
+  const failedRequest = mainDocumentRequest(failedTracePage, { errorText: 'net::ERR_CONNECTION_TIMED_OUT' });
+  failedTracePage.emit('request', failedRequest);
+  failedTracePage.emit('requestfailed', failedRequest);
+  markLightMainFrameGotoTrace_(failedTraceBudget, failedTracePage, { gotoStartMs: 0, gotoOutcome: 'timeout', gotoMs: 60000, gotoResponsePresent: false });
+  assert.strictEqual(failedTrace.failures[0].errorText, 'net::ERR_CONNECTION_TIMED_OUT');
+  assert.strictEqual(failedTrace.responsePresent, false);
+  assert.strictEqual(failedTrace.domContentLoadedMs, null);
+
+  const responseWithoutDclBudget = budgetFor(150000);
+  const responseWithoutDclPage = navigationTracePage();
+  const responseWithoutDclTrace = attachLightMainFrameNavigationTrace_(responseWithoutDclPage, responseWithoutDclBudget);
+  const responseWithoutDclRequest = mainDocumentRequest(responseWithoutDclPage);
+  responseWithoutDclPage.emit('request', responseWithoutDclRequest);
+  responseWithoutDclPage.emit('response', {
+    request: () => responseWithoutDclRequest,
+    url: () => 'https://example.test/',
+    status: () => 200
+  });
+  assert.strictEqual(responseWithoutDclTrace.responsePresent, true);
+  assert.strictEqual(responseWithoutDclTrace.domContentLoadedMs, null);
+
+  const noRequestTraceBudget = budgetFor(150000);
+  const noRequestTracePage = navigationTracePage();
+  const noRequestTrace = attachLightMainFrameNavigationTrace_(noRequestTracePage, noRequestTraceBudget);
+  markLightMainFrameGotoTrace_(noRequestTraceBudget, noRequestTracePage, { gotoStartMs: 0, gotoOutcome: 'timeout', gotoMs: 60000, gotoResponsePresent: false });
+  assert.strictEqual(noRequestTrace.requests.length, 0);
+  assert.strictEqual(noRequestTrace.responses.length, 0);
+  assert.strictEqual(noRequestTrace.domContentLoadedMs, null);
+
+  // Subframe and non-document resources are excluded from the trace.
+  const ignoredTraceBudget = budgetFor(150000);
+  const ignoredTracePage = navigationTracePage();
+  const ignoredTrace = attachLightMainFrameNavigationTrace_(ignoredTracePage, ignoredTraceBudget);
+  ignoredTracePage.emit('request', mainDocumentRequest(ignoredTracePage, { resourceType: 'image' }));
+  ignoredTracePage.emit('request', mainDocumentRequest(ignoredTracePage, { frame: { url: () => 'https://example.test/frame' } }));
+  assert.strictEqual(ignoredTrace.requests.length, 0);
+
+  // Listener setup failure remains trace-only and cannot stop scraping.
+  const brokenTraceBudget = budgetFor(150000);
+  const brokenTrace = attachLightMainFrameNavigationTrace_({ on: () => { throw new Error('listener unavailable'); } }, brokenTraceBudget);
+  assert.strictEqual(brokenTrace.traceError, true);
+
+  const staticTrace = buildLightStaticFetchTrace_({ success: true, status: 200, elapsedMs: 1900, bodyBytes: 80701, redirectCount: 0, redirectCountKnown: true, finalUrl: 'https://example.test/' }, 'https://example.test/');
+  assert.deepStrictEqual(staticTrace, { success: true, status: 200, elapsedMs: 1900, bodyBytes: 80701, redirectCount: 0, finalOriginMatches: true });
+  navigationTraceBudget.topPageStaticFetchTraceV1 = Object.assign({ requestId: navigationTraceBudget.requestId }, staticTrace);
+  const tracedTiming = buildLightRequestTiming_(navigationTraceBudget, navigationTraceBudget.startedAt);
+  assert.strictEqual(tracedTiming.mainFrameNavigationTraceV1.requestId, navigationTraceBudget.requestId);
+  assert.strictEqual(tracedTiming.topPageStaticFetchTraceV1.requestId, navigationTraceBudget.requestId);
+
   // Completion-first retains a hard safety boundary, while a simulated
   // 90-second Render response still has room to return under the 150-second
   // request budget.

@@ -14338,6 +14338,9 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     url: String(url || ''),
     finalUrl: String(url || ''),
     status: null,
+    bodyBytes: 0,
+    redirectCount: 0,
+    redirectCountKnown: true,
     error: '',
     signals: null
   };
@@ -14368,6 +14371,11 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
     });
     result.status = response && typeof response.status === 'number' ? response.status : null;
     result.finalUrl = response && response.url ? response.url : String(url || '');
+    // Fetch exposes a reliable "no redirect" result, but not an exact count
+    // once it has followed redirects. Preserve that distinction for trace-only
+    // diagnostics rather than inventing a redirect count.
+    result.redirectCountKnown = !(response && response.redirected === true);
+    result.redirectCount = result.redirectCountKnown ? 0 : null;
     const contentType = String(response && response.headers && response.headers.get && response.headers.get('content-type') || '');
     if (!response || !response.ok) {
       result.error = result.status ? `HTTP ${result.status}` : 'fetch_failed';
@@ -14378,6 +14386,7 @@ async function fetchTopPageStaticSignals_(url, opts = {}) {
       return result;
     }
     const html = String(await response.text() || '').slice(0, 2 * 1024 * 1024);
+    result.bodyBytes = Buffer.byteLength(html, 'utf8');
     result.signals = extractTopPageStaticSignalsFromHtml_(url, result.finalUrl, result.status, html);
     result.success = !!(result.signals && result.signals.success);
     return result;
@@ -15281,6 +15290,143 @@ async function collectLightPostCoverageSupplementals_(page, finalUrl, options = 
     productSpecFlags: getLightSupplementalDiagnosticFlags_(productSpecTask)
   };
 }
+
+// This trace is deliberately observational: it attaches no routes and never
+// awaits, aborts, or otherwise influences main-frame navigation.
+const LIGHT_MAIN_FRAME_NAV_TRACE_MAX_EVENTS = 3;
+function getLightTraceOrigin_(url) {
+  const value = String(url || '');
+  if (/^about:blank$/i.test(value)) return 'about:blank';
+  if (/^chrome-error:/i.test(value)) return 'chrome-error:';
+  try { return new URL(value).origin; } catch (_) { return ''; }
+}
+function getLightTraceElapsedMs_(budget) {
+  return budget ? Math.max(0, Date.now() - Number(budget.startedAt || Date.now())) : 0;
+}
+function appendLightMainFrameTraceEvent_(trace, key, value, limit = LIGHT_MAIN_FRAME_NAV_TRACE_MAX_EVENTS) {
+  try {
+    if (!trace || !Array.isArray(trace[key])) return;
+    if (trace[key].length < limit) trace[key].push(value);
+  } catch (_) {
+    try { if (trace) trace.traceError = true; } catch (_) {}
+  }
+}
+function createLightMainFrameNavigationTrace_(budget) {
+  return {
+    requestId: String(budget && budget.requestId || ''),
+    gotoStartMs: null,
+    gotoOutcome: '',
+    gotoMs: 0,
+    pageOriginAtGotoEnd: '',
+    responsePresent: false,
+    gotoResponsePresent: false,
+    browserConnected: null,
+    pageClosed: null,
+    requests: [],
+    responses: [],
+    failures: [],
+    frameNavigations: [],
+    domContentLoadedMs: null,
+    loadMs: null,
+    traceError: false
+  };
+}
+function attachLightMainFrameNavigationTrace_(page, budget) {
+  const trace = budget && budget.mainFrameNavigationTraceV1
+    ? budget.mainFrameNavigationTraceV1
+    : createLightMainFrameNavigationTrace_(budget);
+  if (budget) budget.mainFrameNavigationTraceV1 = trace;
+  const safe = (fn) => {
+    try { fn(); } catch (_) { trace.traceError = true; }
+  };
+  const isMainDocument = (request) => {
+    try {
+      return !!request && request.resourceType() === 'document' && request.isNavigationRequest() && request.frame() === page.mainFrame();
+    } catch (_) {
+      trace.traceError = true;
+      return false;
+    }
+  };
+  try {
+    if (!page || typeof page.on !== 'function') throw new Error('page_event_listener_unavailable');
+    page.on('request', (request) => safe(() => {
+      if (!isMainDocument(request)) return;
+      appendLightMainFrameTraceEvent_(trace, 'requests', {
+        origin: getLightTraceOrigin_(request.url()),
+        resourceType: String(request.resourceType() || ''),
+        method: String(request.method() || ''),
+        elapsedMs: getLightTraceElapsedMs_(budget)
+      });
+    }));
+    page.on('response', (response) => safe(() => {
+      const request = response && typeof response.request === 'function' ? response.request() : null;
+      if (!isMainDocument(request)) return;
+      trace.responsePresent = true;
+      appendLightMainFrameTraceEvent_(trace, 'responses', {
+        origin: getLightTraceOrigin_(response.url()),
+        status: typeof response.status === 'function' ? Number(response.status()) : null,
+        elapsedMs: getLightTraceElapsedMs_(budget)
+      });
+    }));
+    page.on('requestfailed', (request) => safe(() => {
+      if (!isMainDocument(request)) return;
+      const failure = typeof request.failure === 'function' ? request.failure() : null;
+      appendLightMainFrameTraceEvent_(trace, 'failures', {
+        origin: getLightTraceOrigin_(request.url()),
+        errorText: String(failure && failure.errorText || '').slice(0, 120),
+        elapsedMs: getLightTraceElapsedMs_(budget)
+      }, 1);
+    }));
+    page.on('framenavigated', (frame) => safe(() => {
+      if (!frame || frame !== page.mainFrame()) return;
+      appendLightMainFrameTraceEvent_(trace, 'frameNavigations', {
+        origin: getLightTraceOrigin_(frame.url()),
+        elapsedMs: getLightTraceElapsedMs_(budget)
+      });
+    }));
+    page.on('domcontentloaded', () => safe(() => {
+      if (trace.domContentLoadedMs === null) trace.domContentLoadedMs = getLightTraceElapsedMs_(budget);
+    }));
+    page.on('load', () => safe(() => {
+      if (trace.loadMs === null) trace.loadMs = getLightTraceElapsedMs_(budget);
+    }));
+  } catch (_) {
+    trace.traceError = true;
+  }
+  return trace;
+}
+function markLightMainFrameGotoTrace_(budget, page, fields = {}) {
+  const trace = budget && budget.mainFrameNavigationTraceV1;
+  if (!trace) return;
+  try {
+    Object.assign(trace, fields);
+    if (Object.prototype.hasOwnProperty.call(fields, 'gotoOutcome')) {
+      trace.gotoMs = Math.max(0, Number(fields.gotoMs || 0) || 0);
+      trace.pageOriginAtGotoEnd = getLightTraceOrigin_(page && typeof page.url === 'function' ? page.url() : '');
+      trace.pageClosed = !!(page && typeof page.isClosed === 'function' && page.isClosed());
+      const browser = budget && budget.currentAttempt && budget.currentAttempt.browser;
+      trace.browserConnected = browser && typeof browser.isConnected === 'function' ? !!browser.isConnected() : null;
+    }
+  } catch (_) {
+    trace.traceError = true;
+  }
+}
+function buildLightStaticFetchTrace_(result, targetUrl) {
+  try {
+    const initialOrigin = getLightTraceOrigin_(targetUrl);
+    const finalOrigin = getLightTraceOrigin_(result && result.finalUrl);
+    return {
+      success: result && result.success === true,
+      status: result && typeof result.status === 'number' ? result.status : null,
+      elapsedMs: Math.max(0, Number(result && result.elapsedMs || 0) || 0),
+      bodyBytes: Math.max(0, Number(result && result.bodyBytes || 0) || 0),
+      redirectCount: result && result.redirectCountKnown === false ? null : Math.max(0, Number(result && result.redirectCount || 0) || 0),
+      finalOriginMatches: !!initialOrigin && initialOrigin === finalOrigin
+    };
+  } catch (_) {
+    return { success: false, status: null, elapsedMs: 0, bodyBytes: 0, redirectCount: null, finalOriginMatches: false, traceError: true };
+  }
+}
 function buildLightRequestTiming_(budget, processingStartedAt) {
   if (!budget) return null;
   const now = Date.now();
@@ -15315,6 +15461,29 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
       : null,
     resilience: budget.resilience && typeof budget.resilience === 'object'
       ? Object.assign({}, budget.resilience)
+      : null,
+    topPageStaticFetchTraceV1: budget.topPageStaticFetchTraceV1 && typeof budget.topPageStaticFetchTraceV1 === 'object'
+      ? Object.assign({}, budget.topPageStaticFetchTraceV1)
+      : null,
+    mainFrameNavigationTraceV1: budget.mainFrameNavigationTraceV1 && typeof budget.mainFrameNavigationTraceV1 === 'object'
+      ? {
+          requestId: String(budget.mainFrameNavigationTraceV1.requestId || ''),
+          gotoStartMs: budget.mainFrameNavigationTraceV1.gotoStartMs,
+          gotoOutcome: String(budget.mainFrameNavigationTraceV1.gotoOutcome || ''),
+          gotoMs: Number(budget.mainFrameNavigationTraceV1.gotoMs || 0),
+          pageOriginAtGotoEnd: String(budget.mainFrameNavigationTraceV1.pageOriginAtGotoEnd || ''),
+          responsePresent: budget.mainFrameNavigationTraceV1.responsePresent === true,
+          gotoResponsePresent: budget.mainFrameNavigationTraceV1.gotoResponsePresent === true,
+          browserConnected: budget.mainFrameNavigationTraceV1.browserConnected,
+          pageClosed: budget.mainFrameNavigationTraceV1.pageClosed,
+          requests: Array.isArray(budget.mainFrameNavigationTraceV1.requests) ? budget.mainFrameNavigationTraceV1.requests.slice(0, LIGHT_MAIN_FRAME_NAV_TRACE_MAX_EVENTS) : [],
+          responses: Array.isArray(budget.mainFrameNavigationTraceV1.responses) ? budget.mainFrameNavigationTraceV1.responses.slice(0, LIGHT_MAIN_FRAME_NAV_TRACE_MAX_EVENTS) : [],
+          failures: Array.isArray(budget.mainFrameNavigationTraceV1.failures) ? budget.mainFrameNavigationTraceV1.failures.slice(0, 1) : [],
+          frameNavigations: Array.isArray(budget.mainFrameNavigationTraceV1.frameNavigations) ? budget.mainFrameNavigationTraceV1.frameNavigations.slice(0, LIGHT_MAIN_FRAME_NAV_TRACE_MAX_EVENTS) : [],
+          domContentLoadedMs: budget.mainFrameNavigationTraceV1.domContentLoadedMs,
+          loadMs: budget.mainFrameNavigationTraceV1.loadMs,
+          traceError: budget.mainFrameNavigationTraceV1.traceError === true
+        }
       : null,
     lightStageGapsV1: {
       requestId: budget.requestId,
@@ -16139,6 +16308,12 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       ? await runLightBudgetStage_(lightBudget, 'top_static_fetch', 20000,
           (timeoutMs) => fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode, timeoutMs, signal: lightAttempt && lightAttempt.controller && lightAttempt.controller.signal }))
         : await fetchTopPageStaticSignals_(urlToFetch, { siteMode, signalsMode, responseMode });
+      if (signalsFirstLight) {
+        lightBudget.topPageStaticFetchTraceV1 = Object.assign(
+          { requestId: lightBudget.requestId },
+          buildLightStaticFetchTrace_(topPageStaticFetchResult, urlToFetch)
+        );
+      }
       scrapeTiming.spans.top_page_static_fetch = Math.max(0, Date.now() - __timingTopPageStaticFetchStart);
       logSf('TOP_PAGE_STATIC_FETCH_DONE', {
         success: topPageStaticFetchResult && topPageStaticFetchResult.success,
@@ -18698,6 +18873,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     if (signalsFirstLight) {
       markLightStageCheckpoint_(lightBudget, 'top_page_goto', 'top_page_goto_start');
       recordLightCheckpoint_(lightBudget, 'before_top_page_goto_budget_check');
+      attachLightMainFrameNavigationTrace_(page, lightBudget);
+      markLightMainFrameGotoTrace_(lightBudget, page, { gotoStartMs: getLightTraceElapsedMs_(lightBudget) });
     }
     const topGotoTimeoutMs = signalsFirstLight
       ? requireLightCoreBudget('top_page_goto', 60000, 4000)
@@ -18709,8 +18886,22 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     let resp;
     try {
       resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
+      if (signalsFirstLight) {
+        markLightMainFrameGotoTrace_(lightBudget, page, {
+          gotoOutcome: 'success',
+          gotoMs: Math.max(0, Date.now() - __timingInitialWaitStart),
+          gotoResponsePresent: !!resp
+        });
+      }
     } catch (err) {
       scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
+      if (signalsFirstLight) {
+        markLightMainFrameGotoTrace_(lightBudget, page, {
+          gotoOutcome: isLightTopGotoTimeoutError_(err) ? 'timeout' : 'error',
+          gotoMs: scrapeTiming.gotoMs,
+          gotoResponsePresent: !!resp
+        });
+      }
       if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
         lightBudget.gotoFallback.gotoTimedOut = true;
         lightBudget.gotoFallback.domFallbackAttempted = true;
@@ -23101,6 +23292,11 @@ module.exports.__lightBudgetTestHooks = {
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
+  getLightTraceOrigin_,
+  createLightMainFrameNavigationTrace_,
+  attachLightMainFrameNavigationTrace_,
+  markLightMainFrameGotoTrace_,
+  buildLightStaticFetchTrace_,
   buildLightRequestTiming_,
   sendLightBudgetTimeout_,
   runLightBudgetStage_,
