@@ -4,6 +4,10 @@ const {
   createLightAttempt_,
   cleanupLightAttempt_,
   getLightPageCreateTimeoutMs_,
+  getLightDomFallbackTimeoutMs_,
+  isLightTopGotoTimeoutError_,
+  assessLightDomFallbackSentinel_,
+  probeLightDomReadiness_,
   lightSetupRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
@@ -40,6 +44,37 @@ function responseSpy() {
   };
 }
 
+function domCandidate(overrides = {}) {
+  return Object.assign({
+    url: 'https://sitakke.jp/',
+    readyState: 'interactive',
+    hasBody: true,
+    bodyTextLength: 100,
+    h1Count: 1,
+    headingCount: 3,
+    linkCount: 5,
+    hasHeaderElement: true,
+    hasNavElement: true,
+    hasFooterElement: true,
+    imgCount: 1,
+    challengeOrError: false
+  }, overrides);
+}
+
+function probePage(sequence, options = {}) {
+  const values = Array.isArray(sequence) ? sequence.slice() : [];
+  let last = values.length ? values[values.length - 1] : domCandidate();
+  return {
+    isClosed: () => options.closed === true,
+    evaluate: async () => {
+      const next = values.length ? values.shift() : last;
+      last = next;
+      if (next instanceof Error) throw next;
+      return next;
+    }
+  };
+}
+
 (async () => {
   // A: normal setup stage keeps its result.
   const normalBudget = budgetFor(100);
@@ -52,6 +87,67 @@ function responseSpy() {
   assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 8000);
   pageCreateBudget.deadlineAt = Date.now() + 4200;
   assert.strictEqual(getLightPageCreateTimeoutMs_(pageCreateBudget), 0);
+
+  // A-C/H: only a Playwright goto TimeoutError is eligible, and a stable DOM
+  // candidate accepts zero/false observations as valid results.
+  assert.strictEqual(isLightTopGotoTimeoutError_({ name: 'TimeoutError', message: 'page.goto: Timeout 25000ms exceeded' }), true);
+  assert.strictEqual(isLightTopGotoTimeoutError_({ name: 'Error', message: 'navigation failed' }), false);
+  assert.strictEqual(assessLightDomFallbackSentinel_(domCandidate({
+    bodyTextLength: 0, h1Count: 0, headingCount: 0, linkCount: 0,
+    hasHeaderElement: false, hasNavElement: false, hasFooterElement: false, imgCount: 0
+  }), 'https://sitakke.jp/').accepted, true);
+  let probeClock = 0;
+  const probeOptions = { maxMs: 20, pollMs: 2, now: () => probeClock, wait: async ms => { probeClock += ms; } };
+  const delayedDom = await probeLightDomReadiness_(probePage([
+    new Error('Execution context was destroyed, most likely because of a navigation'),
+    domCandidate(),
+    domCandidate()
+  ]), 'https://sitakke.jp/', budgetFor(48000), probeOptions);
+  assert.strictEqual(delayedDom.accepted, true);
+  assert.strictEqual(delayedDom.reason, 'sentinel_ready');
+  probeClock = 0;
+  const immediateDom = await probeLightDomReadiness_(probePage([domCandidate(), domCandidate()]), 'https://sitakke.jp/', budgetFor(48000), probeOptions);
+  assert.strictEqual(immediateDom.accepted, true);
+
+  // D-G/I-K: the bounded probe refuses unavailable, unsafe, malformed, and
+  // budget-exhausted documents without making a fresh-browser retry eligible.
+  probeClock = 0;
+  const unavailableDom = await probeLightDomReadiness_(probePage([new Error('Execution context was destroyed')]), 'https://sitakke.jp/', budgetFor(48000), probeOptions);
+  assert.strictEqual(unavailableDom.accepted, false);
+  assert.strictEqual(unavailableDom.reason, 'navigation_in_progress');
+  for (const candidate of [
+    domCandidate({ url: 'about:blank' }),
+    domCandidate({ url: 'https://example.com/' }),
+    domCandidate({ hasBody: false }),
+    domCandidate({ challengeOrError: true })
+  ]) {
+    probeClock = 0;
+    const rejected = await probeLightDomReadiness_(probePage([candidate]), 'https://sitakke.jp/', budgetFor(48000), probeOptions);
+    assert.strictEqual(rejected.accepted, false);
+  }
+  probeClock = 0;
+  const closedDom = await probeLightDomReadiness_(probePage([], { closed: true }), 'https://sitakke.jp/', budgetFor(48000), probeOptions);
+  assert.strictEqual(closedDom.reason, 'page_closed');
+  const disconnectedDom = await probeLightDomReadiness_(probePage([domCandidate()]), 'https://sitakke.jp/', budgetFor(48000), Object.assign({}, probeOptions, {
+    attempt: { browser: { isConnected: () => false } }
+  }));
+  assert.strictEqual(disconnectedDom.reason, 'browser_disconnected');
+  const shortFallbackBudget = budgetFor(48000);
+  shortFallbackBudget.deadlineAt = Date.now() + 100;
+  assert.strictEqual(getLightDomFallbackTimeoutMs_(shortFallbackBudget), 0);
+  const noBudgetDom = await probeLightDomReadiness_(probePage([]), 'https://sitakke.jp/', shortFallbackBudget, { now: Date.now, wait: async () => {} });
+  assert.strictEqual(noBudgetDom.reason, 'insufficient_remaining');
+  const deadlineProbeBudget = budgetFor(48000);
+  deadlineProbeBudget.activeStage = 'top_page_dom_fallback';
+  deadlineProbeBudget.timedOut = true;
+  const deadlineDom = await probeLightDomReadiness_(probePage([]), 'https://sitakke.jp/', deadlineProbeBudget, probeOptions);
+  assert.strictEqual(deadlineDom.reason, 'overall_deadline');
+  assert.strictEqual(deadlineProbeBudget.activeStage, 'top_page_dom_fallback');
+  const evaluateTimeoutDom = await probeLightDomReadiness_({
+    isClosed: () => false,
+    evaluate: () => new Promise(() => {})
+  }, 'https://sitakke.jp/', budgetFor(48000), { maxMs: 5, pollMs: 1 });
+  assert.strictEqual(evaluateTimeoutDom.reason, 'probe_evaluate_timeout');
 
   // CP1-CP4: the compact checkpoints preserve ordering and isolate each gap.
   const checkpointBudget = budgetFor(200);

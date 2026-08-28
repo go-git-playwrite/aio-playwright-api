@@ -14623,6 +14623,9 @@ const queue = new PQueue({ concurrency: CONCURRENCY });
 const LIGHT_REQUEST_BUDGET_MS = Math.max(30000, Math.min(55000, Number(process.env.LIGHT_REQUEST_BUDGET_MS || 48000) || 48000));
 const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.LIGHT_CORE_RESERVE_MS || 6000) || 6000));
 const LIGHT_RESPONSE_CLEANUP_RESERVE_MS = 5000;
+const LIGHT_DOM_FALLBACK_MAX_MS = 3000;
+const LIGHT_DOM_FALLBACK_POLL_MS = 125;
+const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESERVE_MS + LIGHT_RESPONSE_CLEANUP_RESERVE_MS;
 const LIGHT_SETUP_RETRY_ADMISSION_MS = 18000;
 const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 28000;
 const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
@@ -14642,6 +14645,13 @@ function createLightRequestBudget_(requestStartedAt) {
     queueStartedAt: 0,
     checkpoints: {},
     geoPhaseTimings: null,
+    gotoFallback: {
+      gotoTimedOut: false,
+      domFallbackAttempted: false,
+      domFallbackAccepted: false,
+      domFallbackMs: 0,
+      domFallbackReason: ''
+    },
     currentAttempt: null,
     attemptSequence: 0,
     resilience: {
@@ -14726,6 +14736,133 @@ async function cleanupLightAttempt_(attempt, reason, opts = {}) {
 function getLightPageCreateTimeoutMs_(budget) {
   return Math.max(0, Math.min(8000, getLightBudgetRemainingMs_(budget) - LIGHT_RESPONSE_CLEANUP_RESERVE_MS));
 }
+function getLightDomFallbackTimeoutMs_(budget) {
+  return Math.max(0, Math.min(
+    LIGHT_DOM_FALLBACK_MAX_MS,
+    getLightBudgetRemainingMs_(budget) - LIGHT_DOM_FALLBACK_RESERVE_MS
+  ));
+}
+function isLightTopGotoTimeoutError_(error) {
+  if (!error) return false;
+  const name = String(error.name || '');
+  const message = String(error.message || error || '');
+  return name === 'TimeoutError' && /page\.goto|navigat/i.test(message);
+}
+function isLightFallbackOriginAllowed_(targetUrl, currentUrl) {
+  try {
+    const target = new URL(String(targetUrl || ''));
+    const current = new URL(String(currentUrl || ''));
+    const normalize = host => String(host || '').toLowerCase().replace(/^www\./, '');
+    const targetHost = normalize(target.hostname);
+    const currentHost = normalize(current.hostname);
+    return current.protocol === target.protocol && (
+      currentHost === targetHost ||
+      currentHost.endsWith(`.${targetHost}`) ||
+      targetHost.endsWith(`.${currentHost}`)
+    );
+  } catch (_) {
+    return false;
+  }
+}
+function assessLightDomFallbackSentinel_(candidate, targetUrl) {
+  if (!candidate || typeof candidate !== 'object') return { accepted: false, reason: 'evaluate_invalid' };
+  const url = String(candidate.url || '');
+  if (!url || /^about:blank$|^chrome-error:/i.test(url)) return { accepted: false, reason: 'blank_or_error_document' };
+  if (!isLightFallbackOriginAllowed_(targetUrl, url)) return { accepted: false, reason: 'origin_mismatch' };
+  if (candidate.challengeOrError === true) return { accepted: false, reason: 'challenge_or_error_page' };
+  if (candidate.hasBody !== true) return { accepted: false, reason: 'body_missing' };
+  if (!['interactive', 'complete'].includes(String(candidate.readyState || ''))) return { accepted: false, reason: 'document_not_ready' };
+  const numericFields = ['bodyTextLength', 'h1Count', 'headingCount', 'linkCount', 'imgCount'];
+  if (numericFields.some(key => typeof candidate[key] !== 'number' || !Number.isFinite(candidate[key]))) return { accepted: false, reason: 'sentinel_number_missing' };
+  const semanticFields = ['hasHeaderElement', 'hasNavElement', 'hasFooterElement'];
+  if (semanticFields.some(key => typeof candidate[key] !== 'boolean')) return { accepted: false, reason: 'sentinel_boolean_missing' };
+  return { accepted: true, reason: 'sentinel_ready', url };
+}
+async function probeLightDomReadiness_(page, targetUrl, budget, opts = {}) {
+  const now = typeof opts.now === 'function' ? opts.now : Date.now;
+  const wait = typeof opts.wait === 'function'
+    ? opts.wait
+    : (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const maxMs = Number.isFinite(Number(opts.maxMs))
+    ? Math.max(0, Number(opts.maxMs))
+    : getLightDomFallbackTimeoutMs_(budget);
+  const pollMs = Math.max(1, Number(opts.pollMs || LIGHT_DOM_FALLBACK_POLL_MS));
+  const startedAt = now();
+  const attempt = opts && opts.attempt;
+  if (attempt && attempt.browser && typeof attempt.browser.isConnected === 'function' && !attempt.browser.isConnected()) {
+    return { accepted: false, ms: 0, reason: 'browser_disconnected' };
+  }
+  if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return { accepted: false, ms: 0, reason: 'page_closed' };
+  if (budget && budget.timedOut) return { accepted: false, ms: 0, reason: 'overall_deadline' };
+  if (maxMs < pollMs) return { accepted: false, ms: 0, reason: 'insufficient_remaining' };
+  let stableUrl = '';
+  let stableCount = 0;
+  let lastReason = 'probe_window_exhausted';
+  while (now() - startedAt <= maxMs) {
+    if (budget && budget.timedOut) return { accepted: false, ms: Math.max(0, now() - startedAt), reason: 'overall_deadline' };
+    if (attempt && attempt.browser && typeof attempt.browser.isConnected === 'function' && !attempt.browser.isConnected()) {
+      return { accepted: false, ms: Math.max(0, now() - startedAt), reason: 'browser_disconnected' };
+    }
+    if (typeof page.isClosed === 'function' && page.isClosed()) return { accepted: false, ms: Math.max(0, now() - startedAt), reason: 'page_closed' };
+    const remainingProbeMs = Math.max(1, maxMs - (now() - startedAt));
+    let evaluateTimer = null;
+    const evaluated = await Promise.race([
+      Promise.resolve().then(() => page.evaluate(() => {
+        const body = document.body;
+        const bodyText = String(body && (body.innerText || body.textContent) || '').replace(/\s+/g, ' ').trim();
+        const links = Array.from(document.querySelectorAll('a[href]'));
+        const url = location.href;
+        const title = String(document.title || '');
+        const textPrefix = bodyText.slice(0, 500);
+        const challengeOrError = /chrome-error:|ERR_[A-Z_]+|just a moment|checking your browser|captcha|attention required|access denied|application error|bad gateway|site can.t be reached/i.test(`${url}\n${title}\n${textPrefix}`);
+        return {
+          url,
+          readyState: document.readyState,
+          hasBody: !!body,
+          bodyTextLength: bodyText.length,
+          h1Count: document.querySelectorAll('h1').length,
+          headingCount: document.querySelectorAll('h1,h2,h3,h4,h5,h6').length,
+          linkCount: links.length,
+          hasHeaderElement: !!document.querySelector('header'),
+          hasNavElement: !!document.querySelector('nav,[role="navigation"]'),
+          hasFooterElement: !!document.querySelector('footer'),
+          imgCount: document.images.length,
+          challengeOrError
+        };
+      })).then(candidate => ({ candidate }), error => ({ error })),
+      new Promise(resolve => { evaluateTimer = setTimeout(() => resolve({ timedOut: true }), remainingProbeMs); })
+    ]);
+    if (evaluateTimer) clearTimeout(evaluateTimer);
+    if (evaluated && evaluated.timedOut) return { accepted: false, ms: Math.max(0, now() - startedAt), reason: 'probe_evaluate_timeout' };
+    if (evaluated && evaluated.error) {
+      const message = String(evaluated.error && evaluated.error.message || evaluated.error || '');
+      if (/Execution context was destroyed|navigation/i.test(message)) {
+        lastReason = 'navigation_in_progress';
+      } else {
+        return { accepted: false, ms: Math.max(0, now() - startedAt), reason: 'evaluate_failed' };
+      }
+      await wait(pollMs);
+      continue;
+    }
+    const candidate = evaluated && evaluated.candidate;
+    const assessed = assessLightDomFallbackSentinel_(candidate, targetUrl);
+    if (assessed.accepted) {
+      stableCount = stableUrl === assessed.url ? stableCount + 1 : 1;
+      stableUrl = assessed.url;
+      if (stableCount >= 2) return { accepted: true, ms: Math.max(0, now() - startedAt), reason: assessed.reason, url: assessed.url };
+      lastReason = 'url_stabilizing';
+    } else {
+      stableUrl = '';
+      stableCount = 0;
+      lastReason = assessed.reason;
+      if (['blank_or_error_document', 'origin_mismatch', 'challenge_or_error_page'].includes(assessed.reason)) {
+        return { accepted: false, ms: Math.max(0, now() - startedAt), reason: assessed.reason };
+      }
+    }
+    await wait(pollMs);
+  }
+  return { accepted: false, ms: Math.max(0, now() - startedAt), reason: lastReason };
+}
 function lightSetupRetryAdmission_(budget, attempt, stage) {
   const elapsedMs = budget ? Math.max(0, Date.now() - budget.startedAt) : Number.POSITIVE_INFINITY;
   const remainingMs = getLightBudgetRemainingMs_(budget);
@@ -14778,6 +14915,11 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
     browserContextMs: Number(budget.stageMs && budget.stageMs.browserContextMs || 0),
     pageCreateMs: Number(budget.stageMs && budget.stageMs.pageCreateMs || 0),
     initScriptMs: Number(budget.stageMs && budget.stageMs.initScriptMs || 0),
+    gotoTimedOut: budget.gotoFallback && budget.gotoFallback.gotoTimedOut === true,
+    domFallbackAttempted: budget.gotoFallback && budget.gotoFallback.domFallbackAttempted === true,
+    domFallbackAccepted: budget.gotoFallback && budget.gotoFallback.domFallbackAccepted === true,
+    domFallbackMs: Number(budget.gotoFallback && budget.gotoFallback.domFallbackMs || 0),
+    domFallbackReason: String(budget.gotoFallback && budget.gotoFallback.domFallbackReason || ''),
     geoPhaseTimings: budget.geoPhaseTimings && typeof budget.geoPhaseTimings === 'object'
       ? Object.assign({}, budget.geoPhaseTimings)
       : null,
@@ -18159,8 +18301,23 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     try {
       resp = await page.goto(urlToFetch, { waitUntil: 'domcontentloaded', timeout: topGotoTimeoutMs });
     } catch (err) {
-      if (signalsFirstLight) throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
-      throw err;
+      scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
+      if (signalsFirstLight && isLightTopGotoTimeoutError_(err)) {
+        lightBudget.gotoFallback.gotoTimedOut = true;
+        lightBudget.gotoFallback.domFallbackAttempted = true;
+        lightBudget.activeStage = 'top_page_dom_fallback';
+        const fallback = await probeLightDomReadiness_(page, urlToFetch, lightBudget, { attempt: lightAttempt });
+        lightBudget.gotoFallback.domFallbackMs = Number(fallback && fallback.ms || 0);
+        lightBudget.gotoFallback.domFallbackAccepted = !!(fallback && fallback.accepted);
+        lightBudget.gotoFallback.domFallbackReason = String(fallback && fallback.reason || 'probe_failed');
+        if (!fallback || fallback.accepted !== true) {
+          throw createLightBudgetError_('top_page_dom_fallback', String(fallback && fallback.reason || err && (err.message || err) || 'navigation_failed'));
+        }
+      } else if (signalsFirstLight) {
+        throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
+      } else {
+        throw err;
+      }
     }
     if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'top_page_goto_end');
     scrapeTiming.gotoMs = Math.max(0, Date.now() - __timingInitialWaitStart);
@@ -22493,6 +22650,10 @@ module.exports.__lightBudgetTestHooks = {
   markLightAttemptFailure_,
   cleanupLightAttempt_,
   getLightPageCreateTimeoutMs_,
+  getLightDomFallbackTimeoutMs_,
+  isLightTopGotoTimeoutError_,
+  assessLightDomFallbackSentinel_,
+  probeLightDomReadiness_,
   lightSetupRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
