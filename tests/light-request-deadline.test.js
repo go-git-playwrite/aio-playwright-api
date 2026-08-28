@@ -18,6 +18,8 @@ const {
   getLightNavigationRecoveryTimeoutMs_,
   recoverLightTopPageNavigation_,
   lightSetupRetryAdmission_,
+  isLightNavigationProbeRetryableFailure_,
+  lightNavigationProbeRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
@@ -854,6 +856,100 @@ function probePage(sequence, options = {}) {
   assert.strictEqual(failures, 2);
   assert.strictEqual(secondFailureResponse.statusCode, 504);
   assert.strictEqual(secondFailureBudget.resilience.secondAttemptStage, 'page_create');
+
+  // Navigation-probe retry is narrower than setup retry: only a timed-out
+  // goto whose same-page recovery reached DCL and whose probe evaluate hung.
+  const navigationRetryBudget = budgetFor(70000);
+  navigationRetryBudget.gotoFallback.gotoTimedOut = true;
+  navigationRetryBudget.navigationRecovery = { attempted: true, accepted: true, waitMs: 6, timedOut: false, reason: 'domcontentloaded' };
+  const navigationRetryResponse = responseSpy();
+  let navigationAttempts = 0;
+  let firstNavigationAttemptId = '';
+  let secondNavigationAttemptId = '';
+  let firstNavigationResponseSent = null;
+  await runLightScrapeWithSetupRetry_(null, navigationRetryResponse, navigationRetryBudget, async () => {
+    navigationAttempts += 1;
+    const attempt = createLightAttempt_(navigationRetryBudget);
+    if (navigationAttempts === 1) {
+      firstNavigationAttemptId = attempt.id;
+      attempt.page = { close: async () => {} };
+      firstNavigationResponseSent = navigationRetryResponse.headersSent;
+      const error = new Error('probe evaluate timed out');
+      error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+      error.lightBudgetStage = 'top_page_dom_fallback';
+      error.lightFailureReason = 'probe_evaluate_timeout';
+      error.lightAttempt = attempt;
+      throw error;
+    }
+    secondNavigationAttemptId = attempt.id;
+    navigationRetryResponse.status(200).json({ ok: true, freshAttempt: attempt.id });
+  });
+  assert.strictEqual(navigationAttempts, 2);
+  assert.strictEqual(firstNavigationResponseSent, false);
+  assert.notStrictEqual(firstNavigationAttemptId, secondNavigationAttemptId);
+  assert.strictEqual(navigationRetryResponse.statusCode, 200);
+  assert.strictEqual(navigationRetryBudget.resilience.retryPerformed, true);
+  assert.strictEqual(navigationRetryBudget.resilience.retryKind, 'navigation_probe');
+  assert.strictEqual(navigationRetryBudget.resilience.firstFailureStage, 'top_page_dom_fallback');
+  assert.strictEqual(navigationRetryBudget.resilience.firstFailureReason, 'probe_evaluate_timeout');
+  assert.strictEqual(navigationRetryBudget.resilience.retryAdmission, 'navigation_probe_retry_admitted');
+
+  const navigationAdmissionAttempt = createLightAttempt_(budgetFor(70000));
+  navigationAdmissionAttempt.cleanupComplete = true;
+  const navigationAdmissionBudget = budgetFor(70000);
+  navigationAdmissionBudget.gotoFallback.gotoTimedOut = true;
+  navigationAdmissionBudget.navigationRecovery = { attempted: true, accepted: true };
+  assert.strictEqual(isLightNavigationProbeRetryableFailure_(navigationAdmissionBudget, 'top_page_dom_fallback', 'probe_evaluate_timeout'), true);
+  assert.strictEqual(lightNavigationProbeRetryAdmission_(navigationAdmissionBudget, navigationAdmissionAttempt, 'top_page_dom_fallback', 'probe_evaluate_timeout').allowed, true);
+  for (const reason of ['origin_mismatch', 'challenge_or_error_page', 'browser_error_document', 'sentinel_number_missing']) {
+    assert.strictEqual(isLightNavigationProbeRetryableFailure_(navigationAdmissionBudget, 'top_page_dom_fallback', reason), false, reason);
+  }
+  const shortNavigationBudget = budgetFor(59000);
+  shortNavigationBudget.gotoFallback.gotoTimedOut = true;
+  shortNavigationBudget.navigationRecovery = { attempted: true, accepted: true };
+  const shortNavigationAttempt = createLightAttempt_(shortNavigationBudget);
+  shortNavigationAttempt.cleanupComplete = true;
+  assert.strictEqual(lightNavigationProbeRetryAdmission_(shortNavigationBudget, shortNavigationAttempt, 'top_page_dom_fallback', 'probe_evaluate_timeout').reason, 'insufficient_remaining');
+
+  const navigationCleanupFailureResponse = responseSpy();
+  const navigationCleanupFailureBudget = budgetFor(70000);
+  navigationCleanupFailureBudget.gotoFallback.gotoTimedOut = true;
+  navigationCleanupFailureBudget.navigationRecovery = { attempted: true, accepted: true };
+  let navigationCleanupFailureAttempts = 0;
+  await runLightScrapeWithSetupRetry_(null, navigationCleanupFailureResponse, navigationCleanupFailureBudget, async () => {
+    navigationCleanupFailureAttempts += 1;
+    const attempt = createLightAttempt_(navigationCleanupFailureBudget);
+    attempt.page = { close: async () => { throw new Error('close_failed'); } };
+    const error = new Error('probe evaluate timed out');
+    error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+    error.lightBudgetStage = 'top_page_dom_fallback';
+    error.lightFailureReason = 'probe_evaluate_timeout';
+    error.lightAttempt = attempt;
+    throw error;
+  });
+  assert.strictEqual(navigationCleanupFailureAttempts, 1);
+  assert.strictEqual(navigationCleanupFailureResponse.statusCode, 504);
+  assert.strictEqual(navigationCleanupFailureBudget.resilience.retryPerformed, false);
+  assert.strictEqual(navigationCleanupFailureBudget.resilience.retryAdmission, 'cleanup_incomplete');
+
+  const navigationSecondFailureBudget = budgetFor(70000);
+  navigationSecondFailureBudget.gotoFallback.gotoTimedOut = true;
+  navigationSecondFailureBudget.navigationRecovery = { attempted: true, accepted: true };
+  const navigationSecondFailureResponse = responseSpy();
+  let navigationFailures = 0;
+  await runLightScrapeWithSetupRetry_(null, navigationSecondFailureResponse, navigationSecondFailureBudget, async () => {
+    navigationFailures += 1;
+    const attempt = createLightAttempt_(navigationSecondFailureBudget);
+    const error = new Error('probe evaluate timed out');
+    error.code = 'LIGHT_REQUEST_BUDGET_EXHAUSTED';
+    error.lightBudgetStage = 'top_page_dom_fallback';
+    error.lightFailureReason = 'probe_evaluate_timeout';
+    error.lightAttempt = attempt;
+    throw error;
+  });
+  assert.strictEqual(navigationFailures, 2);
+  assert.strictEqual(navigationSecondFailureResponse.statusCode, 504);
+  assert.strictEqual(navigationSecondFailureBudget.resilience.secondAttemptStage, 'top_page_dom_fallback');
 
   console.log('light-request-deadline fixtures: ok');
 })().catch((error) => {

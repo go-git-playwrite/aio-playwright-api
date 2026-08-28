@@ -14848,6 +14848,17 @@ const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 10000;
 const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 2000;
 const LIGHT_HYDRATION_MAX_MS = 20000;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
+// A navigation-probe retry needs a fresh practical setup window, a normal
+// top-page navigation window, core/response reserve, and modest headroom.
+// Coverage remains best-effort on the second attempt and is never fabricated.
+const LIGHT_NAVIGATION_PROBE_RETRY_SETUP_FLOOR_MS = 12000;
+const LIGHT_NAVIGATION_PROBE_RETRY_GOTO_FLOOR_MS = 30000;
+const LIGHT_NAVIGATION_PROBE_RETRY_HEADROOM_MS = 7000;
+const LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS =
+  LIGHT_NAVIGATION_PROBE_RETRY_SETUP_FLOOR_MS +
+  LIGHT_NAVIGATION_PROBE_RETRY_GOTO_FLOOR_MS +
+  LIGHT_CORE_RESPONSE_RESERVE_MS +
+  LIGHT_NAVIGATION_PROBE_RETRY_HEADROOM_MS;
 
 function createLightRequestBudget_(requestStartedAt) {
   const startedAt = Number(requestStartedAt || Date.now()) || Date.now();
@@ -14884,6 +14895,8 @@ function createLightRequestBudget_(requestStartedAt) {
       retryPerformed: false,
       firstFailureStage: '',
       firstFailureCode: '',
+      firstFailureReason: '',
+      retryKind: '',
       retryAdmission: '',
       cleanupMs: 0,
       secondAttemptStage: ''
@@ -15191,6 +15204,30 @@ function lightSetupRetryAdmission_(budget, attempt, stage) {
   if (remainingMs < LIGHT_SETUP_RETRY_MIN_REMAINING_MS) return { allowed: false, reason: 'insufficient_remaining', elapsedMs, remainingMs };
   if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
   return { allowed: true, reason: 'setup_retry_admitted', elapsedMs, remainingMs };
+}
+function isLightNavigationProbeRetryableFailure_(budget, stage, reason) {
+  return !!(
+    budget &&
+    budget.timedOut !== true &&
+    String(stage || '') === 'top_page_dom_fallback' &&
+    String(reason || '') === 'probe_evaluate_timeout' &&
+    budget.gotoFallback && budget.gotoFallback.gotoTimedOut === true &&
+    budget.navigationRecovery && budget.navigationRecovery.attempted === true &&
+    budget.navigationRecovery.accepted === true
+  );
+}
+function lightNavigationProbeRetryAdmission_(budget, attempt, stage, reason) {
+  const remainingMs = getLightBudgetRemainingMs_(budget);
+  if (!isLightNavigationProbeRetryableFailure_(budget, stage, reason)) {
+    return { allowed: false, reason: 'non_navigation_probe_failure', remainingMs };
+  }
+  if (remainingMs < LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS) {
+    return { allowed: false, reason: 'insufficient_remaining', remainingMs };
+  }
+  if (!attempt || attempt.cleanupComplete !== true) {
+    return { allowed: false, reason: 'cleanup_incomplete', remainingMs };
+  }
+  return { allowed: true, reason: 'navigation_probe_retry_admitted', remainingMs };
 }
 
 function recordLightCheckpoint_(budget, name) {
@@ -15569,23 +15606,32 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
       const attempt = err && err.lightAttempt || lightBudget.currentAttempt;
       const stage = String(err && err.lightBudgetStage || attempt && attempt.failureStage || lightBudget.activeStage || 'unknown');
       const code = String(err && err.code || attempt && attempt.failureCode || 'PLAYWRIGHT_SETUP_FAILURE');
+      const failureReason = String(err && err.lightFailureReason || '');
+      const navigationProbeRetry = isLightNavigationProbeRetryableFailure_(lightBudget, stage, failureReason);
       markLightAttemptFailure_(attempt, stage, code);
       if (index === 0 && lightBudget.resilience) {
         lightBudget.resilience.firstFailureStage = stage;
         lightBudget.resilience.firstFailureCode = code;
+        lightBudget.resilience.firstFailureReason = failureReason;
+        lightBudget.resilience.retryKind = navigationProbeRetry ? 'navigation_probe' :
+          (LIGHT_RETRYABLE_SETUP_STAGES.has(stage) ? 'setup' : '');
       } else if (lightBudget.resilience) {
         lightBudget.resilience.secondAttemptStage = stage;
       }
       const cleanup = await cleanupLightAttempt_(attempt, 'setup_failure');
       if (lightBudget.resilience) lightBudget.resilience.cleanupMs = Math.max(Number(lightBudget.resilience.cleanupMs || 0), Number(cleanup && cleanup.cleanupMs || 0));
-      const admission = index === 0 ? lightSetupRetryAdmission_(lightBudget, attempt, stage) : { allowed: false, reason: 'retry_limit' };
+      const admission = index === 0
+        ? (navigationProbeRetry
+          ? lightNavigationProbeRetryAdmission_(lightBudget, attempt, stage, failureReason)
+          : lightSetupRetryAdmission_(lightBudget, attempt, stage))
+        : { allowed: false, reason: 'retry_limit' };
       if (lightBudget.resilience) lightBudget.resilience.retryAdmission = admission.reason;
       if (index === 0 && admission.allowed && !res.headersSent) {
         lightBudget.resilience.retryPerformed = true;
         // The first attempt's local timeout must not poison a fresh, admitted attempt.
         lightBudget.timedOut = false;
         lightBudget.timeoutStage = '';
-        lightBudget.activeStage = 'retry_setup';
+        lightBudget.activeStage = navigationProbeRetry ? 'retry_navigation_probe' : 'retry_setup';
         continue;
       }
       if (!res.headersSent) sendLightBudgetTimeout_(res, lightBudget, lightBudget.queueStartedAt || Date.now(), stage);
@@ -18781,7 +18827,9 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         lightBudget.gotoFallback.domFallbackAccepted = !!(fallback && fallback.accepted);
         lightBudget.gotoFallback.domFallbackReason = String(fallback && fallback.reason || 'probe_failed');
         if (!fallback || fallback.accepted !== true) {
-          throw createLightBudgetError_('top_page_dom_fallback', String(fallback && fallback.reason || err && (err.message || err) || 'navigation_failed'));
+          const failure = createLightBudgetError_('top_page_dom_fallback', String(fallback && fallback.reason || err && (err.message || err) || 'navigation_failed'));
+          failure.lightFailureReason = String(fallback && fallback.reason || 'probe_failed');
+          throw failure;
         }
       } else if (signalsFirstLight) {
         throw createLightBudgetError_('top_page_goto', String(err && (err.message || err) || 'navigation_failed'));
@@ -22803,7 +22851,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
     const elapsedMs = Date.now() - t0;
     const failureStage = String(err && err.lightBudgetStage || lightBudget && lightBudget.activeStage || 'unknown');
     const failureCode = String(err && err.code || 'PLAYWRIGHT_SETUP_FAILURE');
-    if (signalsFirstLight && scrapeOptions.deferRetryableSetupFailure && !res.headersSent && LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage)) {
+    const failureReason = String(err && err.lightFailureReason || '');
+    const retryableNavigationProbeFailure = isLightNavigationProbeRetryableFailure_(lightBudget, failureStage, failureReason);
+    if (signalsFirstLight && scrapeOptions.deferRetryableSetupFailure && !res.headersSent &&
+      (LIGHT_RETRYABLE_SETUP_STAGES.has(failureStage) || retryableNavigationProbeFailure)) {
       markLightAttemptFailure_(lightAttempt, failureStage, failureCode);
       err.lightBudgetStage = failureStage;
       err.lightAttempt = lightAttempt;
@@ -23158,6 +23209,8 @@ module.exports.__lightBudgetTestHooks = {
   getLightNavigationRecoveryTimeoutMs_,
   recoverLightTopPageNavigation_,
   lightSetupRetryAdmission_,
+  isLightNavigationProbeRetryableFailure_,
+  lightNavigationProbeRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
@@ -23173,6 +23226,7 @@ module.exports.__lightBudgetTestHooks = {
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
   LIGHT_SETUP_RETRY_MIN_REMAINING_MS,
+  LIGHT_NAVIGATION_PROBE_RETRY_MIN_REMAINING_MS,
   LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
   LIGHT_SUPPLEMENTAL_RESERVE_MS,
   LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
