@@ -13053,19 +13053,32 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
     // 直列走査は補助情報の重複になるため light では行わない。
     const needsOrganizationScriptScan = renderedStructuredForScriptScan.hasOrganization !== true &&
       !renderedOrganizationProfile.telephone && !renderedOrganizationProfile.address;
-    const scriptScanTimeoutMs = lightBudget && needsOrganizationScriptScan
-      ? takeLightBudgetTimeoutMs_(lightBudget, 'same_origin_script_scan', 2000, LIGHT_CORE_RESERVE_MS, 750)
-      : (needsOrganizationScriptScan ? 3000 : 0);
+    let scriptScanRun = null;
+    if (!balancedMode && needsOrganizationScriptScan) {
+      scriptScanRun = lightBudget
+        ? await runLightSupplementalBudgetTask_(
+            lightBudget,
+            'same_origin_script_scan',
+            LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
+            (timeoutMs) => collectSameOriginScriptSrcJsonLdSummaryLight(page, url, {
+              maxScripts: 3,
+              maxBytesPerScript: 512000,
+              requestTimeoutMs: timeoutMs,
+              lightBudget
+            }),
+            { reserveMs: LIGHT_SUPPLEMENTAL_RESERVE_MS, minimumMs: 750 }
+          )
+        : { state: 'completed', value: await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, { maxScripts: 3, maxBytesPerScript: 512000, requestTimeoutMs: 3000 }) };
+    }
+    const scriptScanFlags = getLightSupplementalDiagnosticFlags_(scriptScanRun);
+    const scriptScanSkippedDueToBudget = scriptScanFlags.skippedDueToBudget;
+    const scriptScanTimedOut = scriptScanFlags.timedOut;
+    const scriptScanUnavailable = scriptScanSkippedDueToBudget || scriptScanTimedOut;
     const scriptSrcOrganizationProfileSummary = balancedMode
       ? null
-      : (scriptScanTimeoutMs
-        ? await collectSameOriginScriptSrcJsonLdSummaryLight(page, url, {
-            maxScripts: 3,
-            maxBytesPerScript: 512000,
-            requestTimeoutMs: scriptScanTimeoutMs,
-            lightBudget
-          }).catch(() => null)
-        : { observed: false, skippedDueToBudget: !!lightBudget, skippedAsRedundant: !needsOrganizationScriptScan, source: 'same_origin_script_src_jsonld_light' });
+      : (scriptScanRun && scriptScanRun.state === 'completed'
+        ? scriptScanRun.value
+        : { observed: false, skippedDueToBudget: scriptScanUnavailable, skippedAsRedundant: !needsOrganizationScriptScan, source: 'same_origin_script_src_jsonld_light' });
     const scriptSrcOrganizationProfileSource = scriptSrcJsonLdSummary || scriptSrcOrganizationProfileSummary;
     phaseTimings.structuredDataMs = Math.max(0, Date.now() - structuredDataStart);
     logHeavySiteBuildGeoAudit('jsonld_parse_end', {
@@ -13247,7 +13260,21 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       scriptSrcError: scriptSrcJsonLdSummary && scriptSrcJsonLdSummary.error || null,
       htmlContentError: htmlContentJsonLdSummary && htmlContentJsonLdSummary.error || null
     };
-    const articleSignals = await collectArticleSignalsFromPageLight_(page, url);
+    const articleSignalsRun = lightBudget
+      ? await runLightSupplementalBudgetTask_(
+          lightBudget,
+          'article_signals',
+          LIGHT_ARTICLE_SIGNALS_MAX_MS,
+          () => collectArticleSignalsFromPageLight_(page, url),
+          { reserveMs: LIGHT_SUPPLEMENTAL_RESERVE_MS, minimumMs: 500 }
+        )
+      : { state: 'completed', value: await collectArticleSignalsFromPageLight_(page, url) };
+    const articleSignalsFlags = getLightSupplementalDiagnosticFlags_(articleSignalsRun);
+    const articleSignalsSkippedDueToBudget = articleSignalsFlags.skippedDueToBudget;
+    const articleSignalsTimedOut = articleSignalsFlags.timedOut;
+    const articleSignals = articleSignalsRun.state === 'completed' && articleSignalsRun.value
+      ? articleSignalsRun.value
+      : buildArticleSignalsFromJsonLdAndMeta_([], {}, url);
     console.log('[DEBUG][ARTICLE_SIGNALS_AUDIT]', JSON.stringify({
       checked: articleSignals.checked === true,
       hasArticleType: articleSignals.summary && articleSignals.summary.hasArticleType,
@@ -13626,6 +13653,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         shadowPrimaryHeadingScan: !!(balancedMode && !shortFastMode),
         mainCandidateScan: !!balancedMode,
         htmlContentLdJsonScan: !!balancedMode,
+        scriptScanSkippedDueToBudget,
+        scriptScanTimedOut,
+        articleSignalsSkippedDueToBudget,
+        articleSignalsTimedOut,
         skippedScans: shortFastMode
           ? ['deep_shadow_heading_scan', 'a11y_heading_scan', 'a11y_main_scan', 'iframe_heading_scan']
           : [],
@@ -14625,10 +14656,16 @@ const LIGHT_CORE_RESERVE_MS = Math.max(2000, Math.min(12000, Number(process.env.
 const LIGHT_RESPONSE_CLEANUP_RESERVE_MS = 5000;
 const LIGHT_DOM_FALLBACK_MAX_MS = 3000;
 const LIGHT_DOM_FALLBACK_POLL_MS = 125;
-const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESERVE_MS + LIGHT_RESPONSE_CLEANUP_RESERVE_MS;
+const LIGHT_CORE_RESPONSE_RESERVE_MS = LIGHT_CORE_RESERVE_MS + LIGHT_RESPONSE_CLEANUP_RESERVE_MS;
+const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
 const LIGHT_SETUP_RETRY_ADMISSION_MS = 18000;
 const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 28000;
 const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
+// 補助観測は core DOM signal / response cleanup のための時間を侵食させない。
+// これらは rendered DOM の正本を補強するだけなので、上限到達は scrape 失敗ではなく skip とする。
+const LIGHT_SUPPLEMENTAL_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
+const LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS = 2500;
+const LIGHT_ARTICLE_SIGNALS_MAX_MS = 1500;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
 
 function createLightRequestBudget_(requestStartedAt) {
@@ -14899,6 +14936,67 @@ function takeLightBudgetTimeoutMs_(budget, stage, ownMaxMs, reserveMs = 0, minim
     return 0;
   }
   return Math.floor(timeoutMs);
+}
+
+// Optional enrichment must never hold the light core path past its own bounded
+// wall-clock allowance. Unlike runLightBudgetStage_ this does not mark the
+// request as failed: callers retain the rendered-DOM observation and treat the
+// enrichment as unavailable.
+async function runLightSupplementalBudgetTask_(budget, stage, ownMaxMs, operation, opts = {}) {
+  const reserveMs = Number.isFinite(Number(opts.reserveMs))
+    ? Math.max(0, Number(opts.reserveMs))
+    : LIGHT_SUPPLEMENTAL_RESERVE_MS;
+  const minimumMs = Number.isFinite(Number(opts.minimumMs))
+    ? Math.max(1, Number(opts.minimumMs))
+    : 1;
+  const run = typeof operation === 'function' ? operation : async () => null;
+  if (!budget) {
+    try {
+      return { state: 'completed', value: await run(Number(ownMaxMs || 0)), timeoutMs: Number(ownMaxMs || 0) };
+    } catch (_) {
+      return { state: 'failed', value: null, timeoutMs: Number(ownMaxMs || 0) };
+    }
+  }
+  const timeoutMs = takeLightBudgetTimeoutMs_(budget, stage, ownMaxMs, reserveMs, minimumMs);
+  if (!timeoutMs || budget.timedOut) {
+    return { state: 'skipped_due_to_budget', value: null, timeoutMs: 0 };
+  }
+  let timer = null;
+  let settled = false;
+  const taskPromise = Promise.resolve().then(() => run(timeoutMs));
+  // A timed-out Playwright call may settle after the light path has continued.
+  // Consume that settlement; its value is intentionally never adopted late.
+  taskPromise.catch(() => {});
+  const result = await new Promise((resolve) => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      budget.skipped.push(String(stage || 'supplemental'));
+      resolve({ state: 'timed_out', value: null, timeoutMs });
+    }, timeoutMs);
+    taskPromise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        resolve({ state: 'completed', value, timeoutMs });
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        resolve({ state: 'failed', value: null, timeoutMs });
+      }
+    );
+  });
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+function getLightSupplementalDiagnosticFlags_(result) {
+  const state = result && typeof result === 'object' ? String(result.state || '') : '';
+  return {
+    skippedDueToBudget: state === 'skipped_due_to_budget',
+    timedOut: state === 'timed_out'
+  };
 }
 function buildLightRequestTiming_(budget, processingStartedAt) {
   if (!budget) return null;
@@ -22645,6 +22743,8 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  collectArticleSignalsFromPageLight_,
+  collectSameOriginScriptSrcJsonLdSummaryLight,
   createLightRequestBudget_,
   createLightAttempt_,
   markLightAttemptFailure_,
@@ -22661,10 +22761,15 @@ module.exports.__lightBudgetTestHooks = {
   buildLightRequestTiming_,
   sendLightBudgetTimeout_,
   runLightBudgetStage_,
+  runLightSupplementalBudgetTask_,
+  getLightSupplementalDiagnosticFlags_,
   closePlaywrightResourceWithin_,
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
   LIGHT_SETUP_RETRY_ADMISSION_MS,
   LIGHT_SETUP_RETRY_MIN_REMAINING_MS,
-  LIGHT_RESPONSE_CLEANUP_RESERVE_MS
+  LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
+  LIGHT_SUPPLEMENTAL_RESERVE_MS,
+  LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
+  LIGHT_ARTICLE_SIGNALS_MAX_MS
 };

@@ -1,5 +1,7 @@
 const assert = require('assert');
 const {
+  collectArticleSignalsFromPageLight_,
+  collectSameOriginScriptSrcJsonLdSummaryLight,
   createLightRequestBudget_,
   createLightAttempt_,
   cleanupLightAttempt_,
@@ -11,7 +13,10 @@ const {
   lightSetupRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
+  getLightBudgetRemainingMs_,
   runLightBudgetStage_,
+  runLightSupplementalBudgetTask_,
+  getLightSupplementalDiagnosticFlags_,
   sendLightBudgetTimeout_,
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_
@@ -80,6 +85,97 @@ function probePage(sequence, options = {}) {
   const normalBudget = budgetFor(100);
   const normal = await runLightBudgetStage_(normalBudget, 'browser_launch', 60000, async () => ({ ok: true }));
   assert.deepStrictEqual(normal, { ok: true });
+
+  // Supplemental enrichment is bounded as a whole, not only at an individual
+  // network request. Its timeout is a skip and leaves the core budget usable.
+  const supplementalBudget = budgetFor(48000);
+  const supplemental = await runLightSupplementalBudgetTask_(
+    supplementalBudget,
+    'same_origin_script_scan',
+    30,
+    async () => ({ organizationProfile: { telephone: null }, hasJsonLd: false })
+  );
+  assert.strictEqual(supplemental.state, 'completed');
+  assert.strictEqual(supplemental.value.hasJsonLd, false);
+  assert.deepStrictEqual(getLightSupplementalDiagnosticFlags_(supplemental), {
+    skippedDueToBudget: false,
+    timedOut: false
+  });
+
+  const scriptScanPage = (source) => ({
+    url: () => 'https://sitakke.jp/',
+    evaluate: async () => source === 'script_src_discovery' ? new Promise(() => {}) : ['https://sitakke.jp/app.js'],
+    content: async () => source === 'page_content' ? new Promise(() => {}) : '<script src="/app.js"></script>',
+    request: {
+      get: async () => source === 'script_request'
+        ? new Promise(() => {})
+        : ({ headers: () => ({}), text: async () => source === 'script_response_text' ? new Promise(() => {}) : '' })
+    }
+  });
+  for (const source of ['script_src_discovery', 'page_content', 'script_request', 'script_response_text']) {
+    const boundedBudget = budgetFor(48000);
+    const timedOut = await runLightSupplementalBudgetTask_(
+      boundedBudget,
+      'same_origin_script_scan',
+      5,
+      () => collectSameOriginScriptSrcJsonLdSummaryLight(scriptScanPage(source), 'https://sitakke.jp/', {
+        maxScripts: 1,
+        requestTimeoutMs: 500
+      })
+    );
+    assert.strictEqual(timedOut.state, 'timed_out', source);
+    assert(boundedBudget.skipped.includes('same_origin_script_scan'), source);
+    assert(getLightBudgetRemainingMs_(boundedBudget) > 40000, source);
+    assert.deepStrictEqual(getLightSupplementalDiagnosticFlags_(timedOut), {
+      skippedDueToBudget: false,
+      timedOut: true
+    }, source);
+  }
+
+  const insufficientSupplementalBudget = budgetFor(48000);
+  insufficientSupplementalBudget.deadlineAt = Date.now() + 500;
+  let supplementalStarted = false;
+  const skippedSupplemental = await runLightSupplementalBudgetTask_(
+    insufficientSupplementalBudget,
+    'same_origin_script_scan',
+    2500,
+    async () => { supplementalStarted = true; return { ignored: true }; },
+    { reserveMs: 1000, minimumMs: 750 }
+  );
+  assert.strictEqual(skippedSupplemental.state, 'skipped_due_to_budget');
+  assert.strictEqual(supplementalStarted, false);
+  assert(insufficientSupplementalBudget.skipped.includes('same_origin_script_scan'));
+  assert.deepStrictEqual(getLightSupplementalDiagnosticFlags_(skippedSupplemental), {
+    skippedDueToBudget: true,
+    timedOut: false
+  });
+
+  const articleBudget = budgetFor(48000);
+  const articleTimeout = await runLightSupplementalBudgetTask_(
+    articleBudget,
+    'article_signals',
+    5,
+    () => collectArticleSignalsFromPageLight_({ evaluate: () => new Promise(() => {}) }, 'https://sitakke.jp/')
+  );
+  assert.strictEqual(articleTimeout.state, 'timed_out');
+  assert.deepStrictEqual(getLightSupplementalDiagnosticFlags_(articleTimeout), {
+    skippedDueToBudget: false,
+    timedOut: true
+  });
+  const articleNoBudget = budgetFor(48000);
+  articleNoBudget.deadlineAt = Date.now() + 100;
+  const articleSkipped = await runLightSupplementalBudgetTask_(
+    articleNoBudget,
+    'article_signals',
+    1500,
+    async () => ({ checked: true }),
+    { reserveMs: 1000, minimumMs: 500 }
+  );
+  assert.strictEqual(articleSkipped.state, 'skipped_due_to_budget');
+  assert.deepStrictEqual(getLightSupplementalDiagnosticFlags_(articleSkipped), {
+    skippedDueToBudget: true,
+    timedOut: false
+  });
 
   // Page creation allows a transient 5.4s setup delay when the global budget
   // is healthy, but retains the 5s response/cleanup reserve.
