@@ -2,6 +2,11 @@ const assert = require('assert');
 const {
   collectArticleSignalsFromPageLight_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
+  buildLightCoverageObservationPlan_,
+  fetchSubpageHtmlLightUrls_,
+  isSubpageHtmlLightObservationSufficient_,
+  buildCoverageSignalsV1FromSubpageObservation_,
+  buildGeoSignalsCoverageSignals_,
   createLightRequestBudget_,
   createLightAttempt_,
   cleanupLightAttempt_,
@@ -14,6 +19,7 @@ const {
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
+  buildLightRequestTiming_,
   runLightBudgetStage_,
   runLightSupplementalBudgetTask_,
   getLightSupplementalDiagnosticFlags_,
@@ -85,6 +91,142 @@ function probePage(sequence, options = {}) {
   const normalBudget = budgetFor(100);
   const normal = await runLightBudgetStage_(normalBudget, 'browser_launch', 60000, async () => ({ ok: true }));
   assert.deepStrictEqual(normal, { ok: true });
+
+  // Coverage prioritizes real reachability evidence over media/article pages.
+  const coverageCandidates = [
+    { url: 'https://sitakke.jp/post/18503/', pageType: 'article', score: 100, source: 'article' },
+    { url: 'https://sitakke.jp/contact/', pageType: 'contact', score: 10, source: 'nav' },
+    { url: 'https://sitakke.jp/company/', pageType: 'about', score: 10, source: 'nav' },
+    { url: 'https://sitakke.jp/service/', pageType: 'service', score: 10, source: 'nav' }
+  ];
+  const coveragePlan = buildLightCoverageObservationPlan_(coverageCandidates, { siteMode: 'media', maxObserve: 2 });
+  assert.deepStrictEqual(coveragePlan.candidates.map(item => item.url), [
+    'https://sitakke.jp/company/',
+    'https://sitakke.jp/contact/'
+  ]);
+  const siteModePlan = (siteMode, candidates) => buildLightCoverageObservationPlan_(candidates, { siteMode, maxObserve: 2 })
+    .candidates.map(item => item.pageType);
+  assert.deepStrictEqual(siteModePlan('corporate', coverageCandidates), ['about', 'service']);
+  assert.deepStrictEqual(siteModePlan('service', coverageCandidates), ['service', 'about']);
+  assert.deepStrictEqual(siteModePlan('ec', [
+    { url: 'https://shop.example.test/products/a/', pageType: 'product', score: 10, source: 'nav' },
+    { url: 'https://shop.example.test/category/a/', pageType: 'category', score: 10, source: 'nav' },
+    { url: 'https://shop.example.test/company/', pageType: 'about', score: 10, source: 'nav' },
+    { url: 'https://shop.example.test/contact/', pageType: 'contact', score: 10, source: 'nav' }
+  ]), ['product', 'about']);
+
+  const htmlResponse = (url, html) => ({
+    ok: true,
+    status: 200,
+    url,
+    redirected: false,
+    headers: { get: () => 'text/html; charset=utf-8' },
+    text: async () => html
+  });
+  const slowCompanyFastContactBudget = budgetFor(140);
+  slowCompanyFastContactBudget.deadlineAt = Date.now() + 110;
+  const fetchOrder = [];
+  const priorityHtml = await fetchSubpageHtmlLightUrls_(coveragePlan.candidates.map(item => item.url), {
+    lightBudget: slowCompanyFastContactBudget,
+    htmlFetchTimeoutMs: 30,
+    reserveMs: 20,
+    minimumMs: 5,
+    reserveLaterCandidates: true,
+    fetchImpl: (url, options) => {
+      fetchOrder.push(url);
+      if (/\/company\//.test(url)) {
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            const error = new Error('aborted');
+            error.name = 'AbortError';
+            reject(error);
+          }, { once: true });
+        });
+      }
+      return Promise.resolve(htmlResponse(url, `<html><head><title>Contact</title></head><body><h1>Contact</h1><a href="/">Home</a><p>${'Contact information. '.repeat(24)}</p></body></html>`));
+    }
+  });
+  assert.deepStrictEqual(fetchOrder, ['https://sitakke.jp/company/', 'https://sitakke.jp/contact/']);
+  assert.strictEqual(priorityHtml.pages[0].ok, false);
+  assert.strictEqual(priorityHtml.pages[0].errorStage, 'timeout');
+  assert.strictEqual(priorityHtml.pages[1].ok, true);
+  assert.strictEqual(isSubpageHtmlLightObservationSufficient_(priorityHtml.pages[1]), true);
+
+  // The full HTML pass completes both priority candidates before the caller
+  // computes Playwright fallback candidates.  An insufficient company page
+  // therefore cannot preempt the contact HTML attempt.
+  const insufficientHtmlOrder = [];
+  const insufficientThenContact = await fetchSubpageHtmlLightUrls_(coveragePlan.candidates.map(item => item.url), {
+    lightBudget: budgetFor(48000),
+    htmlFetchTimeoutMs: 30,
+    reserveMs: 20,
+    minimumMs: 5,
+    reserveLaterCandidates: true,
+    fetchImpl: async (url) => {
+      insufficientHtmlOrder.push(url);
+      const content = /\/company\//.test(url)
+        ? '<html><head><title>Company</title></head><body><h1>Company</h1><p>short</p></body></html>'
+        : `<html><head><title>Contact</title></head><body><h1>Contact</h1><a href="/">Home</a><p>${'Contact information. '.repeat(24)}</p></body></html>`;
+      return htmlResponse(url, content);
+    }
+  });
+  assert.deepStrictEqual(insufficientHtmlOrder, ['https://sitakke.jp/company/', 'https://sitakke.jp/contact/']);
+  assert.strictEqual(isSubpageHtmlLightObservationSufficient_(insufficientThenContact.pages[0]), false);
+  assert.strictEqual(isSubpageHtmlLightObservationSufficient_(insufficientThenContact.pages[1]), true);
+
+  // Candidate-level budget exhaustion is never inflated into an observed page,
+  // but is surfaced explicitly on the coverage result and trace contract.
+  const exhaustedCoverageBudget = budgetFor(100);
+  exhaustedCoverageBudget.deadlineAt = Date.now() + 20;
+  const exhaustedHtml = await fetchSubpageHtmlLightUrls_(coveragePlan.candidates.map(item => item.url), {
+    lightBudget: exhaustedCoverageBudget,
+    htmlFetchTimeoutMs: 30,
+    reserveMs: 20,
+    minimumMs: 5,
+    reserveLaterCandidates: true,
+    fetchImpl: async () => { throw new Error('must not fetch'); }
+  });
+  assert(exhaustedHtml.pages.every(page => page.ok === false && page.errorStage === 'budget'));
+  const exhaustedCoverageSignals = buildGeoSignalsCoverageSignals_(buildCoverageSignalsV1FromSubpageObservation_({
+    topUrl: 'https://sitakke.jp/',
+    origin: 'https://sitakke.jp',
+    siteMode: 'media',
+    candidates: coveragePlan.candidates,
+    observations: exhaustedHtml.pages,
+    coverageRuntime: { observationLimited: true, budgetLimitedCandidateCount: 2, timedOutCandidateCount: 0 }
+  }));
+  assert.strictEqual(exhaustedCoverageSignals.observedSubpageCount, 0);
+  assert.strictEqual(exhaustedCoverageSignals.observationLimited, true);
+  assert.strictEqual(exhaustedCoverageSignals.budgetLimitedCandidateCount, 2);
+
+  const timedOutCoverageSignals = buildGeoSignalsCoverageSignals_(buildCoverageSignalsV1FromSubpageObservation_({
+    topUrl: 'https://sitakke.jp/', origin: 'https://sitakke.jp', siteMode: 'media',
+    candidates: coveragePlan.candidates,
+    observations: [{ url: 'https://sitakke.jp/company/', ok: false, errorStage: 'timeout' }],
+    coverageRuntime: { observationLimited: true, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 1 }
+  }));
+  assert.strictEqual(timedOutCoverageSignals.observedSubpageCount, 0);
+  assert.strictEqual(timedOutCoverageSignals.observationLimited, true);
+  assert.strictEqual(timedOutCoverageSignals.timedOutCandidateCount, 1);
+  const httpFailedCoverageSignals = buildGeoSignalsCoverageSignals_(buildCoverageSignalsV1FromSubpageObservation_({
+    topUrl: 'https://sitakke.jp/', origin: 'https://sitakke.jp', siteMode: 'media',
+    candidates: coveragePlan.candidates,
+    observations: [{ url: 'https://sitakke.jp/company/', ok: false, status: 404, errorStage: 'fetch' }],
+    coverageRuntime: { observationLimited: false, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 0 }
+  }));
+  assert.strictEqual(httpFailedCoverageSignals.observedSubpageCount, 0);
+  assert.strictEqual(httpFailedCoverageSignals.observationLimited, false);
+  assert.strictEqual(httpFailedCoverageSignals.budgetLimitedCandidateCount, 0);
+  assert.strictEqual(httpFailedCoverageSignals.timedOutCandidateCount, 0);
+  const limitedTraceBudget = budgetFor(48000);
+  limitedTraceBudget.coverageTrace = {
+    started: true,
+    skippedDueToBudget: false,
+    completed: true,
+    observationLimited: true,
+    budgetLimitedCandidateCount: 2
+  };
+  assert.deepStrictEqual(buildLightRequestTiming_(limitedTraceBudget, limitedTraceBudget.startedAt).coverageTrace, limitedTraceBudget.coverageTrace);
 
   // Supplemental enrichment is bounded as a whole, not only at an individual
   // network request. Its timeout is a skip and leaves the core budget usable.
@@ -359,7 +501,9 @@ function probePage(sequence, options = {}) {
   assert.deepStrictEqual(coverageSkipResponse.body.diagnostics.coverageTrace, {
     started: true,
     skippedDueToBudget: true,
-    completed: false
+    completed: false,
+    observationLimited: false,
+    budgetLimitedCandidateCount: 0
   });
 
   // F: an expired queued task returns 504 before the task body can run.

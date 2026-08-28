@@ -3908,7 +3908,8 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
     }
     let response = null;
     try {
-      response = await fetch(url, {
+      const fetchImpl = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : fetch;
+      response = await fetchImpl(url, {
         method: 'GET',
         redirect: 'follow',
         headers: {
@@ -3987,9 +3988,30 @@ async function fetchSubpageHtmlLight(url, opts = {}) {
 
 async function fetchSubpageHtmlLightUrls_(urls, opts = {}) {
   const pages = [];
-  for (const url of (Array.isArray(urls) ? urls : [])) {
+  const items = Array.isArray(urls) ? urls : [];
+  for (let index = 0; index < items.length; index += 1) {
+    const url = items[index];
+    const ownMaxMs = typeof opts.htmlFetchTimeoutMsForIndex === 'function'
+      ? opts.htmlFetchTimeoutMsForIndex(index, url)
+      : (Number(opts.htmlFetchTimeoutMs || 0) || 4000);
+    const reserveMs = Number.isFinite(Number(opts.reserveMs))
+      ? Math.max(0, Number(opts.reserveMs))
+      : LIGHT_CORE_RESERVE_MS;
+    const minimumMs = Number.isFinite(Number(opts.minimumMs))
+      ? Math.max(0, Number(opts.minimumMs))
+      : 750;
+    const remainingCandidates = Math.max(0, items.length - index - 1);
+    const reservedForLaterCandidatesMs = opts.reserveLaterCandidates === true
+      ? remainingCandidates * minimumMs
+      : 0;
+    const availableForThisCandidateMs = opts && opts.lightBudget
+      ? Math.max(0, getLightBudgetRemainingMs_(opts.lightBudget, reserveMs) - reservedForLaterCandidatesMs)
+      : ownMaxMs;
+    const allocatedOwnMaxMs = opts.reserveLaterCandidates === true
+      ? Math.min(Math.max(0, Number(ownMaxMs || 0)), availableForThisCandidateMs)
+      : ownMaxMs;
     const timeoutMs = opts && opts.lightBudget
-      ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_html_fetch', 4000, LIGHT_CORE_RESERVE_MS, 750)
+      ? takeLightBudgetTimeoutMs_(opts.lightBudget, 'coverage_html_fetch', allocatedOwnMaxMs, reserveMs, minimumMs)
       : 0;
     if (opts && opts.lightBudget && !timeoutMs) {
       pages.push({ url, finalUrl: url, ok: false, error: 'overall_budget_exhausted', errorStage: 'budget', observationSource: 'html-fetch-light', observationMethod: 'html_fetch_light' });
@@ -6140,6 +6162,66 @@ function sortCoverageObserveCandidates_(candidates, siteMode = 'generic') {
   });
 }
 
+// Light coverage has a short, request-scoped budget.  The observation plan is
+// intentionally independent of a site's content type: company/about and
+// contact pages establish reachability, whereas an article is supplemental.
+function getLightCoverageObservationKind_(candidate, siteMode = 'generic') {
+  const pageType = inferDiscoverCandidatePageType_(candidate, siteMode);
+  const raw = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || candidate.path || candidate.label) || '').toLowerCase();
+  if (pageType === 'about' || /\/(?:about|company|corporate|profile|outline|operator|about-us|company-profile)(?:\/|$|-|_)/i.test(raw)) return 'about';
+  if (pageType === 'business') return 'business';
+  if (pageType === 'contact' || /(?:\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase)(?:\/|$|-|_)|お問い合わせ|お問合せ|問い合わせ|問合せ|資料請求)/i.test(raw)) return 'contact';
+  if (pageType === 'service' || /\/(?:service|services|solution|solutions|pricing|price|plan)(?:\/|$|-|_)/i.test(raw)) return 'service';
+  if (pageType === 'product' || pageType === 'category' || /\/(?:product|products|item|items|category|categories|collection|collections)(?:\/|$|-|_)/i.test(raw)) return pageType === 'category' || /\/categor(?:y|ies)\//i.test(raw) ? 'category' : 'product';
+  if (pageType === 'case' || pageType === 'recruit' || pageType === 'faq') return pageType;
+  if (pageType === 'article' || isDiscoverArticleCandidatePath_(raw)) return 'article';
+  return 'other';
+}
+
+function getLightCoverageObservationPriorityGroups_(siteMode = 'generic') {
+  const mode = String(siteMode || 'generic').toLowerCase();
+  if (mode === 'media') return [['about', 'business'], ['contact'], ['service', 'faq', 'case'], ['article'], ['other']];
+  if (mode === 'corporate') return [['about'], ['business', 'service'], ['contact'], ['case', 'recruit', 'faq'], ['article'], ['other']];
+  if (mode === 'service') return [['service', 'business'], ['about', 'contact'], ['case', 'faq', 'recruit'], ['article'], ['other']];
+  if (mode === 'ec' || mode === 'ecommerce' || mode === 'e-commerce') return [['product', 'category'], ['about', 'contact'], ['service', 'faq'], ['article'], ['other']];
+  return [['about', 'business'], ['contact'], ['service', 'case', 'faq', 'recruit', 'product', 'category'], ['article'], ['other']];
+}
+
+function buildLightCoverageObservationPlan_(candidates, opts = {}) {
+  const maxObserve = Math.max(1, Math.min(5, Number(opts.maxObserve || 2) || 2));
+  const baseOrder = sortCoverageObserveCandidates_(candidates, opts.siteMode || 'generic');
+  const groups = getLightCoverageObservationPriorityGroups_(opts.siteMode || 'generic');
+  const candidatesOut = [];
+  const used = new Set();
+  groups.forEach((kinds, groupIndex) => {
+    if (candidatesOut.length >= maxObserve) return;
+    const candidate = baseOrder.find(item => {
+      const key = discoverSubpageCandidateKey(item && item.url || '');
+      return !!key && !used.has(key) && kinds.includes(getLightCoverageObservationKind_(item, opts.siteMode || 'generic'));
+    });
+    if (!candidate) return;
+    used.add(discoverSubpageCandidateKey(candidate.url));
+    candidatesOut.push(Object.assign({}, candidate, { __lightCoveragePriorityGroup: groupIndex }));
+  });
+  // If no configured role filled the plan, retain the existing candidate order
+  // rather than manufacturing a representative route.
+  baseOrder.forEach(candidate => {
+    if (candidatesOut.length >= maxObserve) return;
+    const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
+    if (!key || used.has(key)) return;
+    used.add(key);
+    candidatesOut.push(Object.assign({}, candidate, { __lightCoveragePriorityGroup: groups.length }));
+  });
+  return {
+    candidates: candidatesOut.map(candidate => {
+      const cleaned = Object.assign({}, candidate);
+      delete cleaned.__lightCoveragePriorityGroup;
+      return cleaned;
+    }),
+    priorities: candidatesOut.map(candidate => candidate.__lightCoveragePriorityGroup)
+  };
+}
+
 function buildCoverageCandidatePageTypes_(candidates) {
   const out = {
     about: false,
@@ -6450,6 +6532,11 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
       }, { sitemap: 0, nav: 0, footer: 0, other: 0 });
   const candidatePageTypes = buildCoverageCandidatePageTypes_(candidates);
   const observedPages = observations.filter(page => page && page.ok === true);
+  const coverageRuntime = payload && payload.coverageRuntime && typeof payload.coverageRuntime === 'object'
+    ? payload.coverageRuntime
+    : {};
+  const budgetLimitedCandidateCount = Math.max(0, Number(coverageRuntime.budgetLimitedCandidateCount || 0) || 0);
+  const timedOutCandidateCount = Math.max(0, Number(coverageRuntime.timedOutCandidateCount || 0) || 0);
   const hasBreadcrumbList = page => {
     const types = Array.isArray(page && page.jsonldTypes) ? page.jsonldTypes : [];
     return page && (
@@ -6551,6 +6638,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     observationPlanAudit,
     representativeObservationQuality: representativeQualityAudit.quality,
     representativeExtractionDiagnostics: representativeQualityAudit.diagnostics,
+    observationLimited: coverageRuntime.observationLimited === true,
+    budgetLimitedCandidateCount,
+    timedOutCandidateCount,
     notes
   };
 }
@@ -6635,6 +6725,9 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     version: 'coverageSignalsV1',
     source: 'discover-and-observe-subpages-light',
     checked: true,
+    observationLimited: coverageSignalsV1.observationLimited === true,
+    budgetLimitedCandidateCount: Math.max(0, Number(coverageSignalsV1.budgetLimitedCandidateCount || 0) || 0),
+    timedOutCandidateCount: Math.max(0, Number(coverageSignalsV1.timedOutCandidateCount || 0) || 0),
     observedSubpageCount: Number(coverageSignalsV1.observedSubpageCount || 0),
     observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
     observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
@@ -8845,6 +8938,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     observedSubpageCount: 0,
     attached: false
   };
+  const coverageBudgetSkippedStart = lightBudget && Array.isArray(lightBudget.skipped)
+    ? lightBudget.skipped.length
+    : 0;
   try {
     emitHeavySiteAudit('attach_start', {
       hasGeoSignalsV1: !!geoSignalsV1,
@@ -8872,6 +8968,9 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       geoSignalsV1.coverageSignals = {
         checked: false,
         skippedDueToBudget: true,
+        observationLimited: true,
+        budgetLimitedCandidateCount: 0,
+        timedOutCandidateCount: 0,
         skipReason: 'overall_budget_exhausted',
         observedSubpageCount: 0,
         representativePages: []
@@ -9011,7 +9110,8 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
     const legacySelectedCandidates = prioritizedCandidates.slice(0, maxObserve);
     const roleBasedSelection = buildRoleBasedSelectedCandidates_(discovered.candidates, { siteMode, maxObserve });
     const roleBasedSelectedCandidates = Array.isArray(roleBasedSelection.candidates) ? roleBasedSelection.candidates : [];
-    const selectedCandidates = (roleBasedSelectedCandidates.length ? roleBasedSelectedCandidates : legacySelectedCandidates).slice();
+    const lightCoveragePlan = buildLightCoverageObservationPlan_(discovered.candidates, { siteMode, maxObserve });
+    const selectedCandidates = lightCoveragePlan.candidates.slice();
     const isContactFormCandidate = candidate => {
       const haystack = [
         candidate && candidate.url,
@@ -9022,12 +9122,6 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       ].map(value => normalizeSubpageJsonLdText(value)).join(' ').toLowerCase();
       return /(?:\/(?:contact|contact-us|inquiry|inquiries|request|requests|quote|otoiawase)(?:\/|$|-|_)|お問い合わせ|お問合せ|問い合わせ|問合せ|資料請求|contact|inquiry|request|quote)/i.test(haystack);
     };
-    const selectedCandidateKeys = new Set(selectedCandidates.map(candidate => discoverSubpageCandidateKey(candidate && candidate.url || '')));
-    const contactFormCandidate = prioritizedCandidates.find(candidate => {
-      const key = discoverSubpageCandidateKey(candidate && candidate.url || '');
-      return !!key && !selectedCandidateKeys.has(key) && isContactFormCandidate(candidate);
-    });
-    if (contactFormCandidate) selectedCandidates.push(contactFormCandidate);
     const hasContactCandidate = discovered.candidates.some(candidate => isContactFormCandidate(candidate));
     const selectedPaths = selectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
     const legacySelectedPaths = legacySelectedCandidates.map(getCoverageCandidatePath_).filter(Boolean);
@@ -9042,9 +9136,11 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
         roleBasedSelectedPaths,
         finalSelectedPaths: selectedPaths,
         finalSelectedPageTypes: selectedCandidates.map(candidate => inferDiscoverCandidatePageType_(candidate, siteMode)).filter(Boolean),
-        usedRoleBasedSelection: roleBasedSelectedCandidates.length > 0,
+        usedRoleBasedSelection: false,
+        usedLightCoveragePriorityPlan: true,
+        finalSelectedPriorities: lightCoveragePlan.priorities,
         maxObserve,
-        note: 'scrape_observation_input_switched_to_role_based'
+        note: 'scrape_observation_input_light_coverage_priority'
       }));
     } catch (_) {}
     try {
@@ -9189,7 +9285,14 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       ? { pages: [] }
       : await fetchSubpageHtmlLightUrls_(selectedCandidates.map(candidate => candidate.url), {
           siteMode,
-          lightBudget
+          lightBudget,
+          // Core DOM observation is already complete here.  Divide the
+          // remaining coverage allowance across the priority pages, while
+          // preserving response/cleanup time for the light request itself.
+          htmlFetchTimeoutMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS : 0,
+          reserveMs: lightBudget ? LIGHT_RESPONSE_CLEANUP_RESERVE_MS : undefined,
+          minimumMs: lightBudget ? LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS : undefined,
+          reserveLaterCandidates: !!lightBudget
         });
     if (!scopedPlaywrightSubpageObservation) {
       const htmlObservedItemsForAudit = Array.isArray(htmlObserved && htmlObserved.pages)
@@ -9431,6 +9534,12 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       siteMode,
       context: opts && opts.context
     }));
+    const coverageBudgetStages = lightBudget && Array.isArray(lightBudget.skipped)
+      ? lightBudget.skipped.slice(coverageBudgetSkippedStart).filter(stage => /^coverage(?:_|$)/.test(String(stage || '')))
+      : [];
+    const budgetLimitedCandidateCount = observations.filter(page => page && page.errorStage === 'budget').length;
+    const timedOutCandidateCount = observations.filter(page => page && page.errorStage === 'timeout').length;
+    const observationLimited = budgetLimitedCandidateCount > 0 || timedOutCandidateCount > 0 || coverageBudgetStages.length > 0;
     const payload = {
       topUrl: normalized.topUrl,
       origin: normalized.origin,
@@ -9438,13 +9547,18 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
       candidateSummary: {
         sourceSummary: discovered.sourceSummary,
         roleRepresentativeCandidates: discovered.roleRepresentativeCandidates,
-        activeObservationInput: roleBasedSelectedCandidates.length ? 'role_based_selected_candidates' : 'legacy_selected_candidates',
-        activeObservationInputChanged: roleBasedSelectedCandidates.length > 0,
+        activeObservationInput: 'light_coverage_priority_candidates',
+        activeObservationInputChanged: true,
         totalCandidates: discovered.totalCandidates,
         observedCount: observations.length
       },
       candidates: selectedCandidates,
       observations,
+      coverageRuntime: {
+        observationLimited,
+        budgetLimitedCandidateCount,
+        timedOutCandidateCount
+      },
       subpageObservationMode: scopedPlaywrightSubpageObservation
         ? 'scopedPlaywright'
         : (htmlFetchOnlySubpageObservation ? 'htmlFetchOnly' : ''),
@@ -14666,6 +14780,10 @@ const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
 const LIGHT_SUPPLEMENTAL_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
 const LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS = 2500;
 const LIGHT_ARTICLE_SIGNALS_MAX_MS = 1500;
+// Coverage is post-core work.  Its first two reachability candidates share a
+// bounded HTML-only allowance while the response/cleanup reserve remains intact.
+const LIGHT_COVERAGE_PRIORITY_HTML_MAX_MS = 2500;
+const LIGHT_COVERAGE_PRIORITY_HTML_MIN_MS = 750;
 const LIGHT_RETRYABLE_SETUP_STAGES = new Set(['browser_launch', 'browser_context', 'page_create', 'init_script']);
 
 function createLightRequestBudget_(requestStartedAt) {
@@ -14703,7 +14821,9 @@ function createLightRequestBudget_(requestStartedAt) {
     coverageTrace: {
       started: false,
       skippedDueToBudget: false,
-      completed: false
+      completed: false,
+      observationLimited: false,
+      budgetLimitedCandidateCount: 0
     },
     stageMs: {
       topPageStaticFetchMs: 0,
@@ -15025,7 +15145,9 @@ function buildLightRequestTiming_(budget, processingStartedAt) {
       ? {
           started: budget.coverageTrace.started === true,
           skippedDueToBudget: budget.coverageTrace.skippedDueToBudget === true,
-          completed: budget.coverageTrace.completed === true
+          completed: budget.coverageTrace.completed === true,
+          observationLimited: budget.coverageTrace.observationLimited === true,
+          budgetLimitedCandidateCount: Math.max(0, Number(budget.coverageTrace.budgetLimitedCandidateCount || 0) || 0)
         }
       : null,
     resilience: budget.resilience && typeof budget.resilience === 'object'
@@ -19287,6 +19409,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       if (signalsFirstLight) {
         const coverageSkippedDueToBudget = !!(coverageSignals && coverageSignals.skippedDueToBudget === true);
         lightBudget.coverageTrace.skippedDueToBudget = coverageSkippedDueToBudget;
+        lightBudget.coverageTrace.observationLimited = !!(coverageSignals && coverageSignals.observationLimited === true);
+        lightBudget.coverageTrace.budgetLimitedCandidateCount = Math.max(0, Number(coverageSignals && coverageSignals.budgetLimitedCandidateCount || 0) || 0);
         if (!coverageSkippedDueToBudget) {
           lightBudget.coverageTrace.completed = true;
           recordLightCheckpoint_(lightBudget, 'coverage_end');
@@ -22745,6 +22869,11 @@ if (require.main === module) {
 module.exports.__lightBudgetTestHooks = {
   collectArticleSignalsFromPageLight_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
+  buildLightCoverageObservationPlan_,
+  fetchSubpageHtmlLightUrls_,
+  isSubpageHtmlLightObservationSufficient_,
+  buildCoverageSignalsV1FromSubpageObservation_,
+  buildGeoSignalsCoverageSignals_,
   createLightRequestBudget_,
   createLightAttempt_,
   markLightAttemptFailure_,
