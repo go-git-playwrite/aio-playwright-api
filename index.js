@@ -11985,6 +11985,40 @@ function emitFreshnessPipelineAudit_(audit) {
   } catch (_) {}
 }
 
+// `observed` records whether the title/meta DOM query completed, not whether
+// the queried value was non-empty. This preserves a confirmed absence for the
+// GAS light bridge while retaining `observed:false` for unavailable DOM work.
+function buildHeadObservations_(input = {}, options = {}) {
+  const observationCompleted = options.observationCompleted === true;
+  const normalize = (value) => {
+    const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+    return text || null;
+  };
+  const title = normalize(input.title);
+  const metaDescription = normalize(input.metaDescription);
+  const defaultSource = options.source || 'rendered_dom';
+  const titleSource = observationCompleted ? (options.titleSource || defaultSource) : 'not_observed';
+  const metaDescriptionSource = observationCompleted ? (options.metaDescriptionSource || defaultSource) : 'not_observed';
+  const metaDescriptionObservation = {
+    value: metaDescription,
+    observed: observationCompleted,
+    source: metaDescriptionSource,
+    confidence: metaDescription ? 'high' : 'low'
+  };
+  if (options.includeMetaDescriptionLength === true) {
+    metaDescriptionObservation.length = metaDescription ? metaDescription.length : 0;
+  }
+  return {
+    title: {
+      value: title,
+      observed: observationCompleted,
+      source: titleSource,
+      confidence: title ? 'high' : 'low'
+    },
+    metaDescription: metaDescriptionObservation
+  };
+}
+
 async function buildGeoSignalsV1(page, url, opts = {}) {
   const generatedAt = new Date().toISOString();
   const startedAt = Date.now();
@@ -13588,18 +13622,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         source: 'not_observed'
       },
       observed: {
-        title: {
-          value: observed.title || null,
-          observed: !!observed.title,
-          source: 'rendered_dom',
-          confidence: observed.title ? 'high' : 'low'
-        },
-        metaDescription: {
-          value: observed.metaDescription || null,
-          observed: !!observed.metaDescription,
-          source: 'rendered_dom',
-          confidence: observed.metaDescription ? 'high' : 'low'
-        },
+        ...buildHeadObservations_(observed, {
+          observationCompleted: true,
+          source: 'rendered_dom'
+        }),
         h1: {
           values: mergedH1.slice(0, 5),
           count: mergedH1.length,
@@ -14324,6 +14350,7 @@ function extractTopPageStaticSignalsFromHtml_(url, finalUrl, status, html) {
       return href;
     }).get().filter(Boolean).slice(0, 10);
     out.bodyTextLength = clean($('body').text()).length;
+    out.parseSucceeded = true;
     out.success = !!(out.title || out.metaDescription || out.h1Count || out.hasSemanticStructure || out.jsonLdCount);
     return out;
   } catch (e) {
@@ -14416,6 +14443,11 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
   const headingTexts = Array.isArray(signals.h1Texts) ? signals.h1Texts.slice(0, 10) : [];
   const h1Count = Number(signals.h1Count || 0);
   const hasMain = signals.hasMainElement === true;
+  const headObservations = buildHeadObservations_(signals, {
+    observationCompleted: !!(staticFetchResult && staticFetchResult.success === true && signals.parseSucceeded === true),
+    source: 'top_page_static_html_fetch',
+    includeMetaDescriptionLength: true
+  });
   const geoSignalsV1 = {
     version: 'geoSignalsV1',
     generatedAt,
@@ -14496,19 +14528,7 @@ function buildStaticFallbackGeoSignalsPayload_(url, staticFetchResult, opts = {}
       source: 'top_page_static_html_fetch'
     },
     observed: {
-      title: {
-        value: signals.title || null,
-        observed: !!signals.title,
-        source: signals.title ? 'top_page_static_html_fetch' : 'not_observed',
-        confidence: signals.title ? 'high' : 'low'
-      },
-      metaDescription: {
-        value: signals.metaDescription || null,
-        observed: !!signals.metaDescription,
-        source: signals.metaDescription ? 'top_page_static_html_fetch' : 'not_observed',
-        confidence: signals.metaDescription ? 'high' : 'low',
-        length: signals.metaDescription ? String(signals.metaDescription).length : 0
-      },
+      ...headObservations,
       h1: {
         values: headingTexts,
         count: h1Count,
@@ -14607,8 +14627,10 @@ function mergeTopPageStaticSignalsIntoPayload_(geoSignalsV1, lightweightSummary,
   geoSignalsV1.coverage = geoSignalsV1.coverage || {};
   geoSignalsV1.coverage.semanticElements = geoSignalsV1.coverage.semanticElements || {};
   const observed = geoSignalsV1.observed;
-  if (!(observed.title && observed.title.value) && fg.observed.title) observed.title = fg.observed.title;
-  if (!(observed.metaDescription && observed.metaDescription.value) && fg.observed.metaDescription) observed.metaDescription = fg.observed.metaDescription;
+  // A completed DOM query with an empty value is a valid absence observation.
+  // Only replace an unavailable rendered-DOM result with a completed static one.
+  if (!(observed.title && observed.title.observed === true) && fg.observed.title && fg.observed.title.observed === true) observed.title = fg.observed.title;
+  if (!(observed.metaDescription && observed.metaDescription.observed === true) && fg.observed.metaDescription && fg.observed.metaDescription.observed === true) observed.metaDescription = fg.observed.metaDescription;
   if (!(observed.h1 && Number(observed.h1.count || 0) > 0) && fg.observed.h1) observed.h1 = fg.observed.h1;
   if (!(geoSignalsV1.articleSignals && geoSignalsV1.articleSignals.checked === true) && fg.articleSignals) geoSignalsV1.articleSignals = fg.articleSignals;
   if (!Number(geoSignalsV1.headings.h1Count || 0) && fg.headings) Object.assign(geoSignalsV1.headings, fg.headings);
@@ -17689,6 +17711,8 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
       const headMeta = phaseResult('headMetaEval');
       const basicDomRaw = phaseResult('basicDomEval');
       const gotoProbe = (gotoPartialRecovery && typeof gotoPartialRecovery === 'object') ? gotoPartialRecovery : {};
+      const headObservationCompleted = phaseByName('headMetaEval').ok === true ||
+        phaseByName('basicDomEval').ok === true || gotoProbe.documentPresent === true;
       const basicDom = Object.assign({}, basicDomRaw, {
         title: basicDomRaw.title || headMeta.title || gotoProbe.title || '',
         metaDescription: basicDomRaw.metaDescription || headMeta.metaDescription || gotoProbe.metaDescription || '',
@@ -17699,6 +17723,12 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         anchorCount: typeof basicDomRaw.anchorCount === 'number'
           ? basicDomRaw.anchorCount
           : (typeof gotoProbe.anchorCount === 'number' ? gotoProbe.anchorCount : basicDomRaw.anchorCount)
+      });
+      const headObservations = buildHeadObservations_(basicDom, {
+        observationCompleted: headObservationCompleted,
+        titleSource: 'rendered_dom_light',
+        metaDescriptionSource: 'basic_dom_eval',
+        includeMetaDescriptionLength: true
       });
       const structuredLight = phaseResult('structuredDataLight');
       const scriptJsonLd = phaseResult('sameOriginScriptJsonLd');
@@ -18194,19 +18224,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           source: 'unified_observer_aio_check'
         },
         observed: {
-          title: {
-            value: basicDom.title || null,
-            observed: !!basicDom.title,
-            source: 'rendered_dom_light',
-            confidence: basicDom.title ? 'high' : 'low'
-          },
-          metaDescription: {
-            value: basicDom.metaDescription || null,
-            observed: !!basicDom.metaDescription,
-            source: basicDom.metaDescription ? 'basic_dom_eval' : 'not_observed',
-            confidence: basicDom.metaDescription ? 'high' : 'low',
-            length: Number(basicDom.metaDescriptionLength || (basicDom.metaDescription ? basicDom.metaDescription.length : 0)) || 0
-          },
+          ...headObservations,
           h1: {
             values: [],
             count: Number(headingsLight.h1Count || 0),
@@ -23277,6 +23295,10 @@ if (require.main === module) {
 
 module.exports.__lightBudgetTestHooks = {
   buildGeoSignalsV1,
+  buildHeadObservations_,
+  extractTopPageStaticSignalsFromHtml_,
+  buildStaticFallbackGeoSignalsPayload_,
+  mergeTopPageStaticSignalsIntoPayload_,
   collectArticleSignalsFromPageLight_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
