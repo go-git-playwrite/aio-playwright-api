@@ -12429,6 +12429,10 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         hasHeaderElement: semanticHeaderCount > 0,
         hasNavElement: semanticNavCount > 0,
         hasFooterElement: semanticFooterCount > 0,
+        // This is a completed rendered-DOM observation.  `false` means the
+        // element was queried successfully and is absent; it is not a
+        // fallback for an unavailable DOM observation.
+        hasMainElement: !!mainElement,
         headerCount: semanticHeaderCount,
         navCount: semanticNavCount,
         footerCount: semanticFooterCount,
@@ -23272,6 +23276,7 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  buildGeoSignalsV1,
   collectArticleSignalsFromPageLight_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
