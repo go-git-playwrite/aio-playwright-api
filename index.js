@@ -6932,6 +6932,19 @@ function attachContactDestination_(geoSignalsV1, contactDestination) {
   geoSignalsV1.trustSignals.contactDestination = normalized;
   geoSignalsV1.observed = geoSignalsV1.observed && typeof geoSignalsV1.observed === 'object' ? geoSignalsV1.observed : {};
   geoSignalsV1.observed.contactDestination = normalized;
+  // Navigation-path absence needs a completed rendered-DOM classification;
+  // destination probing is supplementary and may only complete its own scope.
+  const navigation = geoSignalsV1.navigationPathObservationsV1 && typeof geoSignalsV1.navigationPathObservationsV1 === 'object'
+    ? geoSignalsV1.navigationPathObservationsV1
+    : (geoSignalsV1.observed.navigationPathObservationsV1 && typeof geoSignalsV1.observed.navigationPathObservationsV1 === 'object'
+      ? geoSignalsV1.observed.navigationPathObservationsV1
+      : null);
+  if (navigation && navigation.kinds && navigation.kinds.contact) {
+    navigation.kinds.contact.destinationState = normalized.source;
+    navigation.kinds.contact.destinationObservationComplete = normalized.source !== 'observation_limited';
+    geoSignalsV1.navigationPathObservationsV1 = navigation;
+    geoSignalsV1.observed.navigationPathObservationsV1 = navigation;
+  }
   return normalized;
 }
 
@@ -12428,6 +12441,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       }
       const textHref = (a) => `${a.text} ${a.href}`.toLowerCase();
       const hasLike = (re) => anchors.length ? anchors.some((a) => re.test(textHref(a))) : null;
+      const countLike = (re) => anchors.filter((a) => re.test(textHref(a))).length;
       const firstLikeLink = (re) => {
         const hit = anchors.find((a) => re.test(textHref(a)));
         return hit ? { text: hit.text, href: hit.href } : null;
@@ -12584,6 +12598,20 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       const companyRe = /company|about|corporate|profile|会社|企業|運営|概要|会社情報|企業情報/;
       const serviceRe = /service|business|solution|plan|サービス|事業|料金|プラン/;
       const privacyRe = /privacy|policy|プライバシー|個人情報|プライバシーポリシー|個人情報保護方針/;
+      // Created from the complete rendered-DOM anchor collection, before
+      // response samples are capped. It is not inferred from legacy booleans.
+      const navigationObservationComplete = !shortFastMode;
+      const navigationPathObservationsV1 = {
+        observationVersion: 'navigation_path_observation_v1',
+        authority: 'geoSignalsV1_light_bridge_v1',
+        inputObserved: navigationObservationComplete,
+        observationLimited: !navigationObservationComplete,
+        kinds: {
+          contact: { classificationComplete: navigationObservationComplete, matchedCount: countLike(contactRe), destinationState: 'observation_limited', destinationObservationComplete: false },
+          company: { classificationComplete: navigationObservationComplete, matchedCount: countLike(companyRe) },
+          service: { classificationComplete: navigationObservationComplete, matchedCount: countLike(serviceRe) }
+        }
+      };
       // Form signals intentionally inspect only the top-level DOM. Iframes and shadow roots
       // can contain independent or externally hosted forms, so they keep negatives unknown.
       const formSignals = (() => {
@@ -12723,6 +12751,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         iframeSameOriginHeadings,
         shadowHeadings,
         links: {
+          navigationPathObservationsV1,
           navTextsSample: limit(navTexts, 50),
           internalLinksSample: internal.slice(0, 50),
           externalProfileLinksSample: externalProfileItems.slice(0, 10),
@@ -13446,6 +13475,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
       version: 'geoSignalsV1',
       generatedAt,
       url: String(url || ''),
+      navigationPathObservationsV1: observed.links && observed.links.navigationPathObservationsV1 || null,
       structuredData: structuredDataLight,
       entityLinkSignals: entityLinkSignalsLight,
       articleSignals,
@@ -13693,6 +13723,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           confidence: headingTextsMerged.length ? 'high' : 'low'
         },
         links: {
+          navigationPathObservationsV1: observed.links && observed.links.navigationPathObservationsV1 || null,
           navTextsSample: observed.links && Array.isArray(observed.links.navTextsSample) ? observed.links.navTextsSample.slice(0, 50) : [],
           internalLinksSample: observed.links && Array.isArray(observed.links.internalLinksSample) ? observed.links.internalLinksSample.slice(0, 50) : [],
           externalProfileLinksSample: observed.links && Array.isArray(observed.links.externalProfileLinksSample) ? observed.links.externalProfileLinksSample.slice(0, 10) : [],
@@ -15879,6 +15910,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     a11yMainCount: landmarks.a11yMainCount
   };
   const shortLinks = {
+    navigationPathObservationsV1: links.navigationPathObservationsV1 || g.navigationPathObservationsV1 || null,
     navTextsSample: arr(links.navTextsSample, 10, 'geoSignalsV1.observed.links.navTextsSample', (v) => str(v, 100)),
     internalLinksSample: arr(links.internalLinksSample, 10, 'geoSignalsV1.observed.links.internalLinksSample', linkSample),
     externalProfileLinksSample: arr(links.externalProfileLinksSample, 10, 'geoSignalsV1.observed.links.externalProfileLinksSample', (v) => str(v, 180)),
@@ -15930,6 +15962,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     version: g.version,
     generatedAt: g.generatedAt,
     url: g.url,
+    navigationPathObservationsV1: g.navigationPathObservationsV1 || (observed.links && observed.links.navigationPathObservationsV1) || null,
     structuredData: shortStructuredData,
     entityLinkSignals,
     headings: shortHeadings,
@@ -23295,6 +23328,7 @@ if (require.main === module) {
 
 module.exports.__lightBudgetTestHooks = {
   buildGeoSignalsV1,
+  attachContactDestination_,
   buildHeadObservations_,
   extractTopPageStaticSignalsFromHtml_,
   buildStaticFallbackGeoSignalsPayload_,
