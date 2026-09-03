@@ -7,6 +7,7 @@ const {
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
   parseSubpageJsonLdLightHtml,
+  compactSubpageJsonLdObservation_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,
@@ -393,6 +394,34 @@ function mainDocumentRequest(page, options = {}) {
   assert.strictEqual(subpageWithoutNav.hasNavElement, false);
   assert.strictEqual(subpageWithoutNav.navObservationComplete, true);
 
+  // Compact persistence must preserve all three nav states. Coverage signals
+  // are built from this compact form rather than from the raw parser result.
+  const compactNavTrue = compactSubpageJsonLdObservation_(subpageWithNav);
+  const compactNavFalse = compactSubpageJsonLdObservation_(subpageWithoutNav);
+  const compactNavUnknown = compactSubpageJsonLdObservation_(Object.assign({}, subpageWithNav, {
+    hasNavElement: null,
+    navObservationComplete: null
+  }));
+  assert.strictEqual(compactNavTrue.hasNavElement, true);
+  assert.strictEqual(compactNavTrue.navObservationComplete, true);
+  assert.strictEqual(compactNavFalse.hasNavElement, false);
+  assert.strictEqual(compactNavFalse.navObservationComplete, true);
+  assert.strictEqual(compactNavUnknown.hasNavElement, null);
+  assert.strictEqual(compactNavUnknown.navObservationComplete, null);
+
+  const compactNavFalseSignals = buildCoverageSignalsV1FromSubpageObservation_({
+    observations: [compactNavFalse],
+    coverageRuntime: { observationLimited: false, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 0 }
+  });
+  const compactNavUnknownSignals = buildCoverageSignalsV1FromSubpageObservation_({
+    observations: [compactNavUnknown],
+    coverageRuntime: { observationLimited: false, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 0 }
+  });
+  assert.strictEqual(compactNavFalseSignals.navObservationCompletedPageCount, 1);
+  assert.strictEqual(compactNavFalseSignals.observedNavPageCount, 0);
+  assert.strictEqual(compactNavUnknownSignals.navObservationCompletedPageCount, 0);
+  assert.strictEqual(compactNavUnknownSignals.observedNavPageCount, 0);
+
   const kenkoNavCoverageSignals = buildGeoSignalsCoverageSignals_(buildCoverageSignalsV1FromSubpageObservation_({
     topUrl: 'https://www1.kenko064.com/',
     origin: 'https://www1.kenko064.com',
@@ -402,8 +431,8 @@ function mainDocumentRequest(page, options = {}) {
       { url: 'https://www1.kenko064.com/help/about', pageType: 'about', source: 'ecGeneralLink' }
     ],
     observations: [
-      Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/products/list', finalUrl: 'https://www1.kenko064.com/products/list' }),
-      Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/help/about', finalUrl: 'https://www1.kenko064.com/help/about' })
+      compactSubpageJsonLdObservation_(Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/products/list', finalUrl: 'https://www1.kenko064.com/products/list' })),
+      compactSubpageJsonLdObservation_(Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/help/about', finalUrl: 'https://www1.kenko064.com/help/about' }))
     ],
     coverageRuntime: { observationLimited: false, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 0 }
   }));
