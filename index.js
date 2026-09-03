@@ -3813,6 +3813,14 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const bodyTextLength = normalizeSubpageJsonLdText($('body').first().text()).length;
   const pageType = legalPageType || inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes);
   const productPriceSignal = extractSubpageProductPriceSignal_(jsonLdItems, $, finalUrl || url, siteMode);
+  const productDescriptionSignal = extractSubpageProductDescriptionSignal_(jsonLdItems, $, finalUrl || url, siteMode);
+  const productOfferingSignal = extractSubpageProductOfferingSignal_(
+    finalUrl || url,
+    siteMode,
+    lowerTypes.has('product') || lowerTypes.has('offer'),
+    productPriceSignal,
+    productDescriptionSignal
+  );
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
     : null;
@@ -3913,6 +3921,10 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     hasProductPrice: productPriceSignal.hasProductPrice,
     productPriceObservationComplete: productPriceSignal.productPriceObservationComplete,
     productPriceSignalSource: productPriceSignal.productPriceSignalSource,
+    hasProductOffering: productOfferingSignal.hasProductOffering,
+    productOfferingObservationComplete: productOfferingSignal.productOfferingObservationComplete,
+    productDescriptionLength: productDescriptionSignal.productDescriptionLength,
+    productDescriptionObservationComplete: productDescriptionSignal.productDescriptionObservationComplete,
     hasFaqJsonLd: lowerTypes.has('faqpage'),
     hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
     hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
@@ -4969,6 +4981,64 @@ function extractSubpageProductPriceSignal_(jsonLdItems, $, url, siteMode) {
     productPriceObservationComplete: true,
     productPriceSignalSource: memberPriceNotice ? 'member_price_notice' : null
   };
+}
+
+function extractSubpageProductDescriptionSignal_(jsonLdItems, $, url, siteMode) {
+  if (String(siteMode || '').toLowerCase() !== 'ec' || !isEcProductDetailCandidate_({ url })) {
+    return { productDescriptionLength: null, productDescriptionObservationComplete: false };
+  }
+  const texts = [];
+  const addText = value => {
+    const text = normalizeSubpageJsonLdText(value);
+    if (text && !texts.includes(text)) texts.push(text);
+  };
+  const descriptionNodes = [];
+  const addNode = el => {
+    if (el && !descriptionNodes.includes(el)) descriptionNodes.push(el);
+  };
+  [
+    '[itemprop="description"]',
+    '.ec-productRole__description',
+    '.product_detail_freearea',
+    '[class*="product"][class*="description" i]',
+    '[id*="product"][id*="description" i]'
+  ].forEach(selector => $(selector).each((_, el) => addNode(el)));
+  $('table').each((_, el) => {
+    const heading = normalizeSubpageJsonLdText($(el).find('th,h3,h4').text());
+    if (/(?:商品説明|商品情報|商品仕様|規格|原材料|サイズ・容量)/.test(heading)) addNode(el);
+  });
+  descriptionNodes.forEach(el => {
+    const clone = $(el).clone();
+    clone.find('script,style,noscript,svg,nav,header,footer,form,button,input,select,textarea,[class*="price" i],[id*="price" i],.ec-productRole__code').remove();
+    addText(clone.text());
+  });
+  const visit = node => {
+    if (node == null) return;
+    if (Array.isArray(node)) { node.forEach(visit); return; }
+    if (typeof node !== 'object') return;
+    const type = (Array.isArray(node['@type']) ? node['@type'] : [node['@type']])
+      .map(value => normalizeSubpageJsonLdType(value).toLowerCase());
+    if (type.includes('product') && typeof node.description === 'string') addText(node.description);
+    Object.keys(node).forEach(key => {
+      if (key !== 'description') visit(node[key]);
+    });
+  };
+  visit(jsonLdItems);
+  return {
+    productDescriptionLength: texts.join('\n').length,
+    productDescriptionObservationComplete: true
+  };
+}
+
+function extractSubpageProductOfferingSignal_(url, siteMode, hasProductJsonLd, productPriceSignal, productDescriptionSignal) {
+  if (String(siteMode || '').toLowerCase() !== 'ec' || !isEcProductDetailCandidate_({ url })) {
+    return { hasProductOffering: null, productOfferingObservationComplete: false };
+  }
+  const descriptionLength = Number(productDescriptionSignal && productDescriptionSignal.productDescriptionLength || 0);
+  const hasProductOffering = hasProductJsonLd === true ||
+    (productPriceSignal && productPriceSignal.hasProductPrice === true) ||
+    descriptionLength >= 80;
+  return { hasProductOffering, productOfferingObservationComplete: true };
 }
 
 function addEcGeneralLinkCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, siteMode) {
@@ -6284,6 +6354,10 @@ function compactSubpageJsonLdObservation_(page) {
     hasProductPrice: typeof (page && page.hasProductPrice) === 'boolean' ? page.hasProductPrice : null,
     productPriceObservationComplete: page && page.productPriceObservationComplete === true,
     productPriceSignalSource: page && typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
+    hasProductOffering: typeof (page && page.hasProductOffering) === 'boolean' ? page.hasProductOffering : null,
+    productOfferingObservationComplete: page && page.productOfferingObservationComplete === true,
+    productDescriptionLength: typeof (page && page.productDescriptionLength) === 'number' ? page.productDescriptionLength : null,
+    productDescriptionObservationComplete: page && page.productDescriptionObservationComplete === true,
     hasFaqJsonLd: page && page.hasFaqJsonLd === true,
     hasArticleJsonLd: page && page.hasArticleJsonLd === true,
     hasBlogPostingJsonLd: page && page.hasBlogPostingJsonLd === true,
@@ -6791,6 +6865,22 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   const hasObservedProductPrice = observedProductPricePageCount > 0
     ? true
     : (productPriceObservationComplete ? false : null);
+  const productOfferingTargetPages = observations.filter(page => page && isProductPriceTarget(page));
+  const productOfferingObservationCompletedPageCount = productOfferingTargetPages.filter(page => typeof page.hasProductOffering === 'boolean').length;
+  const observedProductOfferingPageCount = productOfferingTargetPages.filter(page => page.hasProductOffering === true).length;
+  const productOfferingObservationComplete = productOfferingTargetPages.length > 0 &&
+    productOfferingObservationCompletedPageCount === productOfferingTargetPages.length &&
+    coverageRuntime.observationLimited !== true && budgetLimitedCandidateCount === 0 && timedOutCandidateCount === 0;
+  const hasObservedProductOffering = observedProductOfferingPageCount > 0
+    ? true
+    : (productOfferingObservationComplete ? false : null);
+  const productDescriptionObservationCompletedPageCount = productOfferingTargetPages.filter(page => page.productDescriptionObservationComplete === true && typeof page.productDescriptionLength === 'number').length;
+  const productDescriptionObservationComplete = productOfferingTargetPages.length > 0 &&
+    productDescriptionObservationCompletedPageCount === productOfferingTargetPages.length &&
+    coverageRuntime.observationLimited !== true && budgetLimitedCandidateCount === 0 && timedOutCandidateCount === 0;
+  const productDescriptionLength = productDescriptionObservationComplete
+    ? Math.max(...productOfferingTargetPages.map(page => Number(page.productDescriptionLength || 0)))
+    : null;
   const representativePages = observedPages
     .map(page => {
       const candidate = candidateByUrl.get(String(page.url || '')) || {};
@@ -6819,6 +6909,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         hasProductPrice: typeof page.hasProductPrice === 'boolean' ? page.hasProductPrice : null,
         productPriceObservationComplete: page.productPriceObservationComplete === true,
         productPriceSignalSource: typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
+        hasProductOffering: typeof page.hasProductOffering === 'boolean' ? page.hasProductOffering : null,
+        productOfferingObservationComplete: page.productOfferingObservationComplete === true,
+        productDescriptionLength: typeof page.productDescriptionLength === 'number' ? page.productDescriptionLength : null,
+        productDescriptionObservationComplete: page.productDescriptionObservationComplete === true,
         jsonLdTypes,
         legalOperatorInfo,
         matchedCandidateSources: Array.isArray(candidate.sources)
@@ -6887,6 +6981,13 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     productPriceObservationComplete,
     productPriceObservationCompletedPageCount,
     observedProductPricePageCount,
+    hasObservedProductOffering,
+    productOfferingObservationComplete,
+    productOfferingObservationCompletedPageCount,
+    observedProductOfferingPageCount,
+    productDescriptionLength,
+    productDescriptionObservationComplete,
+    productDescriptionObservationCompletedPageCount,
     hasObservedSubpageH1: observedH1PageCount > 0,
     hasObservedBreadcrumbList: observedBreadcrumbListPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
@@ -6999,6 +7100,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     productPriceObservationComplete: coverageSignalsV1.productPriceObservationComplete === true,
     productPriceObservationCompletedPageCount: Number(coverageSignalsV1.productPriceObservationCompletedPageCount || 0),
     observedProductPricePageCount: Number(coverageSignalsV1.observedProductPricePageCount || 0),
+    hasObservedProductOffering: typeof coverageSignalsV1.hasObservedProductOffering === 'boolean' ? coverageSignalsV1.hasObservedProductOffering : null,
+    productOfferingObservationComplete: coverageSignalsV1.productOfferingObservationComplete === true,
+    productDescriptionLength: typeof coverageSignalsV1.productDescriptionLength === 'number' ? coverageSignalsV1.productDescriptionLength : null,
+    productDescriptionObservationComplete: coverageSignalsV1.productDescriptionObservationComplete === true,
     hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
     hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
     hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
@@ -7025,6 +7130,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       hasProductPrice: typeof (page && page.hasProductPrice) === 'boolean' ? page.hasProductPrice : null,
       productPriceObservationComplete: page && page.productPriceObservationComplete === true,
       productPriceSignalSource: page && typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
+      hasProductOffering: typeof (page && page.hasProductOffering) === 'boolean' ? page.hasProductOffering : null,
+      productOfferingObservationComplete: page && page.productOfferingObservationComplete === true,
+      productDescriptionLength: typeof (page && page.productDescriptionLength) === 'number' ? page.productDescriptionLength : null,
+      productDescriptionObservationComplete: page && page.productDescriptionObservationComplete === true,
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
       legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
@@ -7078,6 +7187,12 @@ function buildSubpageSignalsSummary_(pages) {
   const productJsonLdPageCount = okPages.filter(page => page.hasProductJsonLd === true).length;
   const productPriceObservationCompletedPageCount = okPages.filter(page => page.productPriceObservationComplete === true && typeof page.hasProductPrice === 'boolean').length;
   const observedProductPricePageCount = okPages.filter(page => page.hasProductPrice === true).length;
+  const productOfferingObservationCompletedPageCount = okPages.filter(page => page.productOfferingObservationComplete === true && typeof page.hasProductOffering === 'boolean').length;
+  const observedProductOfferingPageCount = okPages.filter(page => page.hasProductOffering === true).length;
+  const productDescriptionObservationCompletedPageCount = okPages.filter(page => page.productDescriptionObservationComplete === true && typeof page.productDescriptionLength === 'number').length;
+  const productDescriptionLength = productDescriptionObservationCompletedPageCount > 0
+    ? Math.max(...okPages.filter(page => page.productDescriptionObservationComplete === true && typeof page.productDescriptionLength === 'number').map(page => Number(page.productDescriptionLength || 0)))
+    : null;
   return {
     observedPageTypes: pageTypes,
     hasAnyJsonLd: okPages.some(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0),
@@ -7091,6 +7206,12 @@ function buildSubpageSignalsSummary_(pages) {
     hasObservedProductPrice: observedProductPricePageCount > 0 ? true : (productPriceObservationCompletedPageCount > 0 ? false : null),
     productPriceObservationCompletedPageCount,
     observedProductPricePageCount,
+    hasObservedProductOffering: observedProductOfferingPageCount > 0 ? true : (productOfferingObservationCompletedPageCount > 0 ? false : null),
+    productOfferingObservationCompletedPageCount,
+    observedProductOfferingPageCount,
+    productDescriptionLength,
+    productDescriptionObservationComplete: productDescriptionObservationCompletedPageCount > 0,
+    productDescriptionObservationCompletedPageCount,
     productJsonLdObservedPageCount,
     productJsonLdPageCount
   };
@@ -7265,6 +7386,10 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         hasProductPrice: typeof page.hasProductPrice === 'boolean' ? page.hasProductPrice : null,
         productPriceObservationComplete: page.productPriceObservationComplete === true,
         productPriceSignalSource: typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
+        hasProductOffering: typeof page.hasProductOffering === 'boolean' ? page.hasProductOffering : null,
+        productOfferingObservationComplete: page.productOfferingObservationComplete === true,
+        productDescriptionLength: typeof page.productDescriptionLength === 'number' ? page.productDescriptionLength : null,
+        productDescriptionObservationComplete: page.productDescriptionObservationComplete === true,
         hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
         hasBreadcrumbUi: page.hasBreadcrumbUi === true,
         hasNavElement: typeof page.hasNavElement === 'boolean' ? page.hasNavElement : null,
@@ -23840,6 +23965,8 @@ module.exports.__lightBudgetTestHooks = {
   buildLightCoverageObservationPlan_,
   isEcProductDetailCandidate_,
   extractSubpageProductPriceSignal_,
+  extractSubpageProductDescriptionSignal_,
+  extractSubpageProductOfferingSignal_,
   inferEcGeneralLinkPageType_,
   addEcGeneralLinkCandidatesFromLinks_,
   fetchSubpageHtmlLightUrls_,
