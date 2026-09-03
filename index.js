@@ -3812,6 +3812,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const sampledText = normalizeSubpageJsonLdText(bodyClone.text()).slice(0, 500);
   const bodyTextLength = normalizeSubpageJsonLdText($('body').first().text()).length;
   const pageType = legalPageType || inferSubpageJsonLdPageType(finalUrl || url, siteMode, uniqueTypes);
+  const productPriceSignal = extractSubpageProductPriceSignal_(jsonLdItems, $, finalUrl || url, siteMode);
   const legalOperatorInfo = legalPageType === 'legal'
     ? extractLegalOperatorInfoFromHtml_(html, finalUrl || url, { title, h1Texts })
     : null;
@@ -3909,6 +3910,9 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     listItemCount: Number(jsonldTypeCounts.ListItem || 0),
     hasBreadcrumbJsonLd: lowerTypes.has('breadcrumblist'),
     hasProductJsonLd: lowerTypes.has('product') || lowerTypes.has('offer'),
+    hasProductPrice: productPriceSignal.hasProductPrice,
+    productPriceObservationComplete: productPriceSignal.productPriceObservationComplete,
+    productPriceSignalSource: productPriceSignal.productPriceSignalSource,
     hasFaqJsonLd: lowerTypes.has('faqpage'),
     hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
     hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
@@ -4917,6 +4921,54 @@ function inferEcGeneralLinkPageType_(link) {
   if (/(?:\/contact|\/contact-us|\/inquiry|\/otoiawase)(?:\/|$|-|_)/i.test(path) || /お問い合わせ|お問合せ|問い合わせ/i.test(label)) return 'contact';
   if (/(?:\/guide|\/guides|\/help|\/support|\/shipping|\/delivery|\/return|\/exchange)(?:\/|$|-|_)/i.test(path) || /(?:ご?利用|購入)ガイド|配送|送料|返品|交換|サポート|ヘルプ/i.test(label)) return 'faq';
   return '';
+}
+
+function isEcProductDetailCandidate_(candidate) {
+  const rawUrl = String(candidate && (candidate.finalUrl || candidate.url || candidate.href || candidate.path) || '');
+  const label = normalizeSubpageJsonLdText([
+    candidate && candidate.label,
+    candidate && candidate.text,
+    candidate && candidate.ariaLabel,
+    candidate && candidate.title
+  ].filter(Boolean).join(' '));
+  const path = (() => {
+    try { return new URL(rawUrl).pathname.toLowerCase(); } catch (_) { return rawUrl.toLowerCase(); }
+  })();
+  if (/\/(?:products?|items?|goods)\/(?:detail|details)\/(?:[^/]+)(?:\/|$)/i.test(path)) return true;
+  if (/\/(?:products?|items?|goods)\/(?!list(?:\/|$)|category|categories|collection|collections)[^/]+(?:\/|$)/i.test(path)) return true;
+  return /商品\s*詳細|製品\s*詳細/.test(label);
+}
+
+function extractSubpageProductPriceSignal_(jsonLdItems, $, url, siteMode) {
+  if (String(siteMode || '').toLowerCase() !== 'ec' || !isEcProductDetailCandidate_({ url })) {
+    return { hasProductPrice: null, productPriceObservationComplete: false, productPriceSignalSource: null };
+  }
+  let hasOfferPrice = false;
+  const visit = node => {
+    if (hasOfferPrice || node == null) return;
+    if (Array.isArray(node)) { node.forEach(visit); return; }
+    if (typeof node !== 'object') return;
+    const type = node['@type'];
+    const types = (Array.isArray(type) ? type : [type]).map(v => normalizeSubpageJsonLdType(v).toLowerCase());
+    const price = node.price;
+    const priceNumber = typeof price === 'number' ? price : Number(String(price == null ? '' : price).replace(/[,\s]/g, ''));
+    if ((types.includes('offer') || Object.prototype.hasOwnProperty.call(node, 'price')) &&
+        Number.isFinite(priceNumber) && priceNumber >= 0) hasOfferPrice = true;
+    Object.keys(node).forEach(key => {
+      if (key !== 'price') visit(node[key]);
+    });
+  };
+  visit(jsonLdItems);
+  if (hasOfferPrice) {
+    return { hasProductPrice: true, productPriceObservationComplete: true, productPriceSignalSource: 'offer_price' };
+  }
+  const pageText = normalizeSubpageJsonLdText($('body').first().text());
+  const memberPriceNotice = /(?:価格|販売価格|卸価格|卸・販売価格|仕入れ価格)[^\n]{0,80}(?:会員(?:のみ)?公開|ログイン後(?:に)?(?:価格)?表示)|(?:会員(?:のみ)?公開|ログイン後(?:に)?(?:価格)?表示)[^\n]{0,80}(?:価格|販売価格|卸価格|卸・販売価格|仕入れ価格)/.test(pageText);
+  return {
+    hasProductPrice: memberPriceNotice ? true : false,
+    productPriceObservationComplete: true,
+    productPriceSignalSource: memberPriceNotice ? 'member_price_notice' : null
+  };
 }
 
 function addEcGeneralLinkCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, siteMode) {
@@ -6229,6 +6281,9 @@ function compactSubpageJsonLdObservation_(page) {
     listItemCount,
     hasBreadcrumbJsonLd: page && page.hasBreadcrumbJsonLd === true,
     hasProductJsonLd: page && page.hasProductJsonLd === true,
+    hasProductPrice: typeof (page && page.hasProductPrice) === 'boolean' ? page.hasProductPrice : null,
+    productPriceObservationComplete: page && page.productPriceObservationComplete === true,
+    productPriceSignalSource: page && typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
     hasFaqJsonLd: page && page.hasFaqJsonLd === true,
     hasArticleJsonLd: page && page.hasArticleJsonLd === true,
     hasBlogPostingJsonLd: page && page.hasBlogPostingJsonLd === true,
@@ -6361,10 +6416,15 @@ function buildLightCoverageObservationPlan_(candidates, opts = {}) {
   const used = new Set();
   groups.forEach((kinds, groupIndex) => {
     if (candidatesOut.length >= maxObserve) return;
-    const candidate = baseOrder.find(item => {
+    const eligible = item => {
       const key = discoverSubpageCandidateKey(item && item.url || '');
       return !!key && !used.has(key) && kinds.includes(getLightCoverageObservationKind_(item, opts.siteMode || 'generic'));
-    });
+    };
+    // EC価格の観測対象は、同一product枠なら一覧より商品詳細を優先する。
+    // 枠数・candidate source・他siteModeの選定契約は変えない。
+    const candidate = String(opts.siteMode || '').toLowerCase() === 'ec' && kinds.includes('product')
+      ? (baseOrder.find(item => eligible(item) && isEcProductDetailCandidate_(item)) || baseOrder.find(eligible))
+      : baseOrder.find(eligible);
     if (!candidate) return;
     used.add(discoverSubpageCandidateKey(candidate.url));
     candidatesOut.push(Object.assign({}, candidate, { __lightCoveragePriorityGroup: groupIndex }));
@@ -6713,6 +6773,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
   };
   const hasBreadcrumbUi = page => page && page.hasBreadcrumbUi === true;
   const hasNavElement = page => page && page.hasNavElement === true;
+  const isProductPriceTarget = page => isEcProductDetailCandidate_(candidateByUrl.get(String(page && page.url || '')) || page);
   const navObservationAttemptedPageCount = observations.length;
   const navObservationCompletedPageCount = observations.filter(page => page && typeof page.hasNavElement === 'boolean').length;
   const observedNavPageCount = observations.filter(page => hasNavElement(page)).length;
@@ -6721,6 +6782,15 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     coverageRuntime.observationLimited !== true &&
     budgetLimitedCandidateCount === 0 &&
     timedOutCandidateCount === 0;
+  const productPriceTargetPages = observations.filter(page => page && isProductPriceTarget(page));
+  const productPriceObservationCompletedPageCount = productPriceTargetPages.filter(page => typeof page.hasProductPrice === 'boolean').length;
+  const observedProductPricePageCount = productPriceTargetPages.filter(page => page.hasProductPrice === true).length;
+  const productPriceObservationComplete = productPriceTargetPages.length > 0 &&
+    productPriceObservationCompletedPageCount === productPriceTargetPages.length &&
+    coverageRuntime.observationLimited !== true && budgetLimitedCandidateCount === 0 && timedOutCandidateCount === 0;
+  const hasObservedProductPrice = observedProductPricePageCount > 0
+    ? true
+    : (productPriceObservationComplete ? false : null);
   const representativePages = observedPages
     .map(page => {
       const candidate = candidateByUrl.get(String(page.url || '')) || {};
@@ -6746,6 +6816,9 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         hasBreadcrumbList: hasBreadcrumbList(page),
         hasBreadcrumbUi: hasBreadcrumbUi(page),
         hasNavElement: typeof page.hasNavElement === 'boolean' ? page.hasNavElement : null,
+        hasProductPrice: typeof page.hasProductPrice === 'boolean' ? page.hasProductPrice : null,
+        productPriceObservationComplete: page.productPriceObservationComplete === true,
+        productPriceSignalSource: typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
         jsonLdTypes,
         legalOperatorInfo,
         matchedCandidateSources: Array.isArray(candidate.sources)
@@ -6810,6 +6883,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     navObservationCompletedPageCount,
     observedNavPageCount,
     navObservationComplete,
+    hasObservedProductPrice,
+    productPriceObservationComplete,
+    productPriceObservationCompletedPageCount,
+    observedProductPricePageCount,
     hasObservedSubpageH1: observedH1PageCount > 0,
     hasObservedBreadcrumbList: observedBreadcrumbListPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
@@ -6918,6 +6995,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     navObservationCompletedPageCount: Number(coverageSignalsV1.navObservationCompletedPageCount || 0),
     observedNavPageCount: Number(coverageSignalsV1.observedNavPageCount || 0),
     navObservationComplete: coverageSignalsV1.navObservationComplete === true,
+    hasObservedProductPrice: typeof coverageSignalsV1.hasObservedProductPrice === 'boolean' ? coverageSignalsV1.hasObservedProductPrice : null,
+    productPriceObservationComplete: coverageSignalsV1.productPriceObservationComplete === true,
+    productPriceObservationCompletedPageCount: Number(coverageSignalsV1.productPriceObservationCompletedPageCount || 0),
+    observedProductPricePageCount: Number(coverageSignalsV1.observedProductPricePageCount || 0),
     hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
     hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
     hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
@@ -6941,6 +7022,9 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
       hasBreadcrumbUi: !!(page && page.hasBreadcrumbUi),
       hasNavElement: typeof (page && page.hasNavElement) === 'boolean' ? page.hasNavElement : null,
+      hasProductPrice: typeof (page && page.hasProductPrice) === 'boolean' ? page.hasProductPrice : null,
+      productPriceObservationComplete: page && page.productPriceObservationComplete === true,
+      productPriceSignalSource: page && typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
       legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
@@ -6992,6 +7076,8 @@ function buildSubpageSignalsSummary_(pages) {
   ))).map(normalizeSubpageJsonLdType).filter(Boolean))).slice(0, 50);
   const productJsonLdObservedPageCount = okPages.filter(page => page.productJsonLdObserved === true).length;
   const productJsonLdPageCount = okPages.filter(page => page.hasProductJsonLd === true).length;
+  const productPriceObservationCompletedPageCount = okPages.filter(page => page.productPriceObservationComplete === true && typeof page.hasProductPrice === 'boolean').length;
+  const observedProductPricePageCount = okPages.filter(page => page.hasProductPrice === true).length;
   return {
     observedPageTypes: pageTypes,
     hasAnyJsonLd: okPages.some(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0),
@@ -7002,6 +7088,9 @@ function buildSubpageSignalsSummary_(pages) {
     pagesWithJsonLdCount: okPages.filter(page => page.hasJsonLd === true || Number(page.jsonLdCount || page.jsonldCount || 0) > 0).length,
     pagesWithBreadcrumbListCount: okPages.filter(page => page.hasBreadcrumbList === true || page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0).length,
     hasProductJsonLdOnSubpage: productJsonLdPageCount > 0 ? true : null,
+    hasObservedProductPrice: observedProductPricePageCount > 0 ? true : (productPriceObservationCompletedPageCount > 0 ? false : null),
+    productPriceObservationCompletedPageCount,
+    observedProductPricePageCount,
     productJsonLdObservedPageCount,
     productJsonLdPageCount
   };
@@ -7173,6 +7262,9 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         hasJsonLd: page.hasJsonLd === true || jsonLdTypes.length > 0,
         productJsonLdObserved: Array.isArray(page.jsonldTypes) ? true : null,
         hasProductJsonLd: page.hasProductJsonLd === true ? true : null,
+        hasProductPrice: typeof page.hasProductPrice === 'boolean' ? page.hasProductPrice : null,
+        productPriceObservationComplete: page.productPriceObservationComplete === true,
+        productPriceSignalSource: typeof page.productPriceSignalSource === 'string' ? page.productPriceSignalSource : null,
         hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
         hasBreadcrumbUi: page.hasBreadcrumbUi === true,
         hasNavElement: typeof page.hasNavElement === 'boolean' ? page.hasNavElement : null,
@@ -23746,11 +23838,14 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
+  isEcProductDetailCandidate_,
+  extractSubpageProductPriceSignal_,
   inferEcGeneralLinkPageType_,
   addEcGeneralLinkCandidatesFromLinks_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,
+  buildSubpageSignalsV1FromSubpageObservation_,
   buildGeoSignalsCoverageSignals_,
   createLightRequestBudget_,
   createLightAttempt_,
