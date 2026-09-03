@@ -3541,7 +3541,44 @@ function extractArticleMetaFromCheerio_($) {
   };
 }
 
-function buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, meta, baseUrl) {
+function normalizeArticleVisibleDate_(value) {
+  const raw = normalizeArticleSignalText_(value, 120);
+  if (!raw) return null;
+  // Keep the accepted grammar deliberately narrow.  This reuses the existing
+  // Japanese numeric-date parser and only admits ISO datetimes as an extra
+  // machine-readable form.
+  const jp = parseJpDateToISO(raw);
+  if (jp) return jp;
+  const iso = raw.match(/^(20\d{2})-(\d{2})-(\d{2})(?:T[0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-][0-2]\d:[0-5]\d)?)?$/);
+  if (!iso) return null;
+  const parsed = new Date(`${iso[1]}-${iso[2]}-${iso[3]}T00:00:00Z`);
+  if (Number.isNaN(+parsed) || parsed.getUTCFullYear() !== Number(iso[1]) || parsed.getUTCMonth() + 1 !== Number(iso[2]) || parsed.getUTCDate() !== Number(iso[3])) return null;
+  return `${iso[1]}-${iso[2]}-${iso[3]}`;
+}
+
+function pickArticleVisibleDate_(candidates) {
+  const nowYear = new Date().getUTCFullYear() + 1;
+  const list = Array.isArray(candidates) ? candidates : [];
+  for (const candidate of list) {
+    if (!candidate || candidate.articleContext !== true || candidate.excluded === true) continue;
+    const iso = normalizeArticleVisibleDate_(candidate.value || candidate.datetime || candidate.text);
+    if (!iso || Number(iso.slice(0, 4)) < 1990 || Number(iso.slice(0, 4)) > nowYear) continue;
+    const kind = String(candidate.kind || '').toLowerCase();
+    const hasDateSignal = candidate.dateSignal === true;
+    const headerNearH1 = candidate.headerNearH1 === true;
+    const labelled = candidate.labelled === true;
+    if (kind === 'time' && (hasDateSignal || labelled || headerNearH1)) {
+      const type = candidate.modified === true ? 'modified' : (candidate.published === true ? 'published' : 'published_or_modified_unknown');
+      return { value: iso, type, source: candidate.source || 'article_time_datetime', confidence: 'high' };
+    }
+    if (hasDateSignal && (headerNearH1 || labelled)) {
+      return { value: iso, type: 'published_or_modified_unknown', source: candidate.source || 'article_header_visible_date', confidence: 'medium' };
+    }
+  }
+  return null;
+}
+
+function buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, meta, baseUrl, visibleDateCandidates) {
   const items = Array.isArray(jsonLdItems) ? jsonLdItems : [];
   const articleNodes = [];
   items.forEach(item => collectArticleJsonLdNodes_(item, articleNodes, 0));
@@ -3579,22 +3616,29 @@ function buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, meta, baseUrl) {
     section: normalizeArticleSignalText_(metaObj.section, 120) || null,
     tags: normalizeArticleSignalArray_(metaObj.tags, 10, 120)
   };
+  const visibleDate = pickArticleVisibleDate_(visibleDateCandidates);
   const hasMeta = !!(metaOut.publishedTime || metaOut.modifiedTime || metaOut.author || metaOut.section || metaOut.tags.length);
   return {
-    checked: items.length > 0 || hasMeta,
+    checked: items.length > 0 || hasMeta || !!visibleDate,
     source: {
       jsonLd: articleNodes.length > 0,
-      meta: hasMeta
+      meta: hasMeta,
+      visibleDate: !!visibleDate
     },
     jsonLd,
     meta: metaOut,
+    visibleDate: visibleDate && visibleDate.value || null,
+    visibleDateType: visibleDate && visibleDate.type || null,
+    visibleDateSource: visibleDate && visibleDate.source || null,
+    visibleDateConfidence: visibleDate && visibleDate.confidence || null,
     summary: {
       hasArticleType: types.length ? true : (items.length ? false : null),
       hasHeadline: !!jsonLd.headline,
-      hasPublishedDate: !!(jsonLd.datePublished || metaOut.publishedTime),
-      hasModifiedDate: !!(jsonLd.dateModified || metaOut.modifiedTime),
+      hasPublishedDate: !!(jsonLd.datePublished || metaOut.publishedTime || (visibleDate && visibleDate.type === 'published')),
+      hasModifiedDate: !!(jsonLd.dateModified || metaOut.modifiedTime || (visibleDate && visibleDate.type === 'modified')),
       hasAuthor: !!(jsonLd.authorName || metaOut.author),
-      hasPublisher: !!jsonLd.publisherName
+      hasPublisher: !!jsonLd.publisherName,
+      hasVisibleDate: !!visibleDate
     }
   };
 }
@@ -3623,6 +3667,36 @@ async function collectArticleSignalsFromPageLight_(page, baseUrl) {
         .map(v => clean(v, 120))
         .filter(Boolean);
       keywords.forEach(tag => { if (!tags.includes(tag) && tags.length < 10) tags.push(tag); });
+      const compact = value => clean(value, 180);
+      const visibleDateCandidates = [];
+      const selectors = ['time', '[datetime]', '[class*="date" i]', '[class*="time" i]', '[class*="publish" i]', '[class*="update" i]', '[class*="posted" i]', '[data-date]', '[data-published]', '[data-modified]'];
+      const seen = new Set();
+      selectors.forEach(selector => Array.from(document.querySelectorAll(selector)).slice(0, 80).forEach(el => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        const ancestry = [];
+        let cur = el;
+        for (let i = 0; cur && i < 6; i += 1, cur = cur.parentElement) ancestry.push(`${cur.tagName || ''} ${cur.className || ''} ${cur.id || ''} ${cur.getAttribute && cur.getAttribute('role') || ''}`.toLowerCase());
+        const context = ancestry.join(' ');
+        const excluded = /(?:\bnav\b|footer|breadcrumb|related|ranking|pagination|category|tag)/i.test(context);
+        const articleRoot = el.closest('article, main, [class*="article" i], [class*="post" i], [class*="entry" i], [class*="detail" i], [class*="content" i]');
+        const header = el.closest('header, [class*="header" i], [class*="head" i]') || (articleRoot && articleRoot.querySelector('header, [class*="header" i], [class*="head" i]'));
+        const headerNearH1 = !!(header && header.querySelector('h1'));
+        const attrs = `${el.className || ''} ${el.id || ''} ${el.getAttribute('itemprop') || ''} ${el.getAttribute('data-date') || ''} ${el.getAttribute('data-published') || ''} ${el.getAttribute('data-modified') || ''}`.toLowerCase();
+        const nearby = compact(`${el.previousElementSibling && el.previousElementSibling.textContent || ''} ${el.parentElement && el.parentElement.textContent || ''}`);
+        visibleDateCandidates.push({
+          kind: el.tagName && el.tagName.toLowerCase() === 'time' ? 'time' : 'visible',
+          value: el.getAttribute('datetime') || el.getAttribute('data-date') || el.getAttribute('data-published') || el.getAttribute('data-modified') || compact(el.textContent),
+          articleContext: !!articleRoot,
+          headerNearH1,
+          excluded,
+          dateSignal: /(?:date|time|publish|update|posted|公開|更新|投稿日|最終更新)/i.test(attrs),
+          labelled: /(?:公開|更新|投稿|投稿日|最終更新|published|modified|updated|posted)/i.test(nearby),
+          published: /(?:publish|posted|公開|投稿)/i.test(attrs + ' ' + nearby),
+          modified: /(?:modified|updated|更新)/i.test(attrs + ' ' + nearby),
+          source: el.tagName && el.tagName.toLowerCase() === 'time' ? 'article_time_datetime' : 'article_header_visible_date'
+        });
+      }));
       return {
         jsonLdItems,
         meta: {
@@ -3631,13 +3705,47 @@ async function collectArticleSignalsFromPageLight_(page, baseUrl) {
           author: metaOne('meta[property="article:author" i]') || metaOne('meta[name="author" i]'),
           section: metaOne('meta[property="article:section" i]'),
           tags
-        }
+        },
+        visibleDateCandidates
       };
     });
-    return buildArticleSignalsFromJsonLdAndMeta_(data && data.jsonLdItems, data && data.meta, baseUrl);
+    return buildArticleSignalsFromJsonLdAndMeta_(data && data.jsonLdItems, data && data.meta, baseUrl, data && data.visibleDateCandidates);
   } catch (_) {
     return buildArticleSignalsFromJsonLdAndMeta_([], {}, baseUrl);
   }
+}
+
+function extractArticleVisibleDateCandidatesFromCheerio_($) {
+  const out = [];
+  const seen = new Set();
+  const selectors = 'time,[datetime],[class*="date" i],[class*="time" i],[class*="publish" i],[class*="update" i],[class*="posted" i],[data-date],[data-published],[data-modified]';
+  $(selectors).slice(0, 120).each((_, el) => {
+    if (seen.has(el)) return;
+    seen.add(el);
+    const $el = $(el);
+    const parents = $el.parents().slice(0, 6).toArray();
+    const context = parents.concat([el]).map(node => `${node.tagName || ''} ${$(node).attr('class') || ''} ${$(node).attr('id') || ''} ${$(node).attr('role') || ''}`).join(' ').toLowerCase();
+    const excluded = /(?:\bnav\b|footer|breadcrumb|related|ranking|pagination|category|tag)/i.test(context);
+    const $root = $el.closest('article,main,[class*="article" i],[class*="post" i],[class*="entry" i],[class*="detail" i],[class*="content" i]');
+    const $header = $el.closest('header,[class*="header" i],[class*="head" i]').length
+      ? $el.closest('header,[class*="header" i],[class*="head" i]')
+      : $root.find('header,[class*="header" i],[class*="head" i]').first();
+    const attrs = `${$el.attr('class') || ''} ${$el.attr('id') || ''} ${$el.attr('itemprop') || ''} ${$el.attr('data-date') || ''} ${$el.attr('data-published') || ''} ${$el.attr('data-modified') || ''}`.toLowerCase();
+    const nearby = normalizeArticleSignalText_(`${$el.prev().text() || ''} ${$el.parent().text() || ''}`, 180);
+    out.push({
+      kind: String(el.tagName || '').toLowerCase() === 'time' ? 'time' : 'visible',
+      value: $el.attr('datetime') || $el.attr('data-date') || $el.attr('data-published') || $el.attr('data-modified') || $el.text(),
+      articleContext: $root.length > 0,
+      headerNearH1: $header.find('h1').length > 0,
+      excluded,
+      dateSignal: /(?:date|time|publish|update|posted|公開|更新|投稿日|最終更新)/i.test(attrs),
+      labelled: /(?:公開|更新|投稿|投稿日|最終更新|published|modified|updated|posted)/i.test(nearby),
+      published: /(?:publish|posted|公開|投稿)/i.test(attrs + ' ' + nearby),
+      modified: /(?:modified|updated|更新)/i.test(attrs + ' ' + nearby),
+      source: String(el.tagName || '').toLowerCase() === 'time' ? 'article_time_datetime' : 'article_header_visible_date'
+    });
+  });
+  return out;
 }
 
 function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
@@ -3769,7 +3877,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
       observationScope: 'contact_subpage'
     };
   })();
-  const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url);
+  const articleSignals = buildArticleSignalsFromJsonLdAndMeta_(jsonLdItems, extractArticleMetaFromCheerio_($), finalUrl || url, extractArticleVisibleDateCandidatesFromCheerio_($));
   let internalLinkCount = 0;
   let externalLinkCount = 0;
   $('a[href]').slice(0, 1200).each((_, el) => {
@@ -8705,8 +8813,10 @@ function summarizeArticleSignalsForFreshness_(articleSignals) {
   const jsonLd = signals.jsonLd && typeof signals.jsonLd === 'object' ? signals.jsonLd : {};
   const meta = signals.meta && typeof signals.meta === 'object' ? signals.meta : {};
   const summary = signals.summary && typeof signals.summary === 'object' ? signals.summary : {};
-  const datePublished = jsonLd.datePublished || meta.publishedTime || null;
-  const dateModified = jsonLd.dateModified || meta.modifiedTime || null;
+  const visibleDate = signals.visibleDate || null;
+  const visibleDateType = signals.visibleDateType || null;
+  const datePublished = jsonLd.datePublished || meta.publishedTime || (visibleDateType === 'published' ? visibleDate : null) || null;
+  const dateModified = jsonLd.dateModified || meta.modifiedTime || (visibleDateType === 'modified' ? visibleDate : null) || null;
   const datePublishedPrecision = jsonLd.datePublishedPrecision || null;
   const hasPublishedDate = summary.hasPublishedDate === true || !!datePublished;
   const hasModifiedDate = summary.hasModifiedDate === true || !!dateModified;
@@ -8717,6 +8827,10 @@ function summarizeArticleSignalsForFreshness_(articleSignals) {
     hasModifiedDate,
     datePublished,
     dateModified,
+    visibleDate,
+    visibleDateType,
+    visibleDateSource: signals.visibleDateSource || null,
+    visibleDateConfidence: signals.visibleDateConfidence || null,
     datePublishedPrecision
   };
 }
@@ -8724,8 +8838,14 @@ function summarizeArticleSignalsForFreshness_(articleSignals) {
 function buildFreshnessOperationSignalsFromArticleSignals_(articleSignals, selectedSource) {
   const articleSummary = summarizeArticleSignalsForFreshness_(articleSignals);
   if (articleSummary.checked !== true) return null;
-  if (!articleSummary.datePublished && !articleSummary.dateModified) return null;
-  const sampleDates = [articleSummary.datePublished, articleSummary.dateModified].filter(Boolean);
+  if (!articleSummary.datePublished && !articleSummary.dateModified && !articleSummary.visibleDate) return null;
+  const sampleDates = [articleSummary.datePublished, articleSummary.dateModified, articleSummary.visibleDate].filter(Boolean);
+  const usesVisibleDateOnly = !articleSummary.datePublished && !articleSummary.dateModified && !!articleSummary.visibleDate;
+  const jsonLd = articleSignals && articleSignals.jsonLd && typeof articleSignals.jsonLd === 'object' ? articleSignals.jsonLd : {};
+  const meta = articleSignals && articleSignals.meta && typeof articleSignals.meta === 'object' ? articleSignals.meta : {};
+  // Priority is source-based, not merely modified-vs-published: structured
+  // article metadata is stronger than a lower-priority meta tag.
+  const preferredLatestDate = jsonLd.dateModified || jsonLd.datePublished || meta.modifiedTime || meta.publishedTime || articleSummary.dateModified || articleSummary.datePublished || articleSummary.visibleDate || null;
   return {
     observed: true,
     checked: true,
@@ -8735,19 +8855,22 @@ function buildFreshnessOperationSignalsFromArticleSignals_(articleSignals, selec
     hasDateModified: !!articleSummary.dateModified,
     datePublished: articleSummary.datePublished || null,
     dateModified: articleSummary.dateModified || null,
+    visibleDate: articleSummary.visibleDate || null,
+    visibleDateType: articleSummary.visibleDateType || null,
+    visibleDateConfidence: articleSummary.visibleDateConfidence || null,
     datePublishedPrecision: articleSummary.datePublishedPrecision || null,
-    latestDate: articleSummary.dateModified || articleSummary.datePublished || null,
+    latestDate: preferredLatestDate,
     newsDateEvidenceCount: sampleDates.length,
-    freshnessEvidenceSources: ['articleSignals'],
+    freshnessEvidenceSources: [usesVisibleDateOnly ? 'article_dom_visible_date' : 'articleSignals'],
     sampleDates,
     evidenceSamples: sampleDates.map((date) => ({
       date,
-      source: selectedSource || 'articleSignals',
+      source: usesVisibleDateOnly ? (articleSummary.visibleDateSource || 'article_dom_visible_date') : (selectedSource || 'articleSignals'),
       text: '',
       href: ''
     })),
     source: 'article_signals',
-    extractionMethod: 'article_signals_facts_bridge_input',
+    extractionMethod: usesVisibleDateOnly ? 'article_dom_visible_date' : 'article_signals_facts_bridge_input',
     articleSignalsSource: selectedSource || null
   };
 }
@@ -9109,6 +9232,16 @@ async function attachCoverageSignalsToGeoSignalsLight_(geoSignalsV1, topUrl, opt
           context: opts && opts.context,
           reuseBrowser: reusePageForDiscover || reuseContextForObserve
         });
+    // Freshness article observation is deliberately separate from coverage-role
+    // selection: media cards are not allowed to displace company/contact pages.
+    await attachMediaFreshnessArticleDomSignalsLight_(geoSignalsV1, opts && opts.page, {
+      siteMode,
+      origin: normalized.origin,
+      url: normalized.topUrl,
+      lightBudget,
+      shortFastMode: opts && opts.shortFastMode === true,
+      staticFallback: effectiveStaticCandidateSubpageObservation
+    });
     await attachNewsIndexFreshnessSignalsLight_(geoSignalsV1, discovered.candidates, {
       siteMode,
       context: opts && opts.context
@@ -11585,6 +11718,66 @@ function normalizeFreshnessDateYmd_(value) {
   const mm = String(m[2] || m[5]).padStart(2, '0');
   const dd = String(m[3] || m[6]).padStart(2, '0');
   return `${y}-${mm}-${dd}`;
+}
+
+const LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT = 2;
+const LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_MS = 2200;
+
+function selectMediaFreshnessArticleCandidates_(candidates, origin) {
+  const seen = new Set();
+  return (Array.isArray(candidates) ? candidates : []).map((candidate, index) => {
+    const href = String(candidate && (candidate.href || candidate.url) || '');
+    let parsed = null;
+    try { parsed = new URL(href); } catch (_) { return null; }
+    if (!origin || parsed.origin !== origin || seen.has(parsed.href)) return null;
+    seen.add(parsed.href);
+    if (candidate.excluded === true || candidate.inNavigation === true || candidate.inFooter === true || candidate.inBreadcrumb === true || candidate.categoryOrTag === true || candidate.pagination === true) return null;
+    const semantic = candidate.semanticArticle === true || candidate.cardLike === true;
+    const contextual = candidate.heading === true || candidate.dateSignal === true || candidate.image === true;
+    if (!semantic || !contextual) return null;
+    return { url: parsed.href, score: (candidate.dateSignal === true ? 4 : 0) + (candidate.heading === true ? 2 : 0) + (candidate.image === true ? 1 : 0), index };
+  }).filter(Boolean).sort((a, b) => b.score - a.score || a.index - b.index).slice(0, LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT);
+}
+
+async function collectMediaFreshnessArticleCandidatesFromPageLight_(page, origin) {
+  if (!page || typeof page.evaluate !== 'function') return [];
+  const candidates = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).slice(0, 500).map((el) => {
+    const parent = el.closest('article,[role="article"],main [class*="card" i],main [class*="article" i],main [class*="post" i],main [class*="entry" i]');
+    const context = [el, ...Array.from(el.parentElement ? [el.parentElement] : []), ...(parent ? [parent] : [])]
+      .map(node => `${node && node.tagName || ''} ${node && node.className || ''} ${node && node.id || ''}`).join(' ').toLowerCase();
+    const text = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+    return {
+      href: el.href || '', semanticArticle: !!parent, cardLike: /card|article|post|entry|story|news/i.test(context),
+      heading: !!(parent && parent.querySelector('h1,h2,h3,h4')), image: !!(parent && parent.querySelector('img,picture')),
+      dateSignal: /date|time|publish|update|posted|公開|更新|投稿日|最終更新/i.test(context + ' ' + text),
+      excluded: /nav|footer|breadcrumb|related|ranking|pagination/i.test(context),
+      inNavigation: !!el.closest('nav,header'), inFooter: !!el.closest('footer'), inBreadcrumb: !!el.closest('[class*="breadcrumb" i],[aria-label*="breadcrumb" i]'),
+      categoryOrTag: /category|tag|search/i.test(context), pagination: /pagination|pager/i.test(context)
+    };
+  })).catch(() => []);
+  return selectMediaFreshnessArticleCandidates_(candidates, origin);
+}
+
+async function attachMediaFreshnessArticleDomSignalsLight_(geoSignalsV1, page, opts = {}) {
+  const siteMode = String(opts.siteMode || '').toLowerCase();
+  if (!geoSignalsV1 || siteMode !== 'media' || opts.shortFastMode === true || opts.staticFallback === true) return null;
+  const origin = opts.origin || (() => { try { return new URL(String(opts.url || '')).origin; } catch (_) { return ''; } })();
+  const candidates = await collectMediaFreshnessArticleCandidatesFromPageLight_(page, origin);
+  if (!candidates.length) return null;
+  const fetched = await fetchSubpageHtmlLightUrls_(candidates.map(item => item.url), {
+    siteMode, lightBudget: opts.lightBudget || null, htmlFetchTimeoutMs: LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_MS,
+    reserveMs: LIGHT_SUPPLEMENTAL_RESERVE_MS, minimumMs: 500, reserveLaterCandidates: true
+  });
+  const pages = Array.isArray(fetched && fetched.pages) ? fetched.pages : [];
+  const samples = pages.map(item => item && item.articleSignals).filter(item => item && item.checked === true);
+  const dates = samples.map(item => item.visibleDate || (item.jsonLd && (item.jsonLd.dateModified || item.jsonLd.datePublished)) || (item.meta && (item.meta.modifiedTime || item.meta.publishedTime))).map(normalizeArticleVisibleDate_).filter(Boolean);
+  if (!dates.length) return null;
+  const unique = Array.from(new Set(dates)).sort();
+  const signal = { observed: true, checked: true, hasNewsDateEvidence: true, hasFreshnessSignal: true, hasDatePublished: false, hasDateModified: false, latestDate: unique[unique.length - 1], newsDateEvidenceCount: unique.length, observedArticleCount: pages.length, freshnessEvidenceSources: ['article_dom_visible_date'], sampleDates: unique.slice(-10), evidenceSamples: unique.slice(-10).map(date => ({ date, source: 'article_dom_visible_date', text: '', href: '' })), source: 'media_article_dom', extractionMethod: 'bounded_media_article_dom' };
+  geoSignalsV1.freshnessOperationSignals = geoSignalsV1.freshnessOperationSignals || signal;
+  geoSignalsV1.observed = geoSignalsV1.observed || {};
+  geoSignalsV1.observed.freshnessOperationSignals = geoSignalsV1.observed.freshnessOperationSignals || signal;
+  return signal;
 }
 
 function buildMediaArticleLinkFreshnessSignals_(geoSignalsV1, opts = {}) {
@@ -23334,6 +23527,16 @@ module.exports.__lightBudgetTestHooks = {
   buildStaticFallbackGeoSignalsPayload_,
   mergeTopPageStaticSignalsIntoPayload_,
   collectArticleSignalsFromPageLight_,
+  buildArticleSignalsFromJsonLdAndMeta_,
+  buildFreshnessOperationSignalsFromArticleSignals_,
+  extractArticleVisibleDateCandidatesFromCheerio_,
+  parseSubpageJsonLdLightHtml,
+  normalizeArticleVisibleDate_,
+  pickArticleVisibleDate_,
+  selectMediaFreshnessArticleCandidates_,
+  collectMediaFreshnessArticleCandidatesFromPageLight_,
+  attachMediaFreshnessArticleDomSignalsLight_,
+  LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
   fetchSubpageHtmlLightUrls_,
