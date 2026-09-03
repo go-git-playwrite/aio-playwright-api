@@ -6,6 +6,7 @@ const {
   addEcGeneralLinkCandidatesFromLinks_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
+  parseSubpageJsonLdLightHtml,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,
@@ -369,6 +370,49 @@ function mainDocumentRequest(page, options = {}) {
   assert.strictEqual(httpFailedCoverageSignals.observationLimited, false);
   assert.strictEqual(httpFailedCoverageSignals.budgetLimitedCandidateCount, 0);
   assert.strictEqual(httpFailedCoverageSignals.timedOutCandidateCount, 0);
+
+  // Subpage nav is derived from the HTML already fetched for coverage; no
+  // additional request is necessary. A completed negative remains distinct
+  // from a failed or timed-out observation.
+  const subpageWithNav = parseSubpageJsonLdLightHtml(
+    'https://shop.example.test/products/list',
+    'https://shop.example.test/products/list',
+    200,
+    '<html><head><title>Products</title></head><body><nav><a href="/">Home</a></nav><h1>Products</h1></body></html>',
+    'ec'
+  );
+  const subpageWithoutNav = parseSubpageJsonLdLightHtml(
+    'https://shop.example.test/help/about',
+    'https://shop.example.test/help/about',
+    200,
+    '<html><head><title>About</title></head><body><main><h1>About</h1></main></body></html>',
+    'ec'
+  );
+  assert.strictEqual(subpageWithNav.hasNavElement, true);
+  assert.strictEqual(subpageWithNav.navObservationComplete, true);
+  assert.strictEqual(subpageWithoutNav.hasNavElement, false);
+  assert.strictEqual(subpageWithoutNav.navObservationComplete, true);
+
+  const kenkoNavCoverageSignals = buildGeoSignalsCoverageSignals_(buildCoverageSignalsV1FromSubpageObservation_({
+    topUrl: 'https://www1.kenko064.com/',
+    origin: 'https://www1.kenko064.com',
+    siteMode: 'ec',
+    candidates: [
+      { url: 'https://www1.kenko064.com/products/list', pageType: 'product', source: 'ecGeneralLink' },
+      { url: 'https://www1.kenko064.com/help/about', pageType: 'about', source: 'ecGeneralLink' }
+    ],
+    observations: [
+      Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/products/list', finalUrl: 'https://www1.kenko064.com/products/list' }),
+      Object.assign({}, subpageWithNav, { url: 'https://www1.kenko064.com/help/about', finalUrl: 'https://www1.kenko064.com/help/about' })
+    ],
+    coverageRuntime: { observationLimited: false, budgetLimitedCandidateCount: 0, timedOutCandidateCount: 0 }
+  }));
+  assert.strictEqual(kenkoNavCoverageSignals.navObservationAttemptedPageCount, 2);
+  assert.strictEqual(kenkoNavCoverageSignals.navObservationCompletedPageCount, 2);
+  assert.strictEqual(kenkoNavCoverageSignals.observedNavPageCount, 2);
+  assert.strictEqual(kenkoNavCoverageSignals.navObservationComplete, true);
+  assert(kenkoNavCoverageSignals.representativePages.every(page => page.hasNavElement === true));
+  assert.strictEqual(timedOutCoverageSignals.navObservationComplete, false);
   const limitedTraceBudget = budgetFor(48000);
   limitedTraceBudget.coverageTrace = {
     started: true,

@@ -3789,6 +3789,9 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     '[class*="pankuzu" i]',
     '[id*="pankuzu" i]'
   ].join(',');
+  // Keep the subpage semantic-nav meaning aligned with the rendered top-page
+  // detector. This reuses the HTML already fetched for light coverage.
+  const hasNavElement = $('nav,[role="navigation"]').length > 0;
   let hasBreadcrumbUi = $(breadcrumbSelector).length > 0;
   if (!hasBreadcrumbUi) {
     $('nav, ol, ul, div').slice(0, 200).each((_, el) => {
@@ -3910,6 +3913,8 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
     hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
     hasBreadcrumbUi,
+    hasNavElement,
+    navObservationComplete: true,
     hasMain: $('main,[role="main"]').length > 0,
     hasMainLandmark: $('main,[role="main"]').length > 0,
     internalLinkCount,
@@ -4004,6 +4009,8 @@ async function fetchSubpageHtmlLightOnce_(url, opts = {}) {
     jsonldTypes: [],
     hasBreadcrumbJsonLd: false,
     hasBreadcrumbUi: false,
+    hasNavElement: null,
+    navObservationComplete: false,
     error,
     errorStage,
     observationSource: 'html-fetch-light',
@@ -4504,6 +4511,7 @@ async function fetchSubpagePlaywrightScopedLightOnce_(url, opts = {}) {
         jsonldTypes: Array.from(new Set(jsonldTypes.filter(Boolean))).slice(0, 50),
         hasBreadcrumbUi: !!document.querySelector('[aria-label*="breadcrumb" i], nav[class*="breadcrumb" i], .breadcrumb, [class*="breadcrumb" i]'),
         hasMain: !!document.querySelector('main,article,[role="main"]'),
+        hasNavElement: !!document.querySelector('nav,[role="navigation"]'),
         formSignals,
         internalLinkCount,
         externalLinkCount,
@@ -6146,6 +6154,10 @@ async function fetchSubpageJsonLdLightOnce_(url, opts = {}) {
       hasWebPage: lowerTypes.has('webpage') || lowerTypes.has('aboutpage') || lowerTypes.has('contactpage') || lowerTypes.has('collectionpage'),
       hasService: lowerTypes.has('service'),
       hasBreadcrumbUi: !!(observed && observed.hasBreadcrumbUi),
+      hasNavElement: typeof (observed && observed.hasNavElement) === 'boolean'
+        ? observed.hasNavElement
+        : null,
+      navObservationComplete: typeof (observed && observed.hasNavElement) === 'boolean',
       formSignals: (observedPageType === 'contact' || isContactCandidate) && observed && observed.formSignals && typeof observed.formSignals === 'object'
         ? observed.formSignals
         : null,
@@ -6698,6 +6710,15 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     );
   };
   const hasBreadcrumbUi = page => page && page.hasBreadcrumbUi === true;
+  const hasNavElement = page => page && page.hasNavElement === true;
+  const navObservationAttemptedPageCount = observations.length;
+  const navObservationCompletedPageCount = observations.filter(page => page && typeof page.hasNavElement === 'boolean').length;
+  const observedNavPageCount = observations.filter(page => hasNavElement(page)).length;
+  const navObservationComplete = navObservationAttemptedPageCount > 0 &&
+    navObservationCompletedPageCount === navObservationAttemptedPageCount &&
+    coverageRuntime.observationLimited !== true &&
+    budgetLimitedCandidateCount === 0 &&
+    timedOutCandidateCount === 0;
   const representativePages = observedPages
     .map(page => {
       const candidate = candidateByUrl.get(String(page.url || '')) || {};
@@ -6722,6 +6743,7 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
         hasH1: Number(page.h1Count || 0) > 0 || h1Texts.length > 0,
         hasBreadcrumbList: hasBreadcrumbList(page),
         hasBreadcrumbUi: hasBreadcrumbUi(page),
+        hasNavElement: typeof page.hasNavElement === 'boolean' ? page.hasNavElement : null,
         jsonLdTypes,
         legalOperatorInfo,
         matchedCandidateSources: Array.isArray(candidate.sources)
@@ -6782,6 +6804,10 @@ function buildCoverageSignalsV1FromSubpageObservation_(payload) {
     observedH1PageCount,
     observedBreadcrumbPageCount,
     observedBreadcrumbListPageCount,
+    navObservationAttemptedPageCount,
+    navObservationCompletedPageCount,
+    observedNavPageCount,
+    navObservationComplete,
     hasObservedSubpageH1: observedH1PageCount > 0,
     hasObservedBreadcrumbList: observedBreadcrumbListPageCount > 0,
     hasObservedAboutPage: observedPages.some(page => isCoverageSignalsAboutPath_(page.finalUrl || page.url || '')),
@@ -6872,7 +6898,9 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     Array.isArray(coverageSignalsV1.representativeObservationQuality.pages)
     ? coverageSignalsV1.representativeObservationQuality.pages
     : [];
-  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0 && !representativePages.length && !qualityPages.length) return null;
+  if (Number(coverageSignalsV1.observedSubpageCount || 0) <= 0 &&
+      Number(coverageSignalsV1.navObservationAttemptedPageCount || 0) <= 0 &&
+      !representativePages.length && !qualityPages.length) return null;
   return {
     version: 'coverageSignalsV1',
     source: 'discover-and-observe-subpages-light',
@@ -6884,6 +6912,10 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
     observedH1PageCount: Number(coverageSignalsV1.observedH1PageCount || 0),
     observedBreadcrumbPageCount: Number(coverageSignalsV1.observedBreadcrumbPageCount || 0),
     observedBreadcrumbListPageCount: Number(coverageSignalsV1.observedBreadcrumbListPageCount || 0),
+    navObservationAttemptedPageCount: Number(coverageSignalsV1.navObservationAttemptedPageCount || 0),
+    navObservationCompletedPageCount: Number(coverageSignalsV1.navObservationCompletedPageCount || 0),
+    observedNavPageCount: Number(coverageSignalsV1.observedNavPageCount || 0),
+    navObservationComplete: coverageSignalsV1.navObservationComplete === true,
     hasObservedSubpageH1: coverageSignalsV1.hasObservedSubpageH1 === true,
     hasObservedBreadcrumbList: coverageSignalsV1.hasObservedBreadcrumbList === true,
     hasObservedAboutPage: coverageSignalsV1.hasObservedAboutPage === true,
@@ -6906,6 +6938,7 @@ function buildGeoSignalsCoverageSignals_(coverageSignalsV1) {
       hasH1: !!(page && page.hasH1),
       hasBreadcrumbList: !!(page && page.hasBreadcrumbList),
       hasBreadcrumbUi: !!(page && page.hasBreadcrumbUi),
+      hasNavElement: typeof (page && page.hasNavElement) === 'boolean' ? page.hasNavElement : null,
       jsonLdTypes: Array.isArray(page && page.jsonLdTypes) ? page.jsonLdTypes.slice(0, 20) : [],
       legalOperatorInfo: page && page.legalOperatorInfo && page.legalOperatorInfo.observed === true ? page.legalOperatorInfo : null,
       matchedCandidateSources: Array.isArray(page && page.matchedCandidateSources)
@@ -7140,6 +7173,7 @@ function buildSubpageSignalsV1FromSubpageObservation_(payload) {
         hasProductJsonLd: page.hasProductJsonLd === true ? true : null,
         hasBreadcrumbList: page.hasBreadcrumbJsonLd === true || Number(page.breadcrumbListCount || 0) > 0,
         hasBreadcrumbUi: page.hasBreadcrumbUi === true,
+        hasNavElement: typeof page.hasNavElement === 'boolean' ? page.hasNavElement : null,
         hasOrganization: page.hasOrganization === true,
         hasWebPage: page.hasWebPage === true,
         hasService: page.hasService === true,
