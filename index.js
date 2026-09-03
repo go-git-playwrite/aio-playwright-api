@@ -12682,6 +12682,25 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         semanticElementsObserved: true,
         source: 'rendered_dom_light'
       };
+      // Completion is structural, not density-based. A short static page may
+      // have a primary paragraph without a <main>; a shell containing only
+      // chrome must not be treated as equivalent primary content.
+      const primaryContentNodes = queryAllDeep('main,[role="main"],article,[role="article"],section,[class*="content" i],[class*="article" i],[class*="post" i],[class*="entry" i]')
+        .filter((el) => {
+          if (!el || el.closest('header,nav,footer,[role="navigation"],[role="banner"],[role="contentinfo"]')) return false;
+          return clean(el.innerText || el.textContent).length > 0;
+        });
+      const directBodyContent = Array.from(document.body ? document.body.children : []).some((el) => {
+        if (!el || el.matches('header,nav,footer,script,style,noscript,template')) return false;
+        try {
+          const clone = el.cloneNode(true);
+          clone.querySelectorAll('header,nav,footer,aside,[role="navigation"],[role="banner"],[role="contentinfo"],script,style,noscript,template').forEach((node) => node.remove());
+          return clean(clone.innerText || clone.textContent).length > 0;
+        } catch (_) {
+          return false;
+        }
+      });
+      const primaryContentObserved = primaryContentNodes.length > 0 || directBodyContent;
       const isVisibleBreadcrumbElement = (el) => {
         if (!el || !el.isConnected) return false;
         const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
@@ -13035,6 +13054,8 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           textLength: bodyText.length,
           sample: bodyText.slice(0, 500)
         },
+        primaryContentObserved,
+        headingCollectionObserved: true,
         phaseTimings: browserPhaseTimings
       };
     }, { inputUrl: String(url || ''), balancedMode, shortFastMode });
@@ -13996,7 +14017,9 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           sample: observed.body && typeof observed.body.sample === 'string' ? observed.body.sample : '',
           source: 'rendered_dom',
           confidence: 'medium'
-        }
+        },
+        primaryContentObserved: observed.primaryContentObserved === true,
+        headingCollectionObserved: observed.headingCollectionObserved === true
       },
       diagnostics: {
         evaluateCount: 1,
@@ -14033,6 +14056,13 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         })
       }
     };
+    geoSignalsV1.renderedDomObservationV1 = buildRenderedDomObservationV1_(geoSignalsV1, {
+      navigationCompleted: opts.navigationCompleted === true,
+      staticFallback: opts.staticFallback === true,
+      retryAttempted: opts.retryAttempted === true,
+      retrySucceeded: opts.retrySucceeded === true
+    });
+    geoSignalsV1.observed.renderedDomObservationV1 = geoSignalsV1.renderedDomObservationV1;
     attachMediaArticleLinkFreshnessSignals_(geoSignalsV1, null, { siteMode, url });
     try {
       console.log('[PW][GEO_SIGNALS_V1]', JSON.stringify({
@@ -15083,6 +15113,11 @@ const LIGHT_DOM_FALLBACK_RESERVE_MS = LIGHT_CORE_RESPONSE_RESERVE_MS;
 // Fresh setup retry must leave enough wall-clock time for a useful second
 // navigation/core-observation attempt and the final response reserve.
 const LIGHT_SETUP_RETRY_MIN_REMAINING_MS = 110000;
+// A rendered-DOM retry is narrower than setup recovery: it is admitted only
+// when a first navigation succeeded but the independently observed primary
+// content surface is incomplete.  Keep a full core/response reserve for the
+// isolated second attempt.
+const LIGHT_RENDERED_DOM_RETRY_MIN_REMAINING_MS = 70000;
 const LIGHT_ATTEMPT_CLEANUP_TIMEOUT_MS = 2000;
 // 補助観測は core DOM signal / response cleanup のための時間を侵食させない。
 // これらは rendered DOM の正本を補強するだけなので、上限到達は scrape 失敗ではなく skip とする。
@@ -15375,6 +15410,65 @@ function lightSetupRetryAdmission_(budget, attempt, stage) {
   if (remainingMs < LIGHT_SETUP_RETRY_MIN_REMAINING_MS) return { allowed: false, reason: 'insufficient_remaining', elapsedMs, remainingMs };
   if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
   return { allowed: true, reason: 'setup_retry_admitted', elapsedMs, remainingMs };
+}
+
+function buildRenderedDomObservationV1_(geoSignalsV1, opts = {}) {
+  const geo = geoSignalsV1 && typeof geoSignalsV1 === 'object' ? geoSignalsV1 : {};
+  const observed = geo.observed && typeof geo.observed === 'object' ? geo.observed : {};
+  const body = observed.body && typeof observed.body === 'object' ? observed.body : {};
+  const links = observed.links && typeof observed.links === 'object' ? observed.links : {};
+  const coverage = geo.coverage && typeof geo.coverage === 'object' ? geo.coverage : {};
+  const semantic = coverage.semanticElements && typeof coverage.semanticElements === 'object' ? coverage.semanticElements : {};
+  const primaryContentObserved = observed.primaryContentObserved === true;
+  const domContentObserved = typeof body.textLength === 'number' && Array.isArray(links.internalLinksSample);
+  const linksObserved = Array.isArray(links.internalLinksSample);
+  // Heading collection is complete when its DOM query completed; zero headings
+  // remains a valid result.  A title-only candidate is not a DOM heading.
+  const headingsObserved = observed.headingCollectionObserved === true;
+  const semanticObserved = semantic.semanticElementsObserved === true;
+  const articleCandidateClassificationCompleted = domContentObserved && primaryContentObserved && linksObserved && headingsObserved;
+  const navigationCompleted = opts.navigationCompleted === true;
+  const observationLimited = !navigationCompleted || !domContentObserved || !primaryContentObserved ||
+    !linksObserved || !headingsObserved || !semanticObserved || !articleCandidateClassificationCompleted ||
+    opts.staticFallback === true;
+  return {
+    observationVersion: 'rendered_dom_observation_v1',
+    navigationCompleted,
+    domContentObserved,
+    primaryContentObserved,
+    linksObserved,
+    headingsObserved,
+    semanticObserved,
+    articleCandidateClassificationCompleted,
+    observationLimited,
+    fallbackKind: opts.staticFallback === true ? 'static_fallback' : null,
+    retryAttempted: opts.retryAttempted === true,
+    retrySucceeded: opts.retrySucceeded === true
+  };
+}
+
+function shouldRetryLightRenderedDomObservation_(observation, opts = {}) {
+  const value = observation && typeof observation === 'object' ? observation : {};
+  if (opts.lightMode !== true || opts.shortFastMode === true || opts.staticFallback === true || opts.retryAttempted === true) return false;
+  if (value.navigationCompleted !== true || value.observationLimited !== true) return false;
+  // Do not retry merely because a page is generic, short, link-sparse, or has
+  // no article candidates. Retrying requires coupled missing observation
+  // surfaces that identify a shell rather than a legitimate simple page.
+  return value.primaryContentObserved !== true &&
+    value.articleCandidateClassificationCompleted !== true;
+}
+
+function lightRenderedDomRetryAdmission_(budget, attempt, observation) {
+  const elapsedMs = budget ? Math.max(0, Date.now() - budget.startedAt) : Number.POSITIVE_INFINITY;
+  const remainingMs = getLightBudgetRemainingMs_(budget);
+  if (!shouldRetryLightRenderedDomObservation_(observation, { lightMode: true })) {
+    return { allowed: false, reason: 'not_incomplete_shell', elapsedMs, remainingMs };
+  }
+  if (remainingMs < LIGHT_RENDERED_DOM_RETRY_MIN_REMAINING_MS) {
+    return { allowed: false, reason: 'insufficient_remaining', elapsedMs, remainingMs };
+  }
+  if (!attempt || attempt.cleanupComplete !== true) return { allowed: false, reason: 'cleanup_incomplete', elapsedMs, remainingMs };
+  return { allowed: true, reason: 'rendered_dom_retry_admitted', elapsedMs, remainingMs };
 }
 function recordLightCheckpoint_(budget, name) {
   if (!budget || !name) return;
@@ -15928,6 +16022,7 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
       const attempt = err && err.lightAttempt || lightBudget.currentAttempt;
       const stage = String(err && err.lightBudgetStage || attempt && attempt.failureStage || lightBudget.activeStage || 'unknown');
       const code = String(err && err.code || attempt && attempt.failureCode || 'PLAYWRIGHT_SETUP_FAILURE');
+      const renderedDomObservation = err && err.renderedDomObservation || null;
       markLightAttemptFailure_(attempt, stage, code);
       if (index === 0 && lightBudget.resilience) {
         lightBudget.resilience.firstFailureStage = stage;
@@ -15941,7 +16036,9 @@ async function runLightScrapeWithSetupRetry_(req, res, lightBudget, scrapeAttemp
         lightBudget.resilience.cleanup = cleanup && cleanup.diagnostics || null;
       }
       const admission = index === 0
-        ? lightSetupRetryAdmission_(lightBudget, attempt, stage)
+        ? (code === 'LIGHT_RENDERED_DOM_INCOMPLETE'
+          ? lightRenderedDomRetryAdmission_(lightBudget, attempt, renderedDomObservation)
+          : lightSetupRetryAdmission_(lightBudget, attempt, stage))
         : { allowed: false, reason: 'retry_limit' };
       if (lightBudget.resilience) lightBudget.resilience.retryAdmission = admission.reason;
       if (index === 0 && admission.allowed && !res.headersSent) {
@@ -16155,6 +16252,7 @@ function buildBalancedShortResponsePayload(fullPayload) {
     version: g.version,
     generatedAt: g.generatedAt,
     url: g.url,
+    renderedDomObservationV1: g.renderedDomObservationV1 || null,
     navigationPathObservationsV1: g.navigationPathObservationsV1 || (observed.links && observed.links.navigationPathObservationsV1) || null,
     structuredData: shortStructuredData,
     entityLinkSignals,
@@ -20002,7 +20100,10 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         debugHeavySite,
         debugHeavySiteStartedAt,
         lightBudget: signalsFirstLight ? lightBudget : null,
-        phaseTimingsTarget: signalsFirstLight ? lightBudget.geoPhaseTimings : null
+        phaseTimingsTarget: signalsFirstLight ? lightBudget.geoPhaseTimings : null,
+        navigationCompleted: !!(resp && typeof resp.status === 'function' && resp.status() >= 200 && resp.status() < 400),
+        retryAttempted: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1,
+        retrySucceeded: Number(scrapeOptions && scrapeOptions.attemptIndex || 1) > 1
       });
       if (signalsFirstLight) recordLightCheckpoint_(lightBudget, 'build_geo_signals_end');
       if (signalsFirstLight) {
@@ -20015,6 +20116,30 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           coreError.code = 'LIGHT_CORE_SIGNALS_UNAVAILABLE';
           coreError.lightBudgetStage = 'build_geo_signals';
           throw coreError;
+        }
+      }
+      if (signalsFirstLight && geoSignalsV1 && geoSignalsV1.renderedDomObservationV1) {
+        const renderedDomObservation = geoSignalsV1.renderedDomObservationV1;
+        const attemptIndex = Number(scrapeOptions && scrapeOptions.attemptIndex || 1);
+        if (attemptIndex > 1 && renderedDomObservation.observationLimited === true) {
+          renderedDomObservation.retrySucceeded = false;
+        }
+        const retryEligible = shouldRetryLightRenderedDomObservation_(renderedDomObservation, {
+          lightMode: true,
+          shortFastMode: balancedShortFastResponse,
+          staticFallback: false,
+          retryAttempted: attemptIndex > 1
+        });
+        // The wrapper owns cleanup and creates a fresh context/page. Do not
+        // let an incomplete first DOM reach article/date extraction.
+        if (retryEligible && attemptIndex === 1 &&
+            getLightBudgetRemainingMs_(lightBudget) >= LIGHT_RENDERED_DOM_RETRY_MIN_REMAINING_MS) {
+          const incompleteError = new Error('light rendered DOM observation incomplete');
+          incompleteError.code = 'LIGHT_RENDERED_DOM_INCOMPLETE';
+          incompleteError.lightBudgetStage = 'rendered_dom_observation';
+          incompleteError.lightAttempt = lightAttempt;
+          incompleteError.renderedDomObservation = renderedDomObservation;
+          throw incompleteError;
         }
       }
       logHeavySiteTopPageAudit('buildGeoSignalsV1_end', {
@@ -20125,6 +20250,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
         geoSignalsV1.productSpecComparisonSignals = productSpecComparisonSignalsLight;
       }
       const lightweightSummary = {
+        renderedDomObservationV1: geoSignalsV1 && geoSignalsV1.renderedDomObservationV1 || null,
         title: observed.title && typeof observed.title.value === 'string' ? observed.title.value : null,
         metaDescription: observed.metaDescription && typeof observed.metaDescription.value === 'string' ? observed.metaDescription.value : null,
         h1Count: observed.h1 && typeof observed.h1.count === 'number' ? observed.h1.count : 0,
@@ -23553,6 +23679,9 @@ module.exports.__lightBudgetTestHooks = {
   assessLightDomFallbackSentinel_,
   probeLightDomReadiness_,
   lightSetupRetryAdmission_,
+  buildRenderedDomObservationV1_,
+  shouldRetryLightRenderedDomObservation_,
+  lightRenderedDomRetryAdmission_,
   recordLightCheckpoint_,
   markLightStageCheckpoint_,
   getLightBudgetRemainingMs_,
@@ -23573,6 +23702,7 @@ module.exports.__lightBudgetTestHooks = {
   enqueueLightScrapeWithDeadline_,
   runLightScrapeWithSetupRetry_,
   LIGHT_SETUP_RETRY_MIN_REMAINING_MS,
+  LIGHT_RENDERED_DOM_RETRY_MIN_REMAINING_MS,
   LIGHT_RESPONSE_CLEANUP_RESERVE_MS,
   LIGHT_SUPPLEMENTAL_RESERVE_MS,
   LIGHT_SAME_ORIGIN_SCRIPT_SCAN_MAX_MS,
