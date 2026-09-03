@@ -2,6 +2,8 @@ const assert = require('assert');
 const lightBudgetHooks = require('../index.js').__lightBudgetTestHooks;
 const {
   collectArticleSignalsFromPageLight_,
+  inferEcGeneralLinkPageType_,
+  addEcGeneralLinkCandidatesFromLinks_,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
   fetchSubpageHtmlLightUrls_,
@@ -233,6 +235,36 @@ function mainDocumentRequest(page, options = {}) {
     { url: 'https://shop.example.test/company/', pageType: 'about', score: 10, source: 'nav' },
     { url: 'https://shop.example.test/contact/', pageType: 'contact', score: 10, source: 'nav' }
   ]), ['product', 'about']);
+
+  const ecLinks = [
+    { href: 'https://shop.example.test/products/', text: '商品一覧' },
+    { href: 'https://shop.example.test/category/tea/', text: '商品カテゴリ' },
+    { href: 'https://shop.example.test/user_data/guide', text: 'ご利用ガイド' },
+    { href: 'https://shop.example.test/help/about', text: '会社概要' },
+    { href: 'https://shop.example.test/contact', text: 'お問い合わせ' },
+    { href: 'https://shop.example.test/help/tradelaw', text: '特定商取引法に基づく表記' }
+  ].concat(Array.from({ length: 50 }, (_, index) => ({ href: `https://shop.example.test/campaign/${index}`, text: `キャンペーン ${index}` })));
+  const ecCandidateMap = new Map();
+  const ecAdded = addEcGeneralLinkCandidatesFromLinks_(ecLinks, 'https://shop.example.test', ecCandidateMap, {}, 'ec');
+  assert.strictEqual(ecAdded.length, 6);
+  assert.deepStrictEqual(Array.from(ecCandidateMap.values()).map(item => item.pageType), ['product', 'category', 'faq', 'about', 'contact', 'legal']);
+  assert.deepStrictEqual(
+    buildLightCoverageObservationPlan_(Array.from(ecCandidateMap.values()), { siteMode: 'ec', maxObserve: 2 }).candidates.map(item => item.pageType),
+    ['product', 'about']
+  );
+  const corporateCandidateMap = new Map();
+  assert.strictEqual(addEcGeneralLinkCandidatesFromLinks_(ecLinks, 'https://shop.example.test', corporateCandidateMap, {}, 'corporate').length, 0);
+  assert.strictEqual(corporateCandidateMap.size, 0);
+  const mediaCandidateMap = new Map();
+  assert.strictEqual(addEcGeneralLinkCandidatesFromLinks_(ecLinks, 'https://shop.example.test', mediaCandidateMap, {}, 'media').length, 0);
+  assert.strictEqual(mediaCandidateMap.size, 0);
+  const semanticEcCandidateMap = new Map([[
+    'https://shop.example.test/products',
+    { url: 'https://shop.example.test/products', label: '商品一覧', pageType: '', source: 'nav', sources: ['nav'], score: 70 }
+  ]]);
+  assert.strictEqual(addEcGeneralLinkCandidatesFromLinks_(ecLinks.slice(0, 1), 'https://shop.example.test', semanticEcCandidateMap, {}, 'ec').length, 0);
+  assert.strictEqual(semanticEcCandidateMap.size, 1);
+  assert.deepStrictEqual(semanticEcCandidateMap.get('https://shop.example.test/products').sources.sort(), ['ecGeneralLink', 'nav']);
 
   const htmlResponse = (url, html) => ({
     ok: true,

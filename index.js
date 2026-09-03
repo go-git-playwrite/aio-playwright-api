@@ -4764,7 +4764,7 @@ function isSubpageHtmlLightTlsSslFailure_(page) {
   return /ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED|(?:^|\b)(?:SSL|TLS)(?:\b|_)/i.test(text);
 }
 
-function normalizeDiscoverSubpageUrl(rawUrl, origin) {
+function normalizeDiscoverSubpageUrl(rawUrl, origin, opts = {}) {
   let parsed = null;
   try { parsed = new URL(String(rawUrl || ''), origin); } catch (_) { return null; }
   if (!/^https?:$/.test(parsed.protocol)) return null;
@@ -4777,7 +4777,7 @@ function normalizeDiscoverSubpageUrl(rawUrl, origin) {
   if (lowerPath === '/' || lowerPath === '') return null;
   if (/\.(?:jpe?g|png|gif|webp|svg|ico|pdf|css|js|zip|csv|xlsx?|docx?|pptx?|xml)(?:$|\/)/i.test(lowerPath)) return null;
   if (/\/(?:wp-json|feed)(?:\/|$)/i.test(lowerPath)) return null;
-  if (/\/(?:tag|category|author|page)\//i.test(lowerPath)) return null;
+  if (!opts.allowCategory && /\/(?:tag|category|author|page)\//i.test(lowerPath)) return null;
   return parsed.toString().replace(/\/$/, '');
 }
 
@@ -4827,7 +4827,7 @@ function reasonDiscoverSubpageCandidate(url, source, sources) {
 function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
   let path = '';
   try { path = new URL(String(url || '')).pathname.toLowerCase(); } catch (_) { path = String(url || '').toLowerCase(); }
-  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'sitemap' ? 20 : (source === 'article' ? 35 : 0))));
+  const sourceScore = source === 'nav' ? 70 : (source === 'footer' ? 55 : (source === 'htmlSitemap' ? 45 : (source === 'article' ? 35 : (source === 'ecGeneralLink' ? 30 : (source === 'sitemap' ? 20 : 0)))));
   const depth = path.split('/').filter(Boolean).length;
   const sourceCount = Array.isArray(sources) ? sources.length : 1;
   let score = sourceScore;
@@ -4845,15 +4845,17 @@ function scoreDiscoverSubpageCandidate(url, source, sources, label = '') {
 
 function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, sourceSummary) {
   const rawHref = rawUrl && typeof rawUrl === 'object' ? (rawUrl.href || rawUrl.url || '') : rawUrl;
-  const label = rawUrl && typeof rawUrl === 'object' ? normalizeSubpageJsonLdText(rawUrl.text || rawUrl.label || rawUrl.title || '') : '';
-  const url = normalizeDiscoverSubpageUrl(rawHref, origin);
+  const label = rawUrl && typeof rawUrl === 'object' ? normalizeSubpageJsonLdText(rawUrl.text || rawUrl.label || rawUrl.ariaLabel || rawUrl.title || '') : '';
+  const pageType = rawUrl && typeof rawUrl === 'object' ? normalizeSubpageJsonLdText(rawUrl.pageType || '').toLowerCase() : '';
+  const url = normalizeDiscoverSubpageUrl(rawHref, origin, { allowCategory: source === 'ecGeneralLink' });
   if (!url) return false;
   const key = discoverSubpageCandidateKey(url);
-  const sourcePriority = { sitemap: 1, htmlSitemap: 2, footer: 3, nav: 4 };
+  const sourcePriority = { sitemap: 1, ecGeneralLink: 2, htmlSitemap: 3, footer: 4, nav: 5 };
   const existing = map.get(key);
   if (existing) {
     if (!existing.sources.includes(source)) existing.sources.push(source);
     if (label && !existing.label) existing.label = label.slice(0, 120);
+    if (pageType && !existing.pageType) existing.pageType = pageType;
     if ((sourcePriority[source] || 0) > (sourcePriority[existing.source] || 0)) {
       existing.source = source;
     }
@@ -4865,6 +4867,7 @@ function addDiscoverSubpageCandidate(map, rawUrl, source, origin, reason, source
   const item = {
     url,
     label: label.slice(0, 120),
+    pageType,
     source,
     sources: [source],
     score: scoreDiscoverSubpageCandidate(url, source, [source], label),
@@ -4885,6 +4888,41 @@ function addDiscoverArticleCandidatesFromLinks_(links, origin, candidateMap, sou
     }
   });
   return articleCandidates;
+}
+
+// EC sites often put purchase paths in generic wrappers rather than semantic
+// nav/footer landmarks. Admit only links with an explicit EC role.
+function inferEcGeneralLinkPageType_(link) {
+  const href = String(link && (link.href || link.url) || '');
+  const label = normalizeSubpageJsonLdText([
+    link && link.text,
+    link && link.ariaLabel,
+    link && link.title
+  ].filter(Boolean).join(' '));
+  const path = (() => {
+    try { return new URL(href).pathname.toLowerCase(); } catch (_) { return href.toLowerCase(); }
+  })();
+  if (isLegalOperatorCandidatePath_(href) || isLegalOperatorCandidateText_(label)) return 'legal';
+  if (/(?:\/category|\/categories|\/collection|\/collections)(?:\/|$|-|_)/i.test(path) || /商品\s*(?:カテゴリ|カテゴリー)|カテゴリ(?:ー)?/i.test(label)) return 'category';
+  if (/(?:\/product|\/products|\/item|\/items|\/goods)(?:\/|$|-|_)/i.test(path) || /商品\s*(?:詳細|一覧|を探す|を見る)|製品\s*(?:詳細|一覧)/i.test(label)) return 'product';
+  if (/(?:\/about|\/company|\/corporate|\/profile|\/outline)(?:\/|$|-|_)/i.test(path) || /会社概要|企業情報|運営会社|販売者情報/i.test(label)) return 'about';
+  if (/(?:\/contact|\/contact-us|\/inquiry|\/otoiawase)(?:\/|$|-|_)/i.test(path) || /お問い合わせ|お問合せ|問い合わせ/i.test(label)) return 'contact';
+  if (/(?:\/guide|\/guides|\/help|\/support|\/shipping|\/delivery|\/return|\/exchange)(?:\/|$|-|_)/i.test(path) || /(?:ご?利用|購入)ガイド|配送|送料|返品|交換|サポート|ヘルプ/i.test(label)) return 'faq';
+  return '';
+}
+
+function addEcGeneralLinkCandidatesFromLinks_(links, origin, candidateMap, sourceSummary, siteMode) {
+  if (String(siteMode || '').toLowerCase() !== 'ec') return [];
+  const added = [];
+  (Array.isArray(links) ? links : []).forEach(link => {
+    const pageType = inferEcGeneralLinkPageType_(link);
+    if (!pageType) return;
+    const candidate = Object.assign({}, link, { pageType });
+    if (addDiscoverSubpageCandidate(candidateMap, candidate, 'ecGeneralLink', origin, 'explicit EC role from internal link', sourceSummary)) {
+      added.push(candidate);
+    }
+  });
+  return added;
 }
 
 function inferDiscoverCandidatePageType_(candidate, siteMode = 'generic') {
@@ -5328,7 +5366,9 @@ async function collectDiscoverLinksFromPage(page) {
     };
     const linkFrom = (a) => ({
       href: absUrl(a.getAttribute && a.getAttribute('href') || ''),
-      text: clean(a.innerText || a.textContent || a.getAttribute && (a.getAttribute('aria-label') || a.getAttribute('title')) || '')
+      text: clean(a.innerText || a.textContent || ''),
+      ariaLabel: clean(a.getAttribute && a.getAttribute('aria-label') || ''),
+      title: clean(a.getAttribute && a.getAttribute('title') || '')
     });
     const allLinks = queryAllDeep('a[href]', { maxNodes: 500 }).map(linkFrom).filter(x => x.href);
     const htmlSitemapLinks = allLinks.filter(x => /sitemap|site-map|サイトマップ/i.test(`${x.href} ${x.text}`)).slice(0, 5);
@@ -5387,7 +5427,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
         addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
       });
       const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+      const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
       logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
+      if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
     } catch (e) {
       errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
     }
@@ -5454,7 +5496,9 @@ async function collectDiscoverFallbackCandidates(topUrl, origin, candidateMap, s
       addDiscoverSubpageCandidate(candidateMap, link, 'footer', origin, 'important path from footer', sourceSummary);
     });
     const articleCandidates = addDiscoverArticleCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary);
+    const ecGeneralCandidates = addEcGeneralLinkCandidatesFromLinks_(navFooterLinks.allLinks, origin, candidateMap, sourceSummary, opts && opts.siteMode);
     logArticleCandidateDiscovery(navFooterLinks, articleCandidates);
+    if (ecGeneralCandidates.length) console.log('[DEBUG][EC_GENERAL_LINK_CANDIDATES]', JSON.stringify({ origin, count: ecGeneralCandidates.length, pageTypes: ecGeneralCandidates.map(item => item.pageType) }));
   } catch (e) {
     errors.push({ source: 'htmlSitemap', message: String(e && (e.message || e) || 'playwright_failed').slice(0, 160) });
   } finally {
@@ -23665,6 +23709,8 @@ module.exports.__lightBudgetTestHooks = {
   LIGHT_MEDIA_FRESHNESS_ARTICLE_MAX_COUNT,
   collectSameOriginScriptSrcJsonLdSummaryLight,
   buildLightCoverageObservationPlan_,
+  inferEcGeneralLinkPageType_,
+  addEcGeneralLinkCandidatesFromLinks_,
   fetchSubpageHtmlLightUrls_,
   isSubpageHtmlLightObservationSufficient_,
   buildCoverageSignalsV1FromSubpageObservation_,
