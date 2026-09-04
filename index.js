@@ -3748,6 +3748,52 @@ function extractArticleVisibleDateCandidatesFromCheerio_($) {
   return out;
 }
 
+// Returns an explicit match first, then recognizes a conservative structural
+// breadcrumb list. This is deliberately not a claim that the list exposes a
+// standards-complete RDFa or Microdata BreadcrumbList. A home link, current
+// class, or RDFa-like attributes alone are insufficient: the list must have a
+// linked ancestor, a non-link marked current item, and a separate reinforcing
+// signal. Header/nav/footer lists are excluded to avoid global navigation.
+function detectBreadcrumbUiFromCheerio_($) {
+  const explicitSelector = [
+    'nav[aria-label*="breadcrumb" i]', '[aria-label*="パンくず"]',
+    '[class*="breadcrumb" i]', '[id*="breadcrumb" i]',
+    '[class*="breadcrumbs" i]', '[id*="breadcrumbs" i]',
+    '[class*="pankuzu" i]', '[id*="pankuzu" i]', '[data-breadcrumb]'
+  ].join(',');
+  const explicit = $(explicitSelector).first();
+  if (explicit.length) return { hasBreadcrumbUi: true, source: 'explicit_selector', element: explicit };
+
+  let structural = null;
+  $('ol,ul').each((_, list) => {
+    if (structural) return;
+    const $list = $(list);
+    if ($list.closest('header,nav,[role="navigation"],footer,[role="contentinfo"]').length) return;
+    const items = $list.children('li').toArray();
+    if (items.length < 2) return;
+    const $last = $(items[items.length - 1]);
+    const priorHasLink = items.slice(0, -1).some((item) => $(item).find('a[href]').length > 0);
+    const finalIsNonLink = $last.find('a[href]').length === 0;
+    const finalCurrent = $last.is('[aria-current="page"],.current,.current-item') ||
+      $last.find('[aria-current="page"],.current,.current-item').length > 0;
+    const microdataItems = $list.find('[property="itemListElement"][typeof~="ListItem"]').length;
+    const hasMicrodata = microdataItems >= 2 &&
+      $list.find('[property="item"],[property="name"],meta[property="position"]').length > 0;
+    const first = $(items[0]);
+    const homeLink = first.find('a[href]').first();
+    const homeCue = homeLink.length > 0 && (
+      /(^|\s)(home|ホーム)(\s|$)/i.test(normalizeSubpageJsonLdText(homeLink.text())) ||
+      /(^|\s)home(\s|$)/i.test(String(homeLink.attr('class') || ''))
+    );
+    if (priorHasLink && finalIsNonLink && finalCurrent && (hasMicrodata || homeCue)) {
+      structural = $list;
+    }
+  });
+  return structural
+    ? { hasBreadcrumbUi: true, source: 'structural_breadcrumb', element: structural }
+    : { hasBreadcrumbUi: false, source: 'not_observed', element: null };
+}
+
 function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const $ = cheerio.load(String(html || ''));
   const title = normalizeSubpageJsonLdText($('title').first().text()).slice(0, 180);
@@ -3779,34 +3825,11 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
   const jsonldTypeCounts = countSubpageJsonLdTypes(jsonldTypes);
   const lowerTypes = new Set(uniqueTypes.map(type => normalizeSubpageJsonLdType(type).toLowerCase()));
   const legalPageType = inferLegalOperatorPageType_(finalUrl || url, title, h1Texts);
-  const breadcrumbSelector = [
-    'nav[aria-label*="breadcrumb" i]',
-    '[aria-label*="パンくず"]',
-    '[class*="breadcrumb" i]',
-    '[id*="breadcrumb" i]',
-    '[class*="breadcrumbs" i]',
-    '[id*="breadcrumbs" i]',
-    '[class*="pankuzu" i]',
-    '[id*="pankuzu" i]'
-  ].join(',');
   // Keep the subpage semantic-nav meaning aligned with the rendered top-page
   // detector. This reuses the HTML already fetched for light coverage.
   const hasNavElement = $('nav,[role="navigation"]').length > 0;
-  let hasBreadcrumbUi = $(breadcrumbSelector).length > 0;
-  if (!hasBreadcrumbUi) {
-    $('nav, ol, ul, div').slice(0, 200).each((_, el) => {
-      if (hasBreadcrumbUi) return;
-      const attrs = [
-        $(el).attr('class'),
-        $(el).attr('id'),
-        $(el).attr('aria-label')
-      ].map(v => normalizeSubpageJsonLdText(v).toLowerCase()).join(' ');
-      const text = normalizeSubpageJsonLdText($(el).text()).slice(0, 120);
-      if (/(breadcrumb|breadcrumbs|pankuzu)/i.test(attrs) || /パンくず/.test(attrs) || /パンくず/.test(text)) {
-        hasBreadcrumbUi = true;
-      }
-    });
-  }
+  const breadcrumbDetection = detectBreadcrumbUiFromCheerio_($);
+  const hasBreadcrumbUi = breadcrumbDetection.hasBreadcrumbUi;
   const bodyClone = $('body').first().clone();
   bodyClone.find('script,style,noscript,svg,nav,footer').remove();
   const sampledText = normalizeSubpageJsonLdText(bodyClone.text()).slice(0, 500);
@@ -3929,6 +3952,7 @@ function parseSubpageJsonLdLightHtml(url, finalUrl, status, html, siteMode) {
     hasArticleJsonLd: lowerTypes.has('article') || lowerTypes.has('newsarticle'),
     hasBlogPostingJsonLd: lowerTypes.has('blogposting'),
     hasBreadcrumbUi,
+    breadcrumbUiSource: breadcrumbDetection.source,
     hasNavElement,
     navObservationComplete: true,
     hasMain: $('main,[role="main"]').length > 0,
@@ -13005,14 +13029,46 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
         if (style && Number(style.opacity) === 0) return false;
         return !el.getClientRects || el.getClientRects().length > 0;
       };
-      const breadcrumbEl = queryAllDeep([
+      const explicitBreadcrumbEl = queryAllDeep([
         '[aria-label*="breadcrumb" i]',
         '[class*="breadcrumb" i]',
         '[id*="breadcrumb" i]',
         'nav[aria-label*="パンくず" i]',
         '[class*="パンくず" i]',
-        '[id*="パンくず" i]'
+        '[id*="パンくず" i]',
+        '[data-breadcrumb]'
       ].join(',')).find(isVisibleBreadcrumbElement) || null;
+      // Do not require a breadcrumb-like class name. This is structural UI
+      // inference, not a claim of standards-complete RDFa/Microdata: require
+      // a linked ancestor, a marked non-link current item, and a separate
+      // reinforcing signal outside global navigation.
+      const findStructuralBreadcrumbEl = () => {
+        const lists = queryAllDeep('ol,ul', { maxNodes: 200 });
+        for (const list of lists) {
+          if (!isVisibleBreadcrumbElement(list) || list.closest('header,nav,[role="navigation"],footer,[role="contentinfo"]')) continue;
+          const items = Array.from(list.children || []).filter((el) => String(el.tagName || '').toLowerCase() === 'li');
+          if (items.length < 2) continue;
+          const last = items[items.length - 1];
+          const priorHasLink = items.slice(0, -1).some((item) => !!item.querySelector('a[href]'));
+          const finalIsNonLink = !last.querySelector('a[href]');
+          const finalCurrent = last.matches('[aria-current="page"],.current,.current-item') ||
+            !!last.querySelector('[aria-current="page"],.current,.current-item');
+          const microdataItems = list.querySelectorAll('[property="itemListElement"][typeof~="ListItem"]').length;
+          const hasMicrodata = microdataItems >= 2 &&
+            !!list.querySelector('[property="item"],[property="name"],meta[property="position"]');
+          const firstLink = items[0].querySelector('a[href]');
+          const homeCue = !!firstLink && (
+            /(^|\s)(home|ホーム)(\s|$)/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) ||
+            /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || ''))
+          );
+          if (priorHasLink && finalIsNonLink && finalCurrent && (hasMicrodata || homeCue)) return list;
+        }
+        return null;
+      };
+      const structuralBreadcrumbEl = explicitBreadcrumbEl ? null : findStructuralBreadcrumbEl();
+      const breadcrumbEl = explicitBreadcrumbEl || structuralBreadcrumbEl;
+      const breadcrumbUiSource = explicitBreadcrumbEl ? 'explicit_selector' :
+        (structuralBreadcrumbEl ? 'structural_breadcrumb' : 'dom_scan');
       const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
       const footerAnchors = anchors.filter((a) => a.footerLike);
       const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
@@ -13299,7 +13355,7 @@ async function buildGeoSignalsV1(page, url, opts = {}) {
           pricingLinkSource: pricingLink === true ? 'dom_link_text' : 'not_observed',
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
-          breadcrumbUiSource: 'dom_scan',
+          breadcrumbUiSource,
           breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
           footerSignals,
           source: 'rendered_dom_light'
@@ -18004,13 +18060,36 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           10
         );
         const footerHay = footerAnchors.map((a) => `${a.text} ${a.href}`).join(' ').toLowerCase();
-        const breadcrumbEl = queryAllDeep([
+        const explicitBreadcrumbEl = queryAllDeep([
           '[aria-label*="breadcrumb" i]',
           '[class*="breadcrumb" i]',
           '[id*="breadcrumb" i]',
           'nav[aria-label*="パンくず" i]',
-          '[class*="パンくず" i]'
+          '[class*="パンくず" i]',
+          '[id*="パンくず" i]',
+          '[data-breadcrumb]'
         ].join(','))[0] || null;
+        const findStructuralBreadcrumbEl = () => {
+          const lists = queryAllDeep('ol,ul', { maxNodes: 200 });
+          for (const list of lists) {
+            if (list.closest('header,nav,[role="navigation"],footer,[role="contentinfo"]')) continue;
+            const items = Array.from(list.children || []).filter((el) => String(el.tagName || '').toLowerCase() === 'li');
+            if (items.length < 2) continue;
+            const last = items[items.length - 1];
+            const priorHasLink = items.slice(0, -1).some((item) => !!item.querySelector('a[href]'));
+            const finalIsNonLink = !last.querySelector('a[href]');
+            const finalCurrent = last.matches('[aria-current="page"],.current,.current-item') || !!last.querySelector('[aria-current="page"],.current,.current-item');
+            const microdataItems = list.querySelectorAll('[property="itemListElement"][typeof~="ListItem"]').length;
+            const hasMicrodata = microdataItems >= 2 && !!list.querySelector('[property="item"],[property="name"],meta[property="position"]');
+            const firstLink = items[0].querySelector('a[href]');
+            const homeCue = !!firstLink && (/^\s*(home|ホーム)\s*$/i.test(clean(firstLink.innerText || firstLink.textContent || firstLink.getAttribute('aria-label') || firstLink.getAttribute('title'))) || /(^|\s)home(\s|$)/i.test(String(firstLink.getAttribute('class') || '')));
+            if (priorHasLink && finalIsNonLink && finalCurrent && (hasMicrodata || homeCue)) return list;
+          }
+          return null;
+        };
+        const structuralBreadcrumbEl = explicitBreadcrumbEl ? null : findStructuralBreadcrumbEl();
+        const breadcrumbEl = explicitBreadcrumbEl || structuralBreadcrumbEl;
+        const breadcrumbUiSource = explicitBreadcrumbEl ? 'explicit_selector' : (structuralBreadcrumbEl ? 'structural_breadcrumb' : 'dom_scan');
         const breadcrumbText = clean(breadcrumbEl && (breadcrumbEl.innerText || breadcrumbEl.textContent));
         const faqSectionEl = queryAllDeep([
           'section[aria-label*="faq" i]',
@@ -18132,7 +18211,7 @@ async function scrapeOnce(req, res, lightBudget = null, scrapeOptions = {}) {
           pricingLinkSource: sourceFor(pricingLink),
           breadcrumbUiObserved: true,
           hasBreadcrumbUi: !!breadcrumbEl,
-          breadcrumbUiSource: 'dom_scan',
+          breadcrumbUiSource,
           breadcrumbUiTextSample: breadcrumbText ? breadcrumbText.slice(0, 120) : '',
           formSignals,
           footerSignals: {
@@ -23943,6 +24022,7 @@ if (require.main === module) {
 }
 
 module.exports.__lightBudgetTestHooks = {
+  detectBreadcrumbUiFromCheerio_,
   buildGeoSignalsV1,
   attachContactDestination_,
   buildHeadObservations_,

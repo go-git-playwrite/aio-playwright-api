@@ -4,7 +4,8 @@
   "type": "commonjs",
   "private": true,
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:breadcrumb-ui": "node tests/breadcrumb-ui-observation.test.js"
   },
   "dependencies": {
   "express": "^4.19.2",
